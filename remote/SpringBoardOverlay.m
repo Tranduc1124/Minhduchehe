@@ -103,7 +103,19 @@ static const char *kShapeKeys[16] = {
 
 static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
-    return r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
+    // Name the remote call that kills the session. g_RC_success is cleared by
+    // any failed remote operation, and the device log shows a healthy session
+    // (ok=1) at 09:14:48, one publish at 09:14:49 costing 166 ms for two calls,
+    // and ok=0 from 09:14:50 onward with no further recovery. persistentPath and
+    // ptsBuffer both succeeded, since PUSH-PROBE stayed quiet, so the failure is
+    // in one of the drawing calls below. This wrapper sees the symbol name of
+    // every one of them, so a 1 to 0 transition names the culprit directly.
+    const int okBefore = remote_call_current_success() ? 1 : 0;
+    uint64_t r = r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
+    if (okBefore && !remote_call_current_success()) {
+        NSLog(@"[PUSH-DLSYM] %s broke the session (fn=%p)", fn, (const void *)fn);
+    }
+    return r;
 }
 
 static uint64_t now_us(void) {
