@@ -154,7 +154,7 @@ static uint64_t now_us(void) {
     return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
-typedef struct { NSMutableData *data; double landW; double landH; } SerCtx;
+typedef struct { NSMutableData *data; double landW; double landH; CGPoint last; } SerCtx;
 static uint32_t g_sbSubpathCount = 0;
 
 // op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
@@ -172,20 +172,41 @@ static void serFunc(void *info, const CGPathElement *e) {
     const CGPoint *src;
     int npts = 1;
     if (e->type == kCGPathElementAddCurveToPoint) {
-        // Emitted as its endpoint only, as it always was.
+        // Flatten the cubic into line segments so circles stop rendering as
+        // diamonds. CGPathAddEllipseInRect builds a circle from four cubics, and
+        // keeping only the endpoints leaves four points and four straight lines,
+        // which is a diamond. That hit the head marker and the FOV ring.
         //
-        // Subdividing the curve into line segments was tried and reverted. It
-        // fixes the diamond shape, but the decoder caps a subpath at 1024
-        // doubles, and a circle went from 4 points to 32. A subpath that was
-        // already 73 points became 584 and was cut in half mid shape, which
-        // drew garbage, flickered, and left the overlay swallowing touches
-        // until the device needed a hard reset.
+        // This is what bricked the device once already, and the reason was not
+        // the subdivision itself but that the decoder cap was left where it was.
+        // The subpath buffer is now static and four times larger, so 32 points
+        // per circle sits far inside it, and the largest subpath the log ever
+        // reported, 73 points, becomes 584 against a 2048 point ceiling.
         //
-        // Making circles round needs the cap raised at the same time, or the
-        // subdivision kept below it. Neither is safe to do in the same change
-        // as a regression this severe, so the cap stays where it is and the
-        // circles stay diamonds until that is fixed properly.
-        src = &e->points[2];
+        // Eight segments per cubic arc: at a 3px head marker the chord error is
+        // well under a tenth of a pixel, and on the FOV ring it is about one
+        // pixel. One remote call per shape is unchanged, because the subpath
+        // still leaves as a single CGPathAddLines.
+        const CGPoint p0 = ctx->last;
+        const CGPoint p1 = e->points[0];
+        const CGPoint p2 = e->points[1];
+        const CGPoint p3 = e->points[2];
+        uint8_t lop = 2;
+        for (int s = 1; s <= 8; s++) {
+            const double t = (double)s / 8.0, u = 1.0 - t;
+            const double a = u * u * u, b = 3.0 * u * u * t;
+            const double c = 3.0 * u * t * t, e = t * t * t;
+            const double lx = a * p0.x + b * p1.x + c * p2.x + e * p3.x;
+            const double ly = a * p0.y + b * p1.y + c * p2.y + e * p3.y;
+            CGPoint q;
+            q.x = ctx->landH - ly;
+            q.y = lx;
+            [ctx->data appendBytes:&lop length:1];
+            [ctx->data appendBytes:&q length:sizeof(q)];
+        }
+        ctx->last.x = ctx->landH - p3.y;
+        ctx->last.y = p3.x;
+        return;
     } else if (e->type == kCGPathElementAddQuadCurveToPoint) {
         src = &e->points[1];
     } else {
@@ -205,6 +226,7 @@ static void serFunc(void *info, const CGPathElement *e) {
     p.x = ctx->landH - src->y;
     p.y = src->x;
     [ctx->data appendBytes:&p length:sizeof(p)];
+    ctx->last = p;
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
@@ -759,7 +781,20 @@ void SBRemotePushESPFrame(UIView *espView) {
             size_t i = 0;
             int curLayer = -1;
             while (i < len) {
-                double run[1024];
+                // Static rather than on the stack. The cap was 1024 doubles,
+                // which is 512 points, and that is the limit that bricked the
+                // overlay when curve subdivision was tried: a circle went from 4
+                // points to 32, and a subpath already at 73 points became 584
+                // and was cut in half mid shape.
+                //
+                // A static buffer moves the limit off the stack, where a bigger
+                // cap would be a few tens of kilobytes of frame, and lets it be
+                // generous. 4096 doubles is 2048 points and 32KB, and
+                // ptsBuffer is 65536 bytes, so a full buffer still fits the
+                // remote scratch with room to spare. The decoder is the only
+                // writer and s_remoteBusy keeps publishes from overlapping.
+                static double s_run[4096];
+                double *run = s_run;
                 int rn = 0;
                 while (i < len) {
                     uint8_t op = b[i++];
@@ -784,7 +819,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                         continue;
                     }
                     run[rn++] = x; run[rn++] = y;
-                    if (rn >= 1024) break;
+                    if (rn >= 4096) break;
                 }
                 // Two doubles is a single point. It cannot be drawn, and the old
                 // code spent 3 calls on it (a remote_write plus moveTo plus
