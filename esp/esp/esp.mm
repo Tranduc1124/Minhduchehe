@@ -2410,6 +2410,17 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     return buffers;
 }
 
+// Counts path elements and curve elements for the [APP-LAYER] diagnostic.
+// CGPathApply takes a plain C function, not a block.
+typedef struct { uint32_t n; uint32_t curves; } ESPPathCountCtx;
+static void espCountPathElements(void *info, const CGPathElement *e) {
+    ESPPathCountCtx *c = (ESPPathCountCtx *)info;
+    if (!c) return;
+    c->n++;
+    if (e->type == kCGPathElementAddCurveToPoint ||
+        e->type == kCGPathElementAddQuadCurveToPoint) c->curves++;
+}
+
 static inline void ESPGeometryBuffersRelease(ESPGeometryBuffers *buffers) {
     if (!buffers) return;
     ESPReleasePath(buffers->boxPath); ESPReleasePath(buffers->boxBotPath); ESPReleasePath(buffers->boxKnockedPath);
@@ -3297,6 +3308,15 @@ static inline uint64_t ESPPhaseNowUS(void) {
         MenuViewApplyPath(self.hpFillRedLayer, showVisuals ? buffers.hpFillRedPath : nil, buffers.hpFillRedDirty);
         MenuViewApplyPath(self.alertLayer, showVisuals ? buffers.alertPath : nil, buffers.alertDirty);
 
+        // The dirty flags are read by the [APP-LAYER] diagnostic further down,
+        // which runs after ESPGeometryBuffersRelease has freed the paths, so
+        // they are copied here while the buffers are still alive.
+        static int s_dirtyBox = 0, s_dirtyBone = 0, s_dirtySnap = 0, s_dirtyHpG = 0;
+        s_dirtyBox = buffers.boxDirty;
+        s_dirtyBone = buffers.boneDirty;
+        s_dirtySnap = buffers.snaplineDirty;
+        s_dirtyHpG  = buffers.hpFillGreenDirty;
+
 
 
         if (showVisuals && stats.aimAssistPath) {
@@ -3315,6 +3335,31 @@ static inline uint64_t ESPPhaseNowUS(void) {
                                           isAimbot && aimSphereMode == 0 && isShowFovCircle, aimFov);
         self.fovLayer.path = hasFov ? fovPath : nil;
         CGPathRelease(fovPath);
+
+        // Every layer has now been assigned, fovLayer and aimAssistLayer
+        // included, so this is the first point at which the counts describe
+        // the frame on screen rather than the one before it.
+        {
+            static uint32_t s_layerLogTick = 0;
+            if ((++s_layerLogTick % 60u) == 1u) {
+                ESPPathCountCtx bx = {0,0}, bn = {0,0}, sn = {0,0}, fv = {0,0}, am = {0,0};
+                CGPathApply(self.boxLayer.path, &bx, espCountPathElements);
+                CGPathApply(self.boneLayer.path, &bn, espCountPathElements);
+                CGPathApply(self.snaplineLayer.path, &sn, espCountPathElements);
+                CGPathApply(self.fovLayer.path, &fv, espCountPathElements);
+                CGPathApply(self.aimAssistLayer.path, &am, espCountPathElements);
+                NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d bone=%d hp=%d show=%d | "
+                      @"box=%u/%u bone=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
+                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
+                      (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isBone, (int)isHealth,
+                      (int)showVisuals,
+                      bx.n, bx.curves, bn.n, bn.curves, sn.n, sn.curves,
+                      fv.n, fv.curves, am.n, am.curves,
+                      (int)s_dirtyBox, (int)s_dirtyBone,
+                      (int)s_dirtySnap, (int)s_dirtyHpG,
+                      (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil));
+            }
+        }
 
         if (isCount) {
             NSString *countText;
