@@ -121,10 +121,6 @@ static uint64_t g_sbNextPublishUS = 0;
 static uint32_t g_sbLastSubpaths = 0;
 static uint64_t g_sbLastCalls = 0;
 
-// Index into kShapeKeys of the FOV ring. It is the one element that is a
-// curve rather than a polygon, and it therefore gets a transport of its own.
-#define SB_LAYER_FOV 14
-
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
     "boneLayer", "boneBotLayer", "boneKnockedLayer",
@@ -243,39 +239,6 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         uint8_t idx = (uint8_t)i;
         [d appendBytes:&tag length:1];
         [d appendBytes:&idx length:1];
-
-        if (i == SB_LAYER_FOV) {
-            // The FOV ring is sent as a rectangle, not as points.
-            //
-            // CGPathGetBoundingBox of a circle is the circle exactly, so there
-            // is nothing to flatten and nothing to guess. The four cubic curves
-            // that CGPathAddEllipseInRect built never reach the wire, which
-            // removes the only part of the geometry path that could be made to
-            // grow without bound. That growth is what bricked the device twice:
-            // keeping just the endpoints gave a diamond, and subdividing the
-            // curves overflowed the subpath buffer and drew fragments.
-            //
-            // Four doubles cannot overflow anything.
-            const CGRect bb = CGPathGetBoundingBox(p);
-            if (bb.size.width >= 1.0 && bb.size.height >= 1.0) {
-                uint8_t eop = 5;                // op 5 = ellipse
-                // landscape rect (x,y,w,h) maps to portrait
-                // (landH - y - h, x, h, w): the rotation swaps the axes and the
-                // far edge in y becomes the near edge.
-                const double ex = ctx.landH - (double)bb.origin.y - (double)bb.size.height;
-                const double ey = (double)bb.origin.x;
-                const double ew = (double)bb.size.height;
-                const double eh = (double)bb.size.width;
-                [d appendBytes:&eop length:1];
-                [d appendBytes:&ex length:sizeof(ex)];
-                [d appendBytes:&ey length:sizeof(ey)];
-                [d appendBytes:&ew length:sizeof(ew)];
-                [d appendBytes:&eh length:sizeof(eh)];
-                emitted = 1;
-            }
-            continue;
-        }
-
         CGPathApply(p, &ctx, serFunc);
         emitted = 1;
     }
@@ -786,7 +749,6 @@ void SBRemotePushESPFrame(UIView *espView) {
             // subpath is classified by its point count alone, so counting the
             // counts names every category without changing any drawing.
             int c2 = 0, c3 = 0, c4 = 0, c5to8 = 0, c9to32 = 0, c33p = 0;
-            int ellipseCount = 0;
             // First rectangle exactly as it is written into the remote buffer,
             // so it can be compared against the app side scr= for the same
             // player. If the two disagree the fault is in the hand-off; if they
@@ -804,45 +766,6 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
-                        continue;
-                    }
-                    if (op == 5) {                 // ellipse as a rect, 4 doubles
-                        if (i + 32 > len) { i = len; break; }
-                        double er[4];
-                        memcpy(er, b + i, 32);
-                        i += 32;
-                        if (er[2] >= 1.0 && er[3] >= 1.0) {
-                            // Drawn as an open polyline, not as a real closed
-                            // ellipse.
-                            //
-                            // CGPathAddEllipseInRect produces a CLOSED subpath.
-                            // Everything else in this path is open, because the
-                            // serialiser drops closeSubpath, so the ellipse was
-                            // the only shape that could be filled rather than
-                            // stroked. On a layer with a non-clear fill that is a
-                            // solid disc across the screen, which is what the
-                            // earlier report described as colour layers filling
-                            // the display, and it hides the very ring it draws.
-                            //
-                            // An open polyline cannot be filled. The point count
-                            // is fixed at 32 regardless of size, so nothing here
-                            // can grow, and it is still one remote call.
-                            static const int kSeg = 32;
-                            static double ring[(kSeg + 1) * 2];
-                            const double cx = er[0] + er[2] * 0.5;
-                            const double cy = er[1] + er[3] * 0.5;
-                            const double rx = er[2] * 0.5, ry = er[3] * 0.5;
-                            for (int s = 0; s <= kSeg; s++) {
-                                const double a = (double)s * 2.0 * M_PI / (double)kSeg;
-                                ring[s * 2]     = cx + rx * cos(a);
-                                ring[s * 2 + 1] = cy + ry * sin(a);
-                            }
-                            remote_write(ptsBuf, ring, sizeof(ring));
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf,
-                                         kSeg + 1, 0, 0, 0, 0);
-                            calls++; drawn++;
-                            ellipseCount++;
-                        }
                         continue;
                     }
                     if (i + 16 > len) { i = len; break; }
@@ -1035,7 +958,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                         }
                         NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
-                              @"bdrops=%llu hold=%llums ell=%d pts2=%d pts3=%d pts4=%d "
+                              @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
                               @"mergedSub=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
@@ -1046,7 +969,6 @@ void SBRemotePushESPFrame(UIView *espView) {
                               (unsigned long long)ups,
                               (unsigned long long)bdropRate,
                               (unsigned long long)holdMS,
-                              ellipseCount,
                               c2, c3, c4, c5to8, c9to32, c33p,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
