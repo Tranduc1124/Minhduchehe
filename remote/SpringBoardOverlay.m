@@ -26,7 +26,16 @@
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
-#define SB_MIN_PUBLISH_INTERVAL_US 66666ULL
+// Publish ceiling. 66666us was 15fps, back when a frame cost 387 remote calls
+// and took 1.6 seconds, so the cap was never what limited anything. Now it is:
+// a frame is about 15 calls at the measured 1.2ms each, roughly 18ms, which
+// leaves about 48ms of the old 66ms window unused. That unused headroom is
+// what reads as lag, so the cap drops to 30fps and the achieved rate is
+// logged as ups so the real number is measured rather than assumed.
+//
+// ups near 30 means the ceiling is binding and can go lower again. ups stuck
+// near 15 means the cost per frame has grown back and the frame is the limit.
+#define SB_MIN_PUBLISH_INTERVAL_US 33333ULL
 
 // Skeleton limbs are the only ESP element with no batchable CoreGraphics
 // primitive: each one needs its own CGPathAddLines call, because the SDK has
@@ -831,14 +840,28 @@ void SBRemotePushESPFrame(UIView *espView) {
                         //                   only fix the geometry.
                         // Until this is measured, both are guesses.
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
+                        // ups = publishes completed in the previous second, which
+                        // is the frame rate actually achieved rather than the one
+                        // the cap allows.
+                        static uint64_t s_prevUpd = 0, s_prevUpdUS = 0;
+                        uint64_t ups = 0;
+                        {
+                            uint64_t tU = now_us();
+                            if (tU > s_prevUpdUS + 1000000ULL) {
+                                ups = g_sbSummaryUpdates - s_prevUpd;
+                                s_prevUpd = g_sbSummaryUpdates;
+                                s_prevUpdUS = tU;
+                            }
+                        }
                         NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
-                              @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f hash=%u "
+                              @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"upd=%llu att=%llu skip=%llu mergedSub=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
                               maxPts, nBig,
                               firstRect[0], firstRect[1], firstRect[2], firstRect[3],
+                              (unsigned long long)ups,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
