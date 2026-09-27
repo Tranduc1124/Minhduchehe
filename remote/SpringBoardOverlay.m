@@ -812,27 +812,34 @@ void SBRemotePushESPFrame(UIView *espView) {
                         memcpy(er, b + i, 32);
                         i += 32;
                         if (er[2] >= 1.0 && er[3] >= 1.0) {
-                            // A real closed ellipse, stroked, not a polyline
-                            // approximation.
+                            // Drawn as an open polyline, not as a real closed
+                            // ellipse.
                             //
-                            // The polyline was a precaution against the ellipse
-                            // being filled instead of stroked, on the theory
-                            // that a closed subpath is the only shape here that
-                            // could fill. The device answered that: the ring came
-                            // back hollow, so the layer's fill is clear and the
-                            // theory was wrong. With that settled there is no
-                            // reason to approximate. CGPathAddEllipseInRect is an
-                            // exact curve, so the ring has no facets at all,
-                            // where 32 chords on a 200 point radius left about a
-                            // pixel of flatness on each segment and read as a
-                            // polygon.
+                            // CGPathAddEllipseInRect produces a CLOSED subpath.
+                            // Everything else in this path is open, because the
+                            // serialiser drops closeSubpath, so the ellipse was
+                            // the only shape that could be filled rather than
+                            // stroked. On a layer with a non-clear fill that is a
+                            // solid disc across the screen, which is what the
+                            // earlier report described as colour layers filling
+                            // the display, and it hides the very ring it draws.
                             //
-                            // Two arguments: path, then the rect. Passing a
-                            // transform in the second slot is what made it draw
-                            // nothing silently before.
-                            remote_write(ptsBuf, er, 32);
-                            dlsym_remote("CGPathAddEllipseInRect", rp, ptsBuf,
-                                         0, 0, 0, 0, 0, 0);
+                            // An open polyline cannot be filled. The point count
+                            // is fixed at 32 regardless of size, so nothing here
+                            // can grow, and it is still one remote call.
+                            static const int kSeg = 32;
+                            static double ring[(kSeg + 1) * 2];
+                            const double cx = er[0] + er[2] * 0.5;
+                            const double cy = er[1] + er[3] * 0.5;
+                            const double rx = er[2] * 0.5, ry = er[3] * 0.5;
+                            for (int s = 0; s <= kSeg; s++) {
+                                const double a = (double)s * 2.0 * M_PI / (double)kSeg;
+                                ring[s * 2]     = cx + rx * cos(a);
+                                ring[s * 2 + 1] = cy + ry * sin(a);
+                            }
+                            remote_write(ptsBuf, ring, sizeof(ring));
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf,
+                                         kSeg + 1, 0, 0, 0, 0);
                             calls++; drawn++;
                             ellipseCount++;
                         }
