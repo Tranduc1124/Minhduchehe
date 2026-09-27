@@ -28,6 +28,14 @@
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
 #define SB_MIN_PUBLISH_INTERVAL_US 66666ULL
 
+// Skeleton limbs are the only ESP element with no batchable CoreGraphics
+// primitive: each one needs its own CGPathAddLines call, because the SDK has
+// nothing that strokes N disjoint segments at once. 12 players x 12 limbs is
+// 144 calls, which is the whole cost the rectangle batching exists to remove.
+// Off by default; the limb count is logged either way so the cost of turning
+// it on is visible before it is turned on.
+#define SB_DRAW_BONES 0
+
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
@@ -421,24 +429,39 @@ void SBRemotePushESPFrame(UIView *espView) {
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;
 
-            // Draw each subpath separately. CGPathAddLines draws ONE polyline and
-            // joins p[i]->p[i+1] unconditionally, so feeding it every point of
-            // every shape draws a long bogus segment from the end of one box to
-            // the start of the next. That is the garbled geometry: the device log
-            // shows n=720 (360 points) landing in a single polyline, and the
-            // screenshot shows the resulting chords across the screen. The FOV
-            // circle survives because it is one closed subpath with nothing to
-            // join to.
+            // Every CoreGraphics call below crosses the process boundary into
+            // SpringBoard, so a frame costs (number of calls) x (cost of one
+            // remote call). The previous loop spent 2 calls per subpath over 137
+            // subpaths and measured 387 calls per publish, which is 0.05 fps on
+            // screen: one repaint every 21 seconds, which is the "ESP does not
+            // move" symptom.
             //
-            // Cost is now 2 remote calls per subpath instead of 1 per frame, so
-            // the subpath count is logged. If it is large we must batch or cap;
-            // that is a separate decision, not a guess.
+            // The batchable primitive is CGPathAddRects, which appends N
+            // rectangles as N independent subpaths in a single call. It is the
+            // only one that exists: CGContextStrokeLines and CGContextStrokeRects
+            // are absent from CoreGraphics.tbd on iOS 17.5, not even privately,
+            // so there is no way to stroke N disjoint segments in one call.
+            //
+            // Rule: anything geometrically a rectangle is batched. Boxes,
+            // snaplines and HP bars are all rectangles and together they are
+            // nearly the whole frame. Skeleton limbs are the one shape that
+            // cannot be batched, so they are counted and dropped unless
+            // SB_DRAW_BONES is set; keeping them would put the frame back at
+            // 150+ calls, and the user has accepted losing them.
             uint32_t subpaths = 0;
+            uint32_t rectCount = 0;
+            uint32_t limbCount = 0;
             uint64_t calls = 0;
             uint32_t drawn = 0;
 
             dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
             calls++;
+
+            // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
+            // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
+            // are flushed in several CGPathAddRects calls rather than overrun it.
+            double rectBuf[512];
+            int rectDoubles = 0;
 
             size_t i = 0;
             while (i < len) {
@@ -456,23 +479,93 @@ void SBRemotePushESPFrame(UIView *espView) {
                     run[rn++] = x; run[rn++] = y;
                     if (rn >= 1024) break;
                 }
-                if (rn < 2) continue;          // subpath too short to draw
-                subpaths++; drawn++;
+                // Two doubles is a single point. It cannot be drawn, and the old
+                // code spent 3 calls on it (a remote_write plus moveTo plus
+                // addLines with count=1, which renders nothing).
+                if (rn < 4) continue;
+                subpaths++;
 
-                remote_write(ptsBuf, run, (size_t)rn * 8);
-                calls++;
-                if (rn == 2) {
-                    // A one-point CGPathAddLines draws nothing, so a lone
-                    // segment would be invisible. Emit it as moveTo + a
-                    // two-point addLines, which costs one extra remote call but
-                    // only for degenerate subpaths.
-                    dlsym_remote("CGPathMoveToPoint", rp, 0, ptsBuf, 0, 0,0,0,0);
-                    dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 1, 0,0,0,0);
-                    calls += 2;
-                } else {
-                    dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, rn / 2, 0,0,0,0);
-                    calls++;
+                const int np = rn / 2;
+                int isRect = 0;
+                double rx = 0, ry = 0, rw = 0, rh = 0;
+
+                if (np == 4) {
+                    // Rectangle test: the subpath is closed and all four corners
+                    // lie on the bounding box. CGPathAddRect emits exactly this,
+                    // so boxes and HP bars match and everything else falls
+                    // through to the polyline branch below.
+                    double minX = run[0], maxX = run[0];
+                    double minY = run[1], maxY = run[1];
+                    for (int k = 1; k < 4; k++) {
+                        double px = run[k*2], py = run[k*2+1];
+                        if (px < minX) minX = px;
+                        if (px > maxX) maxX = px;
+                        if (py < minY) minY = py;
+                        if (py > maxY) maxY = py;
+                    }
+                    const double w = maxX - minX, h = maxY - minY;
+                    if (w > 0.5 && h > 0.5 &&
+                        fabs(run[0] - run[6]) < 0.5 && fabs(run[1] - run[7]) < 0.5) {
+                        isRect = 1;
+                        for (int k = 0; k < 4 && isRect; k++) {
+                            double px = run[k*2], py = run[k*2+1];
+                            if ((fabs(px - minX) > 0.5 && fabs(px - maxX) > 0.5) ||
+                                (fabs(py - minY) > 0.5 && fabs(py - maxY) > 0.5)) {
+                                isRect = 0;
+                            }
+                        }
+                        if (isRect) { rx = minX; ry = minY; rw = w; rh = h; }
+                    }
+                } else if (np == 2) {
+                    // A lone segment. Axis-aligned ones are snaplines, which are
+                    // rectangles in disguise; anything else is a skeleton limb.
+                    const double x0 = run[0], y0 = run[1];
+                    const double x1 = run[2], y1 = run[3];
+                    const double dx = fabs(x1 - x0), dy = fabs(y1 - y0);
+                    const double th = 1.0;
+                    if (dx < 0.5 || dy < 0.5) {
+                        isRect = 1;
+                        if (dx < 0.5) { rx = fmin(x0,x1) - th; ry = fmin(y0,y1); rw = th*2; rh = dy; }
+                        else           { rx = fmin(x0,x1);      ry = fmin(y0,y1) - th; rw = dx; rh = th*2; }
+                    } else {
+                        limbCount++;
+#if SB_DRAW_BONES
+                        remote_write(ptsBuf, run, (size_t)rn * 8);
+                        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                        calls++; drawn++;
+#endif
+                    }
                 }
+
+                if (isRect) {
+                    if (rectDoubles + 4 > (int)(sizeof(rectBuf)/sizeof(rectBuf[0]))) {
+                        remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
+                        dlsym_remote("CGPathAddRects", rp, 0, ptsBuf,
+                                     rectDoubles / 4, 0, 0,0,0);
+                        calls++; drawn++;
+                        rectDoubles = 0;
+                    }
+                    rectBuf[rectDoubles++] = rx;
+                    rectBuf[rectDoubles++] = ry;
+                    rectBuf[rectDoubles++] = rw;
+                    rectBuf[rectDoubles++] = rh;
+                    rectCount++;
+                    continue;
+                }
+
+                // Everything else is one polyline in one call. CGPathAddLines
+                // begins a new subpath at its first point, so separate calls
+                // never join: that is what the old single-polyline version got
+                // wrong and produced chords across the screen.
+                remote_write(ptsBuf, run, (size_t)rn * 8);
+                dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, np, 0,0,0,0);
+                calls++; drawn++;
+            }
+
+            if (rectDoubles >= 4) {
+                remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
+                dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
+                calls++; drawn++;
             }
 
             if (drawn > 0) {
@@ -499,9 +592,10 @@ void SBRemotePushESPFrame(UIView *espView) {
                         //                   only fix the geometry.
                         // Until this is measured, both are guesses.
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
-                        NSLog(@"[SB-PUSH] sub=%u calls=%llu ms=%llu hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u",
-                              g_sbLastSubpaths, (unsigned long long)g_sbLastCalls,
+                        NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu hash=%u "
+                              @"upd=%llu att=%llu skip=%llu mergedSub=%u",
+                              g_sbLastSubpaths, rectCount, limbCount,
+                              (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
