@@ -462,6 +462,17 @@ void SBRemotePushESPFrame(UIView *espView) {
             // are flushed in several CGPathAddRects calls rather than overrun it.
             double rectBuf[512];
             int rectDoubles = 0;
+            // A subpath far larger than any real shape means the stream handed
+            // us points belonging to more than one shape, which is what draws a
+            // line across the screen. Recorded rather than assumed.
+            int maxPts = 0;
+            int nBig = 0;
+            // First rectangle exactly as it is written into the remote buffer,
+            // so it can be compared against the app side scr= for the same
+            // player. If the two disagree the fault is in the hand-off; if they
+            // agree, the fault is in the geometry upstream of the hand-off.
+            double firstRect[4] = {0, 0, 0, 0};
+            int haveFirstRect = 0;
 
             size_t i = 0;
             while (i < len) {
@@ -494,6 +505,8 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
+                if (np > maxPts) maxPts = np;
+                if (np > 8) nBig++;
                 int isRect = 0;
                 double rx = 0, ry = 0, rw = 0, rh = 0;
 
@@ -536,11 +549,15 @@ void SBRemotePushESPFrame(UIView *espView) {
                         if (dx < 0.5) { rx = fmin(x0,x1) - th; ry = fmin(y0,y1); rw = th*2; rh = dy; }
                         else           { rx = fmin(x0,x1);      ry = fmin(y0,y1) - th; rw = dx; rh = th*2; }
                     } else {
+                        // Skeleton limb. It must be skipped explicitly: falling
+                        // through to the generic polyline branch below would draw
+                        // it anyway and cost one remote call each, which is
+                        // exactly what SB_DRAW_BONES=0 is meant to avoid. That
+                        // fall-through is why the device log reported
+                        // calls=58 against limb=43, with 1+1+13 = 15 expected.
                         limbCount++;
-#if SB_DRAW_BONES
-                        remote_write(ptsBuf, run, (size_t)rn * 8);
-                        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
-                        calls++; drawn++;
+#if !SB_DRAW_BONES
+                        continue;
 #endif
                     }
                 }
@@ -557,6 +574,11 @@ void SBRemotePushESPFrame(UIView *espView) {
                     rectBuf[rectDoubles++] = ry;
                     rectBuf[rectDoubles++] = rw;
                     rectBuf[rectDoubles++] = rh;
+                    if (!haveFirstRect) {
+                        firstRect[0] = rx; firstRect[1] = ry;
+                        firstRect[2] = rw; firstRect[3] = rh;
+                        haveFirstRect = 1;
+                    }
                     rectCount++;
                     continue;
                 }
@@ -600,11 +622,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                         //                   only fix the geometry.
                         // Until this is measured, both are guesses.
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
-                        NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu hash=%u "
+                        NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
+                              @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f hash=%u "
                               @"upd=%llu att=%llu skip=%llu mergedSub=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
+                              maxPts, nBig,
+                              firstRect[0], firstRect[1], firstRect[2], firstRect[3],
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
