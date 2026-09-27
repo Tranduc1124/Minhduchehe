@@ -8,6 +8,7 @@
 
 #import "GameLogic.h" 
 #import <QuartzCore/QuartzCore.h>
+#import <mach/mach_time.h>
 #import <UIKit/UIKit.h>
 #import <CoreText/CoreText.h>
 #import <notify.h>
@@ -3044,6 +3045,15 @@ static void ESPDiagHeartbeat(void) {
     if (!CGRectEqualToRect(layer.frame, frame)) layer.frame = frame;
 }
 
+// Monotonic microseconds, for the per-phase render breakdown. Local to the
+// render loop so the two timers in this project stay independent.
+static inline uint64_t ESPPhaseNowUS(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (mach_absolute_time() * tb.numer / tb.denom) / 1000ULL;
+}
+
 - (void)updateFrame {
     // NOTE: no self.window guard — the view may be an OFFSCREEN data source
     // (host window alpha=0, never visible). The GCD frame timer drives the
@@ -3200,7 +3210,15 @@ static void ESPDiagHeartbeat(void) {
         }
 
         [CATransaction begin];
-        [CATransaction setDisableActions:YES];
+        // Per-phase timing for the render loop. The overlay publishes at about
+        // 35fps with a frame cost of 8 to 12ms, so the publish is not what
+        // limits the rate any more: the loop that produces the geometry is.
+        // This splits that loop into the part that reads the game and builds
+        // geometry, the part that pushes it into the CAShapeLayers, and the
+        // part that serialises and hands it to SpringBoard, so the next change
+        // goes where the time actually is rather than where it is assumed to
+        // be. Sampled once a second so the log stays readable.
+        const uint64_t tPhase0 = ESPPhaseNowUS();
         [self resetReusableLayers];
 
         // Free Fire renders landscape. This process never rotates, because it
@@ -3236,6 +3254,7 @@ static void ESPDiagHeartbeat(void) {
         // keep remapped pages hot across the whole frame (bones/HP/dict).
         ds_begin_read_transaction();
         ESPFrameStats stats = [self renderESPWithBuffers:&buffers viewWidth:viewWidth viewHeight:viewHeight matrixVpWidth:matrixVpW matrixVpHeight:matrixVpH screenCenter:screenCenter];
+        const uint64_t tPhase1 = ESPPhaseNowUS();
         ds_end_read_transaction();
         g_hbLastReal = stats.realCount;
         g_hbLastBot  = stats.botCount;
@@ -3330,11 +3349,36 @@ static void ESPDiagHeartbeat(void) {
             if (!self.statusLayer.hidden) self.statusLayer.hidden = YES;
         }
 
+        const uint64_t tPhase2 = ESPPhaseNowUS();
+
         [CATransaction commit];
 
         // Mirror this frame to the SpringBoard dedicated overlay (if active).
         extern void SBRemotePushESPFrame(UIView *espView);
         SBRemotePushESPFrame(self);
+
+        {
+            const uint64_t tPhase3 = ESPPhaseNowUS();
+            static uint64_t s_phUS = 0;
+            static uint32_t s_phFrames = 0;
+            static uint64_t s_phRender = 0, s_phLayer = 0, s_phPush = 0;
+            s_phFrames++;
+            s_phRender  += (tPhase1 - tPhase0);
+            s_phLayer   += (tPhase2 - tPhase1);
+            s_phPush    += (tPhase3 - tPhase2);
+            if (tPhase3 > s_phUS + 1000000ULL) {
+                const uint32_t n = s_phFrames ? s_phFrames : 1;
+                NSLog(@"[PUSH-PHASE] fps=%u read=%.2fms layer=%.2fms push=%.2fms total=%.2fms",
+                      (unsigned)s_phFrames,
+                      (double)s_phRender / (double)n / 1000.0,
+                      (double)s_phLayer / (double)n / 1000.0,
+                      (double)s_phPush / (double)n / 1000.0,
+                      (double)(s_phRender + s_phLayer + s_phPush) / (double)n / 1000.0);
+                s_phUS = tPhase3;
+                s_phFrames = 0;
+                s_phRender = s_phLayer = s_phPush = 0;
+            }
+        }
     }
 }
 
