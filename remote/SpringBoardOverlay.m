@@ -454,31 +454,6 @@ static void sb_invoke_cached_main_raw(int g) {
     }
     remote_write64(g_sbSetPathArgBuf[g], persistentPath(g));
     r_msg2(g_sbSetPathInv[g], "setArgument:atIndex:", g_sbSetPathArgBuf[g], 2, 0, 0);
-    // retainArguments has to run on every present, not once at build time.
-    //
-    // setArgument:atIndex: only stores the pointer. What actually keeps a path
-    // alive until the main thread runs setPath: is retainArguments, and that was
-    // being called once, when the invocation was built, against the path that
-    // existed then. Every frame after that wrote a new path into the argument
-    // buffer with nothing retaining it, so the invocation kept a strong
-    // reference to the original path and handed the main thread that one
-    // forever.
-    //
-    // With a single layer this happened to be invisible, because the path
-    // written at build time was the same object the only layer was ever
-    // repainted with. With six layers it is fatal: five of the six invocations
-    // were built before the first frame published any geometry, so those five
-    // layers were permanently pinned to an empty path and never drew anything.
-    // The device log agrees: the only group that ever rendered is the stroke
-    // group, which is the one built last, and sub=1 pts33=1 groups=1 is a frame
-    // carrying nothing but the FOV ring.
-    //
-    // Calling it every present makes the invocation retain the path it is
-    // actually about to be given. The hold ring is what stops that from leaking:
-    // four frames of paths are kept alive deliberately, and this is the retain
-    // that would otherwise have pinned the build time path for the whole
-    // session.
-    r_msg2(g_sbSetPathInv[g], "retainArguments", 0, 0, 0, 0);
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbSetPathInv[g], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
@@ -881,9 +856,6 @@ void SBRemotePushESPFrame(UIView *espView) {
             double firstRect[4] = {0, 0, 0, 0};
             int haveFirstRect = 0;
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
-            // Bytes the serialiser wrote to each group this frame, for the
-            // [SB-GROUP] census.
-            uint32_t g_sbGrpBytes[SB_GROUP_COUNT] = {0};
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
             // iOS 17.5, and so is CGPathReset, so there is no way to empty a
@@ -906,7 +878,6 @@ void SBRemotePushESPFrame(UIView *espView) {
             const size_t glen = ops[g].length;
             if (glen == 0) continue;
             const uint8_t *b = (const uint8_t *)ops[g].bytes;
-            g_sbGrpBytes[g] = (uint32_t)glen;
 
             // Replace it the only way CoreGraphics allows: build a new path and
             // release the old one. sb_invoke_cached_main_raw writes
@@ -1159,23 +1130,6 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             for (int g = 0; g < SB_GROUP_COUNT; g++) {
                 if (drewGroup[g]) groupsDrawn++;
-            }
-            // Which groups reached a present, so a group that is built but never
-            // drawn is visible in the log instead of only showing up as a colour
-            // that never appears on screen. Bytes per group come from the
-            // serialiser, which knows what was written to each buffer.
-            {
-                static uint32_t s_grpTick = 0;
-                if ((++s_grpTick % 60u) == 1u) {
-                    NSLog(@"[SB-GROUP] main=%d/%u bot=%d/%u knock=%d/%u "
-                          @"hp=%d/%u black=%d/%u alert=%d/%u",
-                          drewGroup[0], g_sbGrpBytes[0],
-                          drewGroup[1], g_sbGrpBytes[1],
-                          drewGroup[2], g_sbGrpBytes[2],
-                          drewGroup[3], g_sbGrpBytes[3],
-                          drewGroup[4], g_sbGrpBytes[4],
-                          drewGroup[5], g_sbGrpBytes[5]);
-                }
             }
             if (drawn > 0) {
                 // Only the groups that received geometry this frame. This is the
