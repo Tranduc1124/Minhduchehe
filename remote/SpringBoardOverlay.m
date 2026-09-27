@@ -472,7 +472,15 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (i + 16 > len) { i = len; break; }
                     double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
                     if (op == 1) {
-                        if (rn > 0) break;      // next subpath starts
+                        // Rewind the 17 bytes just consumed (1 op + 2 doubles).
+                        // Breaking here without rewinding threw away the first
+                        // point of every subpath after the first, so a rectangle
+                        // arrived with 3 points instead of 4 and failed the
+                        // rectangle test: the device log showed rect=0 against
+                        // mergedSub=69, and the subpath count collapsed from 69
+                        // to 13. The next outer pass needs to see this moveTo
+                        // with rn==0 in order to start the new subpath.
+                        if (rn > 0) { i -= 17; break; }
                         run[rn++] = x; run[rn++] = y;
                         continue;
                     }
