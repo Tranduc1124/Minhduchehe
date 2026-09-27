@@ -76,6 +76,14 @@ static uint64_t g_sbRearmAfterUS = 0;
 // discarded at the very first gate, not rate limited. The previous self-heal
 // keyed off g_sbOverlayOn, which is still 1 in that state, so it never fired.
 static int g_sbSessionDead = 0;
+
+// Wall clock of the last publish that actually completed. Recovery is driven
+// off this rather than off a run of consecutive dead frames, because the
+// failure is not steady: the device log shows ok flipping between 0 and 1
+// several times a second, which resets any frame counter long before it can
+// reach a threshold. A frame counter cannot see "nothing has been drawn for
+// three seconds" when frames keep arriving and failing.
+static uint64_t g_sbLastPublishUS = 0;
 static uint64_t g_sbNextPublishUS = 0;
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -404,6 +412,10 @@ int SBoardStartOverlay(void) {
     g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
+    // Arm the recovery clock here rather than waiting for a publish that may
+    // never come, so a session that starts already broken still recovers.
+    g_sbLastPublishUS = now_us();
+    g_sbRearmAfterUS = 0;
     pthread_mutex_unlock(&g_sbLock);
 
     sb_forget_local_paint_state();
@@ -444,48 +456,58 @@ void SBRemotePushESPFrame(UIView *espView) {
     // [PUSH-REARM], because a dead overlay returns before reaching any of them.
     // This line prints regardless of whether a publish happens, and says which
     // gate is holding it.
+    const uint64_t tGate = now_us();
     {
         static uint64_t s_hbUS = 0;
-        uint64_t tHB = now_us();
-        if (tHB > s_hbUS) {
-            s_hbUS = tHB + 1000000ULL;
-            const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tHB;
+        if (tGate > s_hbUS) {
+            s_hbUS = tGate + 1000000ULL;
+            const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tGate;
+            const int64_t sinceDraw = (g_sbLastPublishUS == 0)
+                                   ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
             NSLog(@"[PUSH-HB] on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
-                  @"upd=%llu att=%llu skip=%llu next=%lldms",
+                  @"upd=%llu att=%llu skip=%llu next=%lldms since=%lldms",
                   (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
                   (unsigned long long)g_sbSummaryUpdates,
                   (unsigned long long)g_sbSummaryAttempts,
                   (unsigned long long)g_sbSummarySkips,
-                  (long long)(nextIn / 1000));
+                  (long long)(nextIn / 1000),
+                  (long long)(sinceDraw / 1000));
+        }
+    }
+
+    // Recovery lives here, above every gate, because a frame that never
+    // reaches a publish can fail in several different places and the symptom
+    // is the same in all of them: nothing has been drawn for a long time.
+    //
+    // Time based, not frame based. The failure is not steady, ok flickers
+    // between 0 and 1 several times a second, so a run of consecutive dead
+    // frames never reaches any threshold. Only a clock can see that three
+    // seconds have passed with no completed publish while frames kept coming.
+    if (g_sbEverOn && g_sbLastPublishUS != 0 && tGate > g_sbRearmAfterUS) {
+        if (tGate - g_sbLastPublishUS > 3000000ULL) {      // 3s
+            g_sbRearmAfterUS = tGate + 5000000ULL;         // 5s between attempts
+            g_sbConsecFail = 0;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                const char *why =
+                    remote_call_init_failure_description(remote_call_last_init_failure());
+                NSLog(@"[PUSH-REARM] nothing drawn for 3s (ls=%d ok=%d init=%s pid=%d) "
+                      @"— re-initialising against SpringBoard",
+                      (int)remote_call_has_local_state(),
+                      (int)remote_call_current_success(),
+                      why ? why : "?", remote_call_current_pid());
+                if (SBoardStartOverlay() == 0) {
+                    NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
+                } else {
+                    NSLog(@"[PUSH-REARM] re-init failed, will retry in 5s");
+                }
+            });
         }
     }
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
         // Session died (SB respawn?). Drop until restart.
         g_sbSummarySkips++;
-        // This gate sits above g_sbSummaryAttempts++, so a dead session is
-        // invisible in the counters: skip climbs every frame while att never
-        // moves. That is exactly what the device log showed, and because
-        // g_sbOverlayOn stays 1 the overlay-on rebuild added earlier never
-        // fired either. Rebuild from here instead, off the backoff timer and
-        // off the render thread, since SBoardStartOverlay re-runs
-        // init_remote_call for SpringBoard and creates a new window and layer.
-        if (++g_sbSessionDead >= 30) {
-            g_sbSessionDead = 0;
-            if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
-                g_sbRearmAfterUS = now_us() + 5000000ULL;   // 5s between attempts
-                g_sbConsecFail = 0;
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    NSLog(@"[PUSH-REARM] remote session dead — re-initialising against SpringBoard");
-                    if (SBoardStartOverlay() == 0) {
-                        NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
-                    } else {
-                        NSLog(@"[PUSH-REARM] re-init failed, will retry");
-                    }
-                });
-            }
-        }
         return;
     }
     g_sbSessionDead = 0;
@@ -720,6 +742,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             if (drawn > 0) {
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
+                g_sbLastPublishUS = now_us();
                 g_sbLastSubpaths = subpaths;
                 g_sbLastCalls = calls;
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
