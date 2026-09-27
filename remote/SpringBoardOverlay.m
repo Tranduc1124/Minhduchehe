@@ -812,63 +812,28 @@ void SBRemotePushESPFrame(UIView *espView) {
                         memcpy(er, b + i, 32);
                         i += 32;
                         if (er[2] >= 1.0 && er[3] >= 1.0) {
-                            // The ring, as four Bezier arcs.
+                            // A real closed ellipse, stroked, not a polyline
+                            // approximation.
                             //
-                            // CGPathAddEllipseInRect draws nothing here, so the
-                            // circle is built from curves instead. The four
-                            // control-point arguments are all pointers, which is
-                            // what makes this callable at all: a CGFloat scalar
-                            // would travel in d0-d7 and the remote harness only
-                            // sets x0-x7.
+                            // The polyline was a precaution against the ellipse
+                            // being filled instead of stroked, on the theory
+                            // that a closed subpath is the only shape here that
+                            // could fill. The device answered that: the ring came
+                            // back hollow, so the layer's fill is clear and the
+                            // theory was wrong. With that settled there is no
+                            // reason to approximate. CGPathAddEllipseInRect is an
+                            // exact curve, so the ring has no facets at all,
+                            // where 32 chords on a 200 point radius left about a
+                            // pixel of flatness on each segment and read as a
+                            // polygon.
                             //
-                            // Arcs are appended to the subpath already open, so
-                            // the stroke behaves like every other shape in this
-                            // path, rather than closing it.
-                            //
-                            // Geometry is exact enough to be a curve, not a
-                            // polygon: four quarter arcs with the standard
-                            // kappa, worst radial error about 0.02 percent, so
-                            // 0.04 pixels on a 200 point radius.
-                            static const double kKappa = 0.5522847498307933;
-                            const double cx = er[0] + er[2] * 0.5;
-                            const double cy = er[1] + er[3] * 0.5;
-                            const double r  = er[2] * 0.5 < er[3] * 0.5
-                                           ? er[2] * 0.5 : er[3] * 0.5;
-                            const double k  = r * kKappa;
-                            // Scratch holds cp1, cp2, endpoint, then the start of
-                            // the next arc, which is always the current point.
-                            static double cs[3 * 2];
-
-                            // Start on the right of the circle: a one point run is
-                            // a moveTo and draws nothing, which is exactly the
-                            // opening stroke an arc needs.
-                            cs[0] = cx + r; cs[1] = cy;
-                            remote_write(ptsBuf, cs, 16);
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 1,
-                                         0, 0, 0, 0);
-                            calls++;
-
-                            for (int q = 0; q < 4; q++) {
-                                // a0 at 0 degrees, going clockwise on screen.
-                                const double a0 = (double)q * M_PI_2;
-                                const double sx = cx + r * cos(a0);
-                                const double sy = cy + r * sin(a0);
-                                const double a1 = a0 + M_PI_2;
-                                const double ex = cx + r * cos(a1);
-                                const double ey = cy + r * sin(a1);
-                                // Controls are the tangent lines at each end.
-                                cs[0] = sx + (-sin(a0) * k); cs[1] = sy + ( cos(a0) * k);
-                                cs[2] = ex + ( sin(a1) * k); cs[3] = ey + (-cos(a1) * k);
-                                cs[4] = ex;                 cs[5] = ey;
-                                remote_write(ptsBuf, cs, 48);
-                                dlsym_remote("CGPathAddCurveToPoint", rp,
-                                             ptsBuf,        // cp1
-                                             ptsBuf + 16,   // cp2
-                                             ptsBuf + 32,   // endpoint
-                                             0,             // transform
-                                             0, 0, 0);
-                                calls++; drawn++;
-                            }
+                            // Two arguments: path, then the rect. Passing a
+                            // transform in the second slot is what made it draw
+                            // nothing silently before.
+                            remote_write(ptsBuf, er, 32);
+                            dlsym_remote("CGPathAddEllipseInRect", rp, ptsBuf,
+                                         0, 0, 0, 0, 0, 0);
+                            calls++; drawn++;
                             ellipseCount++;
                         }
                         continue;
