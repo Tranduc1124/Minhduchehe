@@ -847,10 +847,24 @@ void SBRemotePushESPFrame(UIView *espView) {
                 double rx = 0, ry = 0, rw = 0, rh = 0;
 
                 if (np == 4) {
-                    // Rectangle test: the subpath is closed and all four corners
-                    // lie on the bounding box. CGPathAddRect emits exactly this,
-                    // so boxes and HP bars match and everything else falls
-                    // through to the polyline branch below.
+                    // A rectangle is accepted when the four points are the four
+                    // distinct corners of the bounding box.
+                    //
+                    // The previous test also required run[0] equal run[6], that
+                    // is, the first and last point of the subpath to be the same
+                    // point. CGPathAddRect does not emit that. It emits moveTo
+                    // (x,y), lineTo (x+w,y), lineTo (x+w,y+h), lineTo (x,y+h) and
+                    // then a closeSubpath element, and serFunc drops closeSubpath
+                    // because it carries no point. So the last point is (x,y+h)
+                    // and the check was false for every rectangle more than half
+                    // a pixel tall.
+                    //
+                    // That silently did two things. The shape fell through to the
+                    // generic polyline branch, where CGPathAddLines draws an open
+                    // three segment path, so the left edge was never stroked and a
+                    // box was not a box. And it missed the CGPathAddRects batch
+                    // entirely, so every box and every health bar cost a remote
+                    // call of its own instead of being batched.
                     double minX = run[0], maxX = run[0];
                     double minY = run[1], maxY = run[1];
                     for (int k = 1; k < 4; k++) {
@@ -861,17 +875,23 @@ void SBRemotePushESPFrame(UIView *espView) {
                         if (py > maxY) maxY = py;
                     }
                     const double w = maxX - minX, h = maxY - minY;
-                    if (w > 0.5 && h > 0.5 &&
-                        fabs(run[0] - run[6]) < 0.5 && fabs(run[1] - run[7]) < 0.5) {
-                        isRect = 1;
-                        for (int k = 0; k < 4 && isRect; k++) {
-                            double px = run[k*2], py = run[k*2+1];
-                            if ((fabs(px - minX) > 0.5 && fabs(px - maxX) > 0.5) ||
-                                (fabs(py - minY) > 0.5 && fabs(py - maxY) > 0.5)) {
-                                isRect = 0;
-                            }
+                    if (w > 0.5 && h > 0.5) {
+                        int c00 = 0, c01 = 0, c11 = 0, c10 = 0;
+                        for (int k = 0; k < 4; k++) {
+                            const double px = run[k*2], py = run[k*2+1];
+                            const int lo  = fabs(px - minX) <= 0.5;
+                            const int hi  = fabs(px - maxX) <= 0.5;
+                            const int loY = fabs(py - minY) <= 0.5;
+                            const int hiY = fabs(py - maxY) <= 0.5;
+                            if (lo && loY) c00++;
+                            else if (hi && loY) c01++;
+                            else if (hi && hiY) c11++;
+                            else if (lo && hiY) c10++;
                         }
-                        if (isRect) { rx = minX; ry = minY; rw = w; rh = h; }
+                        if (c00 == 1 && c01 == 1 && c11 == 1 && c10 == 1) {
+                            isRect = 1;
+                            rx = minX; ry = minY; rw = w; rh = h;
+                        }
                     }
                 } else if (np == 2) {
                     // A lone segment. Axis-aligned ones are snaplines, which are
