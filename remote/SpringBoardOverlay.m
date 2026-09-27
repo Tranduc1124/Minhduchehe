@@ -82,7 +82,7 @@ static uint64_t now_us(void) {
     return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
-typedef struct { NSMutableData *data; } SerCtx;
+typedef struct { NSMutableData *data; double landW; double landH; } SerCtx;
 static uint32_t g_sbSubpathCount = 0;
 
 // op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
@@ -95,12 +95,29 @@ static void serFunc(void *info, const CGPathElement *e) {
     if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
     uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
     [ctx->data appendBytes:&op length:1];
+
+    const CGPoint *src;
     if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
-        [ctx->data appendBytes:&e->points[0] length:16];
+        src = &e->points[0];
     } else {
         int n = (e->type == kCGPathElementAddQuadCurveToPoint) ? 1 : 2;
-        [ctx->data appendBytes:&e->points[n] length:16];
+        src = &e->points[n];
     }
+
+    // The path is now built in the game's landscape space, but the CAShapeLayer
+    // in SpringBoard lives in the display's portrait space, so every point is
+    // rotated on the way out. This is the only place the two spaces meet.
+    //
+    //   px = landH - y,  py = x
+    //
+    // is a 90 degree rotation with determinant +1, so handedness survives and
+    // nothing is mirrored. The alternative 90 degree rotation is
+    // px = y, py = landW - x; if the overlay ever comes out upside down that is
+    // the one line to change, and nothing else in the pipeline moves.
+    CGPoint p;
+    p.x = ctx->landH - src->y;
+    p.y = src->x;
+    [ctx->data appendBytes:&p length:sizeof(p)];
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
@@ -115,7 +132,12 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         }
     }
     if (CGPathIsEmpty(merged)) { CGPathRelease(merged); return NO; }
-    SerCtx ctx = { .data = d };
+    SerCtx ctx = { .data = d, .landW = 0, .landH = 0 };
+    {
+        const CGRect vb = espView.bounds;
+        ctx.landW = (vb.size.width  > vb.size.height) ? vb.size.width  : vb.size.height;
+        ctx.landH = (vb.size.width  > vb.size.height) ? vb.size.height : vb.size.width;
+    }
     g_sbSubpathCount = 0;
     CGPathApply(merged, &ctx, serFunc);
     CGPathRelease(merged);

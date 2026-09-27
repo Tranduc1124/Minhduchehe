@@ -3203,11 +3203,24 @@ static void ESPDiagHeartbeat(void) {
         [CATransaction setDisableActions:YES];
         [self resetReusableLayers];
 
-        CGFloat viewWidth = self.bounds.size.width;
-        CGFloat viewHeight = self.bounds.size.height;
-        // Project in the SAME space we draw (overlay points).
-        // Using nativeBounds (and forced landscape swap) while drawing in view
-        // points caused aspect mismatch → box slides with cam then snaps.
+        // Free Fire renders landscape. This process never rotates, because it
+        // is a background app while the game owns the screen, so self.bounds is
+        // permanently the portrait pair (390x844). The projection matrix read
+        // out of the game, however, was built for the landscape pair
+        // (844x390). Handing the portrait pair to WorldToScreenLayer transposes
+        // the axes: horizontal edges come out vertical, and boxes no longer sit
+        // on the players. That is the "wrong orientation" report, and it is a
+        // space mismatch rather than a drawing bug.
+        //
+        // An earlier attempt swapped only the matrix and kept the draw space
+        // portrait, which is why it was reverted: project and draw have to use
+        // the same pair. Both now use landscape, and SpringBoardOverlay maps
+        // every point into the portrait layer on serialisation, so the two
+        // spaces are converted in exactly one place.
+        const CGFloat bw = self.bounds.size.width;
+        const CGFloat bh = self.bounds.size.height;
+        CGFloat viewWidth  = (bw > bh) ? bw : bh;
+        CGFloat viewHeight = (bw > bh) ? bh : bw;
         CGFloat matrixVpW = viewWidth;
         CGFloat matrixVpH = viewHeight;
         if (matrixVpW < 1.0) matrixVpW = 1.0;
