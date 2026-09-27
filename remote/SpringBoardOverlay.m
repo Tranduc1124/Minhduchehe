@@ -399,6 +399,7 @@ void SBRemotePushESPFrame(UIView *espView) {
     NSData *frameBytes = [ops copy];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        uint64_t tPubStart = now_us();
         @try {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
             if (!r_is_objc_ptr(g_sbShape)) return;
@@ -489,9 +490,19 @@ void SBRemotePushESPFrame(UIView *espView) {
                     uint64_t nowS = now_us();
                     if (nowS > s_sbLogUS) {
                         s_sbLogUS = nowS + 1000000ULL;
-                        NSLog(@"[SB-PUSH] sub=%u calls=%llu hash=%u upd=%llu att=%llu skip=%llu "
+                        // ms = wall time of one whole publish. Divided by calls it
+                        // gives the per-remote-call cost, which is the number that
+                        // decides the drawing design:
+                        //   ~4 ms/call  -> a remote call is the bottleneck, the
+                        //                   subpath count must fall to ~15.
+                        //   ~0.05 ms    -> calls are cheap, keep every subpath and
+                        //                   only fix the geometry.
+                        // Until this is measured, both are guesses.
+                        uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
+                        NSLog(@"[SB-PUSH] sub=%u calls=%llu ms=%llu hash=%u upd=%llu att=%llu skip=%llu "
                               @"mergedSub=%u",
                               g_sbLastSubpaths, (unsigned long long)g_sbLastCalls,
+                              (unsigned long long)pubMS,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
