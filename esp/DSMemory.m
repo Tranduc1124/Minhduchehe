@@ -646,6 +646,36 @@ void ds_detach(void) {
 }
 
 
+// Deliberately outside the page cache. It maps, copies and unmaps, so it can
+// never be the reason a value looks frozen, and it never consumes a cache slot.
+// Holding the lock across the map is the same rule ds_page_local follows:
+// dropping it around the remap raced kwrite_zone_element.
+bool ds_read_uncached(uint64_t va, void *buf, size_t len) {
+    if (!K(g_ff_map) || !va || !buf || !len) return false;
+    if (g_degraded) return false;
+
+    const uint64_t pageVA = va & ~((uint64_t)PAGE_SIZE - 1);
+    const size_t off = (size_t)(va - pageVA);
+    if (off + len > (size_t)PAGE_SIZE) return false;
+
+    ds_lock();
+    struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
+    bool ok = false;
+    if (page.localAddress) {
+        memcpy(buf, (const void *)(page.localAddress + off), len);
+        ok = true;
+    }
+    if (page.localAddress) {
+        mach_vm_deallocate(mach_task_self_,
+                           (mach_vm_address_t)page.localAddress, PAGE_SIZE);
+    }
+    if (page.port) {
+        mach_port_deallocate(mach_task_self(), (mach_port_name_t)page.port);
+    }
+    ds_unlock();
+    return ok;
+}
+
 void ds_flush_page_cache(void) {
     ds_lock();
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {

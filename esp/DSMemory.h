@@ -70,6 +70,14 @@ void ds_end_read_transaction(void);
 void ds_cache_bump_generation(void);
 void ds_flush_page_cache(void);
 
+// One-shot read that never consults or touches the page cache: map the page,
+// copy, unmap. Exists to tell a lying cache apart from genuinely constant game
+// data. Reading the same address twice in the same frame, once through
+// ds_read and once through here, isolates the cache as the only variable. If
+// they agree while a moving player stays put, the cache is innocent and the
+// constant is the game's own data. Single page only.
+bool ds_read_uncached(uint64_t va, void *buf, size_t len);
+
 // Diagnostic, throttled by the caller. staleGen is the number of live slots
 // mapped BEFORE the current generation, i.e. mappings that survived a match
 // transition and are therefore suspect.
