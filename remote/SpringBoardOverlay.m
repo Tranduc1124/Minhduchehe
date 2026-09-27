@@ -154,8 +154,26 @@ static uint64_t now_us(void) {
     return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
-typedef struct { NSMutableData *data; double landW; double landH; } SerCtx;
+typedef struct { NSMutableData *data; double landW; double landH; int curLayer; } SerCtx;
 static uint32_t g_sbSubpathCount = 0;
+
+// Per layer census: how many subpaths and how many points each of the sixteen
+// layers contributed to the frame, plus how many curve elements were thrown
+// away. Nothing here changes what is drawn; it only records what was drawn.
+//
+// This exists because three symptoms could not be separated by reading the
+// code. The FOV ring is built from straight segments, so the curve flattening
+// in serFunc cannot touch it, yet the ring renders wrong. The head is drawn
+// with an ellipse, so the flattening does reach it, and it renders as a
+// diamond. Whether the ring is a stale path, a truncated one or a subdivided
+// one cannot be told from the source, only from the counts. A subpath count
+// for fovLayer of zero means the layer was skipped by the CGPathIsEmpty
+// check; more than one means something is appending to it every frame.
+static uint32_t g_sbLayerSubs[16];
+static uint32_t g_sbLayerPts[16];
+static uint32_t g_sbLayerCurves;   // AddCurveToPoint seen, flattened to endpoint
+static uint32_t g_sbLayerQuads;    // AddQuadCurveToPoint seen
+static uint32_t g_sbLayerBytes[16];
 
 // op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
 // marker. The break marker is redundant with moveTo mathematically, but it lets
@@ -165,6 +183,13 @@ static void serFunc(void *info, const CGPathElement *e) {
     SerCtx *ctx = (SerCtx *)info;
     if (e->type == kCGPathElementCloseSubpath) return;
     if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
+    const int L = ctx->curLayer;
+    if (L >= 0 && L < 16) {
+        if (e->type == kCGPathElementMoveToPoint) g_sbLayerSubs[L]++;
+        g_sbLayerPts[L]++;
+    }
+    if (e->type == kCGPathElementAddCurveToPoint) g_sbLayerCurves++;
+    if (e->type == kCGPathElementAddQuadCurveToPoint) g_sbLayerQuads++;
     uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
     if (e->type == kCGPathElementAddCurveToPoint) op = 3;
     [ctx->data appendBytes:&op length:1];
@@ -210,13 +235,18 @@ static void serFunc(void *info, const CGPathElement *e) {
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     [d setLength:0];
 
-    SerCtx ctx = { .data = d, .landW = 0, .landH = 0 };
+    SerCtx ctx = { .data = d, .landW = 0, .landH = 0, .curLayer = -1 };
     {
         const CGRect vb = espView.bounds;
         ctx.landW = (vb.size.width  > vb.size.height) ? vb.size.width  : vb.size.height;
         ctx.landH = (vb.size.width  > vb.size.height) ? vb.size.height : vb.size.width;
     }
     g_sbSubpathCount = 0;
+    memset(g_sbLayerSubs, 0, sizeof(g_sbLayerSubs));
+    memset(g_sbLayerPts, 0, sizeof(g_sbLayerPts));
+    memset(g_sbLayerBytes, 0, sizeof(g_sbLayerBytes));
+    g_sbLayerCurves = 0;
+    g_sbLayerQuads = 0;
 
     // Each layer is serialised separately and preceded by a layer marker, rather
     // than all sixteen being merged into one path first. The merge destroyed the
@@ -239,7 +269,11 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         uint8_t idx = (uint8_t)i;
         [d appendBytes:&tag length:1];
         [d appendBytes:&idx length:1];
+        const NSUInteger before = d.length;
+        ctx.curLayer = i;
         CGPathApply(p, &ctx, serFunc);
+        ctx.curLayer = -1;
+        g_sbLayerBytes[i] = (uint32_t)(d.length - before);
         emitted = 1;
     }
     if (!emitted) return NO;
@@ -975,6 +1009,30 @@ void SBRemotePushESPFrame(UIView *espView) {
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
                               g_sbSubpathCount);
+                        // Per layer census. [SB-LAYER] box=subs/pts/bytes,
+                        // bone, snap, fov, aim and the curve count, once per
+                        // second. This is the measurement the three drawing
+                        // symptoms need and the source cannot supply.
+                        //
+                        //   fov sub=0        -> fovLayer was skipped as empty
+                        //   fov sub>1        -> something appends to it per frame
+                        //   fov pts<73       -> the ring is being truncated
+                        //   fov pts==73      -> ring is intact, so the fault is
+                        //                      not in the geometry
+                        //   bone curves>0    -> the head ellipse is being
+                        //                      flattened to a diamond
+                        NSLog(@"[SB-LAYER] box=%u/%u/%u bone=%u/%u/%u "
+                              @"snap=%u/%u/%u hp=%u/%u bg=%u/%u alert=%u/%u "
+                              @"fov=%u/%u/%u aim=%u/%u curves=%u quads=%u",
+                              g_sbLayerSubs[0], g_sbLayerPts[0], g_sbLayerBytes[0],
+                              g_sbLayerSubs[3], g_sbLayerPts[3], g_sbLayerBytes[3],
+                              g_sbLayerSubs[6], g_sbLayerPts[6], g_sbLayerBytes[6],
+                              g_sbLayerSubs[9], g_sbLayerPts[9], g_sbLayerBytes[9],
+                              g_sbLayerSubs[12], g_sbLayerPts[12], g_sbLayerBytes[12],
+                              g_sbLayerSubs[13], g_sbLayerPts[13], g_sbLayerBytes[13],
+                              g_sbLayerSubs[14], g_sbLayerPts[14], g_sbLayerBytes[14],
+                              g_sbLayerSubs[15], g_sbLayerPts[15], g_sbLayerBytes[15],
+                              g_sbLayerCurves, g_sbLayerQuads);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
