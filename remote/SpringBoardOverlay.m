@@ -429,6 +429,28 @@ void SBRemotePushESPFrame(UIView *espView) {
         return;
     }
     if (!espView) return;
+
+    // Unconditional 1 Hz state dump. Every other [SB-PUSH] line sits inside the
+    // success path, so a publish loop that never completes logs nothing at all
+    // and the overlay state becomes invisible. That is exactly what happened:
+    // thirty seconds of device log with no [SB-PUSH], no [PUSH-DEAD] and no
+    // [PUSH-REARM], because a dead overlay returns before reaching any of them.
+    // This line prints regardless of whether a publish happens, and says which
+    // gate is holding it.
+    {
+        static uint64_t s_hbUS = 0;
+        uint64_t tHB = now_us();
+        if (tHB > s_hbUS) {
+            s_hbUS = tHB + 1000000ULL;
+            const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tHB;
+            NSLog(@"[PUSH-HB] on=%d ever=%d fail=%d upd=%llu att=%llu skip=%llu next=%lldms",
+                  (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail,
+                  (unsigned long long)g_sbSummaryUpdates,
+                  (unsigned long long)g_sbSummaryAttempts,
+                  (unsigned long long)g_sbSummarySkips,
+                  (long long)(nextIn / 1000));
+        }
+    }
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
         // Session died (SB respawn?). Drop until restart.
         g_sbSummarySkips++;
