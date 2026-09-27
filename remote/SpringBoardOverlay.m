@@ -69,6 +69,13 @@ static uint64_t g_sbSummaryUpdates = 0;
 static int g_sbConsecFail = 0;
 static int g_sbEverOn = 0;
 static uint64_t g_sbRearmAfterUS = 0;
+
+// Counts consecutive frames dropped because the remote session reported itself
+// dead. That check sits before g_sbSummaryAttempts++, which is why the device
+// log showed skip climbing at 60/s while att stuck at 8: frames were being
+// discarded at the very first gate, not rate limited. The previous self-heal
+// keyed off g_sbOverlayOn, which is still 1 in that state, so it never fired.
+static int g_sbSessionDead = 0;
 static uint64_t g_sbNextPublishUS = 0;
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -443,8 +450,11 @@ void SBRemotePushESPFrame(UIView *espView) {
         if (tHB > s_hbUS) {
             s_hbUS = tHB + 1000000ULL;
             const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tHB;
-            NSLog(@"[PUSH-HB] on=%d ever=%d fail=%d upd=%llu att=%llu skip=%llu next=%lldms",
-                  (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail,
+            NSLog(@"[PUSH-HB] on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
+                  @"upd=%llu att=%llu skip=%llu next=%lldms",
+                  (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
+                  (int)remote_call_has_local_state(),
+                  (int)remote_call_current_success(),
                   (unsigned long long)g_sbSummaryUpdates,
                   (unsigned long long)g_sbSummaryAttempts,
                   (unsigned long long)g_sbSummarySkips,
@@ -454,8 +464,31 @@ void SBRemotePushESPFrame(UIView *espView) {
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
         // Session died (SB respawn?). Drop until restart.
         g_sbSummarySkips++;
+        // This gate sits above g_sbSummaryAttempts++, so a dead session is
+        // invisible in the counters: skip climbs every frame while att never
+        // moves. That is exactly what the device log showed, and because
+        // g_sbOverlayOn stays 1 the overlay-on rebuild added earlier never
+        // fired either. Rebuild from here instead, off the backoff timer and
+        // off the render thread, since SBoardStartOverlay re-runs
+        // init_remote_call for SpringBoard and creates a new window and layer.
+        if (++g_sbSessionDead >= 30) {
+            g_sbSessionDead = 0;
+            if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
+                g_sbRearmAfterUS = now_us() + 5000000ULL;   // 5s between attempts
+                g_sbConsecFail = 0;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    NSLog(@"[PUSH-REARM] remote session dead — re-initialising against SpringBoard");
+                    if (SBoardStartOverlay() == 0) {
+                        NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
+                    } else {
+                        NSLog(@"[PUSH-REARM] re-init failed, will retry");
+                    }
+                });
+            }
+        }
         return;
     }
+    g_sbSessionDead = 0;
 
     g_sbSummaryAttempts++;
 
