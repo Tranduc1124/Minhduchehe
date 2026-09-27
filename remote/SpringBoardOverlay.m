@@ -806,30 +806,40 @@ void SBRemotePushESPFrame(UIView *espView) {
                         curLayer = b[i++];
                         continue;
                     }
-                    if (op == 5) {                 // ellipse, 4 doubles, no run
+                    if (op == 5) {                 // ellipse as a rect, 4 doubles
                         if (i + 32 > len) { i = len; break; }
                         double er[4];
                         memcpy(er, b + i, 32);
                         i += 32;
                         if (er[2] >= 1.0 && er[3] >= 1.0) {
-                            // Emitted as a real ellipse rather than as points.
-                            // A circle through the point path arrives as four
-                            // cubic curves, and every attempt to carry those
-                            // through the serialiser has failed: keeping only
-                            // the endpoints gives a diamond, and subdividing
-                            // them grew the payload until it overflowed the
-                            // subpath buffer and drew fragments across the
-                            // screen. Four doubles cannot do either.
-                            remote_write(ptsBuf, er, 32);
-                            // CGPathAddEllipseInRect(path, rect) takes two
-                            // arguments. It was being called with four, in the
-                            // shape of CGPathAddRects, so the rect argument
-                            // received the zero that was meant to be a
-                            // transform and CoreGraphics was handed a NULL rect.
-                            // It drew nothing, which is why ell=1 came back every
-                            // second while no ring appeared on screen.
-                            dlsym_remote("CGPathAddEllipseInRect", rp, ptsBuf,
-                                         0, 0, 0, 0, 0, 0);
+                            // Drawn as an open polyline, not as a real closed
+                            // ellipse.
+                            //
+                            // CGPathAddEllipseInRect produces a CLOSED subpath.
+                            // Everything else in this path is open, because the
+                            // serialiser drops closeSubpath, so the ellipse was
+                            // the only shape that could be filled rather than
+                            // stroked. On a layer with a non-clear fill that is a
+                            // solid disc across the screen, which is what the
+                            // earlier report described as colour layers filling
+                            // the display, and it hides the very ring it draws.
+                            //
+                            // An open polyline cannot be filled. The point count
+                            // is fixed at 32 regardless of size, so nothing here
+                            // can grow, and it is still one remote call.
+                            static const int kSeg = 32;
+                            static double ring[(kSeg + 1) * 2];
+                            const double cx = er[0] + er[2] * 0.5;
+                            const double cy = er[1] + er[3] * 0.5;
+                            const double rx = er[2] * 0.5, ry = er[3] * 0.5;
+                            for (int s = 0; s <= kSeg; s++) {
+                                const double a = (double)s * 2.0 * M_PI / (double)kSeg;
+                                ring[s * 2]     = cx + rx * cos(a);
+                                ring[s * 2 + 1] = cy + ry * sin(a);
+                            }
+                            remote_write(ptsBuf, ring, sizeof(ring));
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf,
+                                         kSeg + 1, 0, 0, 0, 0);
                             calls++; drawn++;
                             ellipseCount++;
                         }
