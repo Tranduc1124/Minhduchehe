@@ -127,21 +127,6 @@ UIFont *GetCustomFont(CGFloat size);
 
 bool RenderFOVCirclePath(CGMutablePathRef path, float viewWidth, float viewHeight, bool aimbotEnabled, float fovRadius);
 
-void RenderESPForPawn(
-    ESPGeometryBuffers *buffers,
-    ESPAddTextCallback textCallback,
-    ESPAddImageCallback imageCallback,
-    void *callbackContext,
-    uint64_t PawnObject,
-    int CurHP,
-    float dis,
-    float *matrix,
-    float layerWidth,
-    float layerHeight,
-    float matrixVpWidth,
-    float matrixVpHeight
-);
-
 // Fast path when caller already has head/HP/flags (avoids double memory reads in crowded games).
 void RenderESPForPawnEx(
     ESPGeometryBuffers *buffers,

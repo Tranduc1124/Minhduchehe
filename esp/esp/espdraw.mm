@@ -129,8 +129,7 @@ NSString* WeaponNameForPlayerNS(uint64_t PawnObject) {
 }
 
 // ============================================================
-// CORE RENDER — dùng chung cho cả slow path (RenderESPForPawn)
-// và fast path (RenderESPForPawnEx). Nhận sẵn head/hip/bot/knocked
+// CORE RENDER — dùng cho fast path (RenderESPForPawnEx). Nhận sẵn head/hip/bot/knocked
 // từ caller để fast path khỏi đọc lại memory (tránh double reads
 // trong trận đông người). Bones/chân vẫn được đọc từ PawnObject.
 // ============================================================
@@ -368,39 +367,6 @@ static void ESPRenderPawnCore(
             buffers->hpFillRedDirty = true;
         }
     }
-}
-
-// ==========================================
-// HÀM VẼ ESP — SLOW PATH
-// Đọc lại head/hip/bot/knocked từ PawnObject mỗi frame
-// ==========================================
-void RenderESPForPawn(
-    ESPGeometryBuffers *buffers,
-    ESPAddTextCallback textCallback,
-    ESPAddImageCallback imageCallback,
-    void *callbackContext,
-    uint64_t PawnObject,
-    int CurHP,
-    float dis,
-    float *matrix,
-    float layerWidth,
-    float layerHeight,
-    float matrixVpWidth,
-    float matrixVpHeight
-) {
-    if (dis > 400.0f || !buffers || !matrix || !PawnObject || dis < 1.0f) return;
-
-    bool isKnocked = get_IsKnockedDown(PawnObject);
-    bool isBot = get_IsBot(PawnObject);
-    Vector3 head = getPositionExt(getHead(PawnObject));
-    Vector3 hip  = getPositionExt(getHip(PawnObject));
-
-    ESPRenderPawnCore(buffers, textCallback, imageCallback, callbackContext,
-                      PawnObject, CurHP, dis, matrix,
-                      layerWidth, layerHeight, matrixVpWidth, matrixVpHeight,
-                      head.x, head.y, head.z,
-                      hip.x, hip.y, hip.z,
-                      isBot ? 1 : 0, isKnocked ? 1 : 0);
 }
 
 // ==========================================
