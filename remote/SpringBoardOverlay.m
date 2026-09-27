@@ -64,6 +64,13 @@ static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
 
 static uint64_t g_sbPersistentPath = 0;
+// Paths handed to setPath: are still owned by SpringBoard's main thread until
+// it has run, because the present is asynchronous. A ring this long keeps every
+// path alive long after the frame that drew it, and releases it only once no
+// queued present can still be holding it.
+#define SB_PATH_HOLD_FRAMES 4
+static uint64_t g_sbPathRing[SB_PATH_HOLD_FRAMES] = {0};
+static int g_sbPathRingAt = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
 static NSUInteger g_sbLastPathBytes = 0;
@@ -320,6 +327,10 @@ static void sb_forget_local_paint_state(void) {
     g_sbLastSubpaths = 0;
     g_sbLastCalls = 0;
     g_sbNextPublishUS = 0;
+    // The hold ring outlives the session pointer, so it is emptied here rather
+    // than left for the next SBoardStartOverlay to overwrite.
+    for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
+    g_sbPathRingAt = 0;
 }
 
 static void sb_disable_layer_actions(uint64_t layer) {
@@ -759,13 +770,44 @@ void SBRemotePushESPFrame(UIView *espView) {
             // persistentPath() into the argument buffer on every present, so
             // the path is not baked into the cached invocation and a fresh one
             // per frame is correct.
+            //
+            // But the old path must not be released in the same breath. The
+            // present is asynchronous: performSelectorOnMainThread is called
+            // with no boolean, so waitUntilDone is NO and SpringBoard's main
+            // thread runs setPath: on a later turn of its run loop, at least one
+            // frame behind this thread. Releasing here freed the path out from
+            // under that queued call. retainArguments does not save it either,
+            // because that is only called once when the invocation is built; the
+            // argument is overwritten with setArgument:atIndex: every frame and
+            // the new value is never retained.
+            //
+            // The symptom was one snapline becoming two while the camera stood
+            // still, and collapsing to one as soon as it moved. The device log
+            // rules out a duplicate in the data: one player measures pts2=14,
+            // which is thirteen bone segments plus exactly one snapline, so a
+            // second line is not in the stream. A parked camera produces frames
+            // that are byte identical, they queue faster than the main thread
+            // drains them, and the stale path is what the layer still holds.
+            // Moving the camera changes every frame, the queue drains, and the
+            // count is right again.
+            //
+            // So the path is kept alive for SB_PATH_HOLD_FRAMES frames. At the
+            // 8000us publish interval that is about 130ms, far longer than a
+            // main thread turn.
             uint64_t freshPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             calls++;
             if (!freshPath) {
                 NSLog(@"[PUSH-PATH] CGPathCreateMutable returned 0 — skipping frame");
                 return;
             }
-            if (rp) dlsym_remote("CGPathRelease", rp, 0,0,0,0,0,0,0);
+            // Retire the path that fell out of the hold window, not the one the
+            // previous present used.
+            if (g_sbPathRing[g_sbPathRingAt]) {
+                dlsym_remote("CGPathRelease", g_sbPathRing[g_sbPathRingAt], 0,0,0,0,0,0,0);
+                g_sbPathRing[g_sbPathRingAt] = 0;
+            }
+            g_sbPathRing[g_sbPathRingAt] = freshPath;
+            g_sbPathRingAt = (g_sbPathRingAt + 1) % SB_PATH_HOLD_FRAMES;
             rp = freshPath;
             g_sbPersistentPath = freshPath;
 
@@ -1069,6 +1111,16 @@ void SBoardStopOverlay(void) {
     if (remote_call_has_local_state()) {
         if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
         if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
+        // The hold ring still holds paths handed to a queued setPath: that the
+        // main thread has not run yet, so they are freed with the session rather
+        // than left for the next one to overwrite the slots of.
+        for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
+            if (g_sbPathRing[k] && g_sbPathRing[k] != g_sbPersistentPath) {
+                dlsym_remote("CGPathRelease", g_sbPathRing[k], 0,0,0,0,0,0,0);
+            }
+            g_sbPathRing[k] = 0;
+        }
+        g_sbPathRingAt = 0;
         sb_forget_local_paint_state();
         destroy_remote_call();
     } else {
