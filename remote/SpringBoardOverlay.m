@@ -63,15 +63,40 @@ static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
 
-static uint64_t g_sbPersistentPath = 0;
+// Six shape layers in SpringBoard instead of one.
+//
+// With a single layer the whole overlay shared one stroke colour, one fill
+// setting and one line width, because a CALayer has one of each and all
+// sixteen app layers were merged into one path. Two visible consequences the
+// user reported: the health bar rendered as a hollow box instead of a filled
+// bar, and every shape rendered white no matter what colour the app asked for.
+// setFillColor was 0, so nothing was ever filled, and a single setStrokeColor
+// white cannot be green, yellow and red at the same time.
+//
+// Grouping by paint rather than by shape fixes both without a new remote call
+// type: each group keeps its own colour, fill flag and line width, and a group
+// is still one path so it is still one setPath. The cost is five extra setPath
+// calls per frame, fifteen to twenty.
+#define SB_GROUP_COUNT 6
+enum {
+    SB_G_STROKE_MAIN = 0,   // box, bone, snapline, fov, aimAssist
+    SB_G_STROKE_BOT,        // boxBot, boneBot, snaplineBot
+    SB_G_STROKE_KNOCK,      // boxKnocked, boneKnocked, snaplineKnocked
+    SB_G_FILL_HP,           // hpFill green, orange, red
+    SB_G_FILL_BLACK,        // bgFillBlack
+    SB_G_FILL_ALERT         // alert tick
+};
+static uint64_t g_sbShapes[SB_GROUP_COUNT] = {0};
+static uint64_t g_sbSetPathInv[SB_GROUP_COUNT] = {0};
+static uint64_t g_sbSetPathArgBuf[SB_GROUP_COUNT] = {0};
+
+static uint64_t g_sbPersistentPath[SB_GROUP_COUNT] = {0};
 static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
 static NSUInteger g_sbLastPathBytes = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Fl0rk: gDrawViewGeometryPathInvocation + invoke_cached_main_raw
-static uint64_t g_sbSetPathInv = 0;
-static uint64_t g_sbSetPathArgBuf = 0;
 static uint64_t g_sbPerformMainSel = 0;
 static uint64_t g_sbInvokeSel = 0;
 
@@ -127,6 +152,19 @@ static const char *kShapeKeys[16] = {
     "snaplineLayer", "snaplineBotLayer", "snaplineKnockedLayer",
     "hpFillGreenLayer", "hpFillOrangeLayer", "hpFillRedLayer",
     "bgFillBlackLayer", "alertLayer", "fovLayer", "aimAssistLayer"
+};
+
+// Which paint group each of the sixteen layers belongs to. Index order matches
+// kShapeKeys exactly. The three hpFill layers share a group so the bar can be
+// filled in the colour its health calls for only by giving the group a fill,
+// which is the single change that turns the hollow box back into a bar.
+static const uint8_t kGroupOf[16] = {
+    SB_G_STROKE_MAIN, SB_G_STROKE_BOT, SB_G_STROKE_KNOCK,
+    SB_G_STROKE_MAIN, SB_G_STROKE_BOT, SB_G_STROKE_KNOCK,
+    SB_G_STROKE_MAIN, SB_G_STROKE_BOT, SB_G_STROKE_KNOCK,
+    SB_G_FILL_HP,    SB_G_FILL_HP,    SB_G_FILL_HP,
+    SB_G_FILL_BLACK, SB_G_FILL_ALERT,
+    SB_G_STROKE_MAIN, SB_G_STROKE_MAIN
 };
 
 static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
@@ -242,10 +280,10 @@ static void serFunc(void *info, const CGPathElement *e) {
     sbEmit(ctx, (e->type == kCGPathElementMoveToPoint) ? 1 : 2, src->x, src->y);
 }
 
-static BOOL mergePaths(UIView *espView, NSMutableData *d) {
-    [d setLength:0];
+static BOOL mergePaths(UIView *espView, NSMutableData * __strong d[SB_GROUP_COUNT]) {
+    SerCtx ctx = { .data = nil, .landW = 0, .landH = 0, .lastX = 0, .lastY = 0, .haveLast = 0 };
+    for (int g = 0; g < SB_GROUP_COUNT; g++) [d[g] setLength:0];
 
-    SerCtx ctx = { .data = d, .landW = 0, .landH = 0, .lastX = 0, .lastY = 0, .haveLast = 0 };
     {
         const CGRect vb = espView.bounds;
         ctx.landW = (vb.size.width  > vb.size.height) ? vb.size.width  : vb.size.height;
@@ -264,24 +302,37 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     //
     // The marker is what makes the bucket decidable: draw the snapline layers,
     // drop the rest.
+    //
+    // The marker still carries the original layer index even though the bytes
+    // now land in the group's buffer, because the decoder keys its two point
+    // decision off 6 to 8 for snaplines and 3 to 5 for bones. Only the
+    // destination changed.
     int emitted = 0;
     for (int i = 0; i < 16; i++) {
         id val = [espView valueForKey:[NSString stringWithUTF8String:kShapeKeys[i]]];
         if (![val isKindOfClass:[CAShapeLayer class]]) continue;
         CGPathRef p = ((CAShapeLayer *)val).path;
         if (!p || CGPathIsEmpty(p)) continue;
+        NSMutableData *dst = d[kGroupOf[i]];
         uint8_t tag = 4;                       // op 4 = start of a layer
         uint8_t idx = (uint8_t)i;
-        [d appendBytes:&tag length:1];
-        [d appendBytes:&idx length:1];
+        ctx.data = dst;
+        ctx.haveLast = 0;                      // a new subpath has no curve start
+        [dst appendBytes:&tag length:1];
+        [dst appendBytes:&idx length:1];
         CGPathApply(p, &ctx, serFunc);
         emitted = 1;
     }
     if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
-    for (NSUInteger i = 0; i < d.length; i++) {
-        h ^= ((const uint8_t *)d.bytes)[i]; h *= 16777619u;
+    NSUInteger total = 0;
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        NSMutableData *dg = d[g];
+        total += dg.length;
+        for (NSUInteger k = 0; k < dg.length; k++) {
+            h ^= ((const uint8_t *)dg.bytes)[k]; h *= 16777619u;
+        }
     }
     // Never suppress a frame. The hash comparison is gone.
     //
@@ -297,23 +348,25 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     // room for them. A stale frame is what the user is looking at instead.
     (void)h;
     g_sbPathHash = h;
-    g_sbLastPathBytes = d.length;
+    g_sbLastPathBytes = total;
     return YES;
 }
 
 static void sb_forget_local_paint_state(void) {
     // Fl0rk: release_all_cached_main_invocations / forget_remote_state (local side)
-    if (r_is_objc_ptr(g_sbSetPathInv) && remote_call_has_local_state()) {
-        r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        if (r_is_objc_ptr(g_sbSetPathInv[g]) && remote_call_has_local_state()) {
+            r_msg2(g_sbSetPathInv[g], "release", 0,0,0,0);
+        }
+        if (g_sbSetPathArgBuf[g] && remote_call_has_local_state()) {
+            dlsym_remote("free", g_sbSetPathArgBuf[g], 0,0,0,0,0,0,0);
+        }
+        g_sbSetPathInv[g] = 0;
+        g_sbSetPathArgBuf[g] = 0;
     }
-    if (g_sbSetPathArgBuf && remote_call_has_local_state()) {
-        dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
-    }
-    g_sbSetPathInv = 0;
-    g_sbSetPathArgBuf = 0;
     g_sbPerformMainSel = 0;
     g_sbInvokeSel = 0;
-    g_sbPersistentPath = 0;
+    for (int g = 0; g < SB_GROUP_COUNT; g++) g_sbPersistentPath[g] = 0;
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
@@ -336,10 +389,10 @@ static void sb_disable_layer_actions(uint64_t layer) {
     }
 }
 
-static uint64_t persistentPath(void) {
-    if (g_sbPersistentPath) return g_sbPersistentPath;
-    g_sbPersistentPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-    return g_sbPersistentPath;
+static uint64_t persistentPath(int g) {
+    if (g_sbPersistentPath[g]) return g_sbPersistentPath[g];
+    g_sbPersistentPath[g] = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    return g_sbPersistentPath[g];
 }
 
 static uint64_t ptsBuffer(void) {
@@ -348,18 +401,18 @@ static uint64_t ptsBuffer(void) {
     return g_sbMirrorPtsBuf;
 }
 
-static BOOL sb_ensure_setpath_invocation(void) {
-    if (r_is_objc_ptr(g_sbSetPathInv) && g_sbSetPathArgBuf) return YES;
-    if (!r_is_objc_ptr(g_sbShape)) return NO;
+static BOOL sb_ensure_setpath_invocation(int g) {
+    if (r_is_objc_ptr(g_sbSetPathInv[g]) && g_sbSetPathArgBuf[g]) return YES;
+    if (!r_is_objc_ptr(g_sbShapes[g])) return NO;
 
-    uint64_t rp = persistentPath();
+    uint64_t rp = persistentPath(g);
     if (!rp) return NO;
 
     uint64_t setPathSel = r_sel("setPath:");
     if (!setPathSel) return NO;
 
     uint64_t sigSel = r_sel("methodSignatureForSelector:");
-    uint64_t sig = r_msg(g_sbShape, sigSel, setPathSel, 0, 0, 0);
+    uint64_t sig = r_msg(g_sbShapes[g], sigSel, setPathSel, 0, 0, 0);
     if (!r_is_objc_ptr(sig)) return NO;
 
     uint64_t NSInvocation = r_class("NSInvocation");
@@ -369,7 +422,7 @@ static BOOL sb_ensure_setpath_invocation(void) {
     if (!r_is_objc_ptr(inv)) return NO;
     r_msg2(inv, "retain", 0, 0, 0, 0);
 
-    r_msg2(inv, "setTarget:", g_sbShape, 0, 0, 0);
+    r_msg2(inv, "setTarget:", g_sbShapes[g], 0, 0, 0);
     r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
 
     uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
@@ -381,24 +434,24 @@ static BOOL sb_ensure_setpath_invocation(void) {
     r_msg2(inv, "setArgument:atIndex:", argBuf, 2, 0, 0);
     r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
-    g_sbSetPathInv = inv;
-    g_sbSetPathArgBuf = argBuf;
+    g_sbSetPathInv[g] = inv;
+    g_sbSetPathArgBuf[g] = argBuf;
     g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     g_sbInvokeSel = r_sel("invoke");
-    NSLog(@"[SBOverlay] GeometryPathInvocation=0x%llx path=0x%llx", inv, rp);
+    NSLog(@"[SBOverlay] GeometryPathInvocation[g=%d]=0x%llx path=0x%llx", g, inv, rp);
     return YES;
 }
 
-static void sb_invoke_cached_main_raw(void) {
-    if (!sb_ensure_setpath_invocation()) {
-        uint64_t rp = persistentPath();
-        if (rp) r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
+static void sb_invoke_cached_main_raw(int g) {
+    if (!sb_ensure_setpath_invocation(g)) {
+        uint64_t rp = persistentPath(g);
+        if (rp) r_msg2_main_async(g_sbShapes[g], "setPath:", rp, 0,0,0);
         return;
     }
-    remote_write64(g_sbSetPathArgBuf, persistentPath());
-    r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    remote_write64(g_sbSetPathArgBuf[g], persistentPath(g));
+    r_msg2(g_sbSetPathInv[g], "setArgument:atIndex:", g_sbSetPathArgBuf[g], 2, 0, 0);
     if (g_sbPerformMainSel && g_sbInvokeSel) {
-        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        r_msg(g_sbSetPathInv[g], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
 }
 
@@ -496,20 +549,53 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
-    uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-    if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
-    r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
-    r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
-    double lw = 1.5;
-    r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
-    r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
-    double z = 100;
-    r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
-    sb_disable_layer_actions(shape);
-
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
+    if (!r_is_objc_ptr(cLayer)) { destroy_remote_call(); return -1; }
+
+    // Six shape layers, one per paint group, each with its own colour, fill
+    // setting and line width. A single layer cannot do this: a CALayer has one
+    // stroke colour, one fill and one line width, so with all sixteen app layers
+    // merged into one path the health bar rendered as a hollow outline instead
+    // of a filled bar and every shape rendered white no matter what the app
+    // asked for. The three hpFill layers now share a filled group, which is what
+    // turns the bar back into a bar.
+    uint64_t shape = 0;
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        uint64_t sh = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+        if (!r_is_objc_ptr(sh)) { destroy_remote_call(); return -1; }
+        g_sbShapes[g] = sh;
+        r_msg2_main_raw(sh, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(sh, "setOpaque:", 0, 0,0,0);
+
+        const int filled = (g == SB_G_FILL_HP || g == SB_G_FILL_BLACK || g == SB_G_FILL_ALERT);
+        double rgba[4];
+        switch (g) {
+            case SB_G_STROKE_BOT:   rgba[0]=1.0; rgba[1]=1.0; rgba[2]=0.0; rgba[3]=1.0; break;
+            case SB_G_STROKE_KNOCK: rgba[0]=1.0; rgba[1]=0.0; rgba[2]=0.0; rgba[3]=1.0; break;
+            case SB_G_FILL_HP:     rgba[0]=0.0; rgba[1]=1.0; rgba[2]=0.0; rgba[3]=1.0; break;
+            case SB_G_FILL_BLACK:  rgba[0]=0.0; rgba[1]=0.0; rgba[2]=0.0; rgba[3]=0.65; break;
+            case SB_G_FILL_ALERT:  rgba[0]=0.40; rgba[1]=0.76; rgba[2]=0.16; rgba[3]=1.0; break;
+            default:               rgba[0]=0.0; rgba[1]=1.0; rgba[2]=1.0; rgba[3]=1.0; break;
+        }
+        uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                       rgba, 32, NULL,0,NULL,0,NULL,0);
+        uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
+
+        if (filled) {
+            if (r_is_objc_ptr(cg)) r_msg2_main(sh, "setFillColor:", cg, 0,0,0);
+            r_msg2_main(sh, "setStrokeColor:", 0, 0,0,0);
+        } else {
+            if (r_is_objc_ptr(cg)) r_msg2_main(sh, "setStrokeColor:", cg, 0,0,0);
+            r_msg2_main(sh, "setFillColor:", 0, 0,0,0);
+        }
+        double lw = (g == SB_G_FILL_HP) ? 0.0 : 1.0;
+        r_msg2_main_raw(sh, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
+        double z = 100.0 + g;
+        r_msg2_main_raw(sh, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
+        sb_disable_layer_actions(sh);
+        r_msg2_main(cLayer, "addSublayer:", sh, 0,0,0);
+        if (g == SB_G_STROKE_MAIN) shape = sh;
+    }
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
@@ -532,13 +618,15 @@ int SBoardStartOverlay(void) {
     pthread_mutex_unlock(&g_sbLock);
 
     sb_forget_local_paint_state();
-    (void)persistentPath();
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        (void)persistentPath(g);
+        (void)sb_ensure_setpath_invocation(g);
+    }
     (void)ptsBuffer();
-    (void)sb_ensure_setpath_invocation();
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
-          win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
+          win, shape, r_is_objc_ptr(g_sbSetPathInv[SB_G_STROKE_MAIN]) ? "OK" : "NO");
     return 0;
 }
 
@@ -639,8 +727,10 @@ void SBRemotePushESPFrame(UIView *espView) {
         return;
     }
 
-    static NSMutableData *ops = nil;
-    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
+    static NSMutableData *ops[SB_GROUP_COUNT] = {0};
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        if (!ops[g]) ops[g] = [NSMutableData dataWithCapacity:4096];
+    }
 
     if (!mergePaths(espView, ops)) {
         g_sbSummarySkips++;
@@ -662,13 +752,18 @@ void SBRemotePushESPFrame(UIView *espView) {
     const uint64_t tAcquire = now_us();
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
-    NSData *frameBytes = [ops copy];
+    static NSMutableData *frameBytes[SB_GROUP_COUNT];
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        if (!frameBytes[g]) frameBytes[g] = [NSMutableData dataWithCapacity:4096];
+        [frameBytes[g] setLength:0];
+        [frameBytes[g] appendData:ops[g]];
+    }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
         @try {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
-            if (!r_is_objc_ptr(g_sbShape)) return;
+            if (!r_is_objc_ptr(g_sbShapes[SB_G_STROKE_MAIN])) return;
 
             // Which operation poisons the session. g_RC_success is cleared by
             // every failed remote operation, and init_remote_call reporting
@@ -680,7 +775,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             // flag. Sampled only when something is actually wrong, to keep this
             // off the hot path.
             const int okBefore = remote_call_current_success() ? 1 : 0;
-            uint64_t rp = persistentPath();
+            uint64_t rp = persistentPath(SB_G_STROKE_MAIN);
             const int okAfterPath = remote_call_current_success() ? 1 : 0;
             uint64_t ptsBuf = ptsBuffer();
             const int okAfterBuf = remote_call_current_success() ? 1 : 0;
@@ -717,8 +812,20 @@ void SBRemotePushESPFrame(UIView *espView) {
             }
             g_sbConsecFail = 0;
 
-            size_t len = frameBytes.length;
-            const uint8_t *b = (const uint8_t *)frameBytes.bytes;
+            // One pass per paint group. Each group owns a shape layer, so each
+            // needs its own path, its own rectangle scratch and its own setPath.
+            uint32_t subpaths = 0, rectCount = 0, limbCount = 0, drawn = 0;
+            uint64_t calls = 0;
+            int maxPts = 0, nBig = 0;
+            int c2 = 0, c3 = 0, c4 = 0, c5to8 = 0, c9to32 = 0, c33p = 0;
+            double firstRect[4] = {0, 0, 0, 0};
+            int haveFirstRect = 0;
+            uint32_t nTrunc = 0;
+
+            for (int g = 0; g < SB_GROUP_COUNT; g++) {
+            const size_t len = frameBytes[g].length;
+            if (len == 0) continue;
+            const uint8_t *b = (const uint8_t *)frameBytes[g].bytes;
 
             // Every CoreGraphics call below crosses the process boundary into
             // SpringBoard, so a frame costs (number of calls) x (cost of one
@@ -759,41 +866,25 @@ void SBRemotePushESPFrame(UIView *espView) {
             // persistentPath() into the argument buffer on every present, so
             // the path is not baked into the cached invocation and a fresh one
             // per frame is correct.
-            uint64_t freshPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+            uint32_t freshPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             calls++;
             if (!freshPath) {
-                NSLog(@"[PUSH-PATH] CGPathCreateMutable returned 0 — skipping frame");
-                return;
+                NSLog(@"[PUSH-PATH] CGPathCreateMutable returned 0 — skipping group %d", g);
+                continue;
             }
-            if (rp) dlsym_remote("CGPathRelease", rp, 0,0,0,0,0,0,0);
-            rp = freshPath;
-            g_sbPersistentPath = freshPath;
+            uint64_t grp = persistentPath(g);
+            if (grp) dlsym_remote("CGPathRelease", grp, 0,0,0,0,0,0,0);
+            g_sbPersistentPath[g] = freshPath;
+            uint64_t rp = freshPath;
 
-            // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
+            // Scratch for the rectangle batch. ptsBuffer() holds 8192 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
             // are flushed in several CGPathAddRects calls rather than overrun it.
             double rectBuf[512];
             int rectDoubles = 0;
-            // A subpath far larger than any real shape means the stream handed
-            // us points belonging to more than one shape, which is what draws a
-            // line across the screen. Recorded rather than assumed.
-            int maxPts = 0;
-            int nBig = 0;
-            // Shape census. limb=47 against rect=9 does not say what those 47
-            // are, and guessing is what produced three wrong fixes today. A
-            // subpath is classified by its point count alone, so counting the
-            // counts names every category without changing any drawing.
-            int c2 = 0, c3 = 0, c4 = 0, c5to8 = 0, c9to32 = 0, c33p = 0;
-            // First rectangle exactly as it is written into the remote buffer,
-            // so it can be compared against the app side scr= for the same
-            // player. If the two disagree the fault is in the hand-off; if they
-            // agree, the fault is in the geometry upstream of the hand-off.
-            double firstRect[4] = {0, 0, 0, 0};
-            int haveFirstRect = 0;
 
             size_t i = 0;
             int curLayer = -1;
-            uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
                 // this overlay is the FOV ring at 73 straight points; a head
@@ -861,17 +952,41 @@ void SBRemotePushESPFrame(UIView *espView) {
                         if (py > maxY) maxY = py;
                     }
                     const double w = maxX - minX, h = maxY - minY;
-                    if (w > 0.5 && h > 0.5 &&
-                        fabs(run[0] - run[6]) < 0.5 && fabs(run[1] - run[7]) < 0.5) {
-                        isRect = 1;
-                        for (int k = 0; k < 4 && isRect; k++) {
-                            double px = run[k*2], py = run[k*2+1];
-                            if ((fabs(px - minX) > 0.5 && fabs(px - maxX) > 0.5) ||
-                                (fabs(py - minY) > 0.5 && fabs(py - maxY) > 0.5)) {
-                                isRect = 0;
-                            }
+                    // A rectangle is accepted when the four points are the four
+                    // distinct corners of the bounding box.
+                    //
+                    // The previous test also demanded run[0] equal run[6], that
+                    // is, that the first and last point of the subpath be the
+                    // same. CGPathAddRect never produces that. It emits moveTo
+                    // (x,y), lineTo (x+w,y), lineTo (x+w,y+h), lineTo (x,y+h)
+                    // and then a closeSubpath element, and serFunc drops
+                    // closeSubpath because it carries no point. So the last
+                    // point is (x,y+h) and the check was false for every
+                    // rectangle taller than half a pixel.
+                    //
+                    // That silently did two things at once. The rectangle fell
+                    // through to the generic polyline branch, where
+                    // CGPathAddLines draws an open three segment path, so the
+                    // left edge was never stroked and the box was not a box. And
+                    // it missed the CGPathAddRects batch entirely, so every box
+                    // and every health bar cost a remote call of its own.
+                    if (w > 0.5 && h > 0.5) {
+                        int c00 = 0, c01 = 0, c11 = 0, c10 = 0;
+                        for (int k = 0; k < 4; k++) {
+                            const double px = run[k*2], py = run[k*2+1];
+                            const int lo = fabs(px - minX) <= 0.5;
+                            const int hi = fabs(px - maxX) <= 0.5;
+                            const int loY = fabs(py - minY) <= 0.5;
+                            const int hiY = fabs(py - maxY) <= 0.5;
+                            if (lo && loY) c00++;
+                            else if (hi && loY) c01++;
+                            else if (hi && hiY) c11++;
+                            else if (lo && hiY) c10++;
                         }
-                        if (isRect) { rx = minX; ry = minY; rw = w; rh = h; }
+                        if (c00 == 1 && c01 == 1 && c11 == 1 && c10 == 1) {
+                            isRect = 1;
+                            rx = minX; ry = minY; rw = w; rh = h;
+                        }
                     }
                 } else if (np == 2) {
                     // A lone segment. Axis-aligned ones are snaplines, which are
@@ -953,9 +1068,13 @@ void SBRemotePushESPFrame(UIView *espView) {
                 dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++; drawn++;
             }
+            }   // end of paint group loop
 
             if (drawn > 0) {
-                sb_invoke_cached_main_raw();
+                // One present per group, so each shape layer gets its own path.
+                for (int g = 0; g < SB_GROUP_COUNT; g++) {
+                    if (g_sbPersistentPath[g]) sb_invoke_cached_main_raw(g);
+                }
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
                 g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
@@ -1048,7 +1167,11 @@ void SBoardStopOverlay(void) {
     // Fl0rk stop_in_session
     if (remote_call_has_local_state()) {
         if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
-        if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
+        for (int g = 0; g < SB_GROUP_COUNT; g++) {
+            if (g_sbPersistentPath[g]) {
+                dlsym_remote("CGPathRelease", g_sbPersistentPath[g], 0,0,0,0,0,0,0);
+            }
+        }
         sb_forget_local_paint_state();
         destroy_remote_call();
     } else {
