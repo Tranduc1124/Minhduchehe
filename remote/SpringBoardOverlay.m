@@ -194,16 +194,7 @@ static void serFunc(void *info, const CGPathElement *e) {
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     [d setLength:0];
-    CGMutablePathRef merged = CGPathCreateMutable();
-    if (!merged) return NO;
-    for (int i = 0; i < 16; i++) {
-        id val = [espView valueForKey:[NSString stringWithUTF8String:kShapeKeys[i]]];
-        if ([val isKindOfClass:[CAShapeLayer class]]) {
-            CGPathRef p = ((CAShapeLayer *)val).path;
-            if (p && !CGPathIsEmpty(p)) CGPathAddPath(merged, NULL, p);
-        }
-    }
-    if (CGPathIsEmpty(merged)) { CGPathRelease(merged); return NO; }
+
     SerCtx ctx = { .data = d, .landW = 0, .landH = 0 };
     {
         const CGRect vb = espView.bounds;
@@ -211,8 +202,32 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         ctx.landH = (vb.size.width  > vb.size.height) ? vb.size.height : vb.size.width;
     }
     g_sbSubpathCount = 0;
-    CGPathApply(merged, &ctx, serFunc);
-    CGPathRelease(merged);
+
+    // Each layer is serialised separately and preceded by a layer marker, rather
+    // than all sixteen being merged into one path first. The merge destroyed the
+    // only information that told the decoder what a shape was, and without it a
+    // two point subpath is ambiguous: a snapline, the head diamond, a bone, an
+    // alert tick. Guessing that wrong cost twice. Dropping the bucket deleted the
+    // snaplines and the user saw none. Admitting the whole bucket brought the
+    // head diamonds back, so one player showed two lines, and it cost two remote
+    // calls each which took the frame from 15 calls to 115.
+    //
+    // The marker is what makes the bucket decidable: draw the snapline layers,
+    // drop the rest.
+    int emitted = 0;
+    for (int i = 0; i < 16; i++) {
+        id val = [espView valueForKey:[NSString stringWithUTF8String:kShapeKeys[i]]];
+        if (![val isKindOfClass:[CAShapeLayer class]]) continue;
+        CGPathRef p = ((CAShapeLayer *)val).path;
+        if (!p || CGPathIsEmpty(p)) continue;
+        uint8_t tag = 4;                       // op 4 = start of a layer
+        uint8_t idx = (uint8_t)i;
+        [d appendBytes:&tag length:1];
+        [d appendBytes:&idx length:1];
+        CGPathApply(p, &ctx, serFunc);
+        emitted = 1;
+    }
+    if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
     for (NSUInteger i = 0; i < d.length; i++) {
@@ -723,11 +738,17 @@ void SBRemotePushESPFrame(UIView *espView) {
             int haveFirstRect = 0;
 
             size_t i = 0;
+            int curLayer = -1;
             while (i < len) {
                 double run[1024];
                 int rn = 0;
                 while (i < len) {
                     uint8_t op = b[i++];
+                    if (op == 4) {                 // layer marker, no coordinates
+                        if (i >= len) { i = len; break; }
+                        curLayer = b[i++];
+                        continue;
+                    }
                     if (i + 16 > len) { i = len; break; }
                     double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
                     if (op == 1) {
@@ -810,20 +831,29 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // fall-through is why the device log reported
                         // calls=58 against limb=43, with 1+1+13 = 15 expected.
                         limbCount++;
-                        // Draw it. This bucket holds snaplines as well as bones,
-                        // and the two are indistinguishable once sixteen layers
-                        // have been merged into one flat point stream. Dropping
-                        // the bucket is what deleted the snaplines, and the log
-                        // said so at the time: limb=47 with rect=9, far too
-                        // many limbs to be bones on two visible players.
+                        // Only the snapline layers, now that the stream says
+                        // which layer a subpath came from. Layers 6, 7 and 8 are
+                        // snaplineLayer, snaplineBotLayer and
+                        // snaplineKnockedLayer in kShapeKeys.
                         //
-                        // Bones cost nothing extra now because the app side no
-                        // longer emits them, so a call per segment buys back the
-                        // snaplines. If a segment really is a bone it reappears,
-                        // which is a fair trade and visible immediately.
-                        remote_write(ptsBuf, run, (size_t)rn * 8);
-                        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
-                        calls++; drawn++;
+                        // Everything else in this bucket is a segment that is
+                        // not a snapline, and drawing them is what put two lines
+                        // on one player: the head diamond is drawn as segments
+                        // too, so allowing the whole bucket brought the diamonds
+                        // back alongside the snapline. It also cost two remote
+                        // calls each and took the frame from 15 calls to 115.
+                        if (curLayer >= 6 && curLayer <= 8) {
+                            remote_write(ptsBuf, run, (size_t)rn * 8);
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            calls++; drawn++;
+                        }
+#if SB_DRAW_BONES
+                        else if (curLayer >= 3 && curLayer <= 5) {
+                            remote_write(ptsBuf, run, (size_t)rn * 8);
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            calls++; drawn++;
+                        }
+#endif
                     }
                 }
 
