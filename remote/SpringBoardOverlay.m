@@ -154,7 +154,7 @@ static uint64_t now_us(void) {
     return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
-typedef struct { NSMutableData *data; double landW; double landH; } SerCtx;
+typedef struct { NSMutableData *data; double landW; double landH; CGPoint last; } SerCtx;
 static uint32_t g_sbSubpathCount = 0;
 
 // op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
@@ -166,30 +166,65 @@ static void serFunc(void *info, const CGPathElement *e) {
     if (e->type == kCGPathElementCloseSubpath) return;
     if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
     uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
+    if (e->type == kCGPathElementAddCurveToPoint) op = 3;
     [ctx->data appendBytes:&op length:1];
 
     const CGPoint *src;
-    if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
-        src = &e->points[0];
-    } else {
-        int n = (e->type == kCGPathElementAddQuadCurveToPoint) ? 1 : 2;
-        src = &e->points[n];
+    int npts = 1;
+    if (e->type == kCGPathElementAddCurveToPoint) {
+        // Flatten the cubic into line segments here rather than teaching the
+        // decoder about curves.
+        //
+        // Keeping only the endpoint is what made circles render as diamonds:
+        // CGPathAddEllipseInRect builds a circle from four cubic curves, and
+        // dropping the control points left four points joined by straight
+        // lines, which is a diamond. That hit the head marker and the FOV ring
+        // equally.
+        //
+        // Subdividing costs a few more points in the stream and nothing in
+        // remote calls, because the whole subpath still goes out as one
+        // CGPathAddLines. Eight segments per quarter is well past the point
+        // where the facets are visible at overlay sizes.
+        const CGPoint p0 = ctx->last;
+        const CGPoint p1 = e->points[0];
+        const CGPoint p2 = e->points[1];
+        const CGPoint p3 = e->points[2];
+        uint8_t lop = 2;
+        for (int s = 1; s <= 8; s++) {
+            const double t = (double)s / 8.0;
+            const double u = 1.0 - t;
+            const double a = u * u * u, b = 3.0 * u * u * t;
+            const double c = 3.0 * u * t * t, e = t * t * t;
+            const double lx = a * p0.x + b * p1.x + c * p2.x + e * p3.x;
+            const double ly = a * p0.y + b * p1.y + c * p2.y + e * p3.y;
+            CGPoint q;
+            q.x = ctx->landH - ly;
+            q.y = lx;
+            [ctx->data appendBytes:&lop length:1];
+            [ctx->data appendBytes:&q length:sizeof(q)];
+        }
+        ctx->last.x = ctx->landH - p3.y;
+        ctx->last.y = p3.x;
+        return;
     }
 
-    // The path is now built in the game's landscape space, but the CAShapeLayer
-    // in SpringBoard lives in the display's portrait space, so every point is
+    src = (e->type == kCGPathElementAddQuadCurveToPoint) ? &e->points[1]
+                                                        : &e->points[0];
+
+    // The path is built in the game's landscape space, but the CAShapeLayer in
+    // SpringBoard lives in the display's portrait space, so every point is
     // rotated on the way out. This is the only place the two spaces meet.
     //
     //   px = landH - y,  py = x
     //
     // is a 90 degree rotation with determinant +1, so handedness survives and
-    // nothing is mirrored. The alternative 90 degree rotation is
-    // px = y, py = landW - x; if the overlay ever comes out upside down that is
-    // the one line to change, and nothing else in the pipeline moves.
+    // nothing is mirrored. If the overlay ever shows upside down, the other
+    // rotation is px = y, py = landW - x, and nothing else moves.
     CGPoint p;
     p.x = ctx->landH - src->y;
     p.y = src->x;
     [ctx->data appendBytes:&p length:sizeof(p)];
+    ctx->last = p;   // start point for the next cubic
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
