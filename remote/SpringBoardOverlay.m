@@ -154,63 +154,98 @@ static uint64_t now_us(void) {
     return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
-typedef struct { NSMutableData *data; double landW; double landH; } SerCtx;
+// Chords emitted per cubic or quad curve. A quarter turn split into 12 chords
+// sits r*(1-cos(7.5deg)) = r*0.0086 off the true arc, which is a fifth of a
+// pixel across a 20pt head, so it is not distinguishable from a real curve.
+#define SB_CURVE_CHORDS 12
+
+typedef struct {
+    NSMutableData *data;
+    double landW, landH;
+    double lastX, lastY;    // last point emitted, needed as a curve's start
+    int haveLast;
+} SerCtx;
 static uint32_t g_sbSubpathCount = 0;
 
-// op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
-// marker. The break marker is redundant with moveTo mathematically, but it lets
-// the SpringBoard side rebuild subpaths exactly instead of collapsing everything
-// into one polyline (see the decode loop in SBRemotePushESPFrame).
+// Appends one point, rotated into SpringBoard's portrait space. This is the
+// only place the landscape geometry and the portrait display meet.
+//
+//   px = landH - y,  py = x
+//
+// is a 90 degree rotation with determinant +1, so handedness survives and
+// nothing is mirrored. If the overlay ever shows upside down, the other
+// rotation is px = y, py = landW - x, and nothing else moves.
+static void sbEmit(SerCtx *ctx, uint8_t op, double sx, double sy) {
+    CGPoint p;
+    p.x = ctx->landH - sy;
+    p.y = sx;
+    [ctx->data appendBytes:&op length:1];
+    [ctx->data appendBytes:&p length:sizeof(p)];
+    ctx->lastX = sx;
+    ctx->lastY = sy;
+    ctx->haveLast = 1;
+}
+
+// op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo.
+//
+// Curves are emitted as chords, not as their endpoint. Emitting only the
+// endpoint of a cubic curve discards both control points, and four of those
+// discard the four corners of a circle, which is why every ellipse in this
+// overlay rendered as a diamond. The device log confirms the source: a head
+// measured bone=128/16, that is four players at four curve elements each.
+//
+// The earlier attempt at this failed and the reason is worth keeping. It
+// subdivided the whole path, so straight segments were divided too, a subpath
+// that was already 73 points became 584, the decoder capped a subpath at 1024
+// doubles, and the shape was cut in half mid figure. That drew garbage,
+// flickered, and left the overlay swallowing touches until the device needed
+// a hard reset. Only curves are divided here, so a straight segment costs
+// exactly what it cost before. The FOV ring is 73 straight segments and
+// arrives as the same 73 points it always did, and a head ellipse goes from 4
+// elements to 49, well under the cap.
 static void serFunc(void *info, const CGPathElement *e) {
     SerCtx *ctx = (SerCtx *)info;
     if (e->type == kCGPathElementCloseSubpath) return;
-    if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
-    uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
-    if (e->type == kCGPathElementAddCurveToPoint) op = 3;
-    [ctx->data appendBytes:&op length:1];
 
-    const CGPoint *src;
-    int npts = 1;
-    if (e->type == kCGPathElementAddCurveToPoint) {
-        // Emitted as its endpoint only, as it always was.
-        //
-        // Subdividing the curve into line segments was tried and reverted. It
-        // fixes the diamond shape, but the decoder caps a subpath at 1024
-        // doubles, and a circle went from 4 points to 32. A subpath that was
-        // already 73 points became 584 and was cut in half mid shape, which
-        // drew garbage, flickered, and left the overlay swallowing touches
-        // until the device needed a hard reset.
-        //
-        // Making circles round needs the cap raised at the same time, or the
-        // subdivision kept below it. Neither is safe to do in the same change
-        // as a regression this severe, so the cap stays where it is and the
-        // circles stay diamonds until that is fixed properly.
-        src = &e->points[2];
-    } else if (e->type == kCGPathElementAddQuadCurveToPoint) {
-        src = &e->points[1];
-    } else {
-        src = &e->points[0];
+    if (e->type == kCGPathElementAddCurveToPoint && ctx->haveLast) {
+        const double p0x = ctx->lastX, p0y = ctx->lastY;
+        const double p1x = e->points[0].x, p1y = e->points[0].y;
+        const double p2x = e->points[1].x, p2y = e->points[1].y;
+        const double p3x = e->points[2].x, p3y = e->points[2].y;
+        for (int k = 1; k <= SB_CURVE_CHORDS; k++) {
+            const double t  = (double)k / (double)SB_CURVE_CHORDS;
+            const double mt = 1.0 - t;
+            const double b0 = mt*mt*mt, b1 = 3.0*mt*mt*t, b2 = 3.0*mt*t*t, b3 = t*t*t;
+            sbEmit(ctx, 2,
+                   b0*p0x + b1*p1x + b2*p2x + b3*p3x,
+                   b0*p0y + b1*p1y + b2*p2y + b3*p3y);
+        }
+        return;
     }
 
-    // The path is built in the game's landscape space, but the CAShapeLayer in
-    // SpringBoard lives in the display's portrait space, so every point is
-    // rotated on the way out. This is the only place the two spaces meet.
-    //
-    //   px = landH - y,  py = x
-    //
-    // is a 90 degree rotation with determinant +1, so handedness survives and
-    // nothing is mirrored. If the overlay ever shows upside down, the other
-    // rotation is px = y, py = landW - x, and nothing else moves.
-    CGPoint p;
-    p.x = ctx->landH - src->y;
-    p.y = src->x;
-    [ctx->data appendBytes:&p length:sizeof(p)];
+    if (e->type == kCGPathElementAddQuadCurveToPoint && ctx->haveLast) {
+        const double p0x = ctx->lastX, p0y = ctx->lastY;
+        const double p1x = e->points[0].x, p1y = e->points[0].y;
+        const double p2x = e->points[1].x, p2y = e->points[1].y;
+        for (int k = 1; k <= SB_CURVE_CHORDS; k++) {
+            const double t  = (double)k / (double)SB_CURVE_CHORDS;
+            const double mt = 1.0 - t;
+            sbEmit(ctx, 2,
+                   mt*mt*p0x + 2.0*mt*t*p1x + t*t*p2x,
+                   mt*mt*p0y + 2.0*mt*t*p1y + t*t*p2y);
+        }
+        return;
+    }
+
+    if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
+    const CGPoint *src = &e->points[0];
+    sbEmit(ctx, (e->type == kCGPathElementMoveToPoint) ? 1 : 2, src->x, src->y);
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     [d setLength:0];
 
-    SerCtx ctx = { .data = d, .landW = 0, .landH = 0 };
+    SerCtx ctx = { .data = d, .landW = 0, .landH = 0, .lastX = 0, .lastY = 0, .haveLast = 0 };
     {
         const CGRect vb = espView.bounds;
         ctx.landW = (vb.size.width  > vb.size.height) ? vb.size.width  : vb.size.height;
@@ -758,8 +793,15 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             size_t i = 0;
             int curLayer = -1;
+            uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
-                double run[1024];
+                // 2048 doubles is 1024 points per subpath. The largest shape in
+                // this overlay is the FOV ring at 73 straight points; a head
+                // ellipse is 49 after the curve chords. The previous cap of 512
+                // points was cut in half mid figure in an earlier attempt and
+                // that is what left the overlay swallowing touches, so the head
+                // room is deliberate and nTrunc reports if it is ever used.
+                double run[2048];
                 int rn = 0;
                 while (i < len) {
                     uint8_t op = b[i++];
@@ -783,8 +825,8 @@ void SBRemotePushESPFrame(UIView *espView) {
                         run[rn++] = x; run[rn++] = y;
                         continue;
                     }
+                    if (rn >= 2046) { nTrunc++; i = len; break; }
                     run[rn++] = x; run[rn++] = y;
-                    if (rn >= 1024) break;
                 }
                 // Two doubles is a single point. It cannot be drawn, and the old
                 // code spent 3 calls on it (a remote_write plus moveTo plus
@@ -960,7 +1002,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u",
+                              @"mergedSub=%u trunc=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -974,7 +1016,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount);
+                              g_sbSubpathCount, nTrunc);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
