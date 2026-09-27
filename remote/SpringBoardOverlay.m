@@ -821,7 +821,15 @@ void SBRemotePushESPFrame(UIView *espView) {
                             // subpath buffer and drew fragments across the
                             // screen. Four doubles cannot do either.
                             remote_write(ptsBuf, er, 32);
-                            dlsym_remote("CGPathAddEllipseInRect", rp, 0, ptsBuf, 0, 0,0,0,0);
+                            // CGPathAddEllipseInRect(path, rect) takes two
+                            // arguments. It was being called with four, in the
+                            // shape of CGPathAddRects, so the rect argument
+                            // received the zero that was meant to be a
+                            // transform and CoreGraphics was handed a NULL rect.
+                            // It drew nothing, which is why ell=1 came back every
+                            // second while no ring appeared on screen.
+                            dlsym_remote("CGPathAddEllipseInRect", rp, ptsBuf,
+                                         0, 0, 0, 0, 0, 0);
                             calls++; drawn++;
                             ellipseCount++;
                         }
