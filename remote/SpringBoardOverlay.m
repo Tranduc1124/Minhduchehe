@@ -640,8 +640,29 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint64_t calls = 0;
             uint32_t drawn = 0;
 
-            dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
+            // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
+            // iOS 17.5, and so is CGPathReset, so there is no way to empty a
+            // CGMutablePathRef in place. Every dlsym for CGPathClear therefore
+            // failed, and because a failed remote operation clears
+            // g_RC_success, that one nonexistent symbol poisoned the session on
+            // the very first publish of every session. That is what
+            // [PUSH-DLSYM] CGPathClear broke the session was reporting, and it
+            // is why the overlay painted once and then stayed frozen.
+            //
+            // Replace it the only way CoreGraphics allows: build a new path and
+            // release the old one. sb_invoke_cached_main_raw writes
+            // persistentPath() into the argument buffer on every present, so
+            // the path is not baked into the cached invocation and a fresh one
+            // per frame is correct.
+            uint64_t freshPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             calls++;
+            if (!freshPath) {
+                NSLog(@"[PUSH-PATH] CGPathCreateMutable returned 0 — skipping frame");
+                return;
+            }
+            if (rp) dlsym_remote("CGPathRelease", rp, 0,0,0,0,0,0,0);
+            rp = freshPath;
+            g_sbPersistentPath = freshPath;
 
             // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
