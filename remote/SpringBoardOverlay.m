@@ -38,7 +38,17 @@
 // entirely: every frame qualifies, and the rate becomes the render loop rate,
 // bounded by how long a publish actually takes. Frame cost is 9 to 16ms here,
 // so 16.6ms asks for 60fps and the loop supplies what it can.
-#define SB_MIN_PUBLISH_INTERVAL_US 16666ULL
+// Keeping the interval under one render frame period removes the quantisation
+// entirely: every frame qualifies, and the rate becomes the render loop rate,
+// bounded by how long a publish actually takes.
+//
+// "Under" has to mean clearly under. At 16666us against a measured loop of
+// 58 to 63fps, the frame period is about 16.5ms, so the deadline lands between
+// frames and only every second frame qualifies. That is the same quantisation
+// as before, just on the other side of the boundary, and it held the rate at
+// 35fps while the frame cost 10ms and the loop ran at 60. 8000us is roughly
+// half a frame, which leaves no boundary to fall on.
+#define SB_MIN_PUBLISH_INTERVAL_US 8000ULL
 
 // Skeleton limbs are the only ESP element with no batchable CoreGraphics
 // primitive: each one needs its own CGPathAddLines call, because the SDK has
@@ -100,6 +110,12 @@ static uint64_t g_sbLastPublishUS = 0;
 // Retry interval for the rebuild, doubling on each attempt up to a minute, and
 // reset whenever a publish succeeds.
 static uint64_t g_sbRearmBackoffUS = 5000000ULL;
+
+// Busy-flag instrumentation: how many frames collided with a publish still in
+// flight, and the total time the flag has been held. Reported as a per second
+// rate so it can be compared against the frame rate.
+static uint64_t g_sbBusyDrops = 0;
+static uint64_t g_sbHoldUS = 0;
 static uint64_t g_sbNextPublishUS = 0;
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -564,9 +580,17 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     static int s_remoteBusy = 0;
     if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+        // How long one publish holds the flag, and how often a frame arrives
+        // while it is still held. The interval gate lets frames through
+        // non-blockingly, so a drop here is not a wait, it is a collision with
+        // the publish still in flight. With a frame cost of 10ms and a frame
+        // period of 16.6ms the flag should be free again in time, and a
+        // bdrops that climbs says it is not.
+        g_sbBusyDrops++;
         g_sbSummarySkips++;
         return;
     }
+    const uint64_t tAcquire = now_us();
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
@@ -847,24 +871,32 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // is the frame rate actually achieved rather than the one
                         // the cap allows.
                         static uint64_t s_prevUpd = 0, s_prevUpdUS = 0;
-                        uint64_t ups = 0;
+                        static uint64_t s_prevDrops = 0, s_prevHold = 0;
+                        uint64_t ups = 0, bdropRate = 0, holdMS = 0;
                         {
                             uint64_t tU = now_us();
                             if (tU > s_prevUpdUS + 1000000ULL) {
                                 ups = g_sbSummaryUpdates - s_prevUpd;
+                                bdropRate = g_sbBusyDrops - s_prevDrops;
+                                holdMS = (g_sbHoldUS - s_prevHold) / 1000ULL;
                                 s_prevUpd = g_sbSummaryUpdates;
+                                s_prevDrops = g_sbBusyDrops;
+                                s_prevHold = g_sbHoldUS;
                                 s_prevUpdUS = tU;
                             }
                         }
                         NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
-                              @"hash=%u upd=%llu att=%llu skip=%llu mergedSub=%u",
+                              @"bdrops=%llu hold=%llums hash=%u upd=%llu att=%llu skip=%llu "
+                              @"mergedSub=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
                               maxPts, nBig,
                               firstRect[0], firstRect[1], firstRect[2], firstRect[3],
                               (unsigned long long)ups,
+                              (unsigned long long)bdropRate,
+                              (unsigned long long)holdMS,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
@@ -878,6 +910,9 @@ void SBRemotePushESPFrame(UIView *espView) {
                 }
             }
         } @finally {
+            // hold = how long the busy flag was held, which is the delay a
+            // frame arriving right now would have to wait.
+            g_sbHoldUS += now_us() - tAcquire;
             __sync_lock_release(&s_remoteBusy);
         }
     });
