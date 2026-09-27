@@ -28,6 +28,7 @@
 #import "../kexploit/xpaci.h"
 
 #import <mach/mach.h>
+#import <mach/mach_time.h>
 #import <sys/sysctl.h>
 #import <pthread.h>
 
@@ -329,11 +330,35 @@ uint64_t ds_translate_page(uint64_t page_va) {
 #define DS_PAGE_CACHE_SLOTS 256
 #define DS_RECENT_SLOTS 8
 #define DS_FAIL_DEGRADE_THRESHOLD 3
+
+// Hard lifetime for a mapping, counted from the moment it was taken.
+//
+// Why this cannot be based on lastUse: a stale page is not an idle page. When
+// the game hands a recycled VA to new data we keep reading that VA every frame
+// and keep getting the old bytes, so the slot is permanently "hot" and any
+// idle-based scheme would never touch it. The device log shows world frozen at
+// (57.58,12.79,58.47) for 21 s while the camera kept moving. Age therefore has
+// to be measured from insertion and must expire even busy pages, which is what
+// shmemClock[256] in the reference does and what lastUse here could not.
+//
+// 2000 ms is a starting value, not a measured one. It is the knob that trades
+// tracking accuracy against remap cost, so both rates are logged every second
+// (see ds_end_read_transaction) and the value is meant to be tuned from the
+// device log, not defended.
+#define DS_PAGE_TTL_MS 2000ULL
+
+// Upper bound on mappings torn down in one transaction. Releasing all 256 at
+// once is what produced "Taking non-sleepable RW lock with preemption enabled"
+// (see the note in ds_end_read_transaction). Spreading the same total over many
+// transactions keeps the port deallocations apart in time.
+#define DS_MAX_EVICT_PER_TXN 4
+
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
     uint64_t port;     // memory_entry — MUST mach_port_deallocate on eviction
     uint64_t lastUse;  // Fl0rk lastUse clock
+    uint64_t bornMs;   // wall clock at insert — drives DS_PAGE_TTL_MS
     uint64_t gen;      // match generation this mapping was taken under
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
@@ -343,6 +368,10 @@ static int g_recentPageSlots[DS_RECENT_SLOTS];
 static int g_recentCount = 0;
 static uint64_t g_pageUseCounter = 1;
 static int g_pageCacheNext = 0;
+// Lifetime counters, reported once a second as [DS-TLB]. Kept monotonic across
+// flushes so a rate never goes negative.
+static uint64_t g_dsRemapCount = 0;
+static uint64_t g_dsEvictCount = 0;
 // Recursive: begin/end txn + ds_page_local nest like Fl0rk NSRecursiveLock.
 static pthread_mutex_t g_pageCacheLock;
 static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
@@ -395,7 +424,18 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].localAddr = 0;
     g_pageCache[i].port = 0;
     g_pageCache[i].lastUse = 0;
+    g_pageCache[i].bornMs = 0;
+    g_pageCache[i].gen = 0;
     g_pageCache[i].useCount = 0;
+}
+
+// Monotonic milliseconds. Not wall clock: a clock jump must not expire the
+// whole cache at once.
+static uint64_t ds_now_ms(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (mach_absolute_time() * tb.numer / tb.denom) / 1000000ULL;
 }
 
 void ds_begin_read_transaction(void) {
@@ -411,6 +451,50 @@ void ds_end_read_transaction(void) {
     if (g_readTxnDepth == 0) {
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
             if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
+        }
+
+        // Expire mappings that have outlived DS_PAGE_TTL_MS. The reference
+        // implementation carries a per-slot clock (shmemClock[256]) plus an
+        // eviction counter (shmemEvictions); this is the same shape. Without it
+        // a recycled VA is served from the same mapping forever, which is the
+        // "boxes are pinned to one direction" symptom.
+        //
+        // Only DS_MAX_EVICT_PER_TXN are dropped per transaction. The total per
+        // second is still ample — the render loop runs at ~60 Hz, so 4 per
+        // transaction is ~240 per second against a 256 slot cache — but the
+        // mach_port_deallocate calls stay spread out in time, which is the part
+        // that used to panic.
+        uint64_t nowMs = ds_now_ms();
+        int evicted = 0;
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS && evicted < DS_MAX_EVICT_PER_TXN; i++) {
+            if (!g_pageCache[i].localAddr) continue;
+            if (nowMs - g_pageCache[i].bornMs < DS_PAGE_TTL_MS) continue;
+            ds_release_page_slot_locked(i);
+            evicted++;
+        }
+        g_dsEvictCount += (uint64_t)evicted;
+
+        // 1 Hz. remaps and evictions are the two halves of the TTL trade: a TTL
+        // that is too long leaves stale pages in place, one that is too short
+        // burns CPU on vm_map_remote_page. These two rates are what tells them
+        // apart on device.
+        static uint64_t s_lastReportMs = 0;
+        if (nowMs > s_lastReportMs + 1000ULL) {
+            static uint64_t s_lastRemapCount = 0;
+            static uint64_t s_lastEvictCount = 0;
+            uint64_t remapDelta = g_dsRemapCount - s_lastRemapCount;
+            uint64_t evictDelta = g_dsEvictCount - s_lastEvictCount;
+            int live = 0;
+            for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+                if (g_pageCache[i].localAddr) live++;
+            }
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu",
+                  (unsigned long long)DS_PAGE_TTL_MS, live,
+                  (unsigned long long)remapDelta,
+                  (unsigned long long)evictDelta);
+            s_lastReportMs = nowMs;
+            s_lastRemapCount = g_dsRemapCount;
+            s_lastEvictCount = g_dsEvictCount;
         }
     }
     ds_unlock();
@@ -486,6 +570,8 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].gen = g_cacheGeneration;
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;
+    g_pageCache[victim].bornMs = ds_now_ms();
+    g_dsRemapCount++;
     ds_note_recent_locked(victim);
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
     uint64_t a = page.localAddress;
