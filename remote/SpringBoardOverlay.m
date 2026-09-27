@@ -710,6 +710,11 @@ void SBRemotePushESPFrame(UIView *espView) {
             // line across the screen. Recorded rather than assumed.
             int maxPts = 0;
             int nBig = 0;
+            // Shape census. limb=47 against rect=9 does not say what those 47
+            // are, and guessing is what produced three wrong fixes today. A
+            // subpath is classified by its point count alone, so counting the
+            // counts names every category without changing any drawing.
+            int c2 = 0, c3 = 0, c4 = 0, c5to8 = 0, c9to32 = 0, c33p = 0;
             // First rectangle exactly as it is written into the remote buffer,
             // so it can be compared against the app side scr= for the same
             // player. If the two disagree the fault is in the hand-off; if they
@@ -750,6 +755,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                 const int np = rn / 2;
                 if (np > maxPts) maxPts = np;
                 if (np > 8) nBig++;
+                if (np == 2) c2++;
+                else if (np == 3) c3++;
+                else if (np == 4) c4++;
+                else if (np <= 8) c5to8++;
+                else if (np <= 32) c9to32++;
+                else c33p++;
                 int isRect = 0;
                 double rx = 0, ry = 0, rw = 0, rh = 0;
 
@@ -799,9 +810,20 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // fall-through is why the device log reported
                         // calls=58 against limb=43, with 1+1+13 = 15 expected.
                         limbCount++;
-#if !SB_DRAW_BONES
-                        continue;
-#endif
+                        // Draw it. This bucket holds snaplines as well as bones,
+                        // and the two are indistinguishable once sixteen layers
+                        // have been merged into one flat point stream. Dropping
+                        // the bucket is what deleted the snaplines, and the log
+                        // said so at the time: limb=47 with rect=9, far too
+                        // many limbs to be bones on two visible players.
+                        //
+                        // Bones cost nothing extra now because the app side no
+                        // longer emits them, so a call per segment buys back the
+                        // snaplines. If a segment really is a bone it reappears,
+                        // which is a fair trade and visible immediately.
+                        remote_write(ptsBuf, run, (size_t)rn * 8);
+                        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                        calls++; drawn++;
                     }
                 }
 
@@ -887,7 +909,8 @@ void SBRemotePushESPFrame(UIView *espView) {
                         }
                         NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
-                              @"bdrops=%llu hold=%llums hash=%u upd=%llu att=%llu skip=%llu "
+                              @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
+                              @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
                               @"mergedSub=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
@@ -897,6 +920,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                               (unsigned long long)ups,
                               (unsigned long long)bdropRate,
                               (unsigned long long)holdMS,
+                              c2, c3, c4, c5to8, c9to32, c33p,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,

@@ -1787,6 +1787,26 @@ static BoxScreenTrack g_boxScr[96];
 
 static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
                                    float &boxH, float &boxW) {
+    // Screen space smoothing is off. It was producing three separate faults:
+    //
+    //   offset     the minimum follow factor is 0.55, so the box converges on the
+    //              true position asymptotically and never reaches it. A moving
+    //              player is drawn permanently behind where they are.
+    //   wrong      the track table has 96 slots indexed by pawn % 96. Two
+    //              different pawns collide, the t.pawn check resets on each
+    //              collision, and the box alternates between the two players'
+    //              remembered state, which reads as boxes jumping around.
+    //   stale      the table is static and is never cleared on a match change,
+    //              so a new pawn landing on a recycled address inherits the old
+    //              one's size.
+    //
+    // The input is already smoothed. TrackAndExtrapolate applies a light
+    // world space EMA for exactly this reason, so filtering again here was
+    // smoothing twice and the second pass is what the player could see.
+    (void)pawn; (void)topY; (void)centerX; (void)boxH; (void)boxW;
+    return;
+
+#if 0
     if (pawn == 0 || boxH < 1.f || boxW < 1.f) return;
     BoxScreenTrack &t = g_boxScr[pawn % 96ull];
     if (t.pawn != pawn || !t.has) {
@@ -1814,6 +1834,7 @@ static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
     boxW = t.w;
     centerX = t.cx;
     topY = t.topY;
+#endif
 }
 
 static inline void ClearBoxScreenForPawn(uint64_t pawn) {
@@ -4486,25 +4507,18 @@ static inline uint64_t ESPPhaseNowUS(void) {
                         buffers->snaplineDirty = YES;
                     }
                     CGPathAddRect(currentBoxPath, NULL, CGRectMake(boxX, boxY, boxWidth, boxHeight));
-                    // Snapline as a rectangle, not a two-point line.
+                    // Snapline stays a real slanted line, one per player.
                     //
-                    // Boxes and HP bars were already emitted as CGPathAddRect, so
-                    // the SpringBoard side batches them into a single
-                    // CGPathAddRects call. The snapline was the odd one out: a
-                    // moveTo plus lineTo, and because it is not axis aligned it
-                    // fell into the same bucket as a skeleton limb and was
-                    // dropped. That is where snaplines went.
-                    //
-                    // A thin vertical rectangle at the box centre draws the same
-                    // line for every practical purpose, since the slant from
-                    // screen centre is small, and it costs no extra remote call
-                    // because it joins the rectangle batch already being sent.
-                    const float slT = 1.0f;
-                    const float slTop = 45.0f;
-                    const float slH = fabsf(boxY - slTop);
-                    CGPathAddRect(currentLinePath, NULL,
-                                  CGRectMake(centerX - slT, fminf(slTop, boxY),
-                                             slT * 2.0f, fmaxf(slH, 1.0f)));
+                    // It was briefly redrawn as two rectangles to save a remote
+                    // call, and that was a bad trade. Every horizontal segment
+                    // starts at the same screen centre, so with two or more
+                    // players on screen the segments overlap and the farther one
+                    // hides the nearer one, which reads as a single line
+                    // pointing at one player. The elbow is cheaper and wrong.
+                    // A polyline per player is one remote call and gives the
+                    // fan the reference actually shows.
+                    CGPathMoveToPoint(currentLinePath, NULL, screenCenter.x, 45.0f);
+                    CGPathAddLineToPoint(currentLinePath, NULL, centerX, boxY);
 
                     const bool liteOnScreen = (w2sHead.x >= -ep && w2sHead.x <= viewWidth + ep &&
                                                w2sHead.y >= -ep && w2sHead.y <= viewHeight + ep);
