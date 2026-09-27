@@ -526,9 +526,8 @@ int SBoardStartOverlay(void) {
 
     uint64_t clsCol = r_class("UIColor");
     uint64_t clear = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "clearColor", 0,0,0,0) : 0;
-    // No whiteCGColor any more. Each of the six shape layers builds its own
-    // colour with colorWithRed:green:blue:alpha:, because one shared stroke
-    // colour was exactly what made every shape render white.
+    uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
+    uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
@@ -924,6 +923,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             size_t i = 0;
             const size_t len = glen;
             int curLayer = -1;
+            uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
                 // this overlay is the FOV ring at 73 straight points; a head
@@ -1229,28 +1229,19 @@ void SBoardStopOverlay(void) {
     // Fl0rk stop_in_session
     if (remote_call_has_local_state()) {
         if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
-        // Every path this session ever handed to setPath: is either a group's
-        // current path or an entry in the hold ring, and the two sets overlap,
-        // so they are released in one pass over the union. Releasing the group
-        // paths in their own loop first would free a path the ring still names.
-        for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
-            int isCurrent = 0;
-            for (int g = 0; g < SB_GROUP_COUNT; g++) {
-                if (g_sbPathRing[k] && g_sbPathRing[k] == g_sbPersistentPath[g]) {
-                    isCurrent = 1;
-                    g_sbPersistentPath[g] = 0;
-                }
-            }
-            if (g_sbPathRing[k] && !isCurrent) {
-                dlsym_remote("CGPathRelease", g_sbPathRing[k], 0,0,0,0,0,0,0);
-            }
-            g_sbPathRing[k] = 0;
-        }
         for (int g = 0; g < SB_GROUP_COUNT; g++) {
             if (g_sbPersistentPath[g]) {
                 dlsym_remote("CGPathRelease", g_sbPersistentPath[g], 0,0,0,0,0,0,0);
-                g_sbPersistentPath[g] = 0;
             }
+        }
+        // The hold ring still holds paths handed to a queued setPath: that the
+        // main thread has not run yet, so they are freed with the session rather
+        // than left for the next one to overwrite the slots of.
+        for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
+            if (g_sbPathRing[k] && g_sbPathRing[k] != g_sbPersistentPath) {
+                dlsym_remote("CGPathRelease", g_sbPathRing[k], 0,0,0,0,0,0,0);
+            }
+            g_sbPathRing[k] = 0;
         }
         g_sbPathRingAt = 0;
         sb_forget_local_paint_state();
