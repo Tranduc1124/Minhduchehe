@@ -248,15 +248,19 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     for (NSUInteger i = 0; i < d.length; i++) {
         h ^= ((const uint8_t *)d.bytes)[i]; h *= 16777619u;
     }
-    // Skip only if the geometry is genuinely unchanged. The old code compared a
-    // single 32-bit hash for the whole frame, so any collision, or any frame
-    // whose bytes happened to match, was dropped entirely: SpringBoard never
-    // re-rendered and the screen kept showing the previous path. That is the
-    // "ESP is static" symptom, and it is independent of the subpath bug below.
-    // Require both the hash and the length to match, and keep re-publishing
-    // rather than suppressing, because a stale draw is worse than a redundant
-    // one.
-    if (h == g_sbPathHash && d.length == g_sbLastPathBytes) return NO;
+    // Never suppress a frame. The hash comparison is gone.
+    //
+    // It looked safe because it required the hash and the length to both match,
+    // but identical geometry across consecutive frames is the normal case
+    // whenever the camera is still, which is most of the time. The device log
+    // made the symptom exact: with the camera parked the screen showed two
+    // lines for one player, and nudging the camera dropped it back to one. Both
+    // were correct frames, but only one was being sent, so the other stayed on
+    // screen indefinitely.
+    //
+    // A redundant repaint costs a handful of remote calls in a budget that has
+    // room for them. A stale frame is what the user is looking at instead.
+    (void)h;
     g_sbPathHash = h;
     g_sbLastPathBytes = d.length;
     return YES;
