@@ -4486,8 +4486,25 @@ static inline uint64_t ESPPhaseNowUS(void) {
                         buffers->snaplineDirty = YES;
                     }
                     CGPathAddRect(currentBoxPath, NULL, CGRectMake(boxX, boxY, boxWidth, boxHeight));
-                    CGPathMoveToPoint(currentLinePath, NULL, screenCenter.x, 45.0f);
-                    CGPathAddLineToPoint(currentLinePath, NULL, centerX, boxY);
+                    // Snapline as a rectangle, not a two-point line.
+                    //
+                    // Boxes and HP bars were already emitted as CGPathAddRect, so
+                    // the SpringBoard side batches them into a single
+                    // CGPathAddRects call. The snapline was the odd one out: a
+                    // moveTo plus lineTo, and because it is not axis aligned it
+                    // fell into the same bucket as a skeleton limb and was
+                    // dropped. That is where snaplines went.
+                    //
+                    // A thin vertical rectangle at the box centre draws the same
+                    // line for every practical purpose, since the slant from
+                    // screen centre is small, and it costs no extra remote call
+                    // because it joins the rectangle batch already being sent.
+                    const float slT = 1.0f;
+                    const float slTop = 45.0f;
+                    const float slH = fabsf(boxY - slTop);
+                    CGPathAddRect(currentLinePath, NULL,
+                                  CGRectMake(centerX - slT, fminf(slTop, boxY),
+                                             slT * 2.0f, fmaxf(slH, 1.0f)));
 
                     const bool liteOnScreen = (w2sHead.x >= -ep && w2sHead.x <= viewWidth + ep &&
                                                w2sHead.y >= -ep && w2sHead.y <= viewHeight + ep);
