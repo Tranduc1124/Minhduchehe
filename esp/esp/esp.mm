@@ -4226,9 +4226,17 @@ static void ESPDiagHeartbeat(void) {
                 // differ -> cache lying, and the TTL is not reaching the page
                 uint64_t posVA = 0;
                 Vector3 fresh{};
+                Vector3 rawCached{};
                 bool haveFresh = false;
+                bool haveRaw = false;
                 {
-                    uint64_t node = hn;
+                    // Start from exactly the object getPositionExt was handed.
+                    // Reading pawn + kHeadNode directly and then adding
+                    // kTransformInner guesses the branch, and getBoneTrans has
+                    // three: it returns the node, node+0x10, or one level
+                    // deeper. Guessing left posVA=0 on every line, so ok=0 and
+                    // differs=0 said nothing at all.
+                    uint64_t node = getHead(s.pawn);
                     uint64_t tObj = isVaildPtr((uintptr_t)node)
                                   ? ReadAddr<uint64_t>(node + kTransformInner) : 0;
                     uint64_t mtx = (isVaildPtr((uintptr_t)tObj))
@@ -4239,15 +4247,26 @@ static void ESPDiagHeartbeat(void) {
                                    ? ReadAddr<uint64_t>(mtx + kMatrixList) : 0;
                     if (isVaildPtr((uintptr_t)mlist) && idxU <= 8192) {
                         posVA = mlist + sizeof(TMatrix) * (size_t)idxU;
+                        // Same twelve bytes, two paths. raw goes through the page
+                        // cache, fresh maps the page from scratch. Comparing
+                        // these two isolates the cache and nothing else.
+                        //
+                        // Note it must NOT be compared against s.head: that is
+                        // the position after the whole parent transform chain has
+                        // been folded in, while this is the raw matrix entry. They
+                        // are different quantities and are not expected to match.
+                        rawCached = ReadAddr<Vector3>(posVA);
+                        haveRaw = true;
                         haveFresh = ds_read_uncached(posVA, &fresh, sizeof(Vector3));
                     }
                 }
-                const int cacheDiffers = (haveFresh &&
-                    (memcmp(&s.head, &fresh, sizeof(Vector3)) != 0)) ? 1 : 0;
+                const int cacheDiffers = (haveFresh && haveRaw &&
+                    (memcmp(&rawCached, &fresh, sizeof(Vector3)) != 0)) ? 1 : 0;
 
                 NSLog(@"[PUSH] pawn=0x%llx headN=0x%llx hipN=0x%llx n628=0x%llx "
                       @"world=(%.2f,%.2f,%.2f) scr=(%.1f,%.1f,%.3f) on=%d frame=%d "
-                      @"posVA=0x%llx fresh=(%.2f,%.2f,%.2f) ok=%d differs=%d",
+                      @"posVA=0x%llx raw=(%.2f,%.2f,%.2f) fresh=(%.2f,%.2f,%.2f) "
+                      @"ok=%d differs=%d",
                       (unsigned long long)s.pawn,
                       (unsigned long long)hn, (unsigned long long)hp,
                       (unsigned long long)h628,
@@ -4255,6 +4274,7 @@ static void ESPDiagHeartbeat(void) {
                       w2sAimCheck.x, w2sAimCheck.y, w2sAimCheck.z,
                       (int)isOnScreen, g_cacheFrameCounter,
                       (unsigned long long)posVA,
+                      rawCached.x, rawCached.y, rawCached.z,
                       fresh.x, fresh.y, fresh.z,
                       (int)haveFresh, cacheDiffers);
             }
