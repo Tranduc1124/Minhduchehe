@@ -936,17 +936,40 @@ void SBRemotePushESPFrame(UIView *espView) {
                         }
                     }
                 } else if (np == 2) {
-                    // A lone segment. Axis-aligned ones are snaplines, which are
-                    // rectangles in disguise; anything else is a skeleton limb.
-                    const double x0 = run[0], y0 = run[1];
-                    const double x1 = run[2], y1 = run[3];
-                    const double dx = fabs(x1 - x0), dy = fabs(y1 - y0);
-                    const double th = 1.0;
-                    if (dx < 0.5 || dy < 0.5) {
-                        isRect = 1;
-                        if (dx < 0.5) { rx = fmin(x0,x1) - th; ry = fmin(y0,y1); rw = th*2; rh = dy; }
-                        else           { rx = fmin(x0,x1);      ry = fmin(y0,y1) - th; rw = dx; rh = th*2; }
-                    } else {
+                    // A lone segment. It used to be flattened into a two pixel
+                    // thick rectangle whenever it was axis aligned, on the
+                    // theory that a snapline is a rectangle in disguise so it
+                    // could join the CGPathAddRects batch. That theory is wrong
+                    // in the space the decoder actually works in.
+                    //
+                    // serFunc rotates every point by ninety degrees, so in the
+                    // decoder's coordinates the snapline runs from
+                    // (landH - 45, landW/2) to (landH - boxY, centerX). Its
+                    // vertical extent is centerX - landW/2, which goes to zero
+                    // precisely when the target is at the horizontal centre of
+                    // the screen. A player being looked at is at the centre. So
+                    // the snapline for the player under the crosshair is the one
+                    // that gets caught, because its dy drops below half a pixel
+                    // and it is rebuilt as a wide flat bar instead of a line.
+                    //
+                    // The device log confirms it. One player measures pts2=14,
+                    // which is thirteen bone segments plus one snapline, and
+                    // limb=13, so the snapline is not being counted as a limb;
+                    // limbCount only counts non axis aligned segments. The
+                    // remaining one was converted, and rect=3 accounts for it as
+                    // the box, the health bar, and the squashed snapline.
+                    //
+                    // It is also why the count changed with the camera. Off
+                    // centre, dy is large, the segment is drawn as the slanted
+                    // line it is, and the player shows one line. On centre it
+                    // becomes a bar, and the player shows the bar plus the
+                    // neighbouring line.
+                    //
+                    // Two point subpaths are never rectangles. They are now
+                    // always drawn as segments. This costs one remote call per
+                    // player per frame, which the rectangle batching from b2cf77e2
+                    // more than pays for.
+                    {
                         // Skeleton limb. It must be skipped explicitly: falling
                         // through to the generic polyline branch below would draw
                         // it anyway and cost one remote call each, which is
