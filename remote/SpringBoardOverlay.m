@@ -84,6 +84,10 @@ static int g_sbSessionDead = 0;
 // reach a threshold. A frame counter cannot see "nothing has been drawn for
 // three seconds" when frames keep arriving and failing.
 static uint64_t g_sbLastPublishUS = 0;
+
+// Retry interval for the rebuild, doubling on each attempt up to a minute, and
+// reset whenever a publish succeeds.
+static uint64_t g_sbRearmBackoffUS = 5000000ULL;
 static uint64_t g_sbNextPublishUS = 0;
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -487,7 +491,13 @@ void SBRemotePushESPFrame(UIView *espView) {
     // seconds have passed with no completed publish while frames kept coming.
     if (g_sbEverOn && g_sbLastPublishUS != 0 && tGate > g_sbRearmAfterUS) {
         if (tGate - g_sbLastPublishUS > 3000000ULL) {      // 3s
-            g_sbRearmAfterUS = tGate + 5000000ULL;         // 5s between attempts
+            // Backoff grows, because SBoardStartOverlay builds a fresh window
+            // and layer in SpringBoard every time. A fixed 5 second retry turns
+            // a session that cannot be repaired into a loop that keeps adding
+            // overlays to SpringBoard, which is a second way to break it.
+            uint64_t wait = g_sbRearmBackoffUS;
+            g_sbRearmAfterUS = tGate + wait;
+            g_sbRearmBackoffUS = (wait < 60000000ULL) ? (wait * 2) : 60000000ULL;
             g_sbConsecFail = 0;
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 const char *why =
@@ -543,8 +553,31 @@ void SBRemotePushESPFrame(UIView *espView) {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
             if (!r_is_objc_ptr(g_sbShape)) return;
 
+            // Which operation poisons the session. g_RC_success is cleared by
+            // every failed remote operation, and init_remote_call reporting
+            // success does not mean the session works: the device log shows
+            // "session re-initialised" immediately followed by ok=0 three
+            // seconds later, so something in the first publish after a re-init
+            // fails. persistentPath and ptsBuffer are the only remote work a
+            // publish does before drawing, so they are probed either side of the
+            // flag. Sampled only when something is actually wrong, to keep this
+            // off the hot path.
+            const int okBefore = remote_call_current_success() ? 1 : 0;
             uint64_t rp = persistentPath();
+            const int okAfterPath = remote_call_current_success() ? 1 : 0;
             uint64_t ptsBuf = ptsBuffer();
+            const int okAfterBuf = remote_call_current_success() ? 1 : 0;
+            if (!okBefore || !rp || !ptsBuf || !okAfterBuf || !okAfterPath) {
+                static uint64_t s_probeUS = 0;
+                uint64_t tP = now_us();
+                if (tP > s_probeUS) {
+                    s_probeUS = tP + 2000000ULL;   // 2s
+                    NSLog(@"[PUSH-PROBE] before=%d path=0x%llx afterPath=%d "
+                          @"buf=0x%llx afterBuf=%d",
+                          okBefore, (unsigned long long)rp, okAfterPath,
+                          (unsigned long long)ptsBuf, okAfterBuf);
+                }
+            }
             if (!rp || !ptsBuf || !remote_call_current_success()) {
                 // One failure is not a dead session. persistentPath() and
                 // ptsBuffer() each make remote calls, and those are occasionally
@@ -743,6 +776,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
+                g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
                 g_sbLastSubpaths = subpaths;
                 g_sbLastCalls = calls;
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
