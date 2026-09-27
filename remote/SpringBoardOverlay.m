@@ -56,6 +56,19 @@ static uint64_t g_sbInvokeSel = 0;
 static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
 static uint64_t g_sbSummaryUpdates = 0;
+
+// Self-heal state for the overlay. A single transient remote-call failure used
+// to clear g_sbOverlayOn for the rest of the process lifetime, and nothing
+// re-armed it: boot_start_sb_overlay only retries at 3s, 5s, 8s and 12s. The
+// result was exactly one painted frame followed by a frozen overlay, which is
+// the report that it "only picks up once when the kernel exploit runs".
+//
+// Consecutive failures are counted so a hiccup is not fatal, and once the
+// overlay has genuinely died it is rebuilt on a backoff instead of staying
+// dead. Both log lines carry PUSH so a PUSH filter shows them.
+static int g_sbConsecFail = 0;
+static int g_sbEverOn = 0;
+static uint64_t g_sbRearmAfterUS = 0;
 static uint64_t g_sbNextPublishUS = 0;
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -382,6 +395,8 @@ int SBoardStartOverlay(void) {
     g_sbShape = shape;
     g_sbCanvas = container;
     g_sbOverlayOn = YES;
+    g_sbEverOn = 1;
+    g_sbConsecFail = 0;
     pthread_mutex_unlock(&g_sbLock);
 
     sb_forget_local_paint_state();
@@ -396,7 +411,24 @@ int SBoardStartOverlay(void) {
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
-    if (!g_sbOverlayOn || !espView) return;
+    if (!g_sbOverlayOn) {
+        // Rebuild it instead of staying dead. This is the whole fix for the
+        // "ESP paints once and then freezes" report: the old code cleared
+        // g_sbOverlayOn on a single failure and had no path back, so the one
+        // frame that did land stayed on screen for the rest of the session no
+        // matter what happened in the match.
+        if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
+            g_sbRearmAfterUS = now_us() + 3000000ULL;   // 3s between attempts
+            g_sbConsecFail = 0;
+            if (SBoardStartOverlay() == 0) {
+                NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
+            } else {
+                NSLog(@"[PUSH-REARM] rebuild failed, retrying");
+            }
+        }
+        return;
+    }
+    if (!espView) return;
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
         // Session died (SB respawn?). Drop until restart.
         g_sbSummarySkips++;
@@ -437,16 +469,26 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint64_t rp = persistentPath();
             uint64_t ptsBuf = ptsBuffer();
             if (!rp || !ptsBuf || !remote_call_current_success()) {
-                // PAC/exception failure mid-publish — stop hammering SB.
+                // One failure is not a dead session. persistentPath() and
+                // ptsBuffer() each make remote calls, and those are occasionally
+                // flaky, so giving up here is what turned a hiccup into a
+                // permanently frozen overlay. Three in a row is treated as real.
                 if (remote_call_has_local_state() && !remote_call_current_success()) {
-                    NSLog(@"[SBOverlay] RemoteCall failed — abandon session (avoid 0x401)");
+                    if (++g_sbConsecFail < 3) {
+                        g_sbSummarySkips++;
+                        return;   // keep the session, drop this frame
+                    }
+                    NSLog(@"[PUSH-DEAD] RemoteCall failed %d times in a row — overlay down, will rebuild",
+                          g_sbConsecFail);
                     abandon_remote_call();
                     pthread_mutex_lock(&g_sbLock);
                     g_sbOverlayOn = NO;
                     pthread_mutex_unlock(&g_sbLock);
+                    g_sbRearmAfterUS = now_us() + 2000000ULL;   // 2s
                 }
                 return;
             }
+            g_sbConsecFail = 0;
 
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;
