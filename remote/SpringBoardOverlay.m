@@ -17,9 +17,12 @@
 
 #import "SpringBoardOverlay.h"
 #import "RemoteCall.h"
+#import "PAC.h"
 #import "remote_objc.h"
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
+#import <unistd.h>
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
@@ -436,6 +439,133 @@ static int sb_open_session(void) {
     return 0;
 }
 
+// One-shot cost probe.
+//
+// The two numbers that decide the whole drawing design have never been measured
+// apart. [SB-PUSH] puts every CoreGraphics call and the present into one wall
+// clock, and the only samples the device log has are calls=2 ms=6 and
+// calls=67 ms=27. Those two are only compatible with a fixed cost near 5.4ms
+// per publish on top of near 0.32ms per remote call, and nothing in the log
+// says which call the 5.4ms belongs to. Guessing at that produced four wrong
+// designs today, so it is measured instead.
+//
+// This runs once, at overlay start, and draws nothing. The only layer call is
+// the same setPath: present every publish makes, and the path it hands over is
+// replaced by the first real frame. Every remote call below is one the publish
+// loop already makes, so the numbers are the numbers the design needs.
+static uint64_t sb_now_ns(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
+static void sb_cost_probe(void) {
+    static int s_done = 0;
+    if (s_done) return;
+    s_done = 1;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+
+    // A. Local symbol lookup, nothing crosses the process boundary.
+    // do_remote_call_stable runs exactly this on every single call, so this is
+    // the per-call cost that resolving the address once would remove.
+    uint64_t tA = sb_now_ns();
+    for (int i = 0; i < 2000; i++) dlsym(RTLD_DEFAULT, "getpid");
+    uint64_t aDlsym = (sb_now_ns() - tA) / 2000ULL;
+
+    // B. One bare remote call, looked up by name every time. This is what the
+    // publish loop pays per CGPath call today.
+    uint64_t tB = sb_now_ns();
+    for (int i = 0; i < 20; i++) r_dlsym_call(R_TIMEOUT, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t bByName = (sb_now_ns() - tB) / 20ULL;
+
+    // C. The identical call with the address resolved once. B minus C is the
+    // whole value of never looking the name up again.
+    uint64_t getpidAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
+    uint64_t pidCheck = do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t tC = sb_now_ns();
+    for (int i = 0; i < 20; i++) do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t cByAddr = (sb_now_ns() - tC) / 20ULL;
+
+    // D. Cold call. If the fixed cost is a re-arm, the first call after an idle
+    // gap is the expensive one and the rest are cheap, and that shows up here
+    // as a large number sitting next to C.
+    usleep(SB_MIN_PUBLISH_INTERVAL_US);
+    uint64_t tD = sb_now_ns();
+    do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t dCold = sb_now_ns() - tD;
+
+    // E. Path creation, once per publish, because CGPathClear and CGPathReset
+    // are both absent from CoreGraphics.tbd on iOS 17.5 and a fresh path is the
+    // only way to empty one.
+    uint64_t made[8] = {0};
+    uint64_t tE = sb_now_ns();
+    for (int i = 0; i < 8; i++) made[i] = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    uint64_t eCreate = (sb_now_ns() - tE) / 8ULL;
+
+    // F. Two point polyline, the smallest thing a publish can draw.
+    double seg2[4] = {10.0, 10.0, 40.0, 40.0};
+    remote_write(ptsBuffer(), seg2, sizeof(seg2));
+    uint64_t tF = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddLines", made[i], 0, ptsBuffer(), 2, 0,0,0,0);
+    uint64_t fLines = (sb_now_ns() - tF) / 8ULL;
+
+    // G. CGPathAddRects is the only primitive that loops inside SpringBoard,
+    // which is the only reason the rectangle batch is cheap at all. One call
+    // and sixteen calls' worth of rectangles, to separate the per-call cost from
+    // the per-rectangle cost. If the per-rectangle cost is negligible then
+    // every shape that is a rectangle is free and the design stops having to
+    // care about call counts, which is the whole question here.
+    double rects16[64];
+    for (int i = 0; i < 16; i++) {
+        rects16[i*4+0] = 10.0 + (double)i;
+        rects16[i*4+1] = 10.0 + (double)i;
+        rects16[i*4+2] = 6.0;
+        rects16[i*4+3] = 4.0;
+    }
+    remote_write(ptsBuffer(), rects16, sizeof(rects16));
+    uint64_t tG1 = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddRects", made[i], 0, ptsBuffer(), 1, 0,0,0,0);
+    uint64_t gRect1 = (sb_now_ns() - tG1) / 8ULL;
+    uint64_t tG16 = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddRects", made[i], 0, ptsBuffer(), 16, 0,0,0,0);
+    uint64_t gRect16 = (sb_now_ns() - tG16) / 8ULL;
+
+    // H. remote_write. It is a memcpy into a page already shared with
+    // SpringBoard, so it should cost nothing next to a call. If it does not,
+    // then the transport is not the one RemoteCall.m says it is.
+    uint64_t tH = sb_now_ns();
+    for (int i = 0; i < 8; i++) remote_write(ptsBuffer(), rects16, sizeof(rects16));
+    uint64_t hWrite = (sb_now_ns() - tH) / 8ULL;
+
+    // I. The present, once per layer. This is the number that decides how many
+    // colours the overlay can afford at all.
+    uint64_t tI = sb_now_ns();
+    for (int i = 0; i < 4; i++) sb_invoke_cached_main_raw();
+    uint64_t iPresent = (sb_now_ns() - tI) / 4ULL;
+
+    for (int i = 0; i < 8; i++) {
+        if (made[i]) dlsym_remote("CGPathRelease", made[i], 0,0,0,0,0,0,0);
+    }
+
+    NSLog(@"[SB-PROBE] n=20 dlsymLocal=%.1fus callByName=%.1fus callByAddr=%.1fus "
+          @"cold=%.1fus create=%.1fus addLines2=%.1fus addRects1=%.1fus "
+          @"addRects16=%.1fus write512B=%.1fus present=%.1fus pidOk=%d",
+          aDlsym / 1000.0, bByName / 1000.0, cByAddr / 1000.0, dCold / 1000.0,
+          eCreate / 1000.0, fLines / 1000.0, gRect1 / 1000.0, gRect16 / 1000.0,
+          hWrite / 1000.0, iPresent / 1000.0, (int)(pidCheck != 0));
+
+    // A probe that breaks the session must not take the overlay down with it.
+    if (remote_call_has_local_state() && !remote_call_current_success()) {
+        NSLog(@"[SB-PROBE] session unhealthy after probe — dropping it so the rearm path rebuilds clean");
+        abandon_remote_call();
+        pthread_mutex_lock(&g_sbLock);
+        g_sbOverlayOn = NO;
+        pthread_mutex_unlock(&g_sbLock);
+        g_sbRearmAfterUS = now_us() + 2000000ULL;
+    }
+}
+
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return 0; }
@@ -737,6 +867,9 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    // Measures what one call and one present actually cost, once, before any
+    // frame depends on the answer. See sb_cost_probe.
+    sb_cost_probe();
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
