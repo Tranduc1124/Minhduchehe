@@ -483,6 +483,21 @@ int SBoardStartOverlay(void) {
     uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
+    // Built with four separate CGFloats, which is the call the diagnostic proved
+    // carries its arguments: numberWithDouble: on the same path came back
+    // describing itself as 1.5, and setLineWidth: read straight back out of the
+    // CALayer as 1.50. So four doubles in one call is not the open question it
+    // was three rounds ago.
+    double greenRGBA[4] = { 0.0, 1.0, 0.0, 1.0 };
+    uint64_t greenColor = r_is_objc_ptr(clsCol)
+                        ? r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                          &greenRGBA[0], 8, &greenRGBA[1], 8,
+                                          &greenRGBA[2], 8, &greenRGBA[3], 8)
+                        : 0;
+    uint64_t greenCGColor = r_is_objc_ptr(greenColor)
+                          ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
+    if (!r_is_objc_ptr(greenCGColor)) greenCGColor = whiteCGColor;
+
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
@@ -581,14 +596,26 @@ int SBoardStartOverlay(void) {
             ncomp = dlsym_remote("CGColorGetNumberOfComponents", cg, 0,0,0,0,0,0,0);
         }
 
+        // The out buffer is poisoned with a sentinel before the call. This is the
+        // measurement that was missing for four rounds: the buffer came from malloc
+        // and was never written to, and a fresh page reads as sixteen zero bytes,
+        // which is exactly what was logged. A printed zero in a buffer nobody
+        // wrote is not a measurement, and treating it as one is what sent the last
+        // three rounds chasing a colour that may never have been black.
         double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
         uint64_t raw[4] = { 0, 0, 0, 0 };
+        bool wrote = false;
         if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
             uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
             if (outBuf) {
-                dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
-                remote_read(outBuf, got, sizeof(got));
-                remote_read(outBuf, raw, 16);
+                double sentinel[8] = { -7, -7, -7, -7, -7, -7, -7, -7 };
+                for (int k = 0; k < 3; k++) {
+                    remote_write(outBuf, sentinel, sizeof(sentinel));
+                    dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
+                    remote_read(outBuf, got, sizeof(got));
+                    remote_read(outBuf, raw, 16);
+                    if (got[0] != -7.0) { wrote = true; break; }
+                }
                 dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
             }
         }
@@ -639,12 +666,12 @@ int SBoardStartOverlay(void) {
             if (r_is_objc_ptr(is)) r_read_nsstring(is, t2, sizeof(t2));
         }
 
-        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu "
+        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu wrote=%d "
               @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
               @"ret=%.2f,%.2f,%.2f,%.2f dbl=<%s> int=<%s>",
               (unsigned long long)numArgs,
               (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
-              (unsigned long long)ncomp,
+              (unsigned long long)ncomp, (int)wrote,
               want[0], want[1], want[2], want[3],
               invGot[0], invGot[1], invGot[2], invGot[3],
               got[0], got[1], got[2], got[3],
@@ -654,7 +681,14 @@ int SBoardStartOverlay(void) {
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    // Green, so the answer is on the screen instead of in a log line that has now
+    // been wrong four times. If the ESP draws green then the four double arguments
+    // reached SpringBoard and the whole colour path is settled, and the remaining
+    // problem with the overlay is that it is one layer and therefore has no fill,
+    // which is a design limit rather than a transport fault.
+    if (r_is_objc_ptr(greenCGColor)) r_msg2_main(shape, "setStrokeColor:", greenCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] green=%d cg=%d", (int)r_is_objc_ptr(greenColor),
+          (int)r_is_objc_ptr(greenCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     double lw = 1.5;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
