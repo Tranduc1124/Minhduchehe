@@ -1354,7 +1354,25 @@ static int sb_open_session(void) {
         if (remote_call_current_success()) return 0;
         abandon_remote_call();
     }
-    r_settle_us(3000);
+    // r_settle() is an unconditional usleep(gSettleUS) in front of every
+    // r_msg2, r_msg2_main and r_msg2_main_async (remote_objc.m:87), and this
+    // call is the only place the value is ever set, so it applies to the whole
+    // session. It was 50000 by default, dropped to 3000 here, and is now 300.
+    //
+    // The device log for 2026-09-28 22:23:42 onwards is what priced it. Over
+    // roughly sixty steady state publishes:
+    //
+    //     total ~15 ms  flush ~10 ms  geom ~4 ms  pathnew ~2 ms  present ~0.5 ms
+    //
+    // flush is two or three calls and nothing else, so ~3 ms a call, which is
+    // the sleep. Two thirds of every publish was usleep and the present it was
+    // pacing actually measures 0.3-1 ms in the same log. Nothing is waiting on
+    // the main thread, so nothing needs the gap: wait= reads 0-1 ms.
+    //
+    // 300 rather than 0 keeps a small gap, since a zero here removes the pacing
+    // entirely and that is not a change to make on the same build that has
+    // already restarted the device.
+    r_settle_us(300);
     // Fl0rk: EXTRA trojan thread only. Never originalThreadOnly on SpringBoard —
     // that parks com.apple.main-thread at FAKE_PC 0x101 between calls → WATCHDOG
     // (seen IPS: main unresponsive, PC=0x101, 60s checkin timeout).
