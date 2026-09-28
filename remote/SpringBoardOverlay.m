@@ -597,35 +597,58 @@ int SBoardStartOverlay(void) {
         // sixteen zero bytes, so the out buffer really was zero, and both dbl and
         // flt read the same zeros. The colour is black, not misread.
         //
-        // So getArgument:atIndex: reads 0,1,0,1 out of the invocation while the
-        // selector built a black colour from the same invocation, which means
-        // invoke is not reading the place getArgument reads from. The device now
-        // also runs a second invocation with retainArguments skipped, so the log
-        // can say whether that call is the thing that moves the arguments.
-        uint64_t alt = r_arg_probe_alt;
-        uint64_t altCg = r_is_objc_ptr(alt) ? r_msg2_main(alt, "CGColor", 0,0,0,0) : 0;
-        double altGot[4] = { -1, -1, -1, -1 };
-        if (r_is_objc_ptr(altCg)) {
-            uint64_t altBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
-            if (altBuf) {
-                dlsym_remote("CGColorGetComponents", altCg, altBuf, 0,0,0,0,0,0);
-                remote_read(altBuf, altGot, 32);
-                dlsym_remote("free", altBuf, 0,0,0,0,0,0,0);
-            }
+        // The second invocation told us nothing. It returned the value 1, and
+        // r_is_objc_ptr accepts any pointer above 0x100000000, so asking address 1
+        // for CGColor gave nil and noRet was never measured. That result is dropped
+        // rather than reinterpreted, because reading a conclusion out of a garbage
+        // pointer is how the last two rounds went wrong.
+        //
+        // The measurement moves to a channel that returns text.
+        // +[NSNumber numberWithDouble:] takes one CGFloat through exactly the same
+        // path and hands back an object, and -description on that object prints the
+        // number as characters. The colour test spent three rounds proving that a
+        // printed zero was a real zero and not a misread layout, and every one of
+        // those rounds was spent on the reading rather than on the transport. A
+        // string has no such ambiguity: 1.5 and 0.0 are different strings, and no
+        // byte layout turns one into the other.
+        //
+        // The integer case is the control. It travels through identical code with a
+        // different register class, so T1 alone says whether the difference is
+        // specifically about a floating point value, and T2 alone says whether the
+        // path works at all. If T2 prints 7 then arguments arrive and a double is
+        // the only thing that does not, which is a far narrower fault to fix than
+        // arguments do not arrive.
+        char t1[48] = { 0 };
+        char t2[48] = { 0 };
+        double wantInt = 7.0;
+        double wantDbl = 1.5;
+
+        uint64_t NSNum = r_class("NSNumber");
+        uint64_t nDbl = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantDbl, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        uint64_t nInt = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantInt, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        if (r_is_objc_ptr(nDbl)) {
+            uint64_t ds = r_msg2_main(nDbl, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(ds)) r_read_nsstring(ds, t1, sizeof(t1));
+        }
+        if (r_is_objc_ptr(nInt)) {
+            uint64_t is = r_msg2_main(nInt, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(is)) r_read_nsstring(is, t2, sizeof(t2));
         }
 
-        NSLog(@"[SB-COLOR] sig=%d numArgs=%llu pn=%llu col=%d cg=%d ncomp=%llu "
+        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu "
               @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
-              @"ret=%.2f,%.2f,%.2f,%.2f alt=%d altCg=%d noRet=%.2f,%.2f,%.2f,%.2f",
-              (int)r_is_objc_ptr(sig), (unsigned long long)numArgs,
-              (unsigned long long)r_arg_probe_n,
+              @"ret=%.2f,%.2f,%.2f,%.2f dbl=<%s> int=<%s>",
+              (unsigned long long)numArgs,
               (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
               (unsigned long long)ncomp,
               want[0], want[1], want[2], want[3],
               invGot[0], invGot[1], invGot[2], invGot[3],
               got[0], got[1], got[2], got[3],
-              (int)r_is_objc_ptr(alt), (int)r_is_objc_ptr(altCg),
-              altGot[0], altGot[1], altGot[2], altGot[3]);
+              t1, t2);
     }
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
@@ -635,6 +658,19 @@ int SBoardStartOverlay(void) {
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     double lw = 1.5;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
+
+    // Read the width straight back out of SpringBoard's own CALayer. This is the
+    // most direct measurement available: it is the exact call the overlay depends
+    // on for its stroke weight, and the read uses getReturnValue: into a target
+    // buffer followed by remote_read, which is the same read path already proven
+    // good by the colour test. No reinterpretation and no colour space involved.
+    //
+    // The sentinel is minus one, so a value of 0.00 is a real zero and minus one
+    // means the read did not happen.
+    double lwBack = -1.0;
+    bool lwOK = r_msg2_main_struct_ret(shape, "lineWidth", &lwBack, 8,
+                                       NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    NSLog(@"[SB-COLOR] lw want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
