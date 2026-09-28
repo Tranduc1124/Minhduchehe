@@ -1372,7 +1372,14 @@ static int sb_open_session(void) {
     // 300 rather than 0 keeps a small gap, since a zero here removes the pacing
     // entirely and that is not a change to make on the same build that has
     // already restarted the device.
-    r_settle_us(300);
+    //
+    // Put back to 3000 on 2026-09-28 after 300 was measured to work and the
+    // device still froze sooner rather than later. The 300 us build held the
+    // publish at ~9 ms against ~15 ms here, so the same work reached SpringBoard
+    // 1.7x faster and the freeze arrived earlier. Restoring the sleep is a
+    // deliberate step back to the pacing that has a track record, not a claim
+    // that the sleep is the cause.
+    r_settle_us(3000);
     // Fl0rk: EXTRA trojan thread only. Never originalThreadOnly on SpringBoard —
     // that parks com.apple.main-thread at FAKE_PC 0x101 between calls → WATCHDOG
     // (seen IPS: main unresponsive, PC=0x101, 60s checkin timeout).
