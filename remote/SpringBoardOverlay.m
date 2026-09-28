@@ -283,11 +283,15 @@ static void serFunc(void *info, const CGPathElement *e) {
 // the main thread; r_msg2_main is the same call with a 3ms r_settle() sleep in
 // front of it, and the settle is the part that costs.
 // ===========================================================================
+// Longest UTF-8 run a text op may carry. Player names and weapon names go
+// through the same field later, and 31 bytes covers a short name without
+// letting one label overrun the buffer the decoder copies into.
+#define SB_TEXT_MAX 31
 static uint64_t g_sbCountLabel   = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
-static char     g_sbCountLastText[16] = { 0 };
+static char     g_sbCountLastText[SB_TEXT_MAX + 1] = { 0 };
 static int      g_sbCountShown   = 0;
 
 static BOOL sb_cached_pos_invocation(void) {
@@ -450,47 +454,42 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         CGPathApply(p, &ctx, serFunc);
         emitted = 1;
     }
-    // Text runs ride alongside the geometry as op 5. Only the enemy counter for
-    // now: it is the one text the app draws with a font size above 14, since the
-    // name and distance labels are 4.5 to 10pt. That is a checked discriminator
-    // on a real value rather than a hardcoded index, so it cannot silently
-    // capture the wrong label if the order changes.
+    // Text runs ride alongside the geometry as op 5.
     //
     //   op 5, len, x, y, w, h, utf8[len]
+    //
+    // The counter is not in textLayerPool. It has its own layer, statusLayer,
+    // set from stats.realCount and stats.botCount at esp.mm:3394, and the pool
+    // only holds the per-pawn name, distance and weapon labels. Reading the
+    // pool is why txt stayed 0 on every publish while the counter was being
+    // drawn perfectly well in the app.
     //
     // The rect is the app's landscape frame, unswapped. sbEmit rotates points as
     // px = landH - y, py = x, and the label carries that same rotation as its
     // CALayer transform, so it wants the unrotated centre and its own bounds.
     // Swapping w and h here as well would rotate the text twice.
     if (r_is_objc_ptr(g_sbCountLabel)) {
-        NSArray *pool = [espView valueForKey:@"textLayerPool"];
-        NSNumber *active = [espView valueForKey:@"activeTextLayerCount"];
-        if ([pool isKindOfClass:[NSArray class]] &&
-            [active isKindOfClass:[NSNumber class]]) {
-            const NSUInteger n = MIN((NSUInteger)[active unsignedIntegerValue], pool.count);
-            for (NSUInteger i = 0; i < n; i++) {
-                CATextLayer *tl = pool[i];
-                if (![tl isKindOfClass:[CATextLayer class]] || tl.hidden) continue;
-                if (tl.fontSize < 14.0f) continue;
-                NSString *s = tl.string;
-                if (![s isKindOfClass:[NSString class]] || s.length == 0) continue;
+        id st = [espView valueForKey:@"statusLayer"];
+        if ([st isKindOfClass:[CATextLayer class]]) {
+            CATextLayer *tl = (CATextLayer *)st;
+            NSString *s = tl.string;
+            if (!tl.hidden && [s isKindOfClass:[NSString class]] && s.length > 0) {
                 const char *utf8 = s.UTF8String;
-                if (!utf8) continue;
-                const size_t len = strlen(utf8);
-                if (len == 0 || len > 15) continue;
-                const CGRect r = tl.frame;
-                const double w = r.size.width, h = r.size.height;
-                const double px = ctx.landH - r.origin.y - h * 0.5;
-                const double py = r.origin.x + w * 0.5;
-                uint8_t top = 5;
-                uint8_t slen = (uint8_t)len;
-                [d appendBytes:&top length:1];
-                [d appendBytes:&slen length:1];
-                [d appendBytes:&px length:8];
-                [d appendBytes:&py length:8];
-                [d appendBytes:utf8 length:len];
-                emitted = 1;
-                break;
+                const size_t len = utf8 ? strlen(utf8) : 0;
+                if (len > 0 && len <= SB_TEXT_MAX) {
+                    const CGRect r = tl.frame;
+                    const double w = r.size.width, h = r.size.height;
+                    const double px = ctx.landH - r.origin.y - h * 0.5;
+                    const double py = r.origin.x + w * 0.5;
+                    uint8_t top = 5;
+                    uint8_t slen = (uint8_t)len;
+                    [d appendBytes:&top length:1];
+                    [d appendBytes:&slen length:1];
+                    [d appendBytes:&px length:8];
+                    [d appendBytes:&py length:8];
+                    [d appendBytes:utf8 length:len];
+                    emitted = 1;
+                }
             }
         }
     }
@@ -1416,10 +1415,11 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (op == 5) {
                         if (i + 17 > len) { i = len; break; }
                         const uint8_t slen = b[i++];
+                        if (slen > SB_TEXT_MAX) { i = len; break; }
                         double tpx, tpy;
                         memcpy(&tpx, b + i, 8); memcpy(&tpy, b + i + 8, 8); i += 16;
                         if (i + slen > len) { i = len; break; }
-                        char txt[16];
+                        char txt[SB_TEXT_MAX + 1];
                         memcpy(txt, b + i, slen);
                         txt[slen] = 0;
                         i += slen;

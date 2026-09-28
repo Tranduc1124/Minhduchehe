@@ -3367,26 +3367,21 @@ static inline uint64_t ESPPhaseNowUS(void) {
             CGFloat fontSize;
 
             if (stats.realCount == 0 && stats.botCount == 0) {
-                if (isESP2) {
-                    countText = @"CLEAR";
-                    countColor = [UIColor cyanColor];
-                    fontSize = 20.0f;
-                } else {
-                    countText = @"CLEAR";
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 21.0f;
-                }
+                countText = @"0";
+                countColor = [UIColor redColor];
+                fontSize = isESP2 ? 25.0f : 21.0f;
             } else {
-                // Đổi đỏ → xanh lá (user: bỏ vẽ đỏ thừa; đỏ chỉ dành cho knocked/HP thấp).
-                if (isESP2) {
-                    countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 25.0f;
-                } else {
-                    countText = [NSString stringWithFormat:@"PLAYER [%d] | BOT [%d]", stats.realCount, stats.botCount];
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 16.0f;
-                }
+                // A plain number, in red.
+                //
+                // Both of the things that were here before are gone. It read
+                // "PLAYER [n] | BOT [n]", which is eighteen characters and no
+                // longer fits the field the overlay sends over, and it was green:
+                // 69cab125 turned it green because a red count had been asked to
+                // be removed at the time. The current request is a count from 0
+                // to 1000 in red, so that is what it is.
+                countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
+                countColor = [UIColor redColor];
+                fontSize = isESP2 ? 25.0f : 21.0f;
             }
 
             if (![self.lastStatusString isEqualToString:countText]) {
@@ -3399,7 +3394,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
             // Tight frame around text only (was 200x50) — visual only; CATextLayer
             // never receives touches, but keep bounds small and non-interactive flags set.
-            CGFloat countWidth = isESP2 ? 80.0f : 220.0f;
+            CGFloat countWidth = 80.0f;
             CGFloat countHeight = fontSize + 8.0f;
             CGFloat yPos = isESP2 ? 30.0f : 25.0f;
             CGFloat xPos = halfWidth - (countWidth * 0.5f);
