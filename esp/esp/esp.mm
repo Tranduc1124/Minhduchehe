@@ -3153,6 +3153,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
     // game reads + the SpringBoard mirror; stopping when not on screen
     // would freeze the SB overlay. The timer itself is the lifecycle.
 
+    // Every value the memo in UnityMath.mm holds belongs to the frame it was
+    // read in, so the generation opens before the first bone read of this
+    // frame and closes by being replaced on the next one.
+    ESPFrameMemoBegin();
+
     @autoreleasepool {
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame
         static CFTimeInterval lastPrefSync = 0;

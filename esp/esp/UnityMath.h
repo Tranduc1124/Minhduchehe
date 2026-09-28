@@ -33,6 +33,11 @@ Vector3 WorldToScreen(Vector3 obj, float *matrix, float screenX, float screenY);
 
 Vector3 WorldToScreenLayer(Vector3 obj, float *matrix, float vpW, float vpH, float layerW, float layerH);
 Vector3 getPositionExt(uint64_t transObj2);
+
+// Opens a new memo generation. One call per frame, before any bone read.
+// Without it the memo never stores and getPositionExt behaves exactly as it
+// did before, so a caller that forgets is slow rather than wrong.
+void ESPFrameMemoBegin(void);
 NSString *GetNickName(uint64_t PawnObject);
 
 #endif
