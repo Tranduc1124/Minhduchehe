@@ -133,9 +133,37 @@ static uint64_t g_sbRearmBackoffUS = 5000000ULL;
 static uint64_t g_sbBusyDrops = 0;
 static uint64_t g_sbHoldUS = 0;
 static uint64_t g_sbNextPublishUS = 0;
+
+// The address of malloc in the target process, looked up once.
+//
+// dlsym_remote walks the target's symbol tables to answer it, and it was called
+// from six places, one of which is inside the cached invocation builder, which
+// runs once per label per selector. Thirty invocations at startup meant thirty
+// symbol walks to learn an address that cannot change, and each of them goes
+// through the settling transport. The size is an argument to malloc, not a part
+// of the lookup, so one answer serves every size.
+//
+// Cleared with the rest of the session state: a respawned SpringBoard is a new
+// address space, and a cached function pointer into the old one is worse than
+// no pointer at all.
+static uint64_t g_sbRemoteMalloc = 0;
+
+static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
+                             uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+
+static uint64_t sb_remote_malloc(size_t n) {
+    if (!g_sbRemoteMalloc) {
+        g_sbRemoteMalloc = dlsym_remote("malloc", n, 0,0,0,0,0,0,0);
+    }
+    return g_sbRemoteMalloc;
+}
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
 static uint64_t g_sbLastCalls = 0;
+
+// One publish split into the part that is our work and the part that is waiting
+// for SpringBoard's main thread. See sb_invoke_cached_main_raw.
+static uint64_t g_sbLastWaitUS = 0;
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -397,7 +425,7 @@ static BOOL sb_cached_pos_invocation(void) {
     // 16 bytes, not 8: setPosition: takes a CGPoint. The buffer is never freed,
     // it is rewritten in place every frame, which is what lets the present run
     // with waitUntilDone:NO and still see the newest value.
-    uint64_t buf = dlsym_remote("malloc", 16, 0,0,0,0,0,0,0);
+    uint64_t buf = sb_remote_malloc(16);
     if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
     r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
 
@@ -605,7 +633,7 @@ static BOOL sb_cached_invocation(uint64_t label, const char *selName,
     r_msg2(inv, "retain", 0, 0, 0, 0);
     r_msg2(inv, "setTarget:", label, 0, 0, 0);
     r_msg2(inv, "setSelector:", sel, 0, 0, 0);
-    uint64_t buf = dlsym_remote("malloc", bufSize, 0,0,0,0,0,0,0);
+    uint64_t buf = sb_remote_malloc(bufSize);
     if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
     r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
     *invOut = inv;
@@ -631,7 +659,7 @@ static BOOL sb_pooled_pos_invocation(int idx) {
     r_msg2(inv, "retain", 0, 0, 0, 0);
     r_msg2(inv, "setTarget:", label, 0, 0, 0);
     r_msg2(inv, "setSelector:", setPosSel, 0, 0, 0);
-    uint64_t buf = dlsym_remote("malloc", 16, 0,0,0,0,0,0,0);
+    uint64_t buf = sb_remote_malloc(16);
     if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
     r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
     g_sbLabelPosInv[idx] = inv;
@@ -1087,6 +1115,10 @@ static void sb_forget_local_paint_state(void) {
     g_sbFillSubpaths = 0;
     g_sbFillWasDrawn = 0;
     g_sbNameFont = 0;
+    // malloc's address belongs to the process the session pointed at. A
+    // respawned SpringBoard is a new address space, so a cached one is a call
+    // through a stale pointer rather than a slow one.
+    g_sbRemoteMalloc = 0;
     for (int t = 0; t < SB_LABEL_MAX; t++) { g_sbLabelTransInv[t] = 0; g_sbLabelTransBuf[t] = 0; }
     g_sbFillRingAt = 0;
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
@@ -1123,7 +1155,7 @@ static uint64_t persistentPath(void) {
 
 static uint64_t ptsBuffer(void) {
     if (g_sbMirrorPtsBuf) return g_sbMirrorPtsBuf;
-    g_sbMirrorPtsBuf = dlsym_remote("malloc", 65536, 0,0,0,0,0,0,0);
+    g_sbMirrorPtsBuf = sb_remote_malloc(65536);
     return g_sbMirrorPtsBuf;
 }
 
@@ -1151,7 +1183,7 @@ static BOOL sb_ensure_setpath_invocation(void) {
     r_msg2(inv, "setTarget:", g_sbShape, 0, 0, 0);
     r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
 
-    uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+    uint64_t argBuf = sb_remote_malloc(8);
     if (!argBuf) {
         r_msg2(inv, "release", 0, 0, 0, 0);
         return NO;
@@ -1192,7 +1224,21 @@ static void sb_invoke_cached_main_raw(void) {
     // wait is on this side, not on SpringBoard's, so the thing that used to
     // freeze was never the thing being waited on.
     if (g_sbPerformMainSel && g_sbInvokeSel) {
+        // This one call, timed on its own, is the whole question.
+        //
+        // ms varies by a factor of nine between frames that make the same number
+        // of calls: thirteen milliseconds one frame, a hundred and seventeen the
+        // next, both at calls=14. A fixed cost per call cannot do that. So the
+        // spread is either the work or the wait, and they call for opposite
+        // fixes: less work means fewer subpaths, while a wait that costs sixty
+        // milliseconds means the rate is capped by SpringBoard's main thread and
+        // no amount of drawing discipline will raise it.
+        //
+        // g_sbLastWaitUS is that one call. g_sbLastWorkUS is the rest of the
+        // publish. Read them against ms and the answer needs no argument.
+        const uint64_t tWait = now_us();
         r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 1, 0);
+        g_sbLastWaitUS = now_us() - tWait;
     }
 }
 
@@ -2422,7 +2468,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                 r_msg2(inv, "retain", 0, 0, 0, 0);
                                 r_msg2(inv, "setTarget:", g_sbFillShape, 0, 0, 0);
                                 r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
-                                uint64_t ab = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+                                uint64_t ab = sb_remote_malloc(8);
                                 if (ab) {
                                     r_msg2(inv, "setArgument:atIndex:", ab, 2, 0, 0);
                                     g_sbFillInv = inv;
@@ -2487,7 +2533,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u trunc=%u txt=%u cards=%u cardOps=%u",
+                              @"mergedSub=%u trunc=%u txt=%u cards=%u cardOps=%u "
+                              @"wait=%llums work=%llums",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -2501,7 +2548,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount, nTrunc, txtOps, fillDrawn, cardOps);
+                              g_sbSubpathCount, nTrunc, txtOps, fillDrawn, cardOps,
+                              (unsigned long long)(g_sbLastWaitUS / 1000ULL),
+                              (unsigned long long)(pubMS - g_sbLastWaitUS / 1000ULL));
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
