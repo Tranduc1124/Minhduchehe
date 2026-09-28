@@ -307,6 +307,8 @@ static void serFunc(void *info, const CGPathElement *e) {
 // quiet frame costs nothing and a busy one tops out here rather than growing
 // without limit inside SpringBoard.
 #define SB_LABEL_MAX 25
+// How many exist before the first frame. See where they are made.
+#define SB_LABEL_PRESPAWN 6
 
 // Per-pawn labels. A name label is a rounded grey card with white text, which is
 // what the request asked for and it costs nothing extra: a UILabel's background
@@ -347,6 +349,7 @@ static char     g_sbLabelLastText[SB_LABEL_MAX][SB_TEXT_MAX + 1] = { { 0 } };
 static int      g_sbLabelRole[SB_LABEL_MAX]       = { -1 };
 static int      g_sbLabelShown[SB_LABEL_MAX]      = { 0 };
 static int      g_sbLabelUsed                    = 0;
+static int      g_sbLabelClaimedCount            = 0;
 static int      g_sbLabelHigh                    = 0;
 static uint64_t g_sbCardColor                     = 0;
 
@@ -916,9 +919,13 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         const uint64_t nowS = now_us();
         if (nowS > s_txtLogUS) {
             s_txtLogUS = nowS + 1000000ULL;
-            NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d landW=%.0f landH=%.0f bytes=%lu emitted=%d",
+            int shownNow = 0;
+            for (int k = 0; k < SB_LABEL_MAX; k++) if (g_sbLabelShown[k]) shownNow++;
+            NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d made=%d claimed=%d shown=%d high=%d "
+                  @"landW=%.0f landH=%.0f bytes=%lu emitted=%d",
                   (int)r_is_objc_ptr(g_sbCountLabel), enemyCount,
                   (int)r_is_objc_ptr(g_sbFillShape),
+                  g_sbLabelUsed, g_sbLabelClaimedCount, shownNow, g_sbLabelHigh,
                   ctx.landW, ctx.landH, (unsigned long)d.length, emitted);
         }
     }
@@ -1459,6 +1466,33 @@ int SBoardStartOverlay(void) {
     }
     sb_make_count_label(container);
 
+    // The label pool is made now rather than during the match.
+    //
+    // A frame that makes a label costs six hundred to eight hundred milliseconds
+    // and drops the rate to two, and the frames that did it always followed a
+    // pawn appearing. Making a label is a dozen setters, and every one of them
+    // goes through r_msg2 or r_msg2_main, and r_settle is a three millisecond
+    // sleep in front of all of them, so a class selector, an instance, a font, a
+    // transform and a cached invocation for that transform together are well over
+    // a hundred milliseconds of sleeping before anything is drawn.
+    //
+    // Spreading them one per frame did not fix it, it moved the cost onto whichever
+    // frame happened to be on screen, and a pawn appearing is exactly when the
+    // player is moving the camera, which is when a stall shows.
+    //
+    // So they are made here, before the first publish, where a slower start costs
+    // nothing. Six covers three pawns with room. The request was twenty, and
+    // twenty labels at this cost is a five second start, which is the very wait
+    // this build was supposed to be removing; the on demand path stays for
+    // anything beyond six.
+    for (int i = 0; i < SB_LABEL_PRESPAWN; i++) {
+        const uint64_t pre = sb_make_pooled_label(container, ESPTextRoleName, i);
+        if (!r_is_objc_ptr(pre)) break;
+        g_sbLabelObj[i] = pre;
+        g_sbLabelUsed++;
+    }
+    NSLog(@"[SB-LABEL] pre-spawned pool=%d of %d", g_sbLabelUsed, SB_LABEL_PRESPAWN);
+
     // Created after sb_forget_local_paint_state for the same reason the counter
     // label is: that function clears every pointer into the previous session, and
     // it also runs at the end of this function, so anything made before it is
@@ -1721,6 +1755,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // One new label per frame, for the reason given at the allocation.
             static int sb_labelsMadeThisFrame = 0;
             sb_labelsMadeThisFrame = 0;
+            g_sbLabelClaimedCount = 0;
             for (int k = 0; k < SB_LABEL_MAX; k++) g_sbLabelClaimed[k] = 0;
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
@@ -2003,6 +2038,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                             if (idx >= 0) {
                                 g_sbLabelClaimed[idx] = 1;
                                 g_sbLabelKey[idx] = lkey;
+                                g_sbLabelClaimedCount++;
                                 if (idx >= txtSlot) txtSlot = idx + 1;
                                 calls += sb_pooled_label_update(idx, role, tpx, tpy, tw, th, txt);
                             }
