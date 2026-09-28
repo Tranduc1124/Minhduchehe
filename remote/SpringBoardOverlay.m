@@ -330,6 +330,9 @@ static int      g_sbCountShown   = 0;
 static uint64_t g_sbLabelObj[SB_LABEL_MAX]        = { 0 };
 static uint64_t g_sbLabelPosInv[SB_LABEL_MAX]     = { 0 };
 static uint64_t g_sbLabelPosBuf[SB_LABEL_MAX]     = { 0 };
+// Set while a slot is being used by the frame being decoded, so a slot is never
+// handed to two strings and the hide pass knows exactly which slots went unused.
+static uint8_t  g_sbLabelClaimed[SB_LABEL_MAX]    = { 0 };
 static uint64_t g_sbLabelBoundsInv[SB_LABEL_MAX]  = { 0 };
 static uint64_t g_sbLabelBoundsBuf[SB_LABEL_MAX]  = { 0 };
 static double   g_sbLabelLastSize[SB_LABEL_MAX][2] = { { 0.0, 0.0 } };
@@ -480,12 +483,12 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
         // thousandfold of the per frame budget at nine labels.
     }
 
-    // Size before the transform, so setFrame: means what it says. Zero bounds is
-    // why the first counter drew nothing at all.
-    double frame[4] = { 0.0, 0.0, 90.0, 20.0 };
-    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
-                   NULL, 0, NULL, 0, NULL, 0);
-
+    // No size here on purpose. setFrame: takes a CGRect, so it can only go
+    // through r_msg_main_raw, which is around thirteen blocking remote calls per
+    // label, and the size arrives with the first frame anyway through the cached
+    // setBounds: invocation, which is two calls and does not block. The one size
+    // set that must happen here is the transform, because it is what orients the
+    // text and it is set exactly once per label.
     double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
     r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
                    NULL, 0, NULL, 0, NULL, 0);
@@ -897,6 +900,7 @@ static void sb_forget_local_paint_state(void) {
         g_sbLabelLastText[k][0] = 0;
         g_sbLabelRole[k] = -1;
         g_sbLabelShown[k] = 0;
+        g_sbLabelClaimed[k] = 0;
     }
     g_sbLabelUsed = 0;
     g_sbLabelHigh = 0;
@@ -1689,6 +1693,10 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // pawn behind it died. That was a line of mine, added in the same
             // commit as the pool, and it defeated the pool's own cleanup.
             int txtSlot = 0;
+            // One new label per frame, for the reason given at the allocation.
+            static int sb_labelsMadeThisFrame = 0;
+            sb_labelsMadeThisFrame = 0;
+            for (int k = 0; k < SB_LABEL_MAX; k++) g_sbLabelClaimed[k] = 0;
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
             // iOS 17.5, and so is CGPathReset, so there is no way to empty a
@@ -1813,13 +1821,65 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                             calls += sb_count_label_text(txt);
                             calls += sb_count_label_hide(0);
                         } else {
-                            const int idx = txtSlot++;
-                            if (idx >= 0 && idx < SB_LABEL_MAX) {
-                                if (!r_is_objc_ptr(g_sbLabelObj[idx]) &&
-                                    g_sbLabelUsed < SB_LABEL_MAX) {
-                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role);
-                                    if (r_is_objc_ptr(g_sbLabelObj[idx])) g_sbLabelUsed++;
+                            // Find the slot that already holds this role and this
+                            // text, rather than taking the next free index.
+                            //
+                            // Taking the next free index is what made the frame
+                            // cost calls=64 and ms=150, and it was structural
+                            // rather than a tuning problem: the app emits the
+                            // pool in the order it walks the pawns, so the moment
+                            // one pawn leaves, every label after it shifts down
+                            // two slots. A shifted label has the wrong role, the
+                            // role change forces the text to be re-sent at six
+                            // calls and the size to be re-sent at two, and eight
+                            // labels doing that is sixty-four calls of re-sending
+                            // text that was already on screen and already correct.
+                            //
+                            // Matching on content instead makes a name keep its
+                            // slot for as long as that name is on screen. A steady
+                            // frame then costs two calls per label, the position,
+                            // and nothing else.
+                            //
+                            // Distance labels are matched on their text too, so
+                            // two pawns at the same distance may trade slots. That
+                            // is harmless: identical role, identical text, and the
+                            // position is written either way.
+                            int idx = -1;
+                            for (int k = 0; k < SB_LABEL_MAX; k++) {
+                                if (g_sbLabelClaimed[k]) continue;
+                                if (!r_is_objc_ptr(g_sbLabelObj[k])) continue;
+                                if (g_sbLabelRole[k] != role) continue;
+                                if (strcmp(g_sbLabelLastText[k], txt) != 0) continue;
+                                idx = k;
+                                break;
+                            }
+                            if (idx < 0) {
+                                // No match, so take the first unclaimed slot. At
+                                // most one new label is made per frame: nine at
+                                // once was the five and a half second stall, and
+                                // spreading them over nine frames costs the same
+                                // work spread out where a single frame cannot
+                                // overrun the main thread it is feeding.
+                                for (int k = 0; k < SB_LABEL_MAX; k++) {
+                                    if (g_sbLabelClaimed[k]) continue;
+                                    if (r_is_objc_ptr(g_sbLabelObj[k])) continue;
+                                    idx = k;
+                                    break;
                                 }
+                                if (idx >= 0 && sb_labelsMadeThisFrame < 1) {
+                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role);
+                                    sb_labelsMadeThisFrame++;
+                                    if (!r_is_objc_ptr(g_sbLabelObj[idx])) idx = -1;
+                                } else if (idx >= 0) {
+                                    // The slot exists but is empty and this frame
+                                    // has already made one, so leave it for the
+                                    // next frame rather than stalling this one.
+                                    idx = -1;
+                                }
+                            }
+                            if (idx >= 0) {
+                                g_sbLabelClaimed[idx] = 1;
+                                if (idx >= txtSlot) txtSlot = idx + 1;
                                 calls += sb_pooled_label_update(idx, role, tpx, tpy, tw, th, txt);
                             }
                         }
@@ -2019,7 +2079,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // Pooled labels this frame did not use are holding a pawn that
                 // is gone. Leaving them up is how a name sticks to the last
                 // enemy after the match is over.
-                for (int hi = txtSlot; hi < g_sbLabelHigh; hi++) {
+                for (int hi = 0; hi < g_sbLabelHigh; hi++) {
+                    if (g_sbLabelClaimed[hi]) continue;
                     if (g_sbLabelShown[hi] && r_is_objc_ptr(g_sbLabelObj[hi])) {
                         g_sbLabelShown[hi] = 0;
                         r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
