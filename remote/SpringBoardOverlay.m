@@ -556,9 +556,20 @@ int SBoardStartOverlay(void) {
                          ? r_msg2(sig, "numberOfArguments", 0, 0, 0, 0) : 0;
 
         double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
+        // Probe on for this one call only, so r_msg_main_raw reads the arguments
+        // back out of the invocation just before invoking. That is the one step
+        // between "the bytes are in the target's buffer", which is proven, and
+        // "the selector used them", which is not.
+        r_arg_probe_enabled = true;
         uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
                                        &want[0], 8, &want[1], 8,
                                        &want[2], 8, &want[3], 8);
+        r_arg_probe_enabled = false;
+        double invGot[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 4 && i < (int)r_arg_probe_n; i++) {
+            uint64_t bits = r_arg_probe_got[i];
+            memcpy(&invGot[i], &bits, 8);
+        }
         uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
 
         // Number of components the target's colour actually has. A colour made
@@ -571,22 +582,22 @@ int SBoardStartOverlay(void) {
         }
 
         double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
-        int nread = 0;
         if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
             uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
             if (outBuf) {
                 dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
                 remote_read(outBuf, got, sizeof(got));
                 dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
-                nread = (int)ncomp;
             }
         }
-        NSLog(@"[SB-COLOR] sig=%d numArgs=%llu ncomp=%llu nread=%d col=%d cg=%d "
-              @"want=%.2f,%.2f,%.2f,%.2f got=%.2f,%.2f,%.2f,%.2f",
+        NSLog(@"[SB-COLOR] sig=%d numArgs=%llu pn=%llu col=%d cg=%d ncomp=%llu "
+              @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f got=%.2f,%.2f,%.2f,%.2f",
               (int)r_is_objc_ptr(sig), (unsigned long long)numArgs,
-              (unsigned long long)ncomp, nread,
+              (unsigned long long)r_arg_probe_n,
               (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
+              (unsigned long long)ncomp,
               want[0], want[1], want[2], want[3],
+              invGot[0], invGot[1], invGot[2], invGot[3],
               got[0], got[1], got[2], got[3]);
     }
 

@@ -42,6 +42,16 @@ uint64_t r_msg2_main_raw(uint64_t obj, const char *selName,
                          const void *a1, size_t a1Size,
                          const void *a2, size_t a2Size,
                          const void *a3, size_t a3Size);
+// Diagnostic. When r_arg_probe_enabled is set, r_msg_main_raw reads every
+// argument back out of the invocation with getArgument:atIndex: immediately
+// before invoking, and leaves the raw eight bytes in r_arg_probe_got. This
+// measures the one step between "the bytes are in the target's buffer" and "the
+// selector uses them". Off by default because it costs one remote call per
+// argument, and the overlay sets and clears it around a single call.
+extern bool     r_arg_probe_enabled;
+extern uint64_t r_arg_probe_n;
+extern uint64_t r_arg_probe_got[4];
+
 bool     r_msg2_main_struct_ret(uint64_t obj, const char *selName,
                                 void *outBuf, size_t outSize,
                                 const void *a0, size_t a0Size,

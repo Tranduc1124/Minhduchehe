@@ -256,6 +256,10 @@ static uint64_t r_method_signature(uint64_t obj, uint64_t sel)
                                  types, 0, 0, 0);
 }
 
+bool     r_arg_probe_enabled = false;
+uint64_t r_arg_probe_n = 0;
+uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
+
 static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize)
 {
     if (!remoteBuf || remoteSize == 0) return false;
@@ -383,6 +387,22 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     }
 
     r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+
+    if (r_arg_probe_enabled) {
+        r_arg_probe_n = maxUserArgs;
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            r_arg_probe_got[i] = 0;
+            if (!argBufs[i]) continue;
+            uint64_t outBuf = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
+            if (!outBuf) continue;
+            // Poison the buffer first, so a getArgument that writes nothing is
+            // distinguishable from one that wrote zero.
+            remote_write64(outBuf, 0);
+            r_msg2(inv, "getArgument:atIndex:", outBuf, i + 2, 0, 0);
+            r_arg_probe_got[i] = remote_read64(outBuf);
+            r_free(outBuf);
+        }
+    }
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
