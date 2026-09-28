@@ -2920,9 +2920,19 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned int)s_cardDrops);
                     }
                 }
-                if ((g_sbSummaryUpdates & 0x3f) == 0) {
-                    NSLog(@"[SBOverlay] 15fps updates=%llu skips=%llu attempts=%llu",
-                          g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);
+                // Once a second, not every 64th publish. A call-count gate on a
+                // logd round trip means the logging cost rises with the publish
+                // rate, which is the same shape of mistake as the RC_DIAG flood.
+                // [PUSH-HB] already reports these three counters every second, so
+                // this line is a second copy of what the heartbeat says.
+                {
+                    static uint64_t s_ovlLast = 0;
+                    const uint64_t now = now_us();
+                    if (s_ovlLast == 0 || now - s_ovlLast >= 1000000ULL) {
+                        s_ovlLast = now;
+                        NSLog(@"[SBOverlay] 15fps updates=%llu skips=%llu attempts=%llu",
+                              g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);
+                    }
                 }
             }
         } @finally {

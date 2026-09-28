@@ -17,6 +17,16 @@
 #import "../../kexploit/kutils.h"
 #import "../../kexploit/kexploit_opa334.h"
 
+// Monotonic microseconds for the rate limiters on this file's two DIAG lines.
+// clock_gettime rather than mach_absolute_time, because the latter counts ticks
+// and a one-second window built on ticks is a window of arbitrary length.
+#include <time.h>
+static inline uint64_t vm_diag_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
 #define VM_PAGE_PACKED_PTR_BITS                         31
 #define VM_PAGE_PACKED_PTR_SHIFT                        6
 #define VM_KERNEL_POINTER_SIGNIFICANT_BITS              38
@@ -563,9 +573,24 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         uint32_t check = 0;
         kreadbuf(nextAddr + odOff, &check, sizeof(check));
         if (check != newOD || __sync_fetch_and_add(&g_vmShmemCalls, 0) <= 3) {
-            NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
-                  (unsigned long)odOff, newOD, check,
-                  check == newOD ? @"MATCH" : @"MISMATCH");
+            // A mismatch stays visible, but once a second rather than once per
+            // call. The 21:53 log had 310 of these in fifteen seconds, which is
+            // about twenty remaps a second, and an NSLog on the memory path is
+            // an os_log round trip on a path that runs while the page-cache lock
+            // is held. The count per second says the same thing as the raw
+            // flood did and costs one line.
+            static uint64_t s_odLast = 0;
+            static uint64_t s_odCount = 0;
+            const uint64_t now = vm_diag_now_us();
+            s_odCount++;
+            if (s_odLast == 0 || now - s_odLast >= 1000000ULL) {
+                s_odLast = now;
+                NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@ (x%llu this second)",
+                      (unsigned long)odOff, newOD, check,
+                      check == newOD ? @"MATCH" : @"MISMATCH",
+                      (unsigned long long)s_odCount);
+                s_odCount = 0;
+            }
         }
     }
 
@@ -663,10 +688,23 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             uint64_t check = 0;
             kreadbuf(shmemNamedEntry + offAt, &check, sizeof(check));
             if (check != newOffset || vmCallNo <= 3) {
-                NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
-                      (unsigned)offAt, (unsigned long long)newOffset,
-                      (unsigned long long)check,
-                      check == newOffset ? @"MATCH" : @"MISMATCH");
+                // Same 1 Hz limiter as the vme_object_or_delta readback above,
+                // and for the same reason: a mismatch on this path logged once
+                // per call, which is the other half of the 309 lines that
+                // flooded the 21:53 log.
+                static uint64_t s_neLast = 0;
+                static uint64_t s_neCount = 0;
+                const uint64_t now = vm_diag_now_us();
+                s_neCount++;
+                if (s_neLast == 0 || now - s_neLast >= 1000000ULL) {
+                    s_neLast = now;
+                    NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@ (x%llu this second)",
+                          (unsigned)offAt, (unsigned long long)newOffset,
+                          (unsigned long long)check,
+                          check == newOffset ? @"MATCH" : @"MISMATCH",
+                          (unsigned long long)s_neCount);
+                    s_neCount = 0;
+                }
             }
         } else {
             NSLog(@"[DS] DIAG SKIP named_entry.offset: located at 0x%x, not inside "

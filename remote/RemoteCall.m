@@ -600,11 +600,32 @@ static uint32_t reap_dead_port_names(const char *reason)
     return dead;
 }
 
+// Time based, not call based.
+//
+// This used to be "every 64th sign_state", and a call count is the wrong shape
+// for a cost that is paid once per period. The overlay drives the call rate, so
+// every-64th-calls meant the whole-task mach_port_names sweep ran three or four
+// times a second at a healthy publish rate and proportionally more when a
+// publish got slow, which is exactly the wrong direction: the enumeration runs
+// inside g_universal_ipc_mutex and gRemoteCallLock, so it lands on top of every
+// other call that is queued behind it.
+//
+// Once a second bounds it independently of how fast the overlay is running, and
+// still keeps a hard ceiling on how long a dead port name can sit in the task's
+// ipc space.
+//
+// A reap is not load bearing for correctness across sessions, either. Both
+// teardown paths already reap unconditionally (abandon_remote_call_internal and
+// destroy_remote_call_internal), and get_shmem_for_page reaps reactively when a
+// page will not map. What this one covers is a long-lived session that never
+// tears down, which is the only case that needs a periodic pass.
 static void reap_dead_port_names_if_needed(const char *reason)
 {
-    static volatile uint32_t signCount = 0;
-    uint32_t count = __sync_add_and_fetch(&signCount, 1);
-    if ((count & 0x3f) != 0) return;
+    static volatile uint64_t s_lastReap = 0;
+    const uint64_t now = remote_call_diag_now_us();
+    const uint64_t last = __sync_add_and_fetch(&s_lastReap, 0);
+    if (last != 0 && now - last < 1000000ULL) return;
+    __sync_lock_test_and_set(&s_lastReap, now);
     (void)reap_dead_port_names(reason);
 }
 
@@ -1589,8 +1610,23 @@ bool remote_read_internal(uint64_t src, void *dst, uint64_t size)
 
         struct VMShmem *page = get_shmem_for_page(pageAddr);
         if (!page) {
-            NSLog(@"[RemoteCall] DIAG remote_read FAIL no page for src=0x%llx",
-                  (unsigned long long)src);
+            // Rate limited for the same reason RC_DIAG is. remote_read is the
+            // busiest call in the memory path, so a page that cannot be mapped
+            // fails once per read rather than once per frame, and a caller that
+            // keeps asking for the same bad address turns this line into the
+            // same logd flood RC_DIAG was: an os_log round trip per failure,
+            // inside the two global remote-call locks. One line a second still
+            // says it is happening and the address it is happening at.
+            static uint64_t s_readFailLast = 0;
+            static uint64_t s_readFailCount = 0;
+            const uint64_t now = remote_call_diag_now_us();
+            s_readFailCount++;
+            if (s_readFailLast == 0 || now - s_readFailLast >= 1000000ULL) {
+                s_readFailLast = now;
+                NSLog(@"[RemoteCall] DIAG remote_read FAIL no page for src=0x%llx (x%llu in this second)",
+                      (unsigned long long)src, (unsigned long long)s_readFailCount);
+                s_readFailCount = 0;
+            }
             return false;
         }
         memcpy((void *)(uintptr_t)dstAddr, (void *)(uintptr_t)(page->localAddress + offs), (size_t)copyCount);
