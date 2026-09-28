@@ -1438,7 +1438,13 @@ void abandon_remote_call_internal(void) {
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
     destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    // Same rule as destroy_remote_call: the synthetic call thread is parked on
+    // this port with a signed LR of 0x401, and nothing here confirms it stopped.
+    // Leaving the port installed means a late fault is caught instead of fatal.
+    // The port dies with the target on a respawn and the reaper collects it.
+    if (!g_RC_creatingExtraThread) {
+        destroy_exception_port(g_RC_secondExceptionPort);
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1500,15 +1506,49 @@ int destroy_remote_call_internal(void) {
         do_remote_call_stable(100, "munmap", g_RC_trojanMem, PAGE_SIZE, 0, 0, 0, 0, 0, 0);
         g_RC_trojanMem = 0;
     }
+    // The synthetic call thread is the one thing in this file that must never
+    // be left runnable while its catcher is gone.
+    //
+    // do_remote_call_stable(-1, "pthread_exit", ...) is a full remote call: it
+    // catches the parked exception, signs pc=pthread_exit and lr=FAKE_LR_TROJAN
+    // onto the state, and replies. The thread then runs, and its LR is 0x401.
+    // The -1 timeout takes the early return at the top of the call, so we do
+    // not wait for it to finish and we never learn whether it did.
+    //
+    // The next two lines then destroyed the exception port. If the thread was
+    // still inside pthread_exit, or if it returned, it did a RET to 0x401 with
+    // nothing installed to catch it. 0x401 is not in any mapped region, so the
+    // thread took EXC_BAD_ACCESS and the whole process died. That is not a
+    // theory, it is the 2026-09-29 06:39 SpringBoard report: SIGBUS,
+    // EXC_BAD_ACCESS, pc = lr = 0x401, "0x401 is not in any region", faulting
+    // thread in thread_start. It also explains why the crash is intermittent
+    // and why a heavy frame makes it more likely: the teardown only runs after
+    // a session failure, and slow calls are what cause session failures.
+    //
+    // So the port stays installed. If that thread ever does resume, its fault
+    // is caught instead of fatal, and the port becomes a dead name the reaper
+    // collects. Leaking a port is recoverable; a SIGBUS in SpringBoard is not.
+    bool callThreadMayStillBeRunning = false;
     if (g_RC_creatingExtraThread) {
-        do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        // Only wake the thread at all if the session still looks healthy. A
+        // session that has already failed is the common case here, and issuing
+        // a remote call on it is issuing a call whose reply nobody can trust.
+        if (g_RC_success) {
+            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+        callThreadMayStillBeRunning = true;
     }
     else {
+        // This branch resumes the target's ORIGINAL thread on its own PC and
+        // LR, which is the state it was running before we touched it. That is
+        // ordinary code and its port is ours to close.
         restore_trojan_thread(&g_RC_originalState);
     }
 
     destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    if (!callThreadMayStillBeRunning) {
+        destroy_exception_port(g_RC_secondExceptionPort);
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
