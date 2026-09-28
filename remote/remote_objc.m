@@ -813,8 +813,8 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
             if (s_wideWarned != (uint64_t)sel) {
                 s_wideWarned = (uint64_t)sel;
                 NSLog(@"[RemoteObjC] main thread, no direct path for a %llu byte return "
-                      @"from %@ — needs a call off the main thread",
-                      (unsigned long long)retLen, selName);
+                      @"from %s — needs a call off the main thread",
+                      (unsigned long long)retLen, selName ? selName : "(null)");
             }
             return false;
         }

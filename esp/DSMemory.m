@@ -650,7 +650,9 @@ bool ds_read(uint64_t va, void *buf, size_t len) {
 }
 
 bool ds_write(uint64_t va, const void *buf, size_t len) {
-    return ds_rw_remap(va, buf, len, true);
+    // ds_rw_remap takes a void* because it also serves ds_read's own buffer, but
+    // a write never modifies the caller's bytes, so dropping const here is safe.
+    return ds_rw_remap(va, (void *)(uintptr_t)buf, len, true);
 }
 
 uint8_t  ds_read8(uint64_t va)  { uint8_t v=0;  ds_read(va,&v,1); return v; }

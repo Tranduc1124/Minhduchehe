@@ -225,12 +225,53 @@ static bool remote_call_verbose_logging(void)
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
+// Monotonic microseconds for the RC_DIAG rate limiter. clock_gettime rather
+// than mach_absolute_time, because the latter counts ticks and a one-second
+// window built on ticks is a window of arbitrary length.
+static uint64_t remote_call_diag_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
 #define RC_DEBUG(...) do { if (remote_call_verbose_logging()) printf(__VA_ARGS__); } while (0)
+//
 // 3uTools Realtime Log catches NSLog; plain printf is often invisible there.
+//
+// Rate limited to one line per second, and that is the whole point of the
+// macro. Four RC_DIAG fire on the success path of every single remote call
+// (RemoteCall.m:1209, 1216, 1256, 1267), and they fire from inside
+// do_remote_call_stable_addr_internal, which means they fire while
+// g_universal_ipc_mutex and gRemoteCallLock are both held. An NSLog is an
+// os_log IPC to logd, so one publish of fifty calls was two hundred logd
+// round trips, each one inside the lock that every other call is queued behind.
+//
+// That is the measured shape of the freeze. A remote call costs about
+// 0.25 ms when logd is keeping up and 4.4 ms when it is not, with no change
+// in the work between them, and a realtime log consumer attached is exactly
+// what makes the slow case the common one. Fifty calls at 4.4 ms is 220 ms,
+// which is the 218 ms publish the device log recorded.
+//
+// RC_VERBOSE=1 restores every line, so nothing is lost for a deliberate
+// capture. The default is one line a second, which is the rate everything
+// else in this project already logs at and is enough to see that a session
+// is alive or that a specific call keeps failing.
 #define RC_DIAG(fmt, ...) do { \
-        char _rc_diag_buf[1024]; \
-        snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
-        NSLog(@"%s", _rc_diag_buf); \
+        if (remote_call_verbose_logging()) { \
+            char _rc_diag_buf[1024]; \
+            snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
+            NSLog(@"%s", _rc_diag_buf); \
+        } else { \
+            static uint64_t _rc_diag_last = 0; \
+            uint64_t _rc_diag_now = remote_call_diag_now_us(); \
+            if (_rc_diag_last == 0 || _rc_diag_now - _rc_diag_last >= 1000000ULL) { \
+                _rc_diag_last = _rc_diag_now; \
+                char _rc_diag_buf[1024]; \
+                snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
+                NSLog(@"%s", _rc_diag_buf); \
+            } \
+        } \
     } while (0)
 
 static bool remote_call_should_log_result(const char *name, bool stable)
@@ -630,8 +671,11 @@ bool set_exception_port_on_thread(mach_port_t exceptionPort, uint64_t currThread
         return false;
     }
 
-    uint64_t diver = 0;
-    diver = (uint64_t)state.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK;
+    // The diversifier is read for the record. It is not applied to the state
+    // below because thread_set_exception_ports and pthread_exit are reached with
+    // a PC that carries no diversifier, so keeping it would only add a warning
+    // about a value nothing consumes.
+    (void)((uint64_t)state.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK);
 
     arm_thread_state64_set_pc_fptr(state, thread_set_exception_ports_addr);
     arm_thread_state64_set_lr_fptr(state, pthread_exit_addr);
