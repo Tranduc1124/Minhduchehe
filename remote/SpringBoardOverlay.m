@@ -165,6 +165,39 @@ static uint64_t g_sbLastCalls = 0;
 // for SpringBoard's main thread. See sb_invoke_cached_main_raw.
 static uint64_t g_sbLastWaitUS = 0;
 
+// Where the microseconds of one publish actually go.
+//
+// The device log says a publish costs 671 ms over 17 calls and 16 ms over 12
+// calls, and that the 671 ms is not spent waiting on SpringBoard's main thread
+// (wait=0 ms). So the cost is inside the calls, but "inside the calls" is not
+// yet an answer: a publish is five different kinds of remote work and they are
+// not remotely similar in cost. dlsym_remote does a symbol lookup each time,
+// r_msg2 goes through NSInvocation, and remote_write is a plain memcpy into
+// target memory. Without this split, dropping subpath count and fixing the
+// symbol cache look like the same intervention and one of them is wasted.
+//
+// Five groups, in the order a publish does them:
+//   probe   persistentPath + ptsBuffer, two remote calls before any drawing
+//   pathnew CGPathCreateMutable, and the retired path's CGPathRelease
+//   geom    the op loop: CGPathAddLines / CGPathAddRects
+//   label   label place, text, and the hide sweep
+//   flush   the trailing rect batch and the fill batch
+// present is g_sbLastWaitUS and is deliberately not counted again here.
+static uint64_t g_sbTProbe = 0;
+static uint64_t g_sbTPathNew = 0;
+static uint64_t g_sbTGeom = 0;
+static uint64_t g_sbTLabel = 0;
+static uint64_t g_sbTFlush = 0;
+// Publishes completed since the session opened, so the log can cover the first
+// few (where the 22x cold/ warm ratio showed up) and then stay quiet.
+static uint64_t g_sbPubIndex = 0;
+// A publish slower than this is logged whatever its index: the two 671/784 ms
+// frames are the ones that stall SpringBoard's main thread, and they are worth
+// seeing whenever they happen, not only at session start.
+static const uint64_t SB_CALL_SLOW_US = 100000ULL;
+// Log the first this many publishes unconditionally.
+static const uint64_t SB_CALL_FIRST_N = 3;
+
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
     "boneLayer", "boneBotLayer", "boneKnockedLayer",
@@ -1142,6 +1175,12 @@ static void sb_forget_local_paint_state(void) {
     g_sbLastSubpaths = 0;
     g_sbLastCalls = 0;
     g_sbNextPublishUS = 0;
+    // The [SB-CALL] split is only interesting while a session is warming up,
+    // and "warm up" is per session. Without this reset the first-N budget is
+    // spent on the first session the process ever runs and every later session,
+    // which is where the 671 ms frames were seen, logs nothing until one of
+    // them is slow enough to trip SB_CALL_SLOW_US.
+    g_sbPubIndex = 0;
     // The hold ring outlives the session pointer, so it is emptied here rather
     // than left for the next SBoardStartOverlay to overwrite.
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
@@ -1844,10 +1883,12 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // flag. Sampled only when something is actually wrong, to keep this
             // off the hot path.
             const int okBefore = remote_call_current_success() ? 1 : 0;
+            const uint64_t tProbeStart = now_us();
             uint64_t rp = persistentPath();
             const int okAfterPath = remote_call_current_success() ? 1 : 0;
             uint64_t ptsBuf = ptsBuffer();
             const int okAfterBuf = remote_call_current_success() ? 1 : 0;
+            const uint64_t tProbeEnd = now_us();
             if (!okBefore || !rp || !ptsBuf || !okAfterBuf || !okAfterPath) {
                 static uint64_t s_probeUS = 0;
                 uint64_t tP = now_us();
@@ -1968,6 +2009,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // So the path is kept alive for SB_PATH_HOLD_FRAMES frames. At the
             // 8000us publish interval that is about 130ms, far longer than a
             // main thread turn.
+            const uint64_t tPathNewStart = now_us();
             uint64_t freshPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             calls++;
             if (!freshPath) {
@@ -2005,6 +2047,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     g_sbFillPath = fp;
                 }
             }
+            // End of pathnew. Taken here because the fill path is created in
+            // the same breath as the stroke path and is the same kind of work:
+            // a dlsym_remote for CGPathCreateMutable plus a CGPathRelease of the
+            // path that aged out of the hold window.
+            const uint64_t tGeomStart = now_us();
 
             // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
@@ -2409,6 +2456,10 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++; drawn++;
             }
+            // End of geom. The loop above is every CGPathAddLines and every
+            // mid-loop CGPathAddRects, so this group is the one that scales
+            // with the number of things on screen.
+            const uint64_t tLabelStart = now_us();
 
             // Remember whether the last frame drew anything on the fill layer.
             //
@@ -2447,6 +2498,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 g_sbLabelKey[hi] = 0;
             }
             if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
+            // End of label.
+            const uint64_t tFlushStart = now_us();
 
             if (fillN > 0 && fillPath) {
                 remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
@@ -2455,6 +2508,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 fillDrawn++;
                 fillN = 0;
             }
+            // End of flush. The group boundary here is after the fill batch, so
+            // the card present and the stroke present below are not in it: the
+            // stroke present is g_sbLastWaitUS and the card present is one
+            // r_msg2 that always runs. Both are counted in total, neither is
+            // double counted here.
 
             if (drawn > 0 || txtOps > 0 || fillDrawn > 0 || fillWasDrawn) {
                 // No text run this frame means the app is not in a match, and a
@@ -2495,10 +2553,50 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 }
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
-                g_sbLastPublishUS = now_us();
+                const uint64_t tPubEnd = now_us();
+                g_sbLastPublishUS = tPubEnd;
                 g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
                 g_sbLastSubpaths = subpaths;
                 g_sbLastCalls = calls;
+                // [SB-CALL] which of the five groups ate this publish.
+                //
+                // Only the first few publishes and any publish over 100 ms. The
+                // device log measured 671 ms over 17 calls at session start and
+                // 16 ms over 12 calls once warm, so the question is which group
+                // has the 22x. Logging every frame would bury the answer in the
+                // frames that are already known to be cheap.
+                {
+                    g_sbPubIndex++;
+                    const uint64_t total = tPubEnd - tPubStart;
+                    if (g_sbPubIndex <= SB_CALL_FIRST_N || total > SB_CALL_SLOW_US) {
+                        g_sbTProbe = tProbeEnd - tProbeStart;
+                        g_sbTPathNew = tGeomStart - tPathNewStart;
+                        g_sbTGeom = tLabelStart - tGeomStart;
+                        g_sbTLabel = tFlushStart - tLabelStart;
+                        g_sbTFlush = tFlushStart ? (tPubEnd - tFlushStart) : 0;
+                        // The sum of the five plus the present should account for
+                        // the whole publish. rest is the difference, and it is
+                        // the card present and the bookkeeping in between. A rest
+                        // that is large is itself a finding: it means time is
+                        // being spent somewhere this split does not name.
+                        const uint64_t named = g_sbTProbe + g_sbTPathNew + g_sbTGeom
+                                             + g_sbTLabel + g_sbTFlush
+                                             + g_sbLastWaitUS;
+                        NSLog(@"[SB-CALL] pub=%llu total=%lluus probe=%lluus "
+                              @"pathnew=%lluus geom=%lluus label=%lluus flush=%lluus "
+                              @"present=%lluus rest=%lluus calls=%llu",
+                              (unsigned long long)g_sbPubIndex,
+                              (unsigned long long)total,
+                              (unsigned long long)g_sbTProbe,
+                              (unsigned long long)g_sbTPathNew,
+                              (unsigned long long)g_sbTGeom,
+                              (unsigned long long)g_sbTLabel,
+                              (unsigned long long)g_sbTFlush,
+                              (unsigned long long)g_sbLastWaitUS,
+                              (unsigned long long)(total > named ? total - named : 0),
+                              (unsigned long long)calls);
+                    }
+                }
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
                 // Compare p0/p1 against the app-side [PUSH] scr values. If app scr
                 // moves but these do not, the hand-off is dropping frames; if both
