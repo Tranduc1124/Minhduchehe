@@ -104,7 +104,9 @@ static uint64_t s_keyOwner = 0;
 static uint64_t s_keyA = 0;
 static uint64_t s_keyB = 0;
 
-static void pac_release_key_cache(void)
+// Declared in PAC.h, so this cannot be static: the two teardown paths in
+// RemoteCall.m call it to drop the keys with the thread they belong to.
+void pac_release_key_cache(void)
 {
     s_keyOwner = 0;
     s_keyA = 0;
