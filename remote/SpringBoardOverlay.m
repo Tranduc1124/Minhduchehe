@@ -69,40 +69,8 @@ static uint64_t g_sbPersistentPath = 0;
 // path alive long after the frame that drew it, and releases it only once no
 // queued present can still be holding it.
 #define SB_PATH_HOLD_FRAMES 4
-
-// One CAShapeLayer per colour, not one for everything.
-//
-// The app already separates its geometry: kShapeKeys lists sixteen layers, the
-// publish loop walks them one at a time and prefixes each with a layer marker, and
-// nine, ten and eleven are hpFillGreenLayer, hpFillOrangeLayer and hpFillRedLayer.
-// All of that arrived intact and was then thrown away here, because every subpath
-// was appended to one path on one layer. A CALayer carries one strokeColor and one
-// fillColor, so that collapse is lossy in a way nothing downstream can undo, and it
-// is why the health bar drew as a hollow outline: the bar was arriving perfectly,
-// as a two point wide rectangle, and being stroked rather than filled because the
-// only layer it reached had a nil fillColor.
-//
-// Four buckets is what the colour scheme needs, not sixteen. The three box
-// variants, three bone variants and three snapline variants all want one colour,
-// and the FOV ring, alert ticks and aim assist all want the same outline. What
-// genuinely differs is the health bar, and it differs three ways.
-//
-// Each bucket's colour is set once at init and never touched per frame, so the
-// only extra cost per frame is a setPath: for a bucket that received geometry.
-#define SB_BUCKETS 4
-#define SB_B_STROKE  0   // box, bone, snapline, fov, alert, aim
-#define SB_B_HPGREEN 1
-#define SB_B_HPORANGE 2
-#define SB_B_HPRED   3
-
-// The hold window holds a whole set of bucket paths per slot, not one path. If only
-// the outline rotated, the health bar paths would keep accumulating rectangles
-// frame after frame and the bar would grow without bound.
-static uint64_t g_sbPathRing[SB_PATH_HOLD_FRAMES];
+static uint64_t g_sbPathRing[SB_PATH_HOLD_FRAMES] = {0};
 static int g_sbPathRingAt = 0;
-static uint64_t g_sbLayer[SB_BUCKETS] = { 0, 0, 0, 0 };
-static uint64_t g_sbLayerPath[SB_BUCKETS] = { 0, 0, 0, 0 };
-static int g_sbLayerDirty[SB_BUCKETS] = { 0, 0, 0, 0 };
 static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
 static NSUInteger g_sbLastPathBytes = 0;
@@ -385,37 +353,6 @@ static uint64_t persistentPath(void) {
     return g_sbPersistentPath;
 }
 
-static int sb_bucket(int curLayer) {
-    if (curLayer == 9) return SB_B_HPGREEN;
-    if (curLayer == 10) return SB_B_HPORANGE;
-    if (curLayer == 11) return SB_B_HPRED;
-    return SB_B_STROKE;
-}
-
-// A health bar path is created the first time its bucket receives geometry in a
-// frame, and rotated through its own hold window so the previous one stays alive
-// for as long as a queued present can still be holding it, exactly like the
-// outline path. Buckets that get no geometry this frame cost nothing at all.
-static uint64_t g_sbHpRing[3][SB_PATH_HOLD_FRAMES];
-static int g_sbHpRingAt[3] = { 0, 0, 0 };
-
-static uint64_t sb_bucket_path(int bucket, uint64_t *calls) {
-    uint64_t *slot = &g_sbLayerPath[bucket];
-    if (*slot) return *slot;
-    const int k = bucket - 1;
-    uint64_t p = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-    if (!p) return 0;
-    if (calls) (*calls)++;
-    if (g_sbHpRing[k][g_sbHpRingAt[k]]) {
-        dlsym_remote("CGPathRelease", g_sbHpRing[k][g_sbHpRingAt[k]], 0,0,0,0,0,0,0);
-        g_sbHpRing[k][g_sbHpRingAt[k]] = 0;
-    }
-    g_sbHpRing[k][g_sbHpRingAt[k]] = p;
-    g_sbHpRingAt[k] = (g_sbHpRingAt[k] + 1) % SB_PATH_HOLD_FRAMES;
-    *slot = p;
-    return p;
-}
-
 static uint64_t ptsBuffer(void) {
     if (g_sbMirrorPtsBuf) return g_sbMirrorPtsBuf;
     g_sbMirrorPtsBuf = dlsym_remote("malloc", 65536, 0,0,0,0,0,0,0);
@@ -585,72 +522,196 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
+    // [SB-COLOR] proves whether a multi argument selector can carry its
+    // arguments at all, before any second shape layer is attempted.
+    //
+    // The previous six layer attempt drew nothing, and its colour call was
+    // written as r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+    // rgba, 32, ...), that is one 32 byte pointer. Reading r_msg_main_raw shows
+    // why that cannot work. It does not marshal through the x0..x7 injector at
+    // all: it asks the real method signature for numberOfArguments, allocates a
+    // buffer per argument and calls setArgument:atIndex: once for each. Passing
+    // only a0 meant the remaining three arguments were never written, so the
+    // selector ran with three uninitialised CGFloats and every group got a
+    // colour nobody chose.
+    //
+    // The right call passes four separate eight byte doubles, which is what this
+    // does. The colour is then read back through CGColor and its components
+    // printed, so the device says what actually arrived instead of the log
+    // claiming success on a call that may have produced anything.
+    //
+    //   rgba matching the request -> the transport is fine, a second layer for
+    //                                fill is safe to build
+    //   rgba wrong                 -> the marshalling is still wrong and the
+    //                                number printed here says which part
+    {
+        // Everything is printed under one prefix because the device log filter
+        // takes a single term, and splitting this across two prefixes cost a round.
+        //
+        // What is already established, by the log and not by reasoning:
+        //   got=0.00,0.00,0.00,0.00 while col=1 and cg=1
+        // col being non zero means r_write_remote_arg returned true, because a
+        // false there sets argsOK false and the function returns 0. So the four
+        // doubles were written to SpringBoard and read back matching. The read
+        // side is sound too, because got starts at minus one and the sentinel
+        // never appears. The write is confirmed good and the read is confirmed
+        // good, and the value is still zero, so the argument is lost between the
+        // buffer and the selector reading it.
+        //
+        // That leaves one untested step in r_msg_main_raw: maxUserArgs comes
+        // from numberOfArguments on the signature, and if that is wrong then no
+        // setArgument:atIndex: is ever issued and the selector reads whatever
+        // happens to be in d0 to d3. So numArgs is printed here. The expectation
+        // for a four argument selector plus self and _cmd is six.
+        const uint64_t colSel = r_sel("colorWithRed:green:blue:alpha:");
+        uint64_t sig = r_is_objc_ptr(colSel)
+                      ? r_msg(clsCol, r_sel("methodSignatureForSelector:"), colSel, 0, 0, 0)
+                      : 0;
+        uint64_t numArgs = r_is_objc_ptr(sig)
+                         ? r_msg2(sig, "numberOfArguments", 0, 0, 0, 0) : 0;
+
+        double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
+        // Probe on for this one call only, so r_msg_main_raw reads the arguments
+        // back out of the invocation just before invoking. That is the one step
+        // between "the bytes are in the target's buffer", which is proven, and
+        // "the selector used them", which is not.
+        r_arg_probe_enabled = true;
+        uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                       &want[0], 8, &want[1], 8,
+                                       &want[2], 8, &want[3], 8);
+        r_arg_probe_enabled = false;
+        double invGot[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 4 && i < (int)r_arg_probe_n; i++) {
+            uint64_t bits = r_arg_probe_got[i];
+            memcpy(&invGot[i], &bits, 8);
+        }
+        uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
+
+        // Number of components the target's colour actually has. A colour made
+        // from red, green, blue and alpha is normally four or five depending on
+        // whether the space is extended, and the out buffer is sized for that
+        // rather than assuming four.
+        uint64_t ncomp = 0;
+        if (r_is_objc_ptr(cg)) {
+            ncomp = dlsym_remote("CGColorGetNumberOfComponents", cg, 0,0,0,0,0,0,0);
+        }
+
+        // The out buffer is poisoned with a sentinel before the call. This is the
+        // measurement that was missing for four rounds: the buffer came from malloc
+        // and was never written to, and a fresh page reads as sixteen zero bytes,
+        // which is exactly what was logged. A printed zero in a buffer nobody
+        // wrote is not a measurement, and treating it as one is what sent the last
+        // three rounds chasing a colour that may never have been black.
+        double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        uint64_t raw[4] = { 0, 0, 0, 0 };
+        bool wrote = false;
+        if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
+            uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
+            if (outBuf) {
+                double sentinel[8] = { -7, -7, -7, -7, -7, -7, -7, -7 };
+                for (int k = 0; k < 3; k++) {
+                    remote_write(outBuf, sentinel, sizeof(sentinel));
+                    dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
+                    remote_read(outBuf, got, sizeof(got));
+                    remote_read(outBuf, raw, 16);
+                    if (got[0] != -7.0) { wrote = true; break; }
+                }
+                dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
+            }
+        }
+
+        // The float layout theory is dead and the raw bytes say so: raw was
+        // sixteen zero bytes, so the out buffer really was zero, and both dbl and
+        // flt read the same zeros. The colour is black, not misread.
+        //
+        // The second invocation told us nothing. It returned the value 1, and
+        // r_is_objc_ptr accepts any pointer above 0x100000000, so asking address 1
+        // for CGColor gave nil and noRet was never measured. That result is dropped
+        // rather than reinterpreted, because reading a conclusion out of a garbage
+        // pointer is how the last two rounds went wrong.
+        //
+        // The measurement moves to a channel that returns text.
+        // +[NSNumber numberWithDouble:] takes one CGFloat through exactly the same
+        // path and hands back an object, and -description on that object prints the
+        // number as characters. The colour test spent three rounds proving that a
+        // printed zero was a real zero and not a misread layout, and every one of
+        // those rounds was spent on the reading rather than on the transport. A
+        // string has no such ambiguity: 1.5 and 0.0 are different strings, and no
+        // byte layout turns one into the other.
+        //
+        // The integer case is the control. It travels through identical code with a
+        // different register class, so T1 alone says whether the difference is
+        // specifically about a floating point value, and T2 alone says whether the
+        // path works at all. If T2 prints 7 then arguments arrive and a double is
+        // the only thing that does not, which is a far narrower fault to fix than
+        // arguments do not arrive.
+        char t1[48] = { 0 };
+        char t2[48] = { 0 };
+        double wantInt = 7.0;
+        double wantDbl = 1.5;
+
+        uint64_t NSNum = r_class("NSNumber");
+        uint64_t nDbl = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantDbl, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        uint64_t nInt = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantInt, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        if (r_is_objc_ptr(nDbl)) {
+            uint64_t ds = r_msg2_main(nDbl, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(ds)) r_read_nsstring(ds, t1, sizeof(t1));
+        }
+        if (r_is_objc_ptr(nInt)) {
+            uint64_t is = r_msg2_main(nInt, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(is)) r_read_nsstring(is, t2, sizeof(t2));
+        }
+
+        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu wrote=%d "
+              @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
+              @"ret=%.2f,%.2f,%.2f,%.2f dbl=<%s> int=<%s>",
+              (unsigned long long)numArgs,
+              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
+              (unsigned long long)ncomp, (int)wrote,
+              want[0], want[1], want[2], want[3],
+              invGot[0], invGot[1], invGot[2], invGot[3],
+              got[0], got[1], got[2], got[3],
+              t1, t2);
+    }
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    // White outline for everything that is a line: FOV ring, box, bones, snapline,
-    // alert. Green is used only for the health bar now that the bar has its own
-    // filled layer, so a green outline here would make the whole ESP look like a
-    // health bar and say nothing.
-    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    // Green, so the answer is on the screen instead of in a log line that has now
+    // been wrong four times. If the ESP draws green then the four double arguments
+    // reached SpringBoard and the whole colour path is settled, and the remaining
+    // problem with the overlay is that it is one layer and therefore has no fill,
+    // which is a design limit rather than a transport fault.
+    if (r_is_objc_ptr(greenCGColor)) r_msg2_main(shape, "setStrokeColor:", greenCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] green=%d cg=%d", (int)r_is_objc_ptr(greenColor),
+          (int)r_is_objc_ptr(greenCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     double lw = 1.5;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
-    g_sbLayer[SB_B_STROKE] = shape;
-    g_sbLayerPath[SB_B_STROKE] = persistentPath();
 
-    // Three filled layers for the three health bar colours. Fill only, no stroke:
-    // the bar is a solid two point wide rectangle, and stroking it as well is what
-    // made it look like a hollow outline before, because the rectangle reached a
-    // layer whose fillColor was nil.
-    {
-        double hpCol[3][4] = {
-            { 0.10, 1.00, 0.10, 1.00 },   // healthy, over 150
-            { 1.00, 0.65, 0.00, 1.00 },   // hurt, 75 to 150
-            { 1.00, 0.10, 0.10, 1.00 },   // critical, under 75
-        };
-        const int hpBucket[3] = { SB_B_HPGREEN, SB_B_HPORANGE, SB_B_HPRED };
-        for (int i = 0; i < 3; i++) {
-            uint64_t c = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
-                                         &hpCol[i][0], 8, &hpCol[i][1], 8,
-                                         &hpCol[i][2], 8, &hpCol[i][3], 8);
-            uint64_t cg = r_is_objc_ptr(c) ? r_msg2_main(c, "CGColor", 0,0,0,0) : 0;
-            uint64_t L = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-            if (!r_is_objc_ptr(L)) continue;
-            r_msg2_main_raw(L, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-            if (r_is_objc_ptr(cg)) r_msg2_main(L, "setFillColor:", cg, 0,0,0);
-            r_msg2_main(L, "setStrokeColor:", 0, 0,0,0);
-            r_msg2_main(L, "setOpaque:", 0, 0,0,0);
-            // Same z as the outline, added after it, so a bar always sits on top of
-            // the box edge it is attached to instead of under it.
-            double z2 = 100;
-            r_msg2_main_raw(L, "setZPosition:", &z2, 8, NULL,0,NULL,0,NULL,0);
-            sb_disable_layer_actions(L);
-            g_sbLayer[hpBucket[i]] = L;
-        }
-        NSLog(@"[SB-COLOR] layers stroke=%d hpG=%d hpO=%d hpR=%d",
-              (int)r_is_objc_ptr(g_sbLayer[SB_B_STROKE]),
-              (int)r_is_objc_ptr(g_sbLayer[SB_B_HPGREEN]),
-              (int)r_is_objc_ptr(g_sbLayer[SB_B_HPORANGE]),
-              (int)r_is_objc_ptr(g_sbLayer[SB_B_HPRED]));
-    }
-
+    // Read the width straight back out of SpringBoard's own CALayer. This is the
+    // most direct measurement available: it is the exact call the overlay depends
+    // on for its stroke weight, and the read uses getReturnValue: into a target
+    // buffer followed by remote_read, which is the same read path already proven
+    // good by the colour test. No reinterpretation and no colour space involved.
+    //
+    // The sentinel is minus one, so a value of 0.00 is a real zero and minus one
+    // means the read did not happen.
+    double lwBack = -1.0;
+    bool lwOK = r_msg2_main_struct_ret(shape, "lineWidth", &lwBack, 8,
+                                       NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    NSLog(@"[SB-COLOR] lw want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
     sb_disable_layer_actions(shape);
 
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(cLayer)) {
-        r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
-        // Health bar layers go on after the outline so they draw above it.
-        for (int i = 1; i < SB_BUCKETS; i++) {
-            if (r_is_objc_ptr(g_sbLayer[i])) {
-                r_msg2_main(cLayer, "addSublayer:", g_sbLayer[i], 0,0,0);
-            }
-        }
-    }
+    if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
@@ -931,8 +992,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 return;
             }
             // Retire the path that fell out of the hold window, not the one the
-            // previous present used. The health bar paths rotate through their own
-            // ring below, and only when their bucket is actually used.
+            // previous present used.
             if (g_sbPathRing[g_sbPathRingAt]) {
                 dlsym_remote("CGPathRelease", g_sbPathRing[g_sbPathRingAt], 0,0,0,0,0,0,0);
                 g_sbPathRing[g_sbPathRingAt] = 0;
@@ -941,27 +1001,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             g_sbPathRingAt = (g_sbPathRingAt + 1) % SB_PATH_HOLD_FRAMES;
             rp = freshPath;
             g_sbPersistentPath = freshPath;
-            g_sbLayerPath[SB_B_STROKE] = freshPath;
-            // The bar paths are invalidated here rather than rotated. Allocating
-            // three more every frame is not affordable at the measured cost: the
-            // device log reports ms=5 to 11 for calls=2, which is about 2.5 ms per
-            // remote call, so three extra allocations and three extra releases per
-            // frame would roughly double the frame time for buckets that are
-            // usually empty. sb_bucket_path recreates on demand instead, so an
-            // unused colour costs nothing and a used one costs one create and one
-            // release.
-            for (int k = 1; k < SB_BUCKETS; k++) g_sbLayerPath[k] = 0;
 
             // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
             // are flushed in several CGPathAddRects calls rather than overrun it.
             double rectBuf[512];
             int rectDoubles = 0;
-            // Which bucket the pending rectBuf entries belong to. rectBuf is
-            // batched across subpaths, so it has to be flushed the moment the
-            // bucket changes or a health bar rectangle ends up inside the white
-            // outline layer, which is the exact bug this split exists to fix.
-            int rectBucket = -1;
             // A subpath far larger than any real shape means the stream handed
             // us points belonging to more than one shape, which is what draws a
             // line across the screen. Recorded rather than assumed.
@@ -1021,31 +1066,6 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // addLines with count=1, which renders nothing).
                 if (rn < 4) continue;
                 subpaths++;
-
-                // Where this subpath is drawn. The stream already says which of the
-                // app's sixteen layers it came from, and nine, ten and eleven are
-                // the three health bar colours, so the bar can have a fill colour
-                // of its own instead of being stroked like an outline.
-                //
-                // rectBuf is batched across subpaths into one CGPathAddRects, so
-                // the pending rectangles have to be flushed before the target
-                // changes. Without that a bar rectangle joins the white outline
-                // batch, which is the same hollow bar this split removes.
-                const int bucket = sb_bucket(curLayer);
-                uint64_t rpSub = rp;
-                if (bucket != SB_B_STROKE) {
-                    rpSub = sb_bucket_path(bucket, &calls);
-                    if (!rpSub) continue;   // allocation failed, drop this subpath
-                    g_sbLayerDirty[bucket] = 1;
-                    if (rectDoubles >= 4 && rectBucket != bucket) {
-                        remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                        dlsym_remote("CGPathAddRects", g_sbLayerPath[rectBucket],
-                                     0, ptsBuf, rectDoubles / 4, 0, 0, 0, 0);
-                        calls++; drawn++;
-                        rectDoubles = 0;
-                    }
-                    if (rectDoubles == 0) rectBucket = bucket;
-                }
 
                 const int np = rn / 2;
                 if (np > maxPts) maxPts = np;
@@ -1161,13 +1181,13 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // calls each and took the frame from 15 calls to 115.
                         if (curLayer >= 6 && curLayer <= 8) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rpSub, 0, ptsBuf, 2, 0,0,0,0);
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
                             calls++; drawn++;
                         }
 #if SB_DRAW_BONES
                         else if (curLayer >= 3 && curLayer <= 5) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rpSub, 0, ptsBuf, 2, 0,0,0,0);
+                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
                             calls++; drawn++;
                         }
 #endif
@@ -1177,7 +1197,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 if (isRect) {
                     if (rectDoubles + 4 > (int)(sizeof(rectBuf)/sizeof(rectBuf[0]))) {
                         remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                        dlsym_remote("CGPathAddRects", rpSub, 0, ptsBuf,
+                        dlsym_remote("CGPathAddRects", rp, 0, ptsBuf,
                                      rectDoubles / 4, 0, 0,0,0);
                         calls++; drawn++;
                         rectDoubles = 0;
@@ -1200,29 +1220,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // never join: that is what the old single-polyline version got
                 // wrong and produced chords across the screen.
                 remote_write(ptsBuf, run, (size_t)rn * 8);
-                dlsym_remote("CGPathAddLines", rpSub, 0, ptsBuf, np, 0,0,0,0);
+                dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, np, 0,0,0,0);
                 calls++; drawn++;
             }
 
             if (rectDoubles >= 4) {
-                uint64_t rpr = (rectBucket >= 0) ? g_sbLayerPath[rectBucket] : rp;
                 remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                dlsym_remote("CGPathAddRects", rpr, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
+                dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++; drawn++;
-            }
-
-            // Push the outline path, then only the bar layers that got geometry.
-            // A bucket with no bars this frame is not given a new path, so an empty
-            // colour costs no remote call at all and an unused layer keeps whatever
-            // it already had rather than being cleared.
-            sb_invoke_cached_main_raw();
-            for (int k = 1; k < SB_BUCKETS; k++) {
-                if (!g_sbLayerDirty[k]) continue;
-                if (r_is_objc_ptr(g_sbLayer[k]) && g_sbLayerPath[k]) {
-                    r_msg2_main_async(g_sbLayer[k], "setPath:", g_sbLayerPath[k], 0, 0, 0);
-                    calls++;
-                }
-                g_sbLayerDirty[k] = 0;
             }
 
             if (drawn > 0) {
