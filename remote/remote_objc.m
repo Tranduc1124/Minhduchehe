@@ -274,7 +274,54 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
         memcpy(localBuf, arg, copySize);
     }
 
-    bool ok = remote_write(remoteBuf, localBuf, remoteSize);
+    // remote_write goes through the vm_map_entry hijack, so it can silently land
+    // in a stale alias and leave the target's real page untouched, and the file
+    // says so at the top of this one. This function called it exactly once and
+    // trusted the return, so a write that went nowhere looked identical to a write
+    // that worked.
+    //
+    // The device log separated the two. A colour built from four doubles for
+    // 0,1,0,1 came back as a valid UIColor with a valid CGColor, and reading the
+    // components out of SpringBoard gave 0,0,0,0 rather than the -1 the sentinel
+    // starts at. A read that fails leaves the sentinel, so remote_read works and
+    // the target genuinely holds zeros. The write is the half that never arrived.
+    // The argument was then handed to setArgument:atIndex:, which is a pointer to
+    // bytes the target never received, so the selector ran on zeroes.
+    //
+    // r_alloc_str in this same file already had the answer for the string case:
+    // clear the cache, retry, and verify by reading the target's own bytes back.
+    // This does the same, comparing the value rather than a length, so a CGFloat
+    // is checked as well as a C string.
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        remote_clear_shmem_cache();
+        if (!remote_write(remoteBuf, localBuf, remoteSize)) continue;
+
+        uint8_t vstack[64];
+        void *vbuf = vstack;
+        void *vheap = NULL;
+        if (remoteSize > sizeof(vstack)) {
+            vheap = calloc(1, remoteSize);
+            if (!vheap) break;
+            vbuf = vheap;
+        }
+        bool match = remote_read(remoteBuf, vbuf, remoteSize) &&
+                     memcmp(vbuf, localBuf, remoteSize) == 0;
+        if (vheap) free(vheap);
+        if (match) { ok = true; break; }
+        // Only reached when the target did not receive the bytes. Logged once
+        // per distinct buffer so a persistent failure is visible in the device
+        // log instead of showing up later as a colour or a size that silently
+        // came out wrong.
+        static uint64_t s_lastWarned = 0;
+        if (remoteBuf != s_lastWarned) {
+            s_lastWarned = remoteBuf;
+            NSLog(@"[RemoteObjC] remote_write did not reach target buf=0x%llx size=%zu "
+                  "after %d attempts", (unsigned long long)remoteBuf, remoteSize,
+                  attempt + 1);
+        }
+    }
+
     if (localBuf != stackBuf) free(localBuf);
     return ok;
 }
@@ -458,7 +505,9 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
             continue;
         }
         argBufs[i] = argBuf;
-        if (remote_write64(argBuf, userArgs[i])) {
+        // Same verified writer as the other two sites, so a stale alias is
+        // retried here too rather than becoming a silent zero pointer.
+        if (r_write_remote_arg(argBuf, &userArgs[i], sizeof(userArgs[i]), 8)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
