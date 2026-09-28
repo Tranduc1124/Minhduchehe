@@ -288,6 +288,15 @@ static void serFunc(void *info, const CGPathElement *e) {
 // through the same field later, and 31 bytes covers a short name without
 // letting one label overrun the buffer the decoder copies into.
 #define SB_TEXT_MAX 31
+
+// The counter label's own size and offset, in the app's landscape space. The
+// label carries the path rotation as its transform, so these are its bounds,
+// not its on-screen footprint. They are defined once because the position sent
+// per frame is derived from them, and two copies of the same number is how the
+// label ends up sized one thing and positioned as another.
+#define SB_COUNT_W   90.0
+#define SB_COUNT_H   34.0
+#define SB_COUNT_TOP 25.0
 static uint64_t g_sbCountLabel   = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
@@ -408,16 +417,37 @@ static void sb_make_count_label(uint64_t container) {
         if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0, 0, 0);
     }
 
+    // Size first, while the transform is still identity, so setFrame: means what
+    // it says.
+    //
+    // This is the whole reason nothing appeared. A CALayer draws nothing at all
+    // with zero bounds, and setPosition: alone never gives it any: position is
+    // where the layer is, bounds is how big it is, and only bounds was ever set
+    // on this label. The frame log confirmed the mechanism was running, txt=1 on
+    // every publish and calls unchanged at 2 and 10, so the text was being set
+    // into a label with no area to draw it in.
+    double frame[4] = { 0.0, 0.0, SB_COUNT_W, SB_COUNT_H };
+    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
+                   NULL, 0, NULL, 0, NULL, 0);
+
     // The rotation that puts the label in the same space the path is in.
     double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
     r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
                    NULL, 0, NULL, 0, NULL, 0);
 
     r_msg2_main(container, "addSubview:", label, 0, 0, 0);
-    r_msg2_main(label, "setHidden:", 1, 0, 0, 0);
+
+    // Read the size straight back out of SpringBoard's own CALayer, the same way
+    // lineWidth was verified, so "the label has an area" is a measured fact and
+    // not an assumption. The sentinel is minus one, so a real zero is
+    // distinguishable from a read that did not happen.
+    double bBack[4] = { -1.0, -1.0, -1.0, -1.0 };
+    const bool bOK = r_msg2_main_struct_ret(label, "bounds", bBack, sizeof(bBack),
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    NSLog(@"[SB-LABEL] counter label=0x%llx created bounds=%.1f,%.1f %.1fx%.1f ok=%d",
+          label, bBack[0], bBack[1], bBack[2], bBack[3], (int)bOK);
 
     g_sbCountLabel = label;
-    NSLog(@"[SB-LABEL] counter label=0x%llx created", label);
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
@@ -475,8 +505,8 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         char num[8];
         const int n = snprintf(num, sizeof(num), "%d", enemyCount);
         if (n > 0 && n <= SB_TEXT_MAX) {
-            const double w = 80.0, h = 29.0;
-            const double px = ctx.landH - 25.0 - h * 0.5;
+            const double w = SB_COUNT_W, h = SB_COUNT_H;
+            const double px = ctx.landH - SB_COUNT_TOP - h * 0.5;
             const double py = ctx.landW * 0.5;
             uint8_t top = 5;
             uint8_t slen = (uint8_t)n;
