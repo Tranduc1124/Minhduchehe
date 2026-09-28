@@ -191,12 +191,24 @@ static uint64_t g_sbTFlush = 0;
 // Publishes completed since the session opened, so the log can cover the first
 // few (where the 22x cold/ warm ratio showed up) and then stay quiet.
 static uint64_t g_sbPubIndex = 0;
-// A publish slower than this is logged whatever its index: the two 671/784 ms
-// frames are the ones that stall SpringBoard's main thread, and they are worth
-// seeing whenever they happen, not only at session start.
-static const uint64_t SB_CALL_SLOW_US = 100000ULL;
+// A publish slower than this is logged whatever its index.
+//
+// It was 100000, which meant the split only ever printed for the two 671/784
+// ms frames at session start. The device log for 2026-09-28 22:13:42 onwards
+// shows the steady state is 11-33 ms per publish at 27-46 publishes a second,
+// with 7-91 frames dropped per second, so every publish that matters was
+// below the threshold and the five-way split was never printed for any of
+// them. The split is the only measurement that says which group spends the
+// time, so it has to be printed in the range the overlay actually runs in.
+//
+// 8000 us is one 8x frame period: anything a publish costs beyond that is the
+// part of the frame period it is stealing.
+static const uint64_t SB_CALL_SLOW_US = 8000ULL;
 // Log the first this many publishes unconditionally.
 static const uint64_t SB_CALL_FIRST_N = 3;
+// At most this many [SB-NP] lines per publish, so the per-call dump cannot
+// bury the [SB-CALL] line that summarises it.
+static const int SB_NP_MAX_LINES = 5;
 
 // Per call record for the geometry loop, so the question "is a call expensive,
 // or is a call with many points expensive" has an answer from the device
@@ -2654,8 +2666,17 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         // Only on a slow publish, and only the calls that
                         // actually cost something: a whole frame of 23 records
                         // is 23 lines, and the cheap ones answer nothing.
+                        // SB_NP_MAX_LINES caps the per-call dump. The threshold
+                        // is now low enough that most publishes qualify, and a
+                        // publish can hold twenty records over 1 ms, so an
+                        // uncapped loop would bury the [SB-CALL] line it is
+                        // supposed to explain. The worst few name the cost, and
+                        // the total is in the [SB-CALL] line anyway.
+                        int npPrinted = 0;
                         for (int i = 0; i < g_sbNpCount; i++) {
                             if (g_sbNpUS[i] < 1000ULL) continue;   // under 1 ms
+                            if (npPrinted >= SB_NP_MAX_LINES) break;
+                            npPrinted++;
                             NSLog(@"[SB-NP] pub=%llu i=%d kind=%d arg=%u us=%llu "
                                   @"bytes=%llu",
                                   (unsigned long long)g_sbPubIndex, i,
