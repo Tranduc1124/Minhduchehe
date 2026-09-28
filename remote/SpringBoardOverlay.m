@@ -559,6 +559,12 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role, int slot) {
     }
 
     r_msg2_main(container, "addSubview:", label, 0, 0, 0);
+    // A pooled label is born hidden. A UILabel is visible by default, and the
+    // pool is made before the first frame, so a label that has not been given a
+    // position yet would be sitting at the origin waiting for one. It has no
+    // bounds and no text at that point so it draws nothing, but it is one more
+    // thing that has to be true rather than one fewer.
+    r_msg2_main(label, "setHidden:", 1, 0, 0, 0);
     return label;
 }
 
@@ -919,8 +925,22 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         const uint64_t nowS = now_us();
         if (nowS > s_txtLogUS) {
             s_txtLogUS = nowS + 1000000ULL;
+            // A label that is shown but not claimed is a label whose pawn is
+            // gone and whose hide has not happened, which is the stuck name. It is
+            // named here, with the pawn it still thinks it belongs to and the last
+            // position it was given, so the two cases can be told apart: a key that
+            // belongs to nobody, or a key that belongs to a pawn which is somehow
+            // still sending names.
             int shownNow = 0;
-            for (int k = 0; k < SB_LABEL_MAX; k++) if (g_sbLabelShown[k]) shownNow++;
+            for (int k = 0; k < SB_LABEL_MAX; k++) {
+                if (!g_sbLabelShown[k]) continue;
+                shownNow++;
+                if (g_sbLabelClaimed[k]) continue;
+                NSLog(@"[SB-STUCK] slot=%d key=0x%llx pos=%.1f,%.1f text=%s",
+                      k, (unsigned long long)g_sbLabelKey[k],
+                      g_sbLabelLastPos[k][0], g_sbLabelLastPos[k][1],
+                      g_sbLabelLastText[k]);
+            }
             NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d made=%d claimed=%d shown=%d high=%d "
                   @"landW=%.0f landH=%.0f bytes=%lu emitted=%d",
                   (int)r_is_objc_ptr(g_sbCountLabel), enemyCount,
