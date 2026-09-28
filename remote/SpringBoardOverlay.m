@@ -2705,12 +2705,19 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                 s_prevUpdUS = tU;
                             }
                         }
-                        NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
+                        // tid is the thread that actually runs the publish. The
+                        // 21:08:39 stackshot shows two SpringBoard threads
+                        // turnstile-blocked on the app task; without this the
+                        // publish log cannot be tied to either of them.
+                        const uint32_t sbPubTid =
+                            (uint32_t)pthread_mach_thread_np(pthread_self());
+                        NSLog(@"[SB-PUSH] tid=%u sub=%u rect=%u limb=%u calls=%llu ms=%llu "
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
                               @"mergedSub=%u trunc=%u txt=%u cards=%u cardOps=%u "
                               @"wait=%llums work=%llums",
+                              sbPubTid,
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,

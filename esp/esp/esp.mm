@@ -19,6 +19,7 @@
 #include <cmath>
 #include <float.h>
 #import <mach/mach.h>
+#include <pthread.h>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -3163,6 +3164,21 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // Runs before every early return below, so the log always carries the
         // gate state even when the render path bails out immediately.
         ESPDiagHeartbeat();
+
+        // Which thread draws, 1 Hz. The 21:08:39 stackshot has the app's
+        // com.apple.main-thread busy in the kernel while SpringBoard's main
+        // thread is turnstile-blocked on this task, so the draw thread has to
+        // be named before the lock holder can be identified.
+        {
+            static CFTimeInterval s_lastTidLog = 0;
+            if (now - s_lastTidLog > 1.0) {
+                s_lastTidLog = now;
+                NSLog(@"[PUSH][TID] draw tid=%u attached=%d pid=%d base=0x%llx",
+                      (uint32_t)pthread_mach_thread_np(pthread_self()),
+                      ds_attached() ? 1 : 0, ds_pid(),
+                      (unsigned long long)Moudule_Base);
+            }
+        }
         
         // Color / thickness: use synced globals most frames. Re-read prefs only while
         // rainbow is on or ~8×/s so RGB picker still feels live without 16 prefs
