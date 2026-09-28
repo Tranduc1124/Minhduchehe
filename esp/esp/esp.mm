@@ -3096,8 +3096,11 @@ static void ESPDiagHeartbeat(void) {
     // UIKit, so the text is measured once per string and only when the string
     // changed.
     if (role == ESPTextRoleName || role == ESPTextRoleDistance) {
-        UIFont *f = [UIFont fontWithName:fontNameStr size:fontSize]
-                 ?: [UIFont boldSystemFontOfSize:fontSize];
+        // Measured with the font the SpringBoard label actually uses, which is
+        // boldSystemFontOfSize. Measuring with the layer's own font name gives a
+        // different width for the same string, and the two disagreeing is what
+        // made the text spill out of its own card.
+        UIFont *f = [UIFont boldSystemFontOfSize:fontSize];
         if (f) {
             const CGSize sz = [text sizeWithAttributes:@{NSFontAttributeName: f}];
             if (sz.width > 1.0) {

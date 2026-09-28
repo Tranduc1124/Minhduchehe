@@ -320,17 +320,20 @@ static void ESPRenderPawnCore(
             // layer carries the paint, so a filled shape needs a layer whose fill
             // is set. That is one extra layer, and CGPathAddRects draws every
             // card in the frame in a single call however many there are.
+            // One size, and the same font the overlay's label uses: the
+            // SpringBoard label sets boldSystemFontOfSize:11, so measuring with
+            // anything else makes the card and the text disagree.
+            const CGFloat nameFS = 11.0f;
             const CGFloat padX = 6.0f;
-            const CGFloat cardH = dynFontSize + 6.0f;
-            const CGFloat cardTop = y - dynFontSize - 8.0f;
+            const CGFloat cardH = nameFS + 6.0f;
+            const CGFloat cardTop = y - nameFS - 8.0f;
 
-            UIFont *f = [UIFont fontWithName:NSSENCRYPT("arialbd") size:dynFontSize]
-                     ?: [UIFont boldSystemFontOfSize:dynFontSize];
+            UIFont *f = [UIFont boldSystemFontOfSize:nameFS];
             CGFloat nameW = 0.0f;
             if (f) {
                 nameW = ceil([dispName sizeWithAttributes:@{NSFontAttributeName: f}].width);
             }
-            if (nameW < 1.0f) nameW = dynFontSize * 4.0f;
+            if (nameW < 1.0f) nameW = nameFS * 4.0f;
 
             CGPathAddRect(buffers->cardPath, NULL,
                           CGRectMake(centerX - nameW * 0.5f - padX, cardTop,
@@ -340,7 +343,7 @@ static void ESPRenderPawnCore(
             if (textCallback) {
                 textCallback(callbackContext, dispName, ESPTextRoleName,
                              CGRectMake(centerX - 100.0f, cardTop, 200.0f, cardH),
-                             [UIColor whiteColor], dynFontSize, NO);
+                             [UIColor whiteColor], nameFS, NO);
             }
         }
     }

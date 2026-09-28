@@ -313,6 +313,11 @@ static void serFunc(void *info, const CGPathElement *e) {
 // is its own background, so the card is free once the label exists. The
 // distance label sits under the feet with a clear background, so the two look
 // different without a second layer or a second path.
+// The name font size, shared by the app's measurement and by the label that
+// draws the text. It used to be a distance scaled clamp from 4.5 to 10 points,
+// which is unreadable at the bottom of that range and is what the overlay and the
+// card were each independently scaling around.
+#define SB_NAME_FONT_SIZE 11.0
 #define SB_CARD_RADIUS 4.0
 #define SB_CARD_R      0.16
 #define SB_CARD_G      0.16
@@ -465,6 +470,29 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     r_msg2_main(label, "setUserInteractionEnabled:", 0, 0, 0, 0);
     r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);      // centre
     r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
+
+    // The font, which this label was never given.
+    //
+    // Without it a UILabel draws at the system default, around seventeen points,
+    // whatever size the app measured the name at. The app measures with an eight
+    // point font, the card is drawn to that measurement, and the label then paints
+    // twice the size inside it, so the text spills out sideways and reads as a
+    // wide banner stuck to the pawn. The counter label has always set its own font
+    // explicitly and has always looked right, which is why only the names did it.
+    //
+    // One font for every pooled label, set once at creation, because every pooled
+    // label is a name now that the distance is held back. The app uses the same
+    // size for its measurement, so card and text agree by construction.
+    {
+        uint64_t UIFont = r_class("UIFont");
+        if (r_is_objc_ptr(UIFont)) {
+            double fs = SB_NAME_FONT_SIZE;
+            uint64_t font = r_msg_main_raw(UIFont, r_sel("boldSystemFontOfSize:"),
+                                           &fs, 8, NULL, 0, NULL, 0, NULL, 0);
+            if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0, 0, 0);
+        }
+        r_msg2_main(label, "setAdjustsFontSizeToFitWidth:", 0, 0, 0, 0);
+    }
 
     uint64_t UIColor = r_class("UIColor");
     // No background here any more. The card is a filled rectangle in the fill
