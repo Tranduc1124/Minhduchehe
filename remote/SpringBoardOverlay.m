@@ -338,6 +338,11 @@ static void serFunc(void *info, const CGPathElement *e) {
 // How many exist before the first frame. See where they are made.
 #define SB_LABEL_PRESPAWN 6
 
+// How many label updates go by between two label position pushes. See the block
+// in sb_pooled_label_update.
+#define SB_LABEL_MOVE_EVERY 3
+static unsigned g_sbLabelFrame = 0;
+
 // Per-pawn labels. A name label is a rounded grey card with white text, which is
 // what the request asked for and it costs nothing extra: a UILabel's background
 // is its own background, so the card is free once the label exists. The
@@ -712,6 +717,16 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
 
     if (px == g_sbLabelLastPos[idx][0] && py == g_sbLabelLastPos[idx][1]) {
         // Position unchanged, which is the common case when the camera is parked.
+    } else if (++g_sbLabelFrame % SB_LABEL_MOVE_EVERY != 0) {
+        // A moving pawn changes its label position on every single frame, and
+        // each of those is a block queued onto SpringBoard's main thread. Four
+        // labels at thirty publishes a second is three hundred and sixty blocks a
+        // second to drain for text that is static, only anchored to a head that
+        // is already moving on screen.
+        //
+        // One in three is twenty label positions a second for a name tag, which
+        // is not a thing anyone can see, and it takes the pressure off the one
+        // queue that can no longer be drained by waiting.
     } else if (sb_pooled_pos_invocation(idx)) {
         double p[2] = { px, py };
         remote_write(g_sbLabelPosBuf[idx], p, sizeof(p));
@@ -1208,36 +1223,28 @@ static void sb_invoke_cached_main_raw(void) {
     }
     remote_write64(g_sbSetPathArgBuf, persistentPath());
     r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
-    // waitUntilDone:YES.
+    // waitUntilDone:NO, always, and never wait on the main thread again.
     //
-    // It was NO, so presents were queued without limit. The frame rate is capped
-    // at about sixty publishes a second and SpringBoard's main thread does about
-    // sixty turns a second, so publishing slightly faster than the main thread
-    // drains grows the queue without bound. Nothing showed it directly until a
-    // label was created: creating one needs r_msg_main_raw, which itself
-    // presents with waitUntilDone:YES, and that call has to wait for the entire
-    // backlog ahead of it. Six hundred to eight hundred millisecond frames, with
-    // a rate of two, appearing only on the frames that created a label.
+    // It was YES, and that is what killed the device. The watchdog report is
+    // unambiguous: com.apple.main-thread unresponsive, sixty seconds without a
+    // successful checkin, and the main thread parked in a mach_msg receive with
+    // a turnstile block on the app's task. A hang, not a slow frame.
     //
-    // Waiting here costs this thread a main thread turn per frame, which caps
-    // the rate at what the main thread can actually do and makes it steady. The
-    // wait is on this side, not on SpringBoard's, so the thing that used to
-    // freeze was never the thing being waited on.
+    // The deadlock is ours. do_remote_call hijacks a thread from the target to
+    // run a call, and the main thread is the thread it is most willing to take.
+    // Code running on a hijacked main thread that then performs on the main
+    // thread waits for a message that only the main thread could deliver, and
+    // the main thread is busy being the thing that is waiting. The result is a
+    // main thread that never returns to its runloop, and backboardd kills
+    // SpringBoard.
+    //
+    // A growing queue is a slow overlay. A deadlocked main thread is no system.
+    // When both were on the table the queue won and the device restarted, so the
+    // queue is bounded the other way instead: nothing waits, and the per frame
+    // label updates are decimated so there are far fewer blocks to drain.
     if (g_sbPerformMainSel && g_sbInvokeSel) {
-        // This one call, timed on its own, is the whole question.
-        //
-        // ms varies by a factor of nine between frames that make the same number
-        // of calls: thirteen milliseconds one frame, a hundred and seventeen the
-        // next, both at calls=14. A fixed cost per call cannot do that. So the
-        // spread is either the work or the wait, and they call for opposite
-        // fixes: less work means fewer subpaths, while a wait that costs sixty
-        // milliseconds means the rate is capped by SpringBoard's main thread and
-        // no amount of drawing discipline will raise it.
-        //
-        // g_sbLastWaitUS is that one call. g_sbLastWorkUS is the rest of the
-        // publish. Read them against ms and the answer needs no argument.
         const uint64_t tWait = now_us();
-        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 1, 0);
+        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
         g_sbLastWaitUS = now_us() - tWait;
     }
 }
