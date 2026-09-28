@@ -177,13 +177,6 @@ static void ESPRenderPawnCore(
 
     float worldHeight = fabsf(HeadPos.y - RightToePos.y);
 
-    Vector3 L_Ankle      = getPositionExt(getLeftAnkle(PawnObject));
-    Vector3 R_Ankle      = getPositionExt(getRightAnkle(PawnObject));
-    Vector3 L_ForeArm    = getPositionExt(getLeftElbow(PawnObject));
-    Vector3 R_ForeArm    = getPositionExt(getRightElbow(PawnObject));
-    Vector3 L_Hand       = getPositionExt(getLeftHand(PawnObject));
-    Vector3 R_Hand       = getPositionExt(getRightHand(PawnObject));
-
     Vector3 HeadTop = HeadPos; HeadTop.y += 0.2f;
     Vector3 w2sHead    = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
     Vector3 w2sToe     = WorldToScreenLayer(RightToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
@@ -238,45 +231,18 @@ static void ESPRenderPawnCore(
     float centerX = x + boxWidth * 0.5f;
 
     // ---------------------------------------------------------
-    // BONE
+    // BONE — bỏ hẳn.
+    //
+    // Một người là 13 đoạn xương, mỗi đoạn là một CGPathAddLines riêng vì
+    // các đoạn không liền nhau. Đó là 13 remote call cho mỗi người, và log
+    // 13:32 ghi rõ sub=69 limb=56 calls=67: gần như toàn bộ khung hình là
+    // xương. Bỏ xương không chỉ cho đúng ngoại hình, nó cắt số call mà
+    // không thay đổi bất cứ thứ gì khác.
+    //
+    // Sáu lần đọc bộ nhớ lấy khớp tay chân cũng đi cùng, vì chúng chỉ tồn
+    // tại cho hình xương. Không có chúng thì khung hình đọc ít đi sáu địa
+    // chỉ mỗi người mỗi lần vẽ, ở một vòng lặp đang chạy 30 lần giây.
     // ---------------------------------------------------------
-    if (isBone) {
-        Vector3 wHead   = WorldToScreenLayer(HeadPos,   matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLE     = WorldToScreenLayer(L_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRE     = WorldToScreenLayer(R_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLH     = WorldToScreenLayer(L_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRH     = WorldToScreenLayer(R_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLA     = WorldToScreenLayer(L_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRA     = WorldToScreenLayer(R_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLT     = w2sLeftToe;
-        Vector3 wRT     = w2sToe;
-
-        CGPoint pHead = CGPointMake(wHead.x, wHead.y);
-        CGPoint pHip  = CGPointMake(w2sHip.x,  w2sHip.y);
-        CGPoint pNeck = CGPointMake(pHead.x + (pHip.x - pHead.x) * 0.15f, pHead.y + (pHip.y - pHead.y) * 0.15f);
-        CGPoint pLE = CGPointMake(wLE.x, wLE.y);
-        CGPoint pRE = CGPointMake(wRE.x, wRE.y);
-        CGPoint pLS = CGPointMake(pNeck.x + (pLE.x - pNeck.x) * 0.3f, pNeck.y + (pLE.y - pNeck.y) * 0.3f);
-        CGPoint pRS = CGPointMake(pNeck.x + (pRE.x - pNeck.x) * 0.3f, pNeck.y + (pRE.y - pNeck.y) * 0.3f);
-        CGPoint pLH = CGPointMake(wLH.x, wLH.y);
-        CGPoint pRH = CGPointMake(wRH.x, wRH.y);
-        CGPoint pLK = CGPointMake(pHip.x + (wLA.x - pHip.x) * 0.45f, pHip.y + (wLA.y - pHip.y) * 0.45f);
-        CGPoint pRK = CGPointMake(pHip.x + (wRA.x - pHip.x) * 0.45f, pHip.y + (wRA.y - pHip.y) * 0.45f);
-        CGPoint pLA = CGPointMake(wLA.x, wLA.y);
-        CGPoint pRA = CGPointMake(wRA.x, wRA.y);
-        CGPoint pLT = CGPointMake(wLT.x, wLT.y);
-        CGPoint pRT = CGPointMake(wRT.x, wRT.y);
-
-        CGFloat headToHip = fabs(pHead.y - pHip.y);
-        CGFloat headRadius = fmaxf(headToHip / 4.5f, 1.0f);
-        ESPAddCircle(buffers->bonePath, CGPointMake(pHead.x, pHead.y - headRadius * 0.5f), headRadius);
-        ESPAddLine(buffers->bonePath, pNeck, pHip);
-        ESPAddLine(buffers->bonePath, pNeck, pLS); ESPAddLine(buffers->bonePath, pLS, pLE); ESPAddLine(buffers->bonePath, pLE, pLH);
-        ESPAddLine(buffers->bonePath, pNeck, pRS); ESPAddLine(buffers->bonePath, pRS, pRE); ESPAddLine(buffers->bonePath, pRE, pRH);
-        ESPAddLine(buffers->bonePath, pHip, pLK); ESPAddLine(buffers->bonePath, pLK, pLA); ESPAddLine(buffers->bonePath, pLA, pLT);
-        ESPAddLine(buffers->bonePath, pHip, pRK); ESPAddLine(buffers->bonePath, pRK, pRA); ESPAddLine(buffers->bonePath, pRA, pRT);
-        buffers->boneDirty = true;
-    }
 
     // ---------------------------------------------------------
     // WEAPON
@@ -345,27 +311,31 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // THANH MÁU
+    // THANH MÁU — ngang, nằm trên đỉnh đầu, một màu.
+    //
+    // Trước đây là một thanh dọc 2pt bám bên trái box, chia ba đoạn màu
+    // theo lượng máu. Cả ba điều đó sai với yêu cầu: nó dọc chứ không
+    // ngang, nó không nằm trên đầu, và ba màu là ba layer riêng trong khi
+    // SpringBoard chỉ có một CAShapeLayer nên tất cả đều bị gộp về một màu
+    // viền duy nhất. Ba layer cho ba màu là ba lần present để rồi không
+    // thấy màu nào cả.
+    //
+    // Nên còn một đường, một màu. Thanh là hình chữ nhật nên decoder ở
+    // SpringBoard nhận ra bốn góc và gom vào CGPathAddRects, tức nó tốn
+    // đúng một call bất kể có bao nhiêu người trên màn hình.
+    //
+    // Cao 2.5pt với nét 0.75 nên hai cạnh trên dưới của nét vẽ trùng lên
+    // nhau: trên một layer chỉ có nét vẽ, thanh vẫn ra là dải đặc chứ không
+    // phải khung rỗng.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barWidth = 2.0f;
+        const CGFloat barH = 2.5f;
+        const CGFloat barGap = 1.5f;
 
-        CGFloat barX = x - barWidth - 1.0f;
-        CGFloat barHeight = boxHeight;
-        CGFloat filledTop = y + barHeight - (barHeight * healthRatio);
-
-        CGRect fillRect = CGRectMake(barX, filledTop, barWidth, barHeight * healthRatio);
-        if (CurHP >= 150) {
-            CGPathAddRect(buffers->hpFillGreenPath, NULL, fillRect);
-            buffers->hpFillGreenDirty = true;
-        } else if (CurHP >= 75) {
-            CGPathAddRect(buffers->hpFillOrangePath, NULL, fillRect);
-            buffers->hpFillOrangeDirty = true;
-        } else if (CurHP > 0) {
-            CGPathAddRect(buffers->hpFillRedPath, NULL, fillRect);
-            buffers->hpFillRedDirty = true;
-        }
+        CGRect fillRect = CGRectMake(x, y - barH - barGap, boxWidth * healthRatio, barH);
+        CGPathAddRect(buffers->hpFillGreenPath, NULL, fillRect);
+        buffers->hpFillGreenDirty = true;
     }
 }
 

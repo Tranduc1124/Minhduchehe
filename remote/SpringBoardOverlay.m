@@ -811,16 +811,21 @@ int SBoardStartOverlay(void) {
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    // Green, so the answer is on the screen instead of in a log line that has now
-    // been wrong four times. If the ESP draws green then the four double arguments
-    // reached SpringBoard and the whole colour path is settled, and the remaining
-    // problem with the overlay is that it is one layer and therefore has no fill,
-    // which is a design limit rather than a transport fault.
-    if (r_is_objc_ptr(greenCGColor)) r_msg2_main(shape, "setStrokeColor:", greenCGColor, 0,0,0);
-    NSLog(@"[SB-COLOR] green=%d cg=%d", (int)r_is_objc_ptr(greenColor),
-          (int)r_is_objc_ptr(greenCGColor));
+    // White. It was green, and that was deliberate: commit 69cab125 set the
+    // stroke to green as a one-round proof that four CGFloat arguments survive
+    // the crossing, so the colour could be read off the screen instead of off a
+    // log line that had already been wrong four times. The proof was made and
+    // the diagnostic was never taken back down, so the overlay has been drawing
+    // green ever since. The requested ESP is monochrome white.
+    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] white=%d cg=%d", (int)r_is_objc_ptr(whiteColor),
+          (int)r_is_objc_ptr(whiteCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
-    double lw = 1.5;
+    // 0.75, down from 1.5. At 1.5 the box reads as a thick slab on a phone
+    // screen and the horizontal health bar 2.5pt tall disappears into its own
+    // outline. Half a point is the thinnest CAShapeLayer stroke that still
+    // rasterises to a full pixel row on this display.
+    double lw = 0.75;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
 
     // Read the width straight back out of SpringBoard's own CALayer. This is the
