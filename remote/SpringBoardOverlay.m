@@ -22,6 +22,7 @@
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <stdio.h>
 #import <unistd.h>
 #import <pthread.h>
 #import <string.h>
@@ -419,7 +420,7 @@ static void sb_make_count_label(uint64_t container) {
     NSLog(@"[SB-LABEL] counter label=0x%llx created", label);
 }
 
-static BOOL mergePaths(UIView *espView, NSMutableData *d) {
+static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
     [d setLength:0];
 
     SerCtx ctx = { .data = d, .landW = 0, .landH = 0, .lastX = 0, .lastY = 0, .haveLast = 0 };
@@ -458,39 +459,33 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     //
     //   op 5, len, x, y, w, h, utf8[len]
     //
-    // The counter is not in textLayerPool. It has its own layer, statusLayer,
-    // set from stats.realCount and stats.botCount at esp.mm:3394, and the pool
-    // only holds the per-pawn name, distance and weapon labels. Reading the
-    // pool is why txt stayed 0 on every publish while the counter was being
-    // drawn perfectly well in the app.
+    // The count arrives as an argument rather than being read back off
+    // statusLayer, so nothing here depends on a layer being hidden, on its
+    // string being current, or on it being in the pool. Two rounds of scraping
+    // produced txt=0 on every publish.
     //
-    // The rect is the app's landscape frame, unswapped. sbEmit rotates points as
-    // px = landH - y, py = x, and the label carries that same rotation as its
-    // CALayer transform, so it wants the unrotated centre and its own bounds.
-    // Swapping w and h here as well would rotate the text twice.
-    if (r_is_objc_ptr(g_sbCountLabel)) {
-        id st = [espView valueForKey:@"statusLayer"];
-        if ([st isKindOfClass:[CATextLayer class]]) {
-            CATextLayer *tl = (CATextLayer *)st;
-            NSString *s = tl.string;
-            if (!tl.hidden && [s isKindOfClass:[NSString class]] && s.length > 0) {
-                const char *utf8 = s.UTF8String;
-                const size_t len = utf8 ? strlen(utf8) : 0;
-                if (len > 0 && len <= SB_TEXT_MAX) {
-                    const CGRect r = tl.frame;
-                    const double w = r.size.width, h = r.size.height;
-                    const double px = ctx.landH - r.origin.y - h * 0.5;
-                    const double py = r.origin.x + w * 0.5;
-                    uint8_t top = 5;
-                    uint8_t slen = (uint8_t)len;
-                    [d appendBytes:&top length:1];
-                    [d appendBytes:&slen length:1];
-                    [d appendBytes:&px length:8];
-                    [d appendBytes:&py length:8];
-                    [d appendBytes:utf8 length:len];
-                    emitted = 1;
-                }
-            }
+    // The position is the same one the app used: an 80pt wide field centred on
+    // the landscape width, 25pt from the top. It never moves, so the label
+    // costs two calls once and then nothing, however long the match runs.
+    //
+    // px and py are the label's own centre, because it carries the path
+    // rotation as its CALayer transform. Swapping w and h as well would rotate
+    // the text twice.
+    if (r_is_objc_ptr(g_sbCountLabel) && enemyCount >= 0) {
+        char num[8];
+        const int n = snprintf(num, sizeof(num), "%d", enemyCount);
+        if (n > 0 && n <= SB_TEXT_MAX) {
+            const double w = 80.0, h = 29.0;
+            const double px = ctx.landH - 25.0 - h * 0.5;
+            const double py = ctx.landW * 0.5;
+            uint8_t top = 5;
+            uint8_t slen = (uint8_t)n;
+            [d appendBytes:&top length:1];
+            [d appendBytes:&slen length:1];
+            [d appendBytes:&px length:8];
+            [d appendBytes:&py length:8];
+            [d appendBytes:num length:(size_t)n];
+            emitted = 1;
         }
     }
 
@@ -1106,7 +1101,7 @@ int SBoardStartOverlay(void) {
     return 0;
 }
 
-void SBRemotePushESPFrame(UIView *espView) {
+void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
     if (!g_sbOverlayOn) {
         // Rebuild it instead of staying dead. This is the whole fix for the
         // "ESP paints once and then freezes" report: the old code cleared
@@ -1206,7 +1201,7 @@ void SBRemotePushESPFrame(UIView *espView) {
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
-    if (!mergePaths(espView, ops)) {
+    if (!mergePaths(espView, ops, enemyCount)) {
         g_sbSummarySkips++;
         return;
     }

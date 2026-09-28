@@ -3415,8 +3415,8 @@ static inline uint64_t ESPPhaseNowUS(void) {
         [CATransaction commit];
 
         // Mirror this frame to the SpringBoard dedicated overlay (if active).
-        extern void SBRemotePushESPFrame(UIView *espView);
-        SBRemotePushESPFrame(self);
+        // -1 means draw no counter, which is what the isCount toggle asks for.
+        SBRemotePushESPFrame(self, isCount ? (stats.realCount + stats.botCount) : -1);
 
         {
             const uint64_t tPhase3 = ESPPhaseNowUS();
