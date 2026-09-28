@@ -107,6 +107,16 @@ static void init_physmap(void) {
 
 #pragma mark - attach
 
+// Microseconds, for the attach's own wall time. ds_now_ms below is defined
+// after ds_attach, so this cannot reuse it without a forward declaration of a
+// different unit.
+static uint64_t ds_now_us(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (mach_absolute_time() * tb.numer / tb.denom) / 1000ULL;
+}
+
 int ds_attach(void) {
     if (ds_attached()) return 0;
     if (!g_kexploit_ready) return -1;
@@ -178,13 +188,23 @@ int ds_attach(void) {
 
     uint64_t bestStart = 0, bestSize = 0;
     int mappedCount = 0, failCount = 0;
+    // How many entries this walk has to look at, and how many of them ask for
+    // a page. The attach used to be a full map walk per qual, so the cost was
+    // nentries x qual; these two numbers are what make that visible.
+    int qualCount = 0;
+    NSLog(@"[DS] base walk: start nentries=%u", nentries);
+    const uint64_t tWalk0 = ds_now_us();
     for (uint32_t i = 0; i < nentries && K(e); i++) {
         uint64_t start = kread64(e + E_START);
         uint64_t end   = kread64(e + E_END);
         uint64_t size  = (end > start) ? (end - start) : 0;
 
         if (start >= 0x100000000 && size > 0x400000 && start < 0x800000000) {
-            struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
+            // e is the entry that covers start, so vm_map_remote_page's walk
+            // back to it would return e. Passing it in removes one full
+            // vm_map walk per qualifying region, which is the whole attach cost.
+            qualCount++;
+            struct VMShmem page = vm_map_remote_page_for_entry(map, e, start);
             if (page.localAddress) {
                 mappedCount++;
                 uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
@@ -213,8 +233,13 @@ int ds_attach(void) {
         }
         e = kread_ptr(e + off_vm_map_entry_links_next);
     }
-    NSLog(@"[DS] base walk: mapped=%d fail=%d best=0x%llx size=0x%llx",
-          mappedCount, failCount, bestStart, bestSize);
+    // Wall time of the walk. On 2026-09-28 20:39:56 this loop blocked the main
+    // thread for 1.10s and the device wrote a runloop hang report, with the
+    // whole sample stack inside vm_map_find_entry's redundant walk. One number
+    // per attach is enough to tell whether that is gone.
+    NSLog(@"[DS] base walk: mapped=%d qual=%d fail=%d best=0x%llx size=0x%llx us=%llu",
+          mappedCount, qualCount, failCount, bestStart, bestSize,
+          (unsigned long long)(ds_now_us() - tWalk0));
     if (bestStart) {
         g_ff_base = bestStart;
     }

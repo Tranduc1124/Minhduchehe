@@ -177,13 +177,34 @@ uint64_t VME_OFFSET(uint64_t vme_offset_raw)
     return vme_offset_raw << 12;
 }
 
-struct VMObject vm_get_object(uint64_t map, uint64_t address)
+// The body of vm_get_object, with the entry lookup already done.
+//
+// vm_get_object spends its time in vm_map_find_entry, and vm_map_find_entry
+// walks the whole map on every call. That is correct and it is what the comment
+// on vm_map_find_entry demands, because a cached entry pointer goes stale when
+// the target's COW splits an entry. It is the wrong cost for a caller that is
+// ALREADY walking the map and holding the entry in its hand, and ds_attach is
+// exactly that caller: it walks every entry of Free Fire's vm_map looking for
+// the module base, and asked vm_map_remote_page for the page at that entry's
+// start, which walked the same map again from the beginning, once per
+// qualifying region. n entries in, n walks out, and each walk step is one
+// kreadbuf, which is one getsockopt syscall into the kernel. That is the hang
+// measured on the device, on the main thread, inside ds_attach:
+//
+//   ds_attach + 724 -> vm_map_remote_page -> vm_get_object
+//     -> vm_map_find_entry -> vm_map_iterate_entries -> kreadbuf
+//       -> early_kread64 -> getsockopt
+//
+// 1.10 s of a 1.10 s main thread hang, all of it inside the redundant walk.
+// The entry pointer is only trusted for the length of the caller's own
+// iteration, which is exactly the window in which vm_map_find_entry would have
+// returned that same pointer anyway.
+struct VMObject vm_get_object_for_entry(uint64_t entryAddr, uint64_t address)
 {
     struct VMObject result = {0};
- 
-    uint64_t entryAddr = vm_map_find_entry(map, address);
+
     if (!entryAddr) {
-        NSLog(@"[DS] DIAG vm_map_find_entry FAILED addr=0x%llx (no entry covers it)",
+        NSLog(@"[DS] DIAG vm_get_object_for_entry FAILED addr=0x%llx (no entry covers it)",
               (unsigned long long)address);
         return result;
     }
@@ -219,6 +240,14 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
     result.entryOffset  = entryOffs;
  
     return result;
+}
+
+// The original entry point, unchanged for callers that hold no entry: it still
+// pays one full walk to find the entry, on purpose. See the comment on
+// vm_map_find_entry for why that walk is not cached.
+struct VMObject vm_get_object(uint64_t map, uint64_t address)
+{
+    return vm_get_object_for_entry(vm_map_find_entry(map, address), address);
 }
  
 
@@ -635,6 +664,25 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
     {
         NSLog(@"[DS] DIAG vm_map_remote_page no object for 0x%llx",
               (unsigned long long)address);
+        return shmem;
+    }
+
+    return vm_create_shmem_with_object(&vmObject);
+}
+
+// Same page, for a caller that is walking this very map and already holds the
+// entry that covers address. Identical work minus the lookup, so the result is
+// identical: vm_map_find_entry(map, address) would return entryAddr, because
+// that is the entry the caller is standing on. See
+// vm_get_object_for_entry for the measurement that made this necessary.
+struct VMShmem vm_map_remote_page_for_entry(uint64_t vmMap, uint64_t entryAddr, uint64_t address)
+{
+    struct VMShmem shmem = {0};
+    struct VMObject vmObject = vm_get_object_for_entry(entryAddr, address);
+    if (!vmObject.address)
+    {
+        NSLog(@"[DS] DIAG vm_map_remote_page_for_entry no object for 0x%llx entry=0x%llx",
+              (unsigned long long)address, (unsigned long long)entryAddr);
         return shmem;
     }
 

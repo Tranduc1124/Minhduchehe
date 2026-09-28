@@ -86,3 +86,6 @@ struct vm_map_entry {
 };
 
 struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address);
+// Same page, for a caller that already holds the vm_map_entry covering
+// `address`. Skips vm_map_find_entry's full map walk. See the definition.
+struct VMShmem vm_map_remote_page_for_entry(uint64_t vmMap, uint64_t entryAddr, uint64_t address);
