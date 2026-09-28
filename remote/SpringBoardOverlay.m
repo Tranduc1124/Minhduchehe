@@ -1520,7 +1520,12 @@ int SBoardStartOverlay(void) {
     if (r_is_objc_ptr(fillShape)) {
         r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
         if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
-        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
+        // Darker and more opaque than it was. The card sits over a game whose
+        // background is not a fixed colour, and at 0.16 grey and 0.72 the white
+        // name lost against a bright part of the scene. The text was never the
+        // wrong colour: white text on a card that is too light reads as dim, and
+        // the card is what the contrast lives on.
+        double gray[4] = { 0.10, 0.10, 0.10, 0.82 };
         uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
                                              "colorWithRed:green:blue:alpha:",
                                              &gray[0], 8, &gray[1], 8,
@@ -1604,6 +1609,30 @@ int SBoardStartOverlay(void) {
         if (!r_is_objc_ptr(pre)) break;
         g_sbLabelObj[i] = pre;
         g_sbLabelUsed++;
+
+        // Build its invocations now, not when the label is first used.
+        //
+        // A cached invocation costs a method signature lookup, an
+        // invocationWithMethodSignature: and a remote malloc the first time, and
+        // each of those goes through r_msg2, which settles three milliseconds
+        // before it runs. A label needs five: position, bounds, text, hidden and
+        // transform. Built on demand that is about six hundred milliseconds of
+        // construction spread over the first seconds of a match, one label at a
+        // time, and the device log shows it as frames of sixty to a hundred and
+        // seventy milliseconds with the label count climbing from zero across
+        // them. Nineteen remote calls do not cost a hundred and seventeen
+        // milliseconds; a constructor does, and from the outside it looks exactly
+        // like a slow frame.
+        (void)sb_cached_invocation(pre, "setPosition:",
+                                   &g_sbLabelPosInv[i], &g_sbLabelPosBuf[i], 16);
+        (void)sb_cached_invocation(pre, "setBounds:",
+                                   &g_sbLabelBoundsInv[i], &g_sbLabelBoundsBuf[i], 32);
+        (void)sb_cached_invocation(pre, "setText:",
+                                   &g_sbLabelTextInv[i], &g_sbLabelTextBuf[i], 8);
+        (void)sb_cached_invocation(pre, "setHidden:",
+                                   &g_sbLabelHideInv[i], &g_sbLabelHideBuf[i], 8);
+        (void)sb_cached_invocation(pre, "setTransform:",
+                                   &g_sbLabelTransInv[i], &g_sbLabelTransBuf[i], 48);
     }
     NSLog(@"[SB-LABEL] pre-spawned pool=%d of %d", g_sbLabelUsed, SB_LABEL_PRESPAWN);
 

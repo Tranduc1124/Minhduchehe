@@ -227,7 +227,15 @@ static void ESPRenderPawnCore(
     if (boxHeight < 6.0f) boxHeight = 6.0f;
     if (boxWidth < 4.0f) boxWidth = 4.0f;
 
-    CGFloat dynFontSize = fmaxf(4.5f, fminf(10.0f, 350.0f / fmaxf(dis, 1.0f)));
+    // Cố định, và là đúng số mà label bên SpringBoard dùng. Trước đây nó là
+    // khoảng cách nhân với clamp 4.5 đến 10, ở cuối khoảng đó đọc không ra,
+    // mà label thì không tự đổi cỡ được, nên bất cứ số nào khác ở đây chỉ là
+    // một số mà hai bên không thống nhất.
+    CGFloat dynFontSize = 11.0f;
+
+    // Đo một lần, dùng chung cho card, thanh máu và khung label. Ba thứ phải
+    // thống nhất về chiều rộng của cái tên, và mỗi thứ từng có một ý riêng.
+    CGFloat nameCardW = 0.0f, nameCardH = 0.0f, nameCardTop = 0.0f;
     float centerX = x + boxWidth * 0.5f;
 
     // ---------------------------------------------------------
@@ -323,10 +331,10 @@ static void ESPRenderPawnCore(
             // One size, and the same font the overlay's label uses: the
             // SpringBoard label sets boldSystemFontOfSize:11, so measuring with
             // anything else makes the card and the text disagree.
-            const CGFloat nameFS = 11.0f;
-            const CGFloat padX = 6.0f;
-            const CGFloat cardH = nameFS + 6.0f;
-            const CGFloat cardTop = y - nameFS - 8.0f;
+            const CGFloat nameFS = dynFontSize;
+            const CGFloat padX = 10.0f;          // chữ không sát mép
+            const CGFloat cardH = nameFS + 4.0f;
+            const CGFloat cardTop = y - nameFS - 7.0f;
 
             UIFont *f = [UIFont boldSystemFontOfSize:nameFS];
             CGFloat nameW = 0.0f;
@@ -335,15 +343,20 @@ static void ESPRenderPawnCore(
             }
             if (nameW < 1.0f) nameW = nameFS * 4.0f;
 
+            nameCardW = nameW + padX * 2.0f;
+            nameCardH = cardH;
+            nameCardTop = cardTop;
+
             CGPathAddRect(buffers->cardPath, NULL,
-                          CGRectMake(centerX - nameW * 0.5f - padX, cardTop,
-                                     nameW + padX * 2.0f, cardH));
+                          CGRectMake(centerX - nameCardW * 0.5f, cardTop,
+                                     nameCardW, cardH));
             buffers->cardDirty = true;
 
             if (textCallback) {
                 textCallback(callbackContext, dispName, ESPTextRoleName,
                              (uint64_t)PawnObject,
-                             CGRectMake(centerX - 100.0f, cardTop, 200.0f, cardH),
+                             CGRectMake(centerX - nameCardW * 0.5f, cardTop,
+                                        nameCardW, cardH),
                              [UIColor whiteColor], nameFS, NO);
             }
         }
@@ -386,19 +399,33 @@ static void ESPRenderPawnCore(
     // chữ nhật cao 0.75 chồng lên nhau, dải đặc 3pt, vẫn gom trong cùng một
     // lệnh CGPathAddRects, không tốn thêm call nào.
     // ---------------------------------------------------------
-    if (isHealth) {
-        float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barH = 0.75f;      // bằng nét vẽ, để hai cạnh dính nhau
-        const CGFloat barGap = 1.5f;
-        const CGFloat barW = boxWidth * healthRatio;
-        const CGFloat barTop = y - barGap - 3.0f * barH;
+    // Thanh máu là một sợi mảnh nằm ngay mép dưới card, dài bằng đúng card.
+    // Không tốn thêm call nào: cả hai layer đã gom mọi hình chữ nhật trong
+    // khung vào cùng một lệnh CGPathAddRects.
+    //
+    // Phần trống nằm trên layer tô đặc cùng card, nên cùng màu xám và đọc ra
+    // một khối. Phần máu nằm trên layer nét, một hình chữ nhật cao đúng bằng
+    // bề dày nét nên hai cạnh dính nhau và ra một sợi đặc chứ không phải khung.
+    // Trước đây là ba sợi 0.75 chồng nhau, dải 3pt trên đầu mỗi box, trông như
+    // một cái biển.
+    if (isHealth && nameCardW > 1.0f) {
+        const float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
+        const CGFloat barX = centerX - nameCardW * 0.5f;
+        const CGFloat barTop = nameCardTop + nameCardH;
+        const CGFloat trackH = 1.5f;
 
-        for (int seg = 0; seg < 3; seg++) {
+        CGPathAddRect(buffers->cardPath, NULL,
+                      CGRectMake(barX, barTop, nameCardW, trackH));
+        buffers->cardDirty = true;
+
+        const CGFloat fillW = nameCardW * healthRatio;
+        if (fillW > 0.4f) {
             CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                          CGRectMake(x, barTop + seg * barH, barW, barH));
+                          CGRectMake(barX, barTop, fillW, 0.75f));
+            buffers->hpFillGreenDirty = true;
         }
-        buffers->hpFillGreenDirty = true;
     }
+
 }
 
 // ==========================================
