@@ -1752,30 +1752,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     // CGPathAddRects. That is the cost probe's sixteen
                     // rectangles for the price of one, applied to the one shape
                     // that genuinely needs a fill.
-                    if (op == 6) {
-                        while (i < len) {
-                            double fx, fy, fw, fh;
-                            if (i + 32 > len) { i = len; break; }
-                            memcpy(&fx, b + i, 8);      memcpy(&fy, b + i + 8, 8);
-                            memcpy(&fw, b + i + 16, 8);  memcpy(&fh, b + i + 24, 8);
-                            i += 32;
-                            if (fw > 0.5 && fh > 0.5) {
-                                fillDoubles[fillN * 4 + 0] = fx;
-                                fillDoubles[fillN * 4 + 1] = fy;
-                                fillDoubles[fillN * 4 + 2] = fw;
-                                fillDoubles[fillN * 4 + 3] = fh;
-                                fillN++;
-                                if (fillN >= (int)(sizeof(fillDoubles) / sizeof(fillDoubles[0]) / 4)) {
-                                    remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
-                                    dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
-                                    calls++;
-                                    fillDrawn++;
-                                    fillN = 0;
-                                }
-                            }
-                        }
-                        continue;
-                    }
                     // Text run: one byte of length, two doubles of already
                     // rotated centre, then the UTF-8. Handled before the
                     // coordinate branch because it has a different shape, and
