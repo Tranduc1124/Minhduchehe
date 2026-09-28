@@ -82,7 +82,7 @@ void RenderTotalEnemyCount(ESPAddTextCallback textCallback, void *callbackContex
     NSString *countStr = [NSString stringWithFormat:@"%d", totalCount];
 
     // [FIX LAG]: Bỏ tính toán size font, cấp khung rộng và ép tự căn giữa (NO)
-    textCallback(callbackContext, countStr, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
+    textCallback(callbackContext, countStr, ESPTextRoleCounter, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
 }
 
 // ==========================================
@@ -263,7 +263,7 @@ static void ESPRenderPawnCore(
             NSString *wname = WeaponNameForPlayerNS(PawnObject);
             if (wname && wname.length > 0) {
                 // [FIX LAG]: Cấp khung cố định và căn giữa bằng NO
-                textCallback(callbackContext, wname, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
+                textCallback(callbackContext, wname, ESPTextRoleWeapon, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
             }
         }
     }
@@ -272,7 +272,20 @@ static void ESPRenderPawnCore(
     // LINE
     // ---------------------------------------------------------
     if (isLine) {
-        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
+        // The line starts below the red counter, not through the middle of it.
+        //
+        // The counter is a real UILabel in SpringBoard, 34pt tall and 25pt from
+        // the top of the landscape view, and this used to start at 35. The device
+        // screenshot showed the two overlapping, the line leaving from the middle
+        // of the number. 25 + 34 is the bottom of the label, and four points of
+        // clearance puts the line clear of it.
+        //
+        // SB_COUNT_TOP and SB_COUNT_H are the overlay's numbers and live in
+        // SpringBoardOverlay.m. They are repeated here rather than shared because
+        // the two files do not include each other. If the counter ever moves, this
+        // has to move with it.
+        const float kCounterBottom = 25.0f + 34.0f;
+        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, kCounterBottom + 4.0f);
         CGPoint boxTopCenter = CGPointMake(centerX, y);
 
         if (isKnocked) { ESPAddLine(buffers->snaplineKnockedPath, lineStart, boxTopCenter); buffers->snaplineKnockedDirty = true; }
@@ -297,7 +310,7 @@ static void ESPRenderPawnCore(
         NSString *dispName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (dispName.length > 0) {
             // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-            textCallback(callbackContext, dispName, CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f, 200.0f, dynFontSize + 4.0f), [UIColor yellowColor], dynFontSize, NO);
+            textCallback(callbackContext, dispName, ESPTextRoleName, CGRectMake(centerX - 100.0f, y - dynFontSize - 8.0f, 200.0f, dynFontSize + 6.0f), [UIColor whiteColor], dynFontSize, NO);
         }
     }
 
@@ -307,7 +320,7 @@ static void ESPRenderPawnCore(
     if (isDis && textCallback) {
         NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
         // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-        textCallback(callbackContext, distString, CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f, 200.0f, dynFontSize + 4.0f), [UIColor whiteColor], dynFontSize, NO);
+        textCallback(callbackContext, distString, ESPTextRoleDistance, CGRectMake(centerX - 60.0f, y + boxHeight + 3.0f, 120.0f, dynFontSize + 6.0f), [UIColor whiteColor], dynFontSize, NO);
     }
 
     // ---------------------------------------------------------

@@ -19,6 +19,11 @@
 #import "RemoteCall.h"
 #import "PAC.h"
 #import "remote_objc.h"
+// For ESPTextRole, so the role the app stamps on each string and the role the
+// overlay styles it by are the same enum and not two copies of it that can
+// drift. ESPRole.h rather than esp.h, because esp.h reaches Vector3.h, which is
+// C++, and this file is compiled as Objective-C.
+#import "../esp/esp/ESPRole.h"
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -297,12 +302,43 @@ static void serFunc(void *info, const CGPathElement *e) {
 #define SB_COUNT_W   90.0
 #define SB_COUNT_H   34.0
 #define SB_COUNT_TOP 25.0
+
+// One counter plus two labels per pawn, name and distance. Created lazily, so a
+// quiet frame costs nothing and a busy one tops out here rather than growing
+// without limit inside SpringBoard.
+#define SB_LABEL_MAX 25
+
+// Per-pawn labels. A name label is a rounded grey card with white text, which is
+// what the request asked for and it costs nothing extra: a UILabel's background
+// is its own background, so the card is free once the label exists. The
+// distance label sits under the feet with a clear background, so the two look
+// different without a second layer or a second path.
+#define SB_CARD_RADIUS 4.0
+#define SB_CARD_R      0.16
+#define SB_CARD_G      0.16
+#define SB_CARD_B      0.16
+#define SB_CARD_A      0.72
 static uint64_t g_sbCountLabel   = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
 static char     g_sbCountLastText[SB_TEXT_MAX + 1] = { 0 };
 static int      g_sbCountShown   = 0;
+
+// Per-pawn labels. Index 0 is the counter, so the counter keeps its own
+// variables and everything else is poolable.
+static uint64_t g_sbLabelObj[SB_LABEL_MAX]        = { 0 };
+static uint64_t g_sbLabelPosInv[SB_LABEL_MAX]     = { 0 };
+static uint64_t g_sbLabelPosBuf[SB_LABEL_MAX]     = { 0 };
+static double   g_sbLabelLastPos[SB_LABEL_MAX][2] = { { -1.0, -1.0 } };
+static char     g_sbLabelLastText[SB_LABEL_MAX][SB_TEXT_MAX + 1] = { { 0 } };
+static int      g_sbLabelRole[SB_LABEL_MAX]       = { -1 };
+static int      g_sbLabelShown[SB_LABEL_MAX]      = { 0 };
+static int      g_sbLabelUsed                    = 0;
+static int      g_sbLabelHigh                    = 0;
+static uint64_t g_sbCardColor                     = 0;
+static uint64_t g_sbFontSmall                     = 0;
+static uint64_t g_sbFontBig                       = 0;
 
 static BOOL sb_cached_pos_invocation(void) {
     if (r_is_objc_ptr(g_sbCountPosInv) && g_sbCountPosBuf) return YES;
@@ -384,6 +420,167 @@ static uint64_t sb_count_label_hide(int hidden) {
     g_sbCountShown = !hidden;
     r_perform_main(g_sbCountLabel, r_sel("setHidden:"), (hidden ? 1 : 0), false);
     return 1;
+}
+
+// A pooled label, for the per-pawn name and distance text.
+//
+// Built the same way as the counter: a real UILabel added to the same
+// container, carrying the path rotation as its transform so its text is
+// oriented the way the boxes are. The difference is the background, which is
+// what makes the grey card. A UILabel's background is the label's own, so the
+// card costs nothing beyond the label existing: no second CAShapeLayer, no
+// second path, no extra present per frame.
+//
+// Set once per role change, not per frame, because a UILabel's background,
+// corner radius, font and colour are all fixed once chosen.
+static uint64_t sb_make_pooled_label(uint64_t container, int role) {
+    if (!r_is_objc_ptr(container)) return 0;
+
+    uint64_t UILabel = r_class("UILabel");
+    if (!r_is_objc_ptr(UILabel)) return 0;
+    uint64_t alloc = r_msg2_main(UILabel, "alloc", 0, 0, 0, 0);
+    uint64_t label = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(label)) return 0;
+
+    r_msg2_main(label, "setUserInteractionEnabled:", 0, 0, 0, 0);
+    r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);      // centre
+    r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
+
+    uint64_t UIColor = r_class("UIColor");
+    const bool isCard = (role == ESPTextRoleName);
+    if (r_is_objc_ptr(UIColor)) {
+        uint64_t clear = r_msg2_main(UIColor, "clearColor", 0, 0, 0, 0);
+        uint64_t white = r_msg2_main(UIColor, "whiteColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(clear)) r_msg2_main(label, "setBackgroundColor:", clear, 0, 0, 0);
+        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0, 0, 0);
+        if (isCard) {
+            double rgba[4] = { SB_CARD_R, SB_CARD_G, SB_CARD_B, SB_CARD_A };
+            if (!r_is_objc_ptr(g_sbCardColor)) {
+                g_sbCardColor = r_msg2_main_raw(UIColor, "colorWithRed:green:blue:alpha:",
+                                                &rgba[0], 8, &rgba[1], 8,
+                                                &rgba[2], 8, &rgba[3], 8);
+            }
+            if (r_is_objc_ptr(g_sbCardColor)) {
+                r_msg2_main(label, "setBackgroundColor:", g_sbCardColor, 0, 0, 0);
+            }
+        }
+    }
+
+    // Rounded card. CALayer has no cornerRadius of its own worth touching here;
+    // a UIView's own layer does, and masksToBounds is what clips the fill to it.
+    uint64_t layer = r_msg2_main(label, "layer", 0, 0, 0, 0);
+    if (r_is_objc_ptr(layer)) {
+        if (isCard) {
+            double radius = SB_CARD_RADIUS;
+            r_msg_main_raw(layer, r_sel("setCornerRadius:"), &radius, 8,
+                           NULL, 0, NULL, 0, NULL, 0);
+            r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
+        }
+        r_msg2_main(layer, "setShouldRasterize:", 0, 0, 0, 0);
+    }
+
+    // Size before the transform, so setFrame: means what it says. Zero bounds is
+    // why the first counter drew nothing at all.
+    double frame[4] = { 0.0, 0.0, 90.0, 20.0 };
+    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
+                   NULL, 0, NULL, 0, NULL, 0);
+
+    double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+    r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
+                   NULL, 0, NULL, 0, NULL, 0);
+
+    r_msg2_main(container, "addSubview:", label, 0, 0, 0);
+    return label;
+}
+
+static BOOL sb_pooled_pos_invocation(int idx) {
+    if (idx < 0 || idx >= SB_LABEL_MAX) return NO;
+    if (r_is_objc_ptr(g_sbLabelPosInv[idx]) && g_sbLabelPosBuf[idx]) return YES;
+    uint64_t label = g_sbLabelObj[idx];
+    if (!r_is_objc_ptr(label)) return NO;
+    if (!g_sbPerformMainSel || !g_sbInvokeSel) return NO;
+
+    uint64_t setPosSel = r_sel("setPosition:");
+    if (!setPosSel) return NO;
+    uint64_t sig = r_msg(label, r_sel("methodSignatureForSelector:"), setPosSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+    r_msg2(inv, "setTarget:", label, 0, 0, 0);
+    r_msg2(inv, "setSelector:", setPosSel, 0, 0, 0);
+    uint64_t buf = dlsym_remote("malloc", 16, 0,0,0,0,0,0,0);
+    if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
+    r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+    g_sbLabelPosInv[idx] = inv;
+    g_sbLabelPosBuf[idx] = buf;
+    return YES;
+}
+
+static BOOL sb_pooled_label_resize(int idx, double w, double h) {
+    if (idx < 0 || idx >= SB_LABEL_MAX) return NO;
+    uint64_t label = g_sbLabelObj[idx];
+    if (!r_is_objc_ptr(label)) return NO;
+    double frame[4] = { 0.0, 0.0, w, h };
+    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
+                   NULL, 0, NULL, 0, NULL, 0);
+    g_sbLabelLastPos[idx][0] = -1.0;   // a new size moves the label
+    g_sbLabelLastPos[idx][1] = -1.0;
+    return YES;
+}
+
+// Returns the number of remote calls made, so the publish log counts them.
+static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
+                                       double w, double h, const char *utf8) {
+    if (idx < 0 || idx >= SB_LABEL_MAX) return 0;
+    uint64_t label = g_sbLabelObj[idx];
+    if (!r_is_objc_ptr(label)) return 0;
+    uint64_t calls = 0;
+
+    // A role change means a different look, and the look is not per frame.
+    if (g_sbLabelRole[idx] != role) {
+        g_sbLabelRole[idx] = role;
+        if (sb_pooled_label_resize(idx, w, h)) calls += 13;
+        g_sbLabelLastText[idx][0] = 0;   // force the text to be re-sent
+    }
+
+    if (px == g_sbLabelLastPos[idx][0] && py == g_sbLabelLastPos[idx][1]) {
+        // Position unchanged, which is the common case when the camera is parked.
+    } else if (sb_pooled_pos_invocation(idx)) {
+        double p[2] = { px, py };
+        remote_write(g_sbLabelPosBuf[idx], p, sizeof(p));
+        r_msg2(g_sbLabelPosInv[idx], "setArgument:atIndex:", g_sbLabelPosBuf[idx], 2, 0, 0);
+        r_msg(g_sbLabelPosInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        g_sbLabelLastPos[idx][0] = px;
+        g_sbLabelLastPos[idx][1] = py;
+        calls += 2;
+    }
+
+    if (utf8 && strcmp(g_sbLabelLastText[idx], utf8) != 0) {
+        uint64_t nsbuf = r_alloc_str(utf8);
+        if (nsbuf) {
+            uint64_t NSStringCls = r_class("NSString");
+            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+            uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
+            r_free(nsbuf);
+            if (r_is_objc_ptr(ns)) {
+                r_perform_main(label, r_sel("setText:"), ns, false);
+                dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
+                calls += 6;
+                strncpy(g_sbLabelLastText[idx], utf8, SB_TEXT_MAX);
+                g_sbLabelLastText[idx][SB_TEXT_MAX] = 0;
+            }
+        }
+    }
+
+    if (!g_sbLabelShown[idx]) {
+        g_sbLabelShown[idx] = 1;
+        r_perform_main(label, r_sel("setHidden:"), 0, false);
+        calls += 1;
+    }
+    return calls;
 }
 
 static void sb_make_count_label(uint64_t container) {
@@ -509,13 +706,66 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
             const double px = ctx.landH - SB_COUNT_TOP - h * 0.5;
             const double py = ctx.landW * 0.5;
             uint8_t top = 5;
+            uint8_t role = 3;                       // counter
             uint8_t slen = (uint8_t)n;
             [d appendBytes:&top length:1];
+            [d appendBytes:&role length:1];
             [d appendBytes:&slen length:1];
             [d appendBytes:&px length:8];
             [d appendBytes:&py length:8];
+            [d appendBytes:&w length:8];
+            [d appendBytes:&h length:8];
             [d appendBytes:num length:(size_t)n];
             emitted = 1;
+        }
+    }
+
+    // Every other piece of text the app drew this frame.
+    //
+    // The role comes from the pool the app fills in, not from a guess. Four
+    // builds went into guessing: the counter was hunted for in this pool by font
+    // size when it does not live here at all, then read back off statusLayer,
+    // and the name and distance labels were going to be told apart by frame
+    // width. The producer knows what each string is and now says so.
+    {
+        NSArray *layers = [espView valueForKey:@"textLayerPool"];
+        NSArray *roles  = [espView valueForKey:@"textRolePool"];
+        NSNumber *active = [espView valueForKey:@"activeTextLayerCount"];
+        if ([layers isKindOfClass:[NSArray class]] &&
+            [roles  isKindOfClass:[NSArray class]] &&
+            [active isKindOfClass:[NSNumber class]]) {
+            const NSUInteger n = MIN((NSUInteger)[active unsignedIntegerValue], layers.count);
+            for (NSUInteger i = 0; i < n; i++) {
+                CATextLayer *tl = layers[i];
+                if (![tl isKindOfClass:[CATextLayer class]] || tl.hidden) continue;
+                if (i >= roles.count) break;
+                const int role = [roles[i] intValue];
+                if (role == 2) continue;              // weapon name, not wanted
+                NSString *str = tl.string;
+                if (![str isKindOfClass:[NSString class]] || str.length == 0) continue;
+                const char *utf8 = str.UTF8String;
+                if (!utf8) continue;
+                const size_t slen = strlen(utf8);
+                if (slen == 0 || slen > SB_TEXT_MAX) continue;
+
+                const CGRect r = tl.frame;
+                const double w = r.size.width, h = r.size.height;
+                if (w < 4.0 || h < 4.0) continue;
+                const double px = ctx.landH - r.origin.y - h * 0.5;
+                const double py = r.origin.x + w * 0.5;
+                uint8_t top = 5;
+                uint8_t rr = (uint8_t)role;
+                uint8_t sl = (uint8_t)slen;
+                [d appendBytes:&top length:1];
+                [d appendBytes:&rr length:1];
+                [d appendBytes:&sl length:1];
+                [d appendBytes:&px length:8];
+                [d appendBytes:&py length:8];
+                [d appendBytes:&w length:8];
+                [d appendBytes:&h length:8];
+                [d appendBytes:utf8 length:slen];
+                emitted = 1;
+            }
         }
     }
 
@@ -584,6 +834,22 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
     g_sbCountShown = 0;
+    // Pooled labels are subviews of the overlay window, so the window taking them
+    // down takes them with it. Only the local pointers are cleared, because those
+    // refer to a process that no longer exists.
+    for (int k = 0; k < SB_LABEL_MAX; k++) {
+        g_sbLabelObj[k] = 0;
+        g_sbLabelPosInv[k] = 0;
+        g_sbLabelPosBuf[k] = 0;
+        g_sbLabelLastPos[k][0] = -1.0;
+        g_sbLabelLastPos[k][1] = -1.0;
+        g_sbLabelLastText[k][0] = 0;
+        g_sbLabelRole[k] = -1;
+        g_sbLabelShown[k] = 0;
+    }
+    g_sbLabelUsed = 0;
+    g_sbLabelHigh = 0;
+    g_sbCardColor = 0;
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -1360,6 +1626,12 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // Text runs seen this frame. Zero means the app drew no counter, and
             // the label is hidden rather than left showing the last number.
             uint32_t txtOps = 0;
+            // Pooled label slot handed to this frame's first name, and how many
+            // slots exist so far. Labels are made on demand, so a frame with one
+            // enemy makes two and a frame with none makes nothing.
+            int txtSlot = 0;
+            if (g_sbLabelUsed == 0) g_sbLabelUsed = 1;   // slot 0 is the counter's
+            g_sbLabelHigh = 0;
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
             // iOS 17.5, and so is CGPathReset, so there is no way to empty a
@@ -1462,20 +1734,38 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     // coordinate branch because it has a different shape, and
                     // it is not a subpath so it must not fall into one.
                     if (op == 5) {
-                        if (i + 17 > len) { i = len; break; }
+                        // op 5, role, len, px, py, w, h, utf8[len]
+                        if (i + 34 > len) { i = len; break; }
+                        const uint8_t role = b[i++];
                         const uint8_t slen = b[i++];
                         if (slen > SB_TEXT_MAX) { i = len; break; }
-                        double tpx, tpy;
-                        memcpy(&tpx, b + i, 8); memcpy(&tpy, b + i + 8, 8); i += 16;
+                        double tpx, tpy, tw, th;
+                        memcpy(&tpx, b + i, 8);      memcpy(&tpy, b + i + 8, 8);
+                        memcpy(&tw,  b + i + 16, 8);  memcpy(&th,  b + i + 24, 8);
+                        i += 32;
                         if (i + slen > len) { i = len; break; }
                         char txt[SB_TEXT_MAX + 1];
                         memcpy(txt, b + i, slen);
                         txt[slen] = 0;
                         i += slen;
                         txtOps++;
-                        calls += sb_count_label_place(tpx, tpy);
-                        calls += sb_count_label_text(txt);
-                        calls += sb_count_label_hide(0);
+                        if (role == 3) {
+                            // The counter has its own label and its own cached
+                            // position, and it never moves.
+                            calls += sb_count_label_place(tpx, tpy);
+                            calls += sb_count_label_text(txt);
+                            calls += sb_count_label_hide(0);
+                        } else {
+                            const int idx = txtSlot++;
+                            if (idx >= 0 && idx < SB_LABEL_MAX) {
+                                if (!r_is_objc_ptr(g_sbLabelObj[idx]) &&
+                                    g_sbLabelUsed < SB_LABEL_MAX) {
+                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role);
+                                    if (r_is_objc_ptr(g_sbLabelObj[idx])) g_sbLabelUsed++;
+                                }
+                                calls += sb_pooled_label_update(idx, role, tpx, tpy, tw, th, txt);
+                            }
+                        }
                         continue;
                     }
                     if (i + 16 > len) { i = len; break; }
@@ -1669,6 +1959,17 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // No text run this frame means the app is not in a match, and a
                 // stale count left on screen is worse than no count.
                 if (txtOps == 0) calls += sb_count_label_hide(1);
+                // Pooled labels this frame did not use are holding a pawn that
+                // is gone. Leaving them up is how a name sticks to the last
+                // enemy after the match is over.
+                for (int hi = txtSlot; hi < g_sbLabelHigh; hi++) {
+                    if (g_sbLabelShown[hi] && r_is_objc_ptr(g_sbLabelObj[hi])) {
+                        g_sbLabelShown[hi] = 0;
+                        r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
+                        calls += 1;
+                    }
+                }
+                if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();

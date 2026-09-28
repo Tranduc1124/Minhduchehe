@@ -4,6 +4,7 @@
 
 #import "GameLogic.h"
 #import "WeaponTextures.h"
+#import "ESPRole.h"
 
 typedef struct {
     CGMutablePathRef boxPath;
@@ -54,6 +55,7 @@ typedef struct {
 typedef void (*ESPAddTextCallback)(
     void *context,
     NSString *string,
+    int role,
     CGRect frame,
     UIColor *color,
     CGFloat fontSize,

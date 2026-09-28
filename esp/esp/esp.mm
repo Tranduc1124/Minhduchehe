@@ -2682,6 +2682,14 @@ void ESPSyncFromPrefs(void) {
 @property (nonatomic, strong) CAShapeLayer *alertNumRedLayer;
 
 @property (nonatomic, strong) NSMutableArray<CATextLayer *> *textLayerPool;
+// Role for each pooled text layer, index aligned with textLayerPool. Kept
+// beside the layers rather than on them because CATextLayer has nowhere to put
+// a custom value, and the overlay needs to know which label is a name and which
+// is a distance without guessing from frame width or string contents.
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *textRolePool;
+// Index the last dequeueTextLayer handed out, so addText: can record the role
+// against the layer it was given.
+@property (nonatomic, assign) NSUInteger lastTextLayerIndex;
 @property (nonatomic, assign) NSUInteger activeTextLayerCount;
 
 @property (nonatomic, strong) NSMutableArray<CALayer *> *imageLayerPool;
@@ -2693,7 +2701,7 @@ void ESPSyncFromPrefs(void) {
 - (void)configureRenderingLayers;
 - (void)resetReusableLayers;
 - (void)clearAllContent; 
-- (void)addText:(NSString *)text frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned;
+- (void)addText:(NSString *)text role:(int)role frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned;
 - (void)addImage:(UIImage *)image frame:(CGRect)frame;
 @end
 
@@ -2702,10 +2710,10 @@ void ESPSyncFromPrefs(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { return NO; }
 
-static void ESPViewAddTextCallback(void *context, NSString *string, CGRect frame, UIColor *color, CGFloat fontSize, BOOL leftAligned) {
+static void ESPViewAddTextCallback(void *context, NSString *string, int role, CGRect frame, UIColor *color, CGFloat fontSize, BOOL leftAligned) {
     if (!context || !string) return;
     ESP_View *view = (__bridge ESP_View *)context;
-    [view addText:string frame:frame color:color fontSize:fontSize leftAligned:leftAligned];
+    [view addText:string role:role frame:frame color:color fontSize:fontSize leftAligned:leftAligned];
 }
 
 static void ESPViewAddImageCallback(void *context, UIImage *image, CGRect frame) {
@@ -2877,6 +2885,7 @@ static void ESPDiagHeartbeat(void) {
         self.userInteractionEnabled = NO; 
         self.backgroundColor = [UIColor clearColor];
         self.textLayerPool = [NSMutableArray arrayWithCapacity:300];
+        self.textRolePool = [NSMutableArray arrayWithCapacity:300];
         self.imageLayerPool = [NSMutableArray arrayWithCapacity:80];
         
         // NOTE: no dispatch_once attach here! The game may not be running yet
@@ -3008,6 +3017,7 @@ static void ESPDiagHeartbeat(void) {
     if (self.activeTextLayerCount < self.textLayerPool.count) {
         CATextLayer *layer = self.textLayerPool[self.activeTextLayerCount];
         if (layer.hidden) layer.hidden = NO;
+        self.lastTextLayerIndex = self.activeTextLayerCount;
         self.activeTextLayerCount++;
         return layer;
     } 
@@ -3021,6 +3031,7 @@ static void ESPDiagHeartbeat(void) {
         layer.actions = @{ @"position": NSNull.null, @"bounds": NSNull.null, @"string": NSNull.null, @"hidden": NSNull.null, @"foregroundColor": NSNull.null, @"fontSize": NSNull.null };
         [self.textLayerPool addObject:layer];
         [_secureCanvas.layer addSublayer:layer];
+        self.lastTextLayerIndex = self.textLayerPool.count - 1;
         self.activeTextLayerCount++;
         return layer;
     }
@@ -3049,9 +3060,13 @@ static void ESPDiagHeartbeat(void) {
     return self.imageLayerPool.lastObject;
 }
 
-- (void)addText:(NSString *)text frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned {
+- (void)addText:(NSString *)text role:(int)role frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned {
     if (text.length == 0) return;
     CATextLayer *layer = [self dequeueTextLayer];
+    while (self.textRolePool.count <= self.lastTextLayerIndex) {
+        [self.textRolePool addObject:@(ESPTextRoleWeapon)];
+    }
+    self.textRolePool[self.lastTextLayerIndex] = @(role);
     
     static NSString *fontNameStr = nil;
     if (!fontNameStr) {
@@ -4486,7 +4501,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 NSString *distTextFormat = [[NSString alloc] initWithData:distTextBytes encoding:NSUTF8StringEncoding];
                 NSString *distText = [NSString stringWithFormat:distTextFormat, (int)s.dis];
                 CGRect textFrame = CGRectMake(edgeX - radius, edgeY - 4.5f, radius * 2.0f, 10.0f);
-                ESPViewAddTextCallback((__bridge void *)self, distText, textFrame, [UIColor whiteColor], 8.0f, NO);
+                ESPViewAddTextCallback((__bridge void *)self, distText, ESPTextRoleDistance, textFrame, [UIColor whiteColor], 8.0f, NO);
             }
         }
 
