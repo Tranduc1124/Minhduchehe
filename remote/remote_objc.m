@@ -786,7 +786,11 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
         uint64_t ret = r_msg(obj, sel,
                              r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
                              r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
-        return remote_write(outBuf, &ret, outSize);
+        // The value came back in a register, so it is already here. The round
+        // trip needed remote_read because its return value lived in a buffer it
+        // had malloced in the target; there is no buffer to read here.
+        __builtin_memcpy(outBuf, &ret, outSize);
+        return true;
     }
 
     uint64_t sig = r_method_signature(obj, sel);
