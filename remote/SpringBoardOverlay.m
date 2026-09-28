@@ -1831,6 +1831,11 @@ int SBoardStartOverlay(void) {
 }
 
 void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
+    // Declared here rather than beside the publish acquire further down, because
+    // the rebuild below this line is a third caller of SBoardStartOverlay and it
+    // has to take the same flag. Every path that rebuilds the overlay inside
+    // SpringBoard is now mutually exclusive with every path that publishes.
+    static int s_remoteBusy = 0;
     if (!g_sbOverlayOn) {
         // Rebuild it instead of staying dead. This is the whole fix for the
         // "ESP paints once and then freezes" report: the old code cleared
@@ -1840,10 +1845,23 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
             g_sbRearmAfterUS = now_us() + 3000000ULL;   // 3s between attempts
             g_sbConsecFail = 0;
-            if (SBoardStartOverlay() == 0) {
-                NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
-            } else {
-                NSLog(@"[PUSH-REARM] rebuild failed, retrying");
+            // Same flag as the publish below and as the 3s rearm further down.
+            // This branch used to rebuild with nothing held, so a rebuild here
+            // could run on the frame thread at the same moment the 3s rearm was
+            // rebuilding on its own queue, and two SBoardStartOverlay calls in
+            // SpringBoard at once is two overlays on the window.
+            if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+                NSLog(@"[PUSH-REARM] overlay is busy, rebuild skipped this round");
+                return;
+            }
+            @try {
+                if (SBoardStartOverlay() == 0) {
+                    NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
+                } else {
+                    NSLog(@"[PUSH-REARM] rebuild failed, retrying");
+                }
+            } @finally {
+                __sync_lock_release(&s_remoteBusy);
             }
         }
         return;
@@ -1878,6 +1896,18 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         }
     }
 
+    // One remote publish at a time, and one rebuild at a time.
+    //
+    // Declared up here rather than next to its first user, because the rearm
+    // block below now takes the same flag: SBoardStartOverlay rebuilds the
+    // The flag itself is declared at the top of this function, because the
+    // rebuild branch above needs it too.
+    // whole overlay inside SpringBoard out of dozens of blocking remote calls,
+    // and both paths serialise on the same global remote-call mutexes. A
+    // rebuild that overlaps a publish therefore blocks a publish that was
+    // already in flight, which makes an already stalled overlay stall longer
+    // and can feed itself: stall, rebuild, contention, stall, rebuild.
+
     // Recovery lives here, above every gate, because a frame that never
     // reaches a publish can fail in several different places and the symptom
     // is the same in all of them: nothing has been drawn for a long time.
@@ -1897,6 +1927,23 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             g_sbRearmBackoffUS = (wait < 60000000ULL) ? (wait * 2) : 60000000ULL;
             g_sbConsecFail = 0;
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                // The rebuild is serialised against publishes with the same
+                // flag SBRemotePushESPFrame takes below, taken inside this
+                // block and held for the whole rebuild. Taken here rather than
+                // outside the dispatch so the rebuild is the thing that waits,
+                // not the frame loop, and released in @finally so it comes back
+                // on every exit path including a return from inside the rebuild.
+                //
+                // A rebuild that cannot take the flag is skipped, not queued.
+                // The backoff above already owns the retry, and a queued rebuild
+                // is exactly what turned one stall into a loop: each one piled
+                // more remote calls onto a session that was already failing to
+                // publish, so the next frame stalled too and asked for another.
+                if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+                    NSLog(@"[PUSH-REARM] publish in flight, rebuild skipped this round");
+                    return;
+                }
+                @try {
                 const char *why =
                     remote_call_init_failure_description(remote_call_last_init_failure());
                 NSLog(@"[PUSH-REARM] nothing drawn for 3s (ls=%d ok=%d init=%s pid=%d) "
@@ -1908,6 +1955,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
                 } else {
                     NSLog(@"[PUSH-REARM] re-init failed, will retry in 5s");
+                }
+                } @finally {
+                    __sync_lock_release(&s_remoteBusy);
                 }
             });
         }
@@ -1935,7 +1985,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         return;
     }
 
-    static int s_remoteBusy = 0;
+    // s_remoteBusy is declared at the top of this function, because the rearm
+    // block above takes the same flag. One flag, two paths, and a rebuild can
+    // never run while a publish is in flight.
     if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
         // How long one publish holds the flag, and how often a frame arrives
         // while it is still held. The interval gate lets frames through
@@ -2050,6 +2102,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // commit as the pool, and it defeated the pool's own cleanup.
             int txtSlot = 0;
             uint32_t cardOps = 0;
+            // Cards the fill batch had no room for. Monotonic across publishes
+            // and not per frame, so carddrop= in [SB-PUSH] says whether the
+            // bound below is ever reached at all, rather than whether it was
+            // reached in the one frame that happened to be the one logged.
+            static uint32_t s_cardDrops = 0;
             // One new label per frame, for the reason given at the allocation.
             static int sb_labelsMadeThisFrame = 0;
             sb_labelsMadeThisFrame = 0;
@@ -2163,6 +2220,25 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             double firstRect[4] = {0, 0, 0, 0};
             int haveFirstRect = 0;
 
+            // Start of the label group. Moved here from below the parse loop.
+            //
+            // The label records are op 5, and they are parsed inside the loop,
+            // so a boundary taken after the loop measured the two or three
+            // instructions that follow it and reported label=0us on every frame
+            // that ran eight sb_pooled_label_update calls. The whole cost of
+            // setText: and friends was landing in geom=, which is why a device
+            // line of geom=218132us was read as CoreGraphics being slow when it
+            // was the text.
+            //
+            // Declared here and taken at the first op 5 record rather than
+            // declared there, because a declaration inside the loop would not
+            // still be in scope at the sum below. The read is at the top of the
+            // op 5 branch, which is the first thing the label work does, and
+            // the fallback after the loop keeps it non-zero on a frame that
+            // carried no label record at all, so label= can never become the
+            // whole publish. The arithmetic that consumes it is unchanged.
+            uint64_t tLabelStart = 0;
+
             size_t i = 0;
             int curLayer = -1;
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
@@ -2242,11 +2318,33 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                             if (got < 4) break;
                             const double cw = cfx1 - cfx0, ch = cfy1 - cfy0;
                             if (cw > 0.5 && ch > 0.5) {
-                                fillDoubles[fillN * 4 + 0] = cfx0;
-                                fillDoubles[fillN * 4 + 1] = cfy0;
-                                fillDoubles[fillN * 4 + 2] = cw;
-                                fillDoubles[fillN * 4 + 3] = ch;
-                                fillN++;
+                                // This check was missing, and the rectangle
+                                // batch beside it at the tail of the stroke
+                                // loop has had one all along. fillDoubles is
+                                // 256 doubles, so the batch is exactly full at
+                                // 64 cards and the 65th wrote four doubles past
+                                // the end of a stack array. Sixty four enemies
+                                // is not a number a 15fps overlay should be
+                                // crashing on, and the write is a stack smash
+                                // rather than a clean failure, so it is checked
+                                // here with the same form the rectangle batch
+                                // uses.
+                                //
+                                // The card is already fully consumed from the
+                                // stream by this point, so it is counted as
+                                // dropped and the loop moves to the next one.
+                                // Returning or breaking out would leave the
+                                // reader sitting inside the card section and
+                                // desynchronise everything after it.
+                                if (fillN * 4 + 4 <= (int)(sizeof(fillDoubles)/sizeof(fillDoubles[0]))) {
+                                    fillDoubles[fillN * 4 + 0] = cfx0;
+                                    fillDoubles[fillN * 4 + 1] = cfy0;
+                                    fillDoubles[fillN * 4 + 2] = cw;
+                                    fillDoubles[fillN * 4 + 3] = ch;
+                                    fillN++;
+                                } else {
+                                    s_cardDrops++;
+                                }
                             }
                             cardOps++;
                         }
@@ -2254,6 +2352,13 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         continue;
                     }
                     if (op == 5) {
+                        // First label record of the frame is where the label
+                        // group starts. Taken here, ahead of every place, text
+                        // and hide call below, so geom= is geometry and label= is
+                        // labels. The stream puts all of the op 5 records after
+                        // the stroke geometry and before the op 6 cards, so this
+                        // one read is the boundary for the whole group.
+                        if (tLabelStart == 0) tLabelStart = now_us();
                         // op 5, role, len, key(8), px, py, w, h, utf8[len]
                         if (i + 42 > len) { i = len; break; }
                         const uint8_t role = b[i++];
@@ -2546,7 +2651,18 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // End of geom. The loop above is every CGPathAddLines and every
             // mid-loop CGPathAddRects, so this group is the one that scales
             // with the number of things on screen.
-            const uint64_t tLabelStart = now_us();
+            //
+            // This used to be where the label group started. The label records
+            // are op 5 and they are parsed inside the loop, so everything from
+            // sb_count_label_place through the hide pass was counted as geom
+            // and label= came out as 0us. The boundary now opens at the first
+            // op 5 record, before the loop. What is left here is only the
+            // fallback for a frame that carried no label record at all: without
+            // it tLabelStart would still be zero and label= would print the
+            // length of everything after it, which is the same misreading in the
+            // other direction. The label group itself ends below, at
+            // tFlushStart.
+            if (tLabelStart == 0) tLabelStart = now_us();
 
             // Remember whether the last frame drew anything on the fill layer.
             //
@@ -2762,7 +2878,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
                               @"mergedSub=%u trunc=%u txt=%u cards=%u cardOps=%u "
-                              @"wait=%llums work=%llums",
+                              @"wait=%llums work=%llums carddrop=%u",
                               sbPubTid,
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
@@ -2779,7 +2895,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned long long)g_sbSummarySkips,
                               g_sbSubpathCount, nTrunc, txtOps, fillDrawn, cardOps,
                               (unsigned long long)(g_sbLastWaitUS / 1000ULL),
-                              (unsigned long long)(pubMS - g_sbLastWaitUS / 1000ULL));
+                              (unsigned long long)(pubMS - g_sbLastWaitUS / 1000ULL),
+                              (unsigned int)s_cardDrops);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {

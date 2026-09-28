@@ -84,9 +84,44 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
     pthread_mutex_unlock(&gObjCCacheLock);
 }
 
+// Defined below, next to the other timers in this file.
+static uint64_t r_now_us(void);
+
+// How much r_settle() is actually costing, per second. gSettleUS is a number in
+// a header, and 50ms in front of every r_msg2 and r_msg2_main is a lot of
+// waiting that leaves no trace anywhere, so count the sleeps and the microseconds
+// and print the window once a second.
+//
+// r_settle() itself is unchanged and gSettleUS is unchanged: this only makes the
+// sleep that already happens visible on the device.
+static void r_settle_note(uint64_t sleptUS)
+{
+    static uint64_t s_lastUS;
+    static uint64_t s_windowN;
+    static uint64_t s_windowUS;
+
+    uint64_t now = r_now_us();
+    if (s_lastUS == 0) s_lastUS = now;
+    s_windowN++;
+    s_windowUS += sleptUS;
+    if ((now - s_lastUS) < 1000000ull) return;
+
+    // PUSH tagged, like every other line this file prints. See MO_DAU.txt at
+    // r_main_wait_note: a printf without the tag is dropped by the PUSH log
+    // filter, and then the number is never seen again.
+    printf("[PUSH][SB-SETTLE] n=%llu us=%llu\n",
+           (unsigned long long)s_windowN, (unsigned long long)s_windowUS);
+    s_lastUS = now;
+    s_windowN = 0;
+    s_windowUS = 0;
+}
+
 static void r_settle(void)
 {
-    if (gSettleUS) usleep(gSettleUS);
+    if (gSettleUS) {
+        usleep(gSettleUS);
+        r_settle_note((uint64_t)gSettleUS);
+    }
 }
 
 static uint64_t r_call_stable(int timeout, const char *fnName,
@@ -882,7 +917,21 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
 {
     if (!r_is_objc_ptr(obj) || !sel) return 0;
     if (remote_call_uses_vphone_bridge()) {
-        return r_msg_main(obj, sel, object, 0, 0, 0);
+        // objc_msgSend_main is the target's own main thread helper and it takes
+        // no wait flag, so routing wait==NO through it made a caller that asked
+        // for a non-blocking perform block on the target's main thread anyway.
+        // Only wait==YES goes there now.
+        //
+        // The path below is what a non-blocking perform is, so this is the same
+        // call the caller asked for and not a new lifetime pattern for object:
+        // the argument holds exactly as long as the caller's own contract says
+        // it does, and a caller that frees it needs the target to have run the
+        // selector first asks for wait==YES.
+        if (wait) return r_msg_main(obj, sel, object, 0, 0, 0);
+        uint64_t bridgePerformSel =
+            r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+        if (!bridgePerformSel) return 0;
+        return r_msg(obj, bridgePerformSel, sel, object, 0, 0);
     }
 
     // Already on the main thread, so performing the selector here is the same
