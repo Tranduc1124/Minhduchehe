@@ -507,6 +507,53 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
+    // [SB-COLOR] proves whether a multi argument selector can carry its
+    // arguments at all, before any second shape layer is attempted.
+    //
+    // The previous six layer attempt drew nothing, and its colour call was
+    // written as r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+    // rgba, 32, ...), that is one 32 byte pointer. Reading r_msg_main_raw shows
+    // why that cannot work. It does not marshal through the x0..x7 injector at
+    // all: it asks the real method signature for numberOfArguments, allocates a
+    // buffer per argument and calls setArgument:atIndex: once for each. Passing
+    // only a0 meant the remaining three arguments were never written, so the
+    // selector ran with three uninitialised CGFloats and every group got a
+    // colour nobody chose.
+    //
+    // The right call passes four separate eight byte doubles, which is what this
+    // does. The colour is then read back through CGColor and its components
+    // printed, so the device says what actually arrived instead of the log
+    // claiming success on a call that may have produced anything.
+    //
+    //   rgba matching the request -> the transport is fine, a second layer for
+    //                                fill is safe to build
+    //   rgba wrong                 -> the marshalling is still wrong and the
+    //                                number printed here says which part
+    {
+        double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
+        uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                       &want[0], 8, &want[1], 8,
+                                       &want[2], 8, &want[3], 8);
+        uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
+        double got[4] = { -1, -1, -1, -1 };
+        if (r_is_objc_ptr(cg)) {
+            // CGColorGetComponents takes the colour and an out pointer, so both
+            // fit the x0..x7 injector directly. The out buffer has to be the
+            // target's own memory, not ours.
+            uint64_t outBuf = dlsym_remote("malloc", 32, 0,0,0,0,0,0,0);
+            if (outBuf) {
+                dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
+                remote_read(outBuf, got, sizeof(got));
+                dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
+            }
+        }
+        NSLog(@"[SB-COLOR] want=%.2f,%.2f,%.2f,%.2f got=%.2f,%.2f,%.2f,%.2f "
+              @"col=%d cg=%d",
+              want[0], want[1], want[2], want[3],
+              got[0], got[1], got[2], got[3],
+              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg));
+    }
+
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
