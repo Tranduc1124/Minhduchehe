@@ -308,6 +308,9 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
+    // The argument buffers must outlive invoke, see the comment at the free
+    // below. Held here so the error paths can release them too.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -316,15 +319,18 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
             argsOK = false;
             continue;
         }
+        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
     if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
@@ -334,10 +340,34 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
     r_msg(inv, performSel, invokeSel, 0, 1, 0);
+
+    // Only now is it safe to free. setArgument:atIndex: stores the pointer and
+    // copies nothing, and retainArguments only retains arguments that are
+    // objects, so a CGFloat argument is read straight out of this buffer when
+    // invoke runs. Freeing it before invoke is why every number this transport
+    // carried arrived as zero.
+    //
+    // The device log proved it rather than suggesting it. Creating a colour with
+    // colorWithRed:green:blue:alpha: and four separate doubles for 0,1,0,1
+    // returned a valid object and a valid CGColor, and reading the components
+    // back out of SpringBoard gave 0,0,0,0:
+    //
+    //   [SB-COLOR] want=0.00,1.00,0.00,1.00 got=0.00,0.00,0.00,0.00 col=1 cg=1
+    //
+    // This also explains a long standing oddity. setLineWidth: was given 1.5 and
+    // the overlay looked as though it had been honoured, but a zero line width
+    // falls back to the CALayer default of one, which is close enough to 1.5 that
+    // nothing ever looked wrong. It was never actually being set.
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 
     uint64_t ret = 0;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
@@ -418,6 +448,8 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
 
     bool argsOK = true;
     uint64_t userArgs[4] = { a0, a1, a2, a3 };
+    // Held until after invoke. See the comment at the free in r_msg_main_raw.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         8, 0, 0, 0, 0, 0, 0, 0);
@@ -425,21 +457,38 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
+        argBufs[i] = argBuf;
         if (remote_write64(argBuf, userArgs[i])) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
-    if (!argsOK) return;
+    if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
+        return;
+    }
 
     r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
-    if (performSel && invokeSel) r_msg(inv, performSel, invokeSel, 0, 0, 0);
+    if (performSel && invokeSel) {
+        // waitUntilDone is 1, not 0. The argument buffers are only valid until
+        // the invocation has run, and this function has no way to learn when a
+        // queued invocation finished, so it must be told to wait. The previous 0
+        // meant the buffers below were freed while the main thread had not yet
+        // read them.
+        r_msg(inv, performSel, invokeSel, 0, 1, 0);
+    }
+    // Safe now that invoke has returned. See the comment at the free in
+    // r_msg_main_raw.
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 }
 
 uint64_t r_msg2_main_raw(uint64_t obj, const char *selName,
@@ -491,6 +540,8 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
+    // Held until after invoke. See the comment at the free in r_msg_main_raw.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -499,15 +550,18 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
+        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
     if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
@@ -517,10 +571,17 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
     r_msg(inv, performSel, invokeSel, 0, 1, 0);
+
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 
     bool ok = false;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
