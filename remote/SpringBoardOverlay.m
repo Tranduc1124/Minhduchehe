@@ -363,6 +363,7 @@ static uint64_t g_sbFillInv     = 0;
 static uint64_t g_sbFillArgBuf  = 0;
 static uint32_t g_sbFillSubpaths = 0;
 static int      g_sbFillWasDrawn = 0;
+static uint64_t g_sbNameFont     = 0;
 static uint64_t g_sbFontSmall                     = 0;
 static uint64_t g_sbFontBig                       = 0;
 
@@ -459,6 +460,14 @@ static uint64_t sb_count_label_hide(int hidden) {
 //
 // Set once per role change, not per frame, because a UILabel's background,
 // corner radius, font and colour are all fixed once chosen.
+// The rotation, and the invocation that carries it, are needed by
+// sb_make_pooled_label, which is below the label pool's other helpers.
+static uint64_t g_sbLabelTransInv = 0;
+static uint64_t g_sbLabelTransBuf = 0;
+
+static BOOL sb_cached_invocation(uint64_t label, const char *selName,
+                                 uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
+
 static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     if (!r_is_objc_ptr(container)) return 0;
 
@@ -484,16 +493,8 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     // One font for every pooled label, set once at creation, because every pooled
     // label is a name now that the distance is held back. The app uses the same
     // size for its measurement, so card and text agree by construction.
-    {
-        uint64_t UIFont = r_class("UIFont");
-        if (r_is_objc_ptr(UIFont)) {
-            double fs = SB_NAME_FONT_SIZE;
-            uint64_t font = r_msg_main_raw(UIFont, r_sel("boldSystemFontOfSize:"),
-                                           &fs, 8, NULL, 0, NULL, 0, NULL, 0);
-            if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0, 0, 0);
-        }
-        r_msg2_main(label, "setAdjustsFontSizeToFitWidth:", 0, 0, 0, 0);
-    }
+    if (r_is_objc_ptr(g_sbNameFont)) r_msg2_main(label, "setFont:", g_sbNameFont, 0, 0, 0);
+    r_msg2_main(label, "setAdjustsFontSizeToFitWidth:", 0, 0, 0, 0);
 
     uint64_t UIColor = r_class("UIColor");
     // No background here any more. The card is a filled rectangle in the fill
@@ -536,9 +537,16 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     // setBounds: invocation, which is two calls and does not block. The one size
     // set that must happen here is the transform, because it is what orients the
     // text and it is set exactly once per label.
-    double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
-    r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
-                   NULL, 0, NULL, 0, NULL, 0);
+    // The rotation, through a cached invocation: two calls and it does not wait,
+    // where r_msg_main_raw is around thirteen calls and does, because it presents
+    // with waitUntilDone:YES.
+    if (sb_cached_invocation(label, "setTransform:",
+                             &g_sbLabelTransInv, &g_sbLabelTransBuf, 48)) {
+        double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+        remote_write(g_sbLabelTransBuf, tr, sizeof(tr));
+        r_msg2(g_sbLabelTransInv, "setArgument:atIndex:", g_sbLabelTransBuf, 2, 0, 0);
+        r_msg(g_sbLabelTransInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
 
     r_msg2_main(container, "addSubview:", label, 0, 0, 0);
     return label;
@@ -1000,6 +1008,9 @@ static void sb_forget_local_paint_state(void) {
     g_sbFillArgBuf = 0;
     g_sbFillSubpaths = 0;
     g_sbFillWasDrawn = 0;
+    g_sbNameFont = 0;
+    g_sbLabelTransInv = 0;
+    g_sbLabelTransBuf = 0;
     g_sbFillRingAt = 0;
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
     g_sbPathHash = 0;
@@ -1088,8 +1099,23 @@ static void sb_invoke_cached_main_raw(void) {
     }
     remote_write64(g_sbSetPathArgBuf, persistentPath());
     r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    // waitUntilDone:YES.
+    //
+    // It was NO, so presents were queued without limit. The frame rate is capped
+    // at about sixty publishes a second and SpringBoard's main thread does about
+    // sixty turns a second, so publishing slightly faster than the main thread
+    // drains grows the queue without bound. Nothing showed it directly until a
+    // label was created: creating one needs r_msg_main_raw, which itself
+    // presents with waitUntilDone:YES, and that call has to wait for the entire
+    // backlog ahead of it. Six hundred to eight hundred millisecond frames, with
+    // a rate of two, appearing only on the frames that created a label.
+    //
+    // Waiting here costs this thread a main thread turn per frame, which caps
+    // the rate at what the main thread can actually do and makes it steady. The
+    // wait is on this side, not on SpringBoard's, so the thing that used to
+    // freeze was never the thing being waited on.
     if (g_sbPerformMainSel && g_sbInvokeSel) {
-        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 1, 0);
     }
 }
 
@@ -1413,6 +1439,18 @@ int SBoardStartOverlay(void) {
     // The device log agreed and named it exactly: [SB-LABEL] counter label
     // created, then [SB-TXT] lbl=0 on every frame, four builds after the label
     // was known to work.
+    // One font for every label, made once. Making it inside the per label
+    // creation meant an r_msg_main_raw per label, and that call waits for
+    // SpringBoard's main thread, which is two blocking main thread turns for
+    // something that does not change.
+    {
+        uint64_t UIFont = r_class("UIFont");
+        if (r_is_objc_ptr(UIFont) && !r_is_objc_ptr(g_sbNameFont)) {
+            double fs = SB_NAME_FONT_SIZE;
+            g_sbNameFont = r_msg_main_raw(UIFont, r_sel("boldSystemFontOfSize:"),
+                                          &fs, 8, NULL, 0, NULL, 0, NULL, 0);
+        }
+    }
     sb_make_count_label(container);
 
     // Created after sb_forget_local_paint_state for the same reason the counter
