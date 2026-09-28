@@ -489,6 +489,21 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         }
     }
 
+    // What the text block above actually saw. Three rounds of txt=0 were spent
+    // guessing which of its four conditions was false, none of which was in the
+    // log. bytes is the decisive one: if the op had been appended the stream
+    // would be twenty bytes longer than the same frame without a counter.
+    {
+        static uint64_t s_txtLogUS = 0;
+        const uint64_t nowS = now_us();
+        if (nowS > s_txtLogUS) {
+            s_txtLogUS = nowS + 1000000ULL;
+            NSLog(@"[SB-TXT] lbl=%d cnt=%d landW=%.0f landH=%.0f bytes=%lu emitted=%d",
+                  (int)r_is_objc_ptr(g_sbCountLabel), enemyCount,
+                  ctx.landW, ctx.landH, (unsigned long)d.length, emitted);
+        }
+    }
+
     if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
