@@ -338,6 +338,7 @@ static uint64_t g_sbLabelPosBuf[SB_LABEL_MAX]     = { 0 };
 // Set while a slot is being used by the frame being decoded, so a slot is never
 // handed to two strings and the hide pass knows exactly which slots went unused.
 static uint8_t  g_sbLabelClaimed[SB_LABEL_MAX]    = { 0 };
+static uint64_t g_sbLabelKey[SB_LABEL_MAX]       = { 0 };
 static uint64_t g_sbLabelBoundsInv[SB_LABEL_MAX]  = { 0 };
 static uint64_t g_sbLabelBoundsBuf[SB_LABEL_MAX]  = { 0 };
 static double   g_sbLabelLastSize[SB_LABEL_MAX][2] = { { 0.0, 0.0 } };
@@ -830,6 +831,7 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
     {
         NSArray *layers = [espView valueForKey:@"textLayerPool"];
         NSArray *roles  = [espView valueForKey:@"textRolePool"];
+        NSArray *keys   = [espView valueForKey:@"textKeyPool"];
         NSNumber *active = [espView valueForKey:@"activeTextLayerCount"];
         if ([layers isKindOfClass:[NSArray class]] &&
             [roles  isKindOfClass:[NSArray class]] &&
@@ -858,9 +860,15 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
                 uint8_t top = 5;
                 uint8_t rr = (uint8_t)role;
                 uint8_t sl = (uint8_t)slen;
+                // Identity of whatever the text belongs to, so the overlay keys
+                // its labels on the pawn rather than on the string.
+                id keyObj = (i < keys.count) ? keys[i] : nil;
+                const uint64_t lk = [keyObj isKindOfClass:[NSNumber class]]
+                                  ? (uint64_t)[keyObj unsignedLongLongValue] : 0ULL;
                 [d appendBytes:&top length:1];
                 [d appendBytes:&rr length:1];
                 [d appendBytes:&sl length:1];
+                [d appendBytes:&lk length:8];
                 [d appendBytes:&px length:8];
                 [d appendBytes:&py length:8];
                 [d appendBytes:&w length:8];
@@ -968,6 +976,7 @@ static void sb_forget_local_paint_state(void) {
         g_sbLabelRole[k] = -1;
         g_sbLabelShown[k] = 0;
         g_sbLabelClaimed[k] = 0;
+        g_sbLabelKey[k] = 0;
     }
     g_sbLabelUsed = 0;
     g_sbLabelHigh = 0;
@@ -1802,23 +1811,36 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     // reader that can decide wrongly and then take the rest of
                     // the frame with it. That is what happened twice.
                     if (op == 6) {
-                        int got = 0;
-                        double cfx0 = 0, cfy0 = 0, cfx1 = 0, cfy1 = 0;
-                        while (i < len && got < 4) {
-                            if (i + 17 > len) { i = len; break; }
-                            const uint8_t pt = b[i++];
-                            double px2, py2;
-                            memcpy(&px2, b + i, 8); memcpy(&py2, b + i + 8, 8);
-                            i += 16;
-                            if (got == 0) { cfx0 = cfx1 = px2; cfy0 = cfy1 = py2; }
-                            else {
-                                if (px2 < cfx0) cfx0 = px2; else if (px2 > cfx1) cfx1 = px2;
-                                if (py2 < cfy0) cfy0 = py2; else if (py2 > cfy1) cfy1 = py2;
+                        // Every card in the frame, not one.
+                        //
+                        // Op 6 is a marker for the whole filled section: the app
+                        // emits it once and then every card's four points, so a
+                        // reader that takes four points and returns leaves the
+                        // rest to the stroke reader. That is where three of the
+                        // four cards went: they arrived as ordinary white
+                        // rectangles on the stroke layer, which is the empty
+                        // outline the device showed, and cards=1 against
+                        // cardOps=1 is consistent with exactly that.
+                        //
+                        // Four points is seventeen bytes each, so a card is
+                        // sixty eight. Anything left over that is not a whole card
+                        // is dropped rather than guessed at.
+                        while (i + 4 * 17 <= len) {
+                            double cfx0 = 0, cfy0 = 0, cfx1 = 0, cfy1 = 0;
+                            int got = 0;
+                            while (got < 4 && i + 17 <= len) {
+                                i++;                              // the op byte
+                                double px2, py2;
+                                memcpy(&px2, b + i, 8); memcpy(&py2, b + i + 8, 8);
+                                i += 16;
+                                if (got == 0) { cfx0 = cfx1 = px2; cfy0 = cfy1 = py2; }
+                                else {
+                                    if (px2 < cfx0) cfx0 = px2; else if (px2 > cfx1) cfx1 = px2;
+                                    if (py2 < cfy0) cfy0 = py2; else if (py2 > cfy1) cfy1 = py2;
+                                }
+                                got++;
                             }
-                            got++;
-                            (void)pt;
-                        }
-                        if (got == 4) {
+                            if (got < 4) break;
                             const double cw = cfx1 - cfx0, ch = cfy1 - cfy0;
                             if (cw > 0.5 && ch > 0.5) {
                                 fillDoubles[fillN * 4 + 0] = cfx0;
@@ -1827,16 +1849,19 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                 fillDoubles[fillN * 4 + 3] = ch;
                                 fillN++;
                             }
+                            cardOps++;
                         }
-                        cardOps++;
+                        i = len;
                         continue;
                     }
                     if (op == 5) {
-                        // op 5, role, len, px, py, w, h, utf8[len]
-                        if (i + 34 > len) { i = len; break; }
+                        // op 5, role, len, key(8), px, py, w, h, utf8[len]
+                        if (i + 42 > len) { i = len; break; }
                         const uint8_t role = b[i++];
                         const uint8_t slen = b[i++];
                         if (slen > SB_TEXT_MAX) { i = len; break; }
+                        uint64_t lkey = 0;
+                        memcpy(&lkey, b + i, 8); i += 8;
                         double tpx, tpy, tw, th;
                         memcpy(&tpx, b + i, 8);      memcpy(&tpy, b + i + 8, 8);
                         memcpy(&tw,  b + i + 16, 8);  memcpy(&th,  b + i + 24, 8);
@@ -1881,8 +1906,15 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                             for (int k = 0; k < SB_LABEL_MAX; k++) {
                                 if (g_sbLabelClaimed[k]) continue;
                                 if (!r_is_objc_ptr(g_sbLabelObj[k])) continue;
+                                // Matched on the pawn's identity, never on the
+                                // string. Every bot in this game is called BOT, so
+                                // matching on text gave all of them one slot: they
+                                // took turns writing it, the position flipped
+                                // between pawns every frame, and the names of the
+                                // other three never appeared at all. That is the
+                                // text that would not stay with its card.
                                 if (g_sbLabelRole[k] != role) continue;
-                                if (strcmp(g_sbLabelLastText[k], txt) != 0) continue;
+                                if (g_sbLabelKey[k] != lkey) continue;
                                 idx = k;
                                 break;
                             }
@@ -1896,6 +1928,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                 for (int k = 0; k < SB_LABEL_MAX; k++) {
                                     if (g_sbLabelClaimed[k]) continue;
                                     if (r_is_objc_ptr(g_sbLabelObj[k])) continue;
+                                    if (g_sbLabelKey[k] != 0) continue;
                                     idx = k;
                                     break;
                                 }
@@ -1912,6 +1945,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                             }
                             if (idx >= 0) {
                                 g_sbLabelClaimed[idx] = 1;
+                                g_sbLabelKey[idx] = lkey;
                                 if (idx >= txtSlot) txtSlot = idx + 1;
                                 calls += sb_pooled_label_update(idx, role, tpx, tpy, tw, th, txt);
                             }

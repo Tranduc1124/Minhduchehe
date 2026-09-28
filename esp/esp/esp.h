@@ -60,10 +60,15 @@ typedef struct {
     CGMutablePathRef aimAssistPath; 
 } ESPFrameStats;
 
+// key is the identity of the thing the text belongs to, so the overlay can keep
+// one label per pawn rather than one label per distinct string. Every bot in
+// this game is called BOT, so matching labels by their text gave all of them a
+// single label that they took turns writing. Zero means no identity.
 typedef void (*ESPAddTextCallback)(
     void *context,
     NSString *string,
     int role,
+    uint64_t key,
     CGRect frame,
     UIColor *color,
     CGFloat fontSize,

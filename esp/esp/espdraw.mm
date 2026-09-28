@@ -82,7 +82,7 @@ void RenderTotalEnemyCount(ESPAddTextCallback textCallback, void *callbackContex
     NSString *countStr = [NSString stringWithFormat:@"%d", totalCount];
 
     // [FIX LAG]: Bỏ tính toán size font, cấp khung rộng và ép tự căn giữa (NO)
-    textCallback(callbackContext, countStr, ESPTextRoleCounter, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
+    textCallback(callbackContext, countStr, ESPTextRoleCounter, 0, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
 }
 
 // ==========================================
@@ -263,7 +263,7 @@ static void ESPRenderPawnCore(
             NSString *wname = WeaponNameForPlayerNS(PawnObject);
             if (wname && wname.length > 0) {
                 // [FIX LAG]: Cấp khung cố định và căn giữa bằng NO
-                textCallback(callbackContext, wname, ESPTextRoleWeapon, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
+                textCallback(callbackContext, wname, ESPTextRoleWeapon, 0, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
             }
         }
     }
@@ -342,6 +342,7 @@ static void ESPRenderPawnCore(
 
             if (textCallback) {
                 textCallback(callbackContext, dispName, ESPTextRoleName,
+                             (uint64_t)PawnObject,
                              CGRectMake(centerX - 100.0f, cardTop, 200.0f, cardH),
                              [UIColor whiteColor], nameFS, NO);
             }
