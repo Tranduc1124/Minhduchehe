@@ -110,6 +110,7 @@ typedef struct RemoteCallState {
     uint64_t vmMap;
     uint64_t callThreadAddr;
     uint64_t trojanThreadAddr;
+    uint64_t mainThreadAddr;
     int pid;
     bool success;
     NSMutableArray<NSNumber *> *threadList;
@@ -166,6 +167,7 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_vmMap                 (remote_call_current_state()->vmMap)
 #define g_RC_callThreadAddr        (remote_call_current_state()->callThreadAddr)
 #define g_RC_trojanThreadAddr      (remote_call_current_state()->trojanThreadAddr)
+#define g_RC_mainThreadAddr        (remote_call_current_state()->mainThreadAddr)
 #define g_RC_pid                   (remote_call_current_state()->pid)
 #define g_RC_success               (remote_call_current_state()->success)
 #define g_RC_threadList            (remote_call_current_state()->threadList)
@@ -1007,6 +1009,35 @@ int remote_call_current_pid(void)
 bool remote_call_uses_vphone_bridge(void)
 {
     return g_RC_vphoneBridge;
+}
+
+// True when the thread that executes a remote call IS the target's main thread.
+//
+// Every call after init runs on the trojan thread, and the trojan thread is the
+// first thread in the task's list, which is the main thread. A caller that is
+// about to ask the main thread to do something must know this first: asking the
+// main thread to run a block and then waiting for it, while running on the main
+// thread, is a self deadlock. The main thread never returns to its runloop to
+// deliver the block, so the wait never ends, and backboardd kills SpringBoard
+// when the checkin goes stale.
+//
+// Logged on the device at the time of the kill, springboardd's report and the
+// main thread's own state:
+//     unresponsive dispatch queue(s): com.apple.main-thread
+//     60 seconds since last successful checkin
+//     thread 1552: mach_msg receive on port 0x73e840b4c063f347
+//     thread 1552: turnstile blocked on task pid 296, hops: 2
+//
+// A slow frame does not park the main thread in a mach message receive with a
+// turnstile block on this app's task. That is a deadlock and this is it.
+bool remote_call_runs_on_target_main_thread(void)
+{
+    if (g_RC_vphoneBridge) return false;
+    if (!g_RC_taskAddr || !g_RC_mainThreadAddr) return false;
+    // While the extra thread is bootstrapping, calls run on the synthetic call
+    // thread instead, and the main thread is parked, not executing anything.
+    if (g_RC_creatingExtraThread) return false;
+    return g_RC_trojanThreadAddr == g_RC_mainThreadAddr;
 }
 
 int remote_call_set_stable_timeout_floor_ms(int timeoutMS)
@@ -2014,6 +2045,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     if (!g_RC_trojanThreadAddr)
         g_RC_trojanThreadAddr = firstThread;
+
+    // The thread every call is parked on, and the target's main thread, are the
+    // same thing unless the synthetic call thread is in use. Callers that have
+    // to reason about "am I on the main thread already" need that fact, so keep
+    // it rather than making them re-derive it from the thread list.
+    g_RC_mainThreadAddr = firstThread;
+    RC_DIAG("main thread 0x%llx trojan=0x%llx (equal=%d)",
+            (unsigned long long)g_RC_mainThreadAddr,
+            (unsigned long long)g_RC_trojanThreadAddr,
+            g_RC_mainThreadAddr == g_RC_trojanThreadAddr);
 
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);

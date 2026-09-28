@@ -88,6 +88,12 @@ bool remote_call_has_local_state(void);
 bool remote_call_current_success(void);
 int remote_call_current_pid(void);
 bool remote_call_uses_vphone_bridge(void);
+// True when the thread running a remote call is the target's main thread, which
+// is the normal case after init. Callers that want the main thread to do
+// something must not then wait on the main thread: that deadlocks SpringBoard
+// and backboardd kills it at the 60 second checkin. See the comment on the
+// definition for the report that proves it.
+bool remote_call_runs_on_target_main_thread(void);
 int remote_call_set_stable_timeout_floor_ms(int timeoutMS);
 RemoteCallInitFailure remote_call_last_init_failure(void);
 uint32_t remote_call_last_init_failure_pid(void);

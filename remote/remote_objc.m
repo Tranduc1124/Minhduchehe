@@ -8,6 +8,7 @@
 #import <pthread.h>
 #import <stdlib.h>
 #import <string.h>
+#import <time.h>
 #import <unistd.h>
 
 extern uint64_t remote_read64(uint64_t src);
@@ -331,6 +332,105 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
     return ok;
 }
 
+// Widen a value of `size` bytes to a register width, the way the argument
+// buffers are already widened when they are written with setArgument:atIndex:.
+static uint64_t r_widen_arg(const void *p, size_t size)
+{
+    if (!p) return 0;
+    uint64_t v = 0;
+    size_t n = (size > 8) ? 8 : size;
+    __builtin_memcpy(&v, p, n);
+    return v;
+}
+
+static uint64_t r_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+// How long the blocking dispatch to SpringBoard's main thread took, how many
+// there have been, and the worst one so far. Every waitUntilDone:YES dispatch
+// in this file reports here, and this is the number that decides who is holding
+// the main thread.
+//
+// The file header says only a waitUntilDone:NO perform is supposed to touch
+// SpringBoard's main thread. That is not what the code does: every helper below
+// ends in performSelectorOnMainThread:...waitUntilDone:YES, which parks the
+// calling thread until the main thread runs the block. So the claim and the code
+// disagree, and the watchdog report is what the disagreement costs:
+//
+//     unresponsive dispatch queue(s): com.apple.main-thread
+//     60 seconds since last successful checkin
+//
+// Read the number two ways. Worst in the low milliseconds across a whole session
+// means the main thread is servicing us promptly and the hang is not this, so
+// stop looking here. Worst in the seconds, or a summary that stops repeating
+// while the overlay is still running, means the dispatch is what wedges the main
+// thread and the fix is to take these off the main thread.
+//
+// PUSH tagged. MO_DAU.txt: a printf without the tag is dropped by the PUSH log
+// filter, and then the number is never seen again.
+#define R_MAIN_WAIT_SLOW_US 50000ull
+static void r_main_wait_note(const char *what, uint64_t waitedUS)
+{
+    static uint64_t s_count;
+    static uint64_t s_maxUS;
+    static uint64_t s_totalUS;
+    s_count++;
+    s_totalUS += waitedUS;
+    if (waitedUS > s_maxUS) {
+        s_maxUS = waitedUS;
+        printf("[PUSH][SB-WAIT] new worst %s %lluus n=%llu total=%lluus\n",
+               what, (unsigned long long)waitedUS, (unsigned long long)s_count,
+               (unsigned long long)s_totalUS);
+    }
+    if (waitedUS >= R_MAIN_WAIT_SLOW_US) {
+        printf("[PUSH][SB-WAIT] slow %s %lluus n=%llu worst=%lluus\n",
+               what, (unsigned long long)waitedUS, (unsigned long long)s_count,
+               (unsigned long long)s_maxUS);
+    }
+    if ((s_count % 200) == 0) {
+        printf("[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus\n",
+               (unsigned long long)s_count, (unsigned long long)s_maxUS,
+               (unsigned long long)s_totalUS);
+    }
+}
+
+// Run a main thread message without going through NSInvocation, when the thread
+// running this call is already the target's main thread. Returns true and stores
+// the selector's return value in outRet; false means the caller must use the
+// normal round trip.
+//
+// A remote call runs on the trojan thread, and that is the target's first
+// thread, which is the main thread. So "perform this on the main thread and
+// wait for it" is a main thread waiting for the main thread. The main thread
+// cannot get back to its runloop to drain the queue, the wait never ends,
+// backboardd stops getting checkins and SpringBoard is killed at sixty seconds.
+// The device log for the kill that is being fixed here:
+//
+//     unresponsive dispatch queue(s): com.apple.main-thread
+//     60 seconds since last successful checkin
+//     thread 1552: mach_msg receive on port 0x73e840b4c063f347
+//     thread 1552: turnstile blocked on task pid 296, hops: 2
+//
+// A direct objc_msgSend from this thread is already a main thread call, so the
+// round trip buys nothing that was wanted and costs the deadlock.
+static bool r_msg_main_direct(uint64_t obj, uint64_t sel,
+                              const void *a0, size_t a0Size,
+                              const void *a1, size_t a1Size,
+                              const void *a2, size_t a2Size,
+                              const void *a3, size_t a3Size,
+                              uint64_t *outRet)
+{
+    if (!remote_call_runs_on_target_main_thread()) return false;
+    *outRet = r_msg(obj, sel,
+                    r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
+                    r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
+    return true;
+}
+
 uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
                         const void *a0, size_t a0Size,
                         const void *a1, size_t a1Size,
@@ -338,6 +438,12 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
                         const void *a3, size_t a3Size)
 {
     if (!r_is_objc_ptr(obj) || !sel) return 0;
+
+    uint64_t directRet = 0;
+    if (r_msg_main_direct(obj, sel, a0, a0Size, a1, a1Size,
+                          a2, a2Size, a3, a3Size, &directRet)) {
+        return directRet;
+    }
 
     uint64_t sig = r_method_signature(obj, sel);
     if (!r_is_objc_ptr(sig)) return 0;
@@ -461,7 +567,14 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
-    r_msg(inv, performSel, invokeSel, 0, 1, 0);
+    // waitUntilDone:YES, timed. This parks the EXTRA thread until SpringBoard's
+    // main thread runs the block, so this call's duration is the main thread's
+    // latency as seen by the overlay. r_main_wait_note says what to do with it.
+    {
+        uint64_t t0 = r_now_us();
+        r_msg(inv, performSel, invokeSel, 0, 1, 0);
+        r_main_wait_note("r_msg_main_raw", r_now_us() - t0);
+    }
 
     // Only now is it safe to free. setArgument:atIndex: stores the pointer and
     // copies nothing, and retainArguments only retains arguments that are
@@ -540,6 +653,13 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
     if (!sel) return;
     r_settle();
 
+    // Already on the main thread, so the call is already a main thread call.
+    // See r_msg_main_direct for why the round trip must not be taken here.
+    if (remote_call_runs_on_target_main_thread()) {
+        r_msg(obj, sel, a0, a1, a2, a3);
+        return;
+    }
+
     uint64_t sig = 0;
     {
         uint64_t sigSel = r_sel("methodSignatureForSelector:");
@@ -599,7 +719,9 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
         // queued invocation finished, so it must be told to wait. The previous 0
         // meant the buffers below were freed while the main thread had not yet
         // read them.
+        uint64_t t0 = r_now_us();
         r_msg(inv, performSel, invokeSel, 0, 1, 0);
+        r_main_wait_note("r_msg2_main_async", r_now_us() - t0);
     }
     // Safe now that invoke has returned. See the comment at the free in
     // r_msg_main_raw.
@@ -635,6 +757,37 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     uint64_t sel = r_sel(selName);
     if (!sel) return false;
     r_settle();
+
+    // Already on the main thread. See r_msg_main_direct. This one cannot simply
+    // hand the register back, because a struct wider than eight bytes is not in
+    // a register and there is no return buffer to read it out of without an
+    // invocation. So the direct path is only for the narrow case, and the wide
+    // case reports failure instead of deadlocking SpringBoard. A caller that
+    // needs the wide case has to move the call off the main thread, and the log
+    // line below is what says which caller that is.
+    if (remote_call_runs_on_target_main_thread()) {
+        static uint64_t s_wideWarned = 0;
+        uint64_t sigD = r_method_signature(obj, sel);
+        if (!r_is_objc_ptr(sigD)) return false;
+        uint64_t retLen = r_msg2(sigD, "methodReturnLength", 0, 0, 0, 0);
+        // A struct wider than a register is not in a register at all, so the
+        // direct path cannot produce it. The caller gets false and a log line
+        // naming the selector, which is what tells us which call has to move
+        // off the main thread.
+        if (retLen == 0 || retLen > 8 || retLen < outSize) {
+            if (s_wideWarned != (uint64_t)sel) {
+                s_wideWarned = (uint64_t)sel;
+                NSLog(@"[RemoteObjC] main thread, no direct path for a %llu byte return "
+                      @"from %@ — needs a call off the main thread",
+                      (unsigned long long)retLen, selName);
+            }
+            return false;
+        }
+        uint64_t ret = r_msg(obj, sel,
+                             r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
+                             r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
+        return remote_write(outBuf, &ret, outSize);
+    }
 
     uint64_t sig = r_method_signature(obj, sel);
     if (!r_is_objc_ptr(sig)) return false;
@@ -694,7 +847,12 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
-    r_msg(inv, performSel, invokeSel, 0, 1, 0);
+    // waitUntilDone:YES, timed. See r_main_wait_note.
+    {
+        uint64_t t0 = r_now_us();
+        r_msg(inv, performSel, invokeSel, 0, 1, 0);
+        r_main_wait_note("r_msg2_main_struct_ret", r_now_us() - t0);
+    }
 
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         if (argBufs[i]) r_free(argBufs[i]);
@@ -723,9 +881,23 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
         return r_msg_main(obj, sel, object, 0, 0, 0);
     }
 
+    // Already on the main thread, so performing the selector here is the same
+    // call the main thread would have made. With wait set this used to be a
+    // guaranteed self deadlock. See r_msg_main_direct.
+    if (remote_call_runs_on_target_main_thread()) {
+        return r_msg(obj, sel, object, 0, 0, 0);
+    }
+
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     if (!performSel) return 0;
-    return r_msg(obj, performSel, sel, object, wait ? 1 : 0, 0);
+    if (!wait) {
+        return r_msg(obj, performSel, sel, object, 0, 0);
+    }
+    // waitUntilDone:YES, timed. See r_main_wait_note.
+    uint64_t t0 = r_now_us();
+    uint64_t r = r_msg(obj, performSel, sel, object, 1, 0);
+    r_main_wait_note("r_perform_main", r_now_us() - t0);
+    return r;
 }
 
 uint64_t r_cfstr(const char *s)
