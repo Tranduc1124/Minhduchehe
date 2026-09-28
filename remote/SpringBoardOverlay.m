@@ -2011,28 +2011,34 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                 break;
                             }
                             if (idx < 0) {
-                                // No match, so take the first unclaimed slot. At
-                                // most one new label is made per frame: nine at
-                                // once was the five and a half second stall, and
-                                // spreading them over nine frames costs the same
-                                // work spread out where a single frame cannot
-                                // overrun the main thread it is feeding.
+                                // No slot holds this pawn, so take one that is free.
+                                // Free means unclaimed and unowned, not empty: a
+                                // pre-spawned label has an object and no key, and
+                                // skipping anything with an object meant the six
+                                // labels made at overlay start were never used.
+                                // The pool stayed at zero, every pawn went through
+                                // the make-one-per-frame path, and every one of
+                                // those frames cost eight hundred milliseconds.
+                                // [SB-LABEL] pre-spawned pool=6 of 6 was printed and
+                                // then made=0 on every publish, which is the whole
+                                // thing in two lines of the log.
                                 for (int k = 0; k < SB_LABEL_MAX; k++) {
                                     if (g_sbLabelClaimed[k]) continue;
-                                    if (r_is_objc_ptr(g_sbLabelObj[k])) continue;
                                     if (g_sbLabelKey[k] != 0) continue;
                                     idx = k;
                                     break;
                                 }
-                                if (idx >= 0 && sb_labelsMadeThisFrame < 1) {
-                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role, idx);
-                                    sb_labelsMadeThisFrame++;
-                                    if (!r_is_objc_ptr(g_sbLabelObj[idx])) idx = -1;
-                                } else if (idx >= 0) {
-                                    // The slot exists but is empty and this frame
+                                if (idx >= 0 && !r_is_objc_ptr(g_sbLabelObj[idx]) &&
+                                    sb_labelsMadeThisFrame >= 1) {
+                                    // Nothing pre-spawned was free and this frame
                                     // has already made one, so leave it for the
                                     // next frame rather than stalling this one.
                                     idx = -1;
+                                }
+                                if (idx >= 0 && !r_is_objc_ptr(g_sbLabelObj[idx])) {
+                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role, idx);
+                                    sb_labelsMadeThisFrame++;
+                                    if (!r_is_objc_ptr(g_sbLabelObj[idx])) idx = -1;
                                 }
                             }
                             if (idx >= 0) {
@@ -2243,6 +2249,28 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             const int fillWasDrawn = g_sbFillWasDrawn;
             g_sbFillWasDrawn = 0;
 
+            // Hide the labels this frame did not use, and hand their keys back.
+            //
+            // Outside the block above on purpose. That block only runs when
+            // something was drawn, so a frame that drew nothing skipped the hide
+            // entirely and left a name on screen with nothing to move it. The log
+            // caught it directly: a frame reporting shown=1 with claimed=0, that
+            // is, a label nobody was using and nothing hid it.
+            //
+            // A slot being unclaimed is the definition of free. An unclaimed slot
+            // that keeps its key is also a pool that only shrinks, one dead pawn
+            // at a time.
+            for (int hi = 0; hi < g_sbLabelHigh; hi++) {
+                if (g_sbLabelClaimed[hi]) continue;
+                if (g_sbLabelShown[hi] && r_is_objc_ptr(g_sbLabelObj[hi])) {
+                    g_sbLabelShown[hi] = 0;
+                    r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
+                    calls += 1;
+                }
+                g_sbLabelKey[hi] = 0;
+            }
+            if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
+
             if (fillN > 0 && fillPath) {
                 remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
                 dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
@@ -2255,25 +2283,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // No text run this frame means the app is not in a match, and a
                 // stale count left on screen is worse than no count.
                 if (txtOps == 0) calls += sb_count_label_hide(1);
-                // Pooled labels this frame did not use are holding a pawn that
-                // is gone. Leaving them up is how a name sticks to the last
-                // enemy after the match is over.
-                for (int hi = 0; hi < g_sbLabelHigh; hi++) {
-                    if (g_sbLabelClaimed[hi]) continue;
-                    if (g_sbLabelShown[hi] && r_is_objc_ptr(g_sbLabelObj[hi])) {
-                        g_sbLabelShown[hi] = 0;
-                        r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
-                        calls += 1;
-                    }
-                    // Give the key back. A slot that has been claimed keeps a
-                    // non zero key, and a free slot is only ever taken by one with
-                    // a zero key, so without this the pool was consumed one dead
-                    // pawn at a time and never recovered. It is also why a name
-                    // outlived its pawn: the label was hidden but still owned.
-                    g_sbLabelKey[hi] = 0;
-                }
-                if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
-
                 // Present the cards. Its own cached invocation, for the same
                 // reason the stroke layer has one: r_msg_main_raw rebuilds an
                 // invocation per call and waits for the main thread.
