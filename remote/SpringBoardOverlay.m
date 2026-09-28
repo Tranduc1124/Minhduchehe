@@ -530,28 +530,64 @@ int SBoardStartOverlay(void) {
     //   rgba wrong                 -> the marshalling is still wrong and the
     //                                number printed here says which part
     {
+        // Everything is printed under one prefix because the device log filter
+        // takes a single term, and splitting this across two prefixes cost a round.
+        //
+        // What is already established, by the log and not by reasoning:
+        //   got=0.00,0.00,0.00,0.00 while col=1 and cg=1
+        // col being non zero means r_write_remote_arg returned true, because a
+        // false there sets argsOK false and the function returns 0. So the four
+        // doubles were written to SpringBoard and read back matching. The read
+        // side is sound too, because got starts at minus one and the sentinel
+        // never appears. The write is confirmed good and the read is confirmed
+        // good, and the value is still zero, so the argument is lost between the
+        // buffer and the selector reading it.
+        //
+        // That leaves one untested step in r_msg_main_raw: maxUserArgs comes
+        // from numberOfArguments on the signature, and if that is wrong then no
+        // setArgument:atIndex: is ever issued and the selector reads whatever
+        // happens to be in d0 to d3. So numArgs is printed here. The expectation
+        // for a four argument selector plus self and _cmd is six.
+        const uint64_t colSel = r_sel("colorWithRed:green:blue:alpha:");
+        uint64_t sig = r_is_objc_ptr(colSel)
+                      ? r_msg(clsCol, r_sel("methodSignatureForSelector:"), colSel, 0, 0, 0)
+                      : 0;
+        uint64_t numArgs = r_is_objc_ptr(sig)
+                         ? r_msg2(sig, "numberOfArguments", 0, 0, 0, 0) : 0;
+
         double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
         uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
                                        &want[0], 8, &want[1], 8,
                                        &want[2], 8, &want[3], 8);
         uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
-        double got[4] = { -1, -1, -1, -1 };
+
+        // Number of components the target's colour actually has. A colour made
+        // from red, green, blue and alpha is normally four or five depending on
+        // whether the space is extended, and the out buffer is sized for that
+        // rather than assuming four.
+        uint64_t ncomp = 0;
         if (r_is_objc_ptr(cg)) {
-            // CGColorGetComponents takes the colour and an out pointer, so both
-            // fit the x0..x7 injector directly. The out buffer has to be the
-            // target's own memory, not ours.
-            uint64_t outBuf = dlsym_remote("malloc", 32, 0,0,0,0,0,0,0);
+            ncomp = dlsym_remote("CGColorGetNumberOfComponents", cg, 0,0,0,0,0,0,0);
+        }
+
+        double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        int nread = 0;
+        if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
+            uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
             if (outBuf) {
                 dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
                 remote_read(outBuf, got, sizeof(got));
                 dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
+                nread = (int)ncomp;
             }
         }
-        NSLog(@"[SB-COLOR] want=%.2f,%.2f,%.2f,%.2f got=%.2f,%.2f,%.2f,%.2f "
-              @"col=%d cg=%d",
+        NSLog(@"[SB-COLOR] sig=%d numArgs=%llu ncomp=%llu nread=%d col=%d cg=%d "
+              @"want=%.2f,%.2f,%.2f,%.2f got=%.2f,%.2f,%.2f,%.2f",
+              (int)r_is_objc_ptr(sig), (unsigned long long)numArgs,
+              (unsigned long long)ncomp, nread,
+              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
               want[0], want[1], want[2], want[3],
-              got[0], got[1], got[2], got[3],
-              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg));
+              got[0], got[1], got[2], got[3]);
     }
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
