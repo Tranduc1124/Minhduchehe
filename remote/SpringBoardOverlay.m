@@ -252,6 +252,169 @@ static void serFunc(void *info, const CGPathElement *e) {
     sbEmit(ctx, (e->type == kCGPathElementMoveToPoint) ? 1 : 2, src->x, src->y);
 }
 
+// ===========================================================================
+// Counter label — a real UILabel living inside SpringBoard.
+//
+// A CGPath can only be stroked, and a stroke is a colour and a width, so text
+// drawn as a path would have to become filled rectangles, one batched call per
+// string but hundreds of subpaths, in a bitmap font nobody asked for. The
+// reference implementation in 0xjohnnydev/cyanide never does that: typebanner.m
+// allocates a UILabel inside SpringBoard, sets a real UIFont on it, and calls
+// setText:. No CATextLayer anywhere in that repository. A label is how text
+// reaches a process you do not own.
+//
+// The catch is orientation. The overlay's whole geometry goes through
+// px = landH - y, py = x, so a label placed by the same rule would draw its
+// text sideways. Giving the label the linear part of that rotation as its own
+// CALayer transform puts it back in the app's landscape space, which is the
+// same space the path was authored in, so the text ends up oriented exactly the
+// way the boxes are. Nothing here is a guess about how the device is held; it
+// is the identical map that is already proven on screen.
+//
+//   CGAffineTransform maps (u,v) to (a*u + c*v, b*u + d*v), and the path
+//   rotation minus its translation is (x, y) to (-y, x). So a=0, b=1, c=-1,
+//   d=0, and CALayer puts a local point at position + T*(local - anchor*bounds).
+//   With the default centred anchor that solves to position =
+//   (landH - y - h/2, x + w/2) for a frame of (x, y, w, h).
+//
+// Position therefore moves per frame, but the text only changes when the count
+// does, and setText: is only sent when it changed. A parked camera costs two
+// calls. r_perform_main is used for it because it is one remote call and hops to
+// the main thread; r_msg2_main is the same call with a 3ms r_settle() sleep in
+// front of it, and the settle is the part that costs.
+// ===========================================================================
+static uint64_t g_sbCountLabel   = 0;
+static uint64_t g_sbCountPosInv  = 0;
+static uint64_t g_sbCountPosBuf  = 0;
+static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
+static char     g_sbCountLastText[16] = { 0 };
+static int      g_sbCountShown   = 0;
+
+static BOOL sb_cached_pos_invocation(void) {
+    if (r_is_objc_ptr(g_sbCountPosInv) && g_sbCountPosBuf) return YES;
+    if (!r_is_objc_ptr(g_sbCountLabel)) return NO;
+    // The present selectors are built by sb_ensure_setpath_invocation. Without
+    // them the invocation can be prepared but never run, and lastPos must not be
+    // advanced, so they are required here rather than checked at the call site.
+    if (!g_sbPerformMainSel || !g_sbInvokeSel) return NO;
+
+    uint64_t setPosSel = r_sel("setPosition:");
+    if (!setPosSel) return NO;
+    uint64_t sig = r_msg(g_sbCountLabel, r_sel("methodSignatureForSelector:"), setPosSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+    r_msg2(inv, "setTarget:", g_sbCountLabel, 0, 0, 0);
+    r_msg2(inv, "setSelector:", setPosSel, 0, 0, 0);
+
+    // 16 bytes, not 8: setPosition: takes a CGPoint. The buffer is never freed,
+    // it is rewritten in place every frame, which is what lets the present run
+    // with waitUntilDone:NO and still see the newest value.
+    uint64_t buf = dlsym_remote("malloc", 16, 0,0,0,0,0,0,0);
+    if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
+    r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+
+    g_sbCountPosInv = inv;
+    g_sbCountPosBuf = buf;
+    return YES;
+}
+
+// Returns the number of remote calls made, so the publish log counts them.
+static uint64_t sb_count_label_place(double px, double py) {
+    if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
+    if (!sb_cached_pos_invocation()) return 0;
+    if (px == g_sbCountLastPos[0] && py == g_sbCountLastPos[1]) return 0;
+
+    double p[2] = { px, py };
+    remote_write(g_sbCountPosBuf, p, sizeof(p));
+    r_msg2(g_sbCountPosInv, "setArgument:atIndex:", g_sbCountPosBuf, 2, 0, 0);
+    // Only remember the position once the present that carries it has actually
+    // been queued. Marking it before the queue would mean a frame that arrives
+    // before the invocation is ready silently never draws the label again, which
+    // is exactly the class of bug where the overlay works once and then freezes.
+    r_msg(g_sbCountPosInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    g_sbCountLastPos[0] = px;
+    g_sbCountLastPos[1] = py;
+    return 2;
+}
+
+static uint64_t sb_count_label_text(const char *utf8) {
+    if (!r_is_objc_ptr(g_sbCountLabel) || !utf8) return 0;
+    if (strcmp(g_sbCountLastText, utf8) == 0) return 0;
+
+    uint64_t nsbuf = r_alloc_str(utf8);
+    if (!nsbuf) return 0;
+    uint64_t NSStringCls = r_class("NSString");
+    uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+    uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
+    r_free(nsbuf);
+    if (!r_is_objc_ptr(ns)) return 0;
+
+    uint64_t calls = 4;   // malloc, memcpy, alloc, initWithUTF8String
+    r_perform_main(g_sbCountLabel, r_sel("setText:"), ns, false);
+    calls++;
+    dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
+    calls++;
+
+    strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
+    g_sbCountLastText[sizeof(g_sbCountLastText) - 1] = 0;
+    return calls;
+}
+
+static uint64_t sb_count_label_hide(int hidden) {
+    if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
+    if (g_sbCountShown == !hidden) return 0;
+    g_sbCountShown = !hidden;
+    r_perform_main(g_sbCountLabel, r_sel("setHidden:"), (hidden ? 1 : 0), false);
+    return 1;
+}
+
+static void sb_make_count_label(uint64_t container) {
+    if (g_sbCountLabel || !r_is_objc_ptr(container)) return;
+
+    uint64_t UILabel = r_class("UILabel");
+    if (!r_is_objc_ptr(UILabel)) return;
+    uint64_t alloc = r_msg2_main(UILabel, "alloc", 0, 0, 0, 0);
+    uint64_t label = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(label)) return;
+
+    // A label is not interactive by default, but the overlay window is
+    // already non-interactive and this is the property that would matter if
+    // that ever changed: a label that eats a tap is the bug the old overlay
+    // had.
+    r_msg2_main(label, "setUserInteractionEnabled:", 0, 0, 0, 0);
+    r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);   // centre
+    r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
+
+    uint64_t UIColor = r_class("UIColor");
+    uint64_t clear = r_is_objc_ptr(UIColor) ? r_msg2_main(UIColor, "clearColor", 0, 0, 0, 0) : 0;
+    uint64_t red   = r_is_objc_ptr(UIColor) ? r_msg2_main(UIColor, "redColor",   0, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(clear)) r_msg2_main(label, "setBackgroundColor:", clear, 0, 0, 0);
+    if (r_is_objc_ptr(red))   r_msg2_main(label, "setTextColor:", red, 0, 0, 0);
+
+    uint64_t UIFont = r_class("UIFont");
+    if (r_is_objc_ptr(UIFont)) {
+        double fs = 26.0;
+        uint64_t font = r_msg_main_raw(UIFont, r_sel("systemFontOfSize:"),
+                                       &fs, 8, NULL, 0, NULL, 0, NULL, 0);
+        if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0, 0, 0);
+    }
+
+    // The rotation that puts the label in the same space the path is in.
+    double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+    r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
+                   NULL, 0, NULL, 0, NULL, 0);
+
+    r_msg2_main(container, "addSubview:", label, 0, 0, 0);
+    r_msg2_main(label, "setHidden:", 1, 0, 0, 0);
+
+    g_sbCountLabel = label;
+    NSLog(@"[SB-LABEL] counter label=0x%llx created", label);
+}
+
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     [d setLength:0];
 
@@ -287,6 +450,51 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         CGPathApply(p, &ctx, serFunc);
         emitted = 1;
     }
+    // Text runs ride alongside the geometry as op 5. Only the enemy counter for
+    // now: it is the one text the app draws with a font size above 14, since the
+    // name and distance labels are 4.5 to 10pt. That is a checked discriminator
+    // on a real value rather than a hardcoded index, so it cannot silently
+    // capture the wrong label if the order changes.
+    //
+    //   op 5, len, x, y, w, h, utf8[len]
+    //
+    // The rect is the app's landscape frame, unswapped. sbEmit rotates points as
+    // px = landH - y, py = x, and the label carries that same rotation as its
+    // CALayer transform, so it wants the unrotated centre and its own bounds.
+    // Swapping w and h here as well would rotate the text twice.
+    if (r_is_objc_ptr(g_sbCountLabel)) {
+        NSArray *pool = [espView valueForKey:@"textLayerPool"];
+        NSNumber *active = [espView valueForKey:@"activeTextLayerCount"];
+        if ([pool isKindOfClass:[NSArray class]] &&
+            [active isKindOfClass:[NSNumber class]]) {
+            const NSUInteger n = MIN((NSUInteger)[active unsignedIntegerValue], pool.count);
+            for (NSUInteger i = 0; i < n; i++) {
+                CATextLayer *tl = pool[i];
+                if (![tl isKindOfClass:[CATextLayer class]] || tl.hidden) continue;
+                if (tl.fontSize < 14.0f) continue;
+                NSString *s = tl.string;
+                if (![s isKindOfClass:[NSString class]] || s.length == 0) continue;
+                const char *utf8 = s.UTF8String;
+                if (!utf8) continue;
+                const size_t len = strlen(utf8);
+                if (len == 0 || len > 15) continue;
+                const CGRect r = tl.frame;
+                const double w = r.size.width, h = r.size.height;
+                const double px = ctx.landH - r.origin.y - h * 0.5;
+                const double py = r.origin.x + w * 0.5;
+                uint8_t top = 5;
+                uint8_t slen = (uint8_t)len;
+                [d appendBytes:&top length:1];
+                [d appendBytes:&slen length:1];
+                [d appendBytes:&px length:8];
+                [d appendBytes:&py length:8];
+                [d appendBytes:utf8 length:len];
+                emitted = 1;
+                break;
+            }
+        }
+    }
+
     if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
@@ -325,6 +533,18 @@ static void sb_forget_local_paint_state(void) {
     g_sbInvokeSel = 0;
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
+    // The label itself is left alone. It is a subview of the overlay window, so
+    // the window going away takes it with it, and the session that is about to
+    // be rebuilt creates a fresh one. Only the local pointers and the cached
+    // last text are cleared, because those refer to a process that no longer
+    // exists and reading them would be a use after free.
+    g_sbCountPosInv = 0;
+    g_sbCountPosBuf = 0;
+    g_sbCountLabel = 0;
+    g_sbCountLastPos[0] = -1.0;
+    g_sbCountLastPos[1] = -1.0;
+    g_sbCountLastText[0] = 0;
+    g_sbCountShown = 0;
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -847,6 +1067,11 @@ int SBoardStartOverlay(void) {
 
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
+    // A real UILabel, added as a subview of the same container, so the counter
+    // can be a number in a real font instead of a path that can only be
+    // stroked. Created once; the frame moves per publish, the text only when
+    // the count changes.
+    sb_make_count_label(container);
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
@@ -1084,6 +1309,9 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint32_t limbCount = 0;
             uint64_t calls = 0;
             uint32_t drawn = 0;
+            // Text runs seen this frame. Zero means the app drew no counter, and
+            // the label is hidden rather than left showing the last number.
+            uint32_t txtOps = 0;
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
             // iOS 17.5, and so is CGPathReset, so there is no way to empty a
@@ -1179,6 +1407,26 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
+                        continue;
+                    }
+                    // Text run: one byte of length, two doubles of already
+                    // rotated centre, then the UTF-8. Handled before the
+                    // coordinate branch because it has a different shape, and
+                    // it is not a subpath so it must not fall into one.
+                    if (op == 5) {
+                        if (i + 17 > len) { i = len; break; }
+                        const uint8_t slen = b[i++];
+                        double tpx, tpy;
+                        memcpy(&tpx, b + i, 8); memcpy(&tpy, b + i + 8, 8); i += 16;
+                        if (i + slen > len) { i = len; break; }
+                        char txt[16];
+                        memcpy(txt, b + i, slen);
+                        txt[slen] = 0;
+                        i += slen;
+                        txtOps++;
+                        calls += sb_count_label_place(tpx, tpy);
+                        calls += sb_count_label_text(txt);
+                        calls += sb_count_label_hide(0);
                         continue;
                     }
                     if (i + 16 > len) { i = len; break; }
@@ -1368,7 +1616,10 @@ void SBRemotePushESPFrame(UIView *espView) {
                 calls++; drawn++;
             }
 
-            if (drawn > 0) {
+            if (drawn > 0 || txtOps > 0) {
+                // No text run this frame means the app is not in a match, and a
+                // stale count left on screen is worse than no count.
+                if (txtOps == 0) calls += sb_count_label_hide(1);
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
@@ -1416,7 +1667,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u trunc=%u",
+                              @"mergedSub=%u trunc=%u txt=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -1430,7 +1681,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount, nTrunc);
+                              g_sbSubpathCount, nTrunc, txtOps);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
