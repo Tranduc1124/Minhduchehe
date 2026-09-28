@@ -569,6 +569,13 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role, int slot) {
     // bounds and no text at that point so it draws nothing, but it is one more
     // thing that has to be true rather than one fewer.
     r_msg2_main(label, "setHidden:", 1, 0, 0, 0);
+
+    // A new object has no bounds, so any size remembered for the slot is void.
+    // The caller does not know whether this label replaced an earlier one.
+    if (slot >= 0 && slot < SB_LABEL_MAX) {
+        g_sbLabelLastSize[slot][0] = 0.0;
+        g_sbLabelLastSize[slot][1] = 0.0;
+    }
     return label;
 }
 
@@ -959,20 +966,10 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
                 if (!g_sbLabelShown[k]) continue;
                 shownNow++;
                 if (g_sbLabelClaimed[k]) continue;
-                // Ask the label whether it is actually hidden. The hide is
-                // queued, and a queued call that never lands looks exactly like
-                // one that was never sent, so the flag on this side is not
-                // evidence of anything. A BOOL getter comes back in eight bytes
-                // through the read path already proven on lineWidth, and this
-                // only runs when something is actually stuck.
-                double hidBack = -1.0;
-                const bool hidOK = r_msg2_main_struct_ret(g_sbLabelObj[k], "hidden",
-                                                          &hidBack, 8,
-                                                          NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-                NSLog(@"[SB-STUCK] slot=%d key=0x%llx pos=%.1f,%.1f text=%s hidden=%.0f ok=%d",
+                NSLog(@"[SB-STUCK] slot=%d key=0x%llx pos=%.1f,%.1f text=%s",
                       k, (unsigned long long)g_sbLabelKey[k],
                       g_sbLabelLastPos[k][0], g_sbLabelLastPos[k][1],
-                      g_sbLabelLastText[k], hidBack, (int)hidOK);
+                      g_sbLabelLastText[k]);
             }
             NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d made=%d claimed=%d shown=%d high=%d "
                   @"landW=%.0f landH=%.0f bytes=%lu emitted=%d",
@@ -1069,6 +1066,14 @@ static void sb_forget_local_paint_state(void) {
         g_sbLabelLastText[k][0] = 0;
         g_sbLabelRole[k] = -1;
         g_sbLabelShown[k] = 0;
+        // The remembered size goes with them. A fresh label starts with zero
+        // bounds, so a cache that still holds the old size makes
+        // sb_pooled_label_resize decide the bounds are already right, and the
+        // label stays zero sized and draws nothing. That is why two names out of
+        // four appeared: the two whose measurements happened to match the
+        // figures left over from the previous session.
+        g_sbLabelLastSize[k][0] = 0.0;
+        g_sbLabelLastSize[k][1] = 0.0;
         g_sbLabelClaimed[k] = 0;
         g_sbLabelKey[k] = 0;
     }
@@ -1354,6 +1359,21 @@ int SBoardStartOverlay(void) {
         return -1;
     }
 
+    // Forget the previous session's objects here, once, with the session open
+    // and before anything in this session exists.
+    //
+    // It used to be at the end of this function, and this function creates the
+    // shape, the fill layer, the counter label and the label pool. Every one of
+    // them was assigned to a global and then cleared by this same call before the
+    // first publish could see it. The fill layer is the third casualty after the
+    // counter label: each worked on the first try, each was dead on arrival, and
+    // each time the symptom was a feature that produced nothing.
+    //
+    // A reset that runs between creation and use is not a reset. It is a race
+    // with a fixed outcome. It runs here, where its purpose is served, which is
+    // invalidating pointers into a process that is no longer there.
+    sb_forget_local_paint_state();
+
     uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0,0,0,0);
     if (!r_is_objc_ptr(app)) { destroy_remote_call(); return -1; }
 
@@ -1530,7 +1550,6 @@ int SBoardStartOverlay(void) {
     // card needs exists by the time this returns, so there is no reason for it
     // not to be here.
 
-    sb_forget_local_paint_state();
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
