@@ -342,6 +342,10 @@ static uint64_t g_sbLabelPosBuf[SB_LABEL_MAX]     = { 0 };
 static uint8_t  g_sbLabelClaimed[SB_LABEL_MAX]    = { 0 };
 static uint64_t g_sbLabelKey[SB_LABEL_MAX]       = { 0 };
 static uint64_t g_sbLabelBoundsInv[SB_LABEL_MAX]  = { 0 };
+static uint64_t g_sbLabelTextInv[SB_LABEL_MAX]    = { 0 };
+static uint64_t g_sbLabelTextBuf[SB_LABEL_MAX]    = { 0 };
+static uint64_t g_sbLabelHideInv[SB_LABEL_MAX]    = { 0 };
+static uint64_t g_sbLabelHideBuf[SB_LABEL_MAX]    = { 0 };
 static uint64_t g_sbLabelBoundsBuf[SB_LABEL_MAX]  = { 0 };
 static double   g_sbLabelLastSize[SB_LABEL_MAX][2] = { { 0.0, 0.0 } };
 static double   g_sbLabelLastPos[SB_LABEL_MAX][2] = { { -1.0, -1.0 } };
@@ -691,7 +695,21 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
             uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
             r_free(nsbuf);
             if (r_is_objc_ptr(ns)) {
-                r_perform_main(label, r_sel("setText:"), ns, false);
+                // Through a cached invocation, not r_perform_main.
+                //
+                // Everything known to work here goes through one: setPath: for the
+                // boxes, setBounds:, setPosition: and setTransform: for the labels.
+                // setText: and setHidden: were the only two left on r_perform_main,
+                // and they were the only two misbehaving, which is not a
+                // coincidence to keep ignoring. The argument is the NSString's
+                // address written into a persistent buffer, exactly as the path
+                // pointer is written for setPath:.
+                if (sb_cached_invocation(label, "setText:",
+                                         &g_sbLabelTextInv[idx], &g_sbLabelTextBuf[idx], 8)) {
+                    remote_write64(g_sbLabelTextBuf[idx], ns);
+                    r_msg2(g_sbLabelTextInv[idx], "setArgument:atIndex:", g_sbLabelTextBuf[idx], 2, 0, 0);
+                    r_msg(g_sbLabelTextInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+                }
                 dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
                 calls += 6;
                 strncpy(g_sbLabelLastText[idx], utf8, SB_TEXT_MAX);
@@ -701,8 +719,13 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
     }
 
     if (!g_sbLabelShown[idx]) {
+        if (sb_cached_invocation(label, "setHidden:",
+                                 &g_sbLabelHideInv[idx], &g_sbLabelHideBuf[idx], 8)) {
+            remote_write64(g_sbLabelHideBuf[idx], 0);
+            r_msg2(g_sbLabelHideInv[idx], "setArgument:atIndex:", g_sbLabelHideBuf[idx], 2, 0, 0);
+            r_msg(g_sbLabelHideInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        }
         g_sbLabelShown[idx] = 1;
-        r_perform_main(label, r_sel("setHidden:"), 0, false);
         calls += 1;
     }
     return calls;
@@ -936,10 +959,20 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
                 if (!g_sbLabelShown[k]) continue;
                 shownNow++;
                 if (g_sbLabelClaimed[k]) continue;
-                NSLog(@"[SB-STUCK] slot=%d key=0x%llx pos=%.1f,%.1f text=%s",
+                // Ask the label whether it is actually hidden. The hide is
+                // queued, and a queued call that never lands looks exactly like
+                // one that was never sent, so the flag on this side is not
+                // evidence of anything. A BOOL getter comes back in eight bytes
+                // through the read path already proven on lineWidth, and this
+                // only runs when something is actually stuck.
+                double hidBack = -1.0;
+                const bool hidOK = r_msg2_main_struct_ret(g_sbLabelObj[k], "hidden",
+                                                          &hidBack, 8,
+                                                          NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                NSLog(@"[SB-STUCK] slot=%d key=0x%llx pos=%.1f,%.1f text=%s hidden=%.0f ok=%d",
                       k, (unsigned long long)g_sbLabelKey[k],
                       g_sbLabelLastPos[k][0], g_sbLabelLastPos[k][1],
-                      g_sbLabelLastText[k]);
+                      g_sbLabelLastText[k], hidBack, (int)hidOK);
             }
             NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d made=%d claimed=%d shown=%d high=%d "
                   @"landW=%.0f landH=%.0f bytes=%lu emitted=%d",
@@ -1025,6 +1058,12 @@ static void sb_forget_local_paint_state(void) {
         g_sbLabelObj[k] = 0;
         g_sbLabelPosInv[k] = 0;
         g_sbLabelPosBuf[k] = 0;
+        g_sbLabelTextInv[k] = 0;
+        g_sbLabelTextBuf[k] = 0;
+        g_sbLabelHideInv[k] = 0;
+        g_sbLabelHideBuf[k] = 0;
+        g_sbLabelBoundsInv[k] = 0;
+        g_sbLabelBoundsBuf[k] = 0;
         g_sbLabelLastPos[k][0] = -1.0;
         g_sbLabelLastPos[k][1] = -1.0;
         g_sbLabelLastText[k][0] = 0;
@@ -1455,6 +1494,42 @@ int SBoardStartOverlay(void) {
     g_sbRearmAfterUS = 0;
     pthread_mutex_unlock(&g_sbLock);
 
+    // The filled layer for the cards: no stroke at all, grey fill, and it sits
+    // under the stroke layer so a card never draws over a box edge.
+    uint64_t fillShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+    if (r_is_objc_ptr(fillShape)) {
+        r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
+        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
+        uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
+                                             "colorWithRed:green:blue:alpha:",
+                                             &gray[0], 8, &gray[1], 8,
+                                             &gray[2], 8, &gray[3], 8);
+        if (r_is_objc_ptr(grayColor)) {
+            uint64_t gcg = r_msg2_main(grayColor, "CGColor", 0,0,0,0);
+            if (r_is_objc_ptr(gcg)) r_msg2_main(fillShape, "setFillColor:", gcg, 0,0,0);
+        }
+        r_msg2_main(fillShape, "setOpaque:", 0, 0,0,0);
+        double zf = 99.0;
+        r_msg2_main_raw(fillShape, "setZPosition:", &zf, 8, NULL,0,NULL,0,NULL,0);
+        sb_disable_layer_actions(fillShape);
+        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", fillShape, 0,0,0);
+        g_sbFillShape = fillShape;
+        g_sbFillPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+        NSLog(@"[SB-FILL] fill layer=0x%llx path=0x%llx", fillShape, g_sbFillPath);
+    }
+
+    // The filled layer first, before anything that is slow.
+    //
+    // The card only exists on this layer, and it was being made last, after the
+    // font, the counter label and six pre-spawned labels, each of which settles
+    // three milliseconds per call. The device log had fill=0 for the first eight
+    // seconds of a session, and the report matches it exactly: pawns already
+    // alive when the overlay came up had boxes and names but no card at all, and
+    // a card only appeared for a pawn that spawned afterwards. Everything the
+    // card needs exists by the time this returns, so there is no reason for it
+    // not to be here.
+
     sb_forget_local_paint_state();
     (void)persistentPath();
     (void)ptsBuffer();
@@ -1519,30 +1594,6 @@ int SBoardStartOverlay(void) {
     // cleared again before the first publish can see it. It cost one round on the
     // label and one round here, both times silently, and both times the symptom
     // was a feature that produced nothing.
-    // The filled layer for the cards: no stroke at all, grey fill, and it sits
-    // under the stroke layer so a card never draws over a box edge.
-    uint64_t fillShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-    if (r_is_objc_ptr(fillShape)) {
-        r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-        if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
-        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
-        uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
-                                             "colorWithRed:green:blue:alpha:",
-                                             &gray[0], 8, &gray[1], 8,
-                                             &gray[2], 8, &gray[3], 8);
-        if (r_is_objc_ptr(grayColor)) {
-            uint64_t gcg = r_msg2_main(grayColor, "CGColor", 0,0,0,0);
-            if (r_is_objc_ptr(gcg)) r_msg2_main(fillShape, "setFillColor:", gcg, 0,0,0);
-        }
-        r_msg2_main(fillShape, "setOpaque:", 0, 0,0,0);
-        double zf = 99.0;
-        r_msg2_main_raw(fillShape, "setZPosition:", &zf, 8, NULL,0,NULL,0,NULL,0);
-        sb_disable_layer_actions(fillShape);
-        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", fillShape, 0,0,0);
-        g_sbFillShape = fillShape;
-        g_sbFillPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-        NSLog(@"[SB-FILL] fill layer=0x%llx path=0x%llx", fillShape, g_sbFillPath);
-    }
 
     // Measures what one call and one present actually cost, once, before any
     // frame depends on the answer. See sb_cost_probe.
@@ -2284,7 +2335,12 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 if (g_sbLabelClaimed[hi]) continue;
                 if (g_sbLabelShown[hi] && r_is_objc_ptr(g_sbLabelObj[hi])) {
                     g_sbLabelShown[hi] = 0;
-                    r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
+                    if (sb_cached_invocation(g_sbLabelObj[hi], "setHidden:",
+                                             &g_sbLabelHideInv[hi], &g_sbLabelHideBuf[hi], 8)) {
+                        remote_write64(g_sbLabelHideBuf[hi], 1);
+                        r_msg2(g_sbLabelHideInv[hi], "setArgument:atIndex:", g_sbLabelHideBuf[hi], 2, 0, 0);
+                        r_msg(g_sbLabelHideInv[hi], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+                    }
                     calls += 1;
                 }
                 g_sbLabelKey[hi] = 0;
