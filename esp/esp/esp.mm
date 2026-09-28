@@ -3350,14 +3350,18 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 CGPathApply(self.aimAssistLayer.path, &am, espCountPathElements);
                 NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d bone=%d hp=%d show=%d | "
                       @"box=%u/%u bone=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
-                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
+                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d | "
+                      @"count=%d real=%d bot=%d sum=%d stHidden=%d stStr=%@",
                       (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isBone, (int)isHealth,
                       (int)showVisuals,
                       bx.n, bx.curves, bn.n, bn.curves, sn.n, sn.curves,
                       fv.n, fv.curves, am.n, am.curves,
                       (int)s_dirtyBox, (int)s_dirtyBone,
                       (int)s_dirtySnap, (int)s_dirtyHpG,
-                      (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil));
+                      (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil),
+                      (int)isCount, (int)stats.realCount, (int)stats.botCount,
+                      (int)(stats.realCount + stats.botCount),
+                      (int)self.statusLayer.hidden, self.statusLayer.string);
             }
         }
 
@@ -3415,8 +3419,15 @@ static inline uint64_t ESPPhaseNowUS(void) {
         [CATransaction commit];
 
         // Mirror this frame to the SpringBoard dedicated overlay (if active).
-        // -1 means draw no counter, which is what the isCount toggle asks for.
-        SBRemotePushESPFrame(self, isCount ? (stats.realCount + stats.botCount) : -1);
+        //
+        // The count goes across unconditionally. It used to be gated on isCount,
+        // and that made a requested feature depend on a menu toggle: with the
+        // toggle off the app never set statusLayer, the overlay was handed -1,
+        // and no text op was ever built, which is three rounds of txt=0 with a
+        // perfectly healthy label. isCount still governs the app's own layer,
+        // which is the one the menu setting is really about; the overlay
+        // counter is a separate always-on display that was asked for by name.
+        SBRemotePushESPFrame(self, stats.realCount + stats.botCount);
 
         {
             const uint64_t tPhase3 = ESPPhaseNowUS();
