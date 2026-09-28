@@ -259,6 +259,7 @@ static uint64_t r_method_signature(uint64_t obj, uint64_t sel)
 bool     r_arg_probe_enabled = false;
 uint64_t r_arg_probe_n = 0;
 uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
+uint64_t r_arg_probe_alt = 0;
 
 static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize)
 {
@@ -401,6 +402,53 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
             r_msg2(inv, "getArgument:atIndex:", outBuf, i + 2, 0, 0);
             r_arg_probe_got[i] = remote_read64(outBuf);
             r_free(outBuf);
+        }
+
+        // Second invocation, identical in every way except that retainArguments
+        // is not called. Same buffers, same pointers, same order.
+        //
+        // The probe above measured getArgument:atIndex: reading 0,1,0,1 out of
+        // the invocation, and the selector then produced a colour whose
+        // components were sixteen literal zero bytes rather than a misread
+        // layout, since flt and dbl agreed and raw was all zero. So the
+        // invocation holds the values and invoke does not use them, which means
+        // invoke reads somewhere getArgument does not read.
+        //
+        // The only step between the two is retainArguments, and its documented
+        // job is to keep object arguments alive, which is nothing to do with a
+        // CGFloat. If skipping it produces the right colour, then calling it is
+        // what moves the arguments somewhere invoke cannot see, and the fix is
+        // to stop calling it for scalar arguments. If both invocations are black
+        // then it is not retainArguments and the fault is inside invoke itself.
+        r_arg_probe_alt = 0;
+        {
+            uint64_t inv2 = r_msg_retained_return(NSInvocation,
+                                                   r_sel("invocationWithMethodSignature:"),
+                                                   sig, 0, 0, 0);
+            if (r_is_objc_ptr(inv2)) {
+                r_msg2(inv2, "setTarget:", obj, 0, 0, 0);
+                r_msg2(inv2, "setSelector:", sel, 0, 0, 0);
+                for (uint64_t i = 0; i < maxUserArgs; i++) {
+                    if (argBufs[i]) {
+                        r_msg2(inv2, "setArgument:atIndex:", argBufs[i], i + 2, 0, 0);
+                    }
+                }
+                uint64_t ps2 = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+                uint64_t iv2 = r_sel("invoke");
+                if (ps2 && iv2) r_msg(inv2, ps2, iv2, 0, 1, 0);
+
+                uint64_t rl2 = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
+                if (rl2 > 0 && rl2 <= 8) {
+                    uint64_t rb2 = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
+                    if (rb2) {
+                        remote_write64(rb2, 0);
+                        r_msg2(inv2, "getReturnValue:", rb2, 0, 0, 0);
+                        r_arg_probe_alt = remote_read64(rb2);
+                        r_free(rb2);
+                    }
+                }
+                r_msg2(inv2, "release", 0, 0, 0, 0);
+            }
         }
     }
 

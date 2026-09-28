@@ -51,6 +51,9 @@ uint64_t r_msg2_main_raw(uint64_t obj, const char *selName,
 extern bool     r_arg_probe_enabled;
 extern uint64_t r_arg_probe_n;
 extern uint64_t r_arg_probe_got[4];
+// Return value of a second invocation built exactly like the first except that
+// retainArguments is skipped. See the probe in r_msg_main_raw.
+extern uint64_t r_arg_probe_alt;
 
 bool     r_msg2_main_struct_ret(uint64_t obj, const char *selName,
                                 void *outBuf, size_t outSize,

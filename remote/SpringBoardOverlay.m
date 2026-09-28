@@ -593,38 +593,30 @@ int SBoardStartOverlay(void) {
             }
         }
 
-        // The probe settles where the fault is not. getArgument:atIndex: read the
-        // four doubles back out of the invocation as 0,1,0,1, exactly as written,
-        // so the target has the right values in the right place. The colour is
-        // still zero. So the transport is good and the reading is the suspect.
+        // The float layout theory is dead and the raw bytes say so: raw was
+        // sixteen zero bytes, so the out buffer really was zero, and both dbl and
+        // flt read the same zeros. The colour is black, not misread.
         //
-        // CGColorGetComponents is declared as taking a CGFloat *, and CGFloat is a
-        // double on arm64, so four components should be thirty two bytes. But the
-        // bit depth belongs to the colour space, not to CGFloat, and a space can
-        // hold its components as 32 bit floats. Four floats is sixteen bytes, and
-        // reinterpreting those sixteen bytes as four doubles does not fail loudly,
-        // it just prints zero:
-        //
-        //   floats 0,1,0,1   00 00 00 00 | 00 00 80 3F | 00 00 00 00 | 00 00 80 3F
-        //   as doubles        got[0]=0.0  got[1]=0x3F80000000000000 (about 1e-300)
-        //                     got[2]=0.0  got[3]=0x3F80000000000000
-        //   printed %.2f     0.00,0.00,0.00,0.00
-        //
-        // Which is exactly what the device printed, for exactly this request. The
-        // sentinel argument does not apply here, because the read succeeds; it is
-        // the interpretation that is wrong, and a wrong interpretation and a real
-        // zero look identical in the log.
-        //
-        // So the same sixteen bytes are read a second time as four floats, and the
-        // first two eight byte words are printed as hex. Hex is the part that does
-        // not depend on me guessing right: 3ff0000000000000 is a double 1.0, and
-        // 000000003f800000 is a float 1.0 sitting at offset four.
-        float gotF[4] = { -1, -1, -1, -1 };
-        memcpy(gotF, got, 16);
+        // So getArgument:atIndex: reads 0,1,0,1 out of the invocation while the
+        // selector built a black colour from the same invocation, which means
+        // invoke is not reading the place getArgument reads from. The device now
+        // also runs a second invocation with retainArguments skipped, so the log
+        // can say whether that call is the thing that moves the arguments.
+        uint64_t alt = r_arg_probe_alt;
+        uint64_t altCg = r_is_objc_ptr(alt) ? r_msg2_main(alt, "CGColor", 0,0,0,0) : 0;
+        double altGot[4] = { -1, -1, -1, -1 };
+        if (r_is_objc_ptr(altCg)) {
+            uint64_t altBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
+            if (altBuf) {
+                dlsym_remote("CGColorGetComponents", altCg, altBuf, 0,0,0,0,0,0);
+                remote_read(altBuf, altGot, 32);
+                dlsym_remote("free", altBuf, 0,0,0,0,0,0,0);
+            }
+        }
 
         NSLog(@"[SB-COLOR] sig=%d numArgs=%llu pn=%llu col=%d cg=%d ncomp=%llu "
               @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
-              @"dbl=%.2f,%.2f,%.2f,%.2f flt=%.2f,%.2f,%.2f,%.2f raw=%016llx,%016llx",
+              @"ret=%.2f,%.2f,%.2f,%.2f alt=%d altCg=%d noRet=%.2f,%.2f,%.2f,%.2f",
               (int)r_is_objc_ptr(sig), (unsigned long long)numArgs,
               (unsigned long long)r_arg_probe_n,
               (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
@@ -632,8 +624,8 @@ int SBoardStartOverlay(void) {
               want[0], want[1], want[2], want[3],
               invGot[0], invGot[1], invGot[2], invGot[3],
               got[0], got[1], got[2], got[3],
-              gotF[0], gotF[1], gotF[2], gotF[3],
-              (unsigned long long)raw[0], (unsigned long long)raw[1]);
+              (int)r_is_objc_ptr(alt), (int)r_is_objc_ptr(altCg),
+              altGot[0], altGot[1], altGot[2], altGot[3]);
     }
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
