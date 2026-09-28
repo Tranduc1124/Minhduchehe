@@ -356,6 +356,7 @@ static int      g_sbFillRingAt  = 0;
 static uint64_t g_sbFillInv     = 0;
 static uint64_t g_sbFillArgBuf  = 0;
 static uint32_t g_sbFillSubpaths = 0;
+static int      g_sbFillWasDrawn = 0;
 static uint64_t g_sbFontSmall                     = 0;
 static uint64_t g_sbFontBig                       = 0;
 
@@ -811,7 +812,9 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
                 if (![tl isKindOfClass:[CATextLayer class]] || tl.hidden) continue;
                 if (i >= roles.count) break;
                 const int role = [roles[i] intValue];
-                if (role == 2) continue;              // weapon name, not wanted
+                // The weapon name and the distance are not sent. The distance was
+                // asked to come back later, after the card is settled.
+                if (role == 1 || role == 2) continue;
                 NSString *str = tl.string;
                 if (![str isKindOfClass:[NSString class]] || str.length == 0) continue;
                 const char *utf8 = str.UTF8String;
@@ -946,6 +949,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbFillInv = 0;
     g_sbFillArgBuf = 0;
     g_sbFillSubpaths = 0;
+    g_sbFillWasDrawn = 0;
     g_sbFillRingAt = 0;
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
     g_sbPathHash = 0;
@@ -1619,6 +1623,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // pawn behind it died. That was a line of mine, added in the same
             // commit as the pool, and it defeated the pool's own cleanup.
             int txtSlot = 0;
+            uint32_t cardOps = 0;
             // One new label per frame, for the reason given at the allocation.
             static int sb_labelsMadeThisFrame = 0;
             sb_labelsMadeThisFrame = 0;
@@ -1724,9 +1729,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
             size_t i = 0;
             int curLayer = -1;
-            // Inside the filled section, so these subpaths are cards: they go to
-            // the second layer with a grey fill, never to the stroke layer.
-            int inFill = 0;
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
@@ -1742,7 +1744,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
-                        inFill = 0;
                         continue;
                     }
                     // Op 6 opens a filled subpath: the cards. They go to the
@@ -1789,7 +1790,43 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     // eight bytes, not thirty two. It read past the end of its own
                     // data, which is why one card sometimes drew, four cards never
                     // did, and frames with four took six hundred milliseconds.
-                    if (op == 6) { inFill = 1; continue; }
+                    //
+                    // Op 6 is the cards. Read here and read completely, rather
+                    // than through the shared subpath reader: a card is four
+                    // points, so four op bytes and four coordinate pairs, and a
+                    // reader that has to also decide where the section ends is a
+                    // reader that can decide wrongly and then take the rest of
+                    // the frame with it. That is what happened twice.
+                    if (op == 6) {
+                        int got = 0;
+                        double cfx0 = 0, cfy0 = 0, cfx1 = 0, cfy1 = 0;
+                        while (i < len && got < 4) {
+                            if (i + 17 > len) { i = len; break; }
+                            const uint8_t pt = b[i++];
+                            double px2, py2;
+                            memcpy(&px2, b + i, 8); memcpy(&py2, b + i + 8, 8);
+                            i += 16;
+                            if (got == 0) { cfx0 = cfx1 = px2; cfy0 = cfy1 = py2; }
+                            else {
+                                if (px2 < cfx0) cfx0 = px2; else if (px2 > cfx1) cfx1 = px2;
+                                if (py2 < cfy0) cfy0 = py2; else if (py2 > cfy1) cfy1 = py2;
+                            }
+                            got++;
+                            (void)pt;
+                        }
+                        if (got == 4) {
+                            const double cw = cfx1 - cfx0, ch = cfy1 - cfy0;
+                            if (cw > 0.5 && ch > 0.5) {
+                                fillDoubles[fillN * 4 + 0] = cfx0;
+                                fillDoubles[fillN * 4 + 1] = cfy0;
+                                fillDoubles[fillN * 4 + 2] = cw;
+                                fillDoubles[fillN * 4 + 3] = ch;
+                                fillN++;
+                            }
+                        }
+                        cardOps++;
+                        continue;
+                    }
                     if (op == 5) {
                         // op 5, role, len, px, py, w, h, utf8[len]
                         if (i + 34 > len) { i = len; break; }
@@ -1899,42 +1936,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // code spent 3 calls on it (a remote_write plus moveTo plus
                 // addLines with count=1, which renders nothing).
                 if (rn < 4) continue;
-                const int np0 = rn / 2;
-
-                if (inFill) {
-                    // A card. Four points, bounding box, into the fill batch,
-                    // which is one CGPathAddRects for the whole frame.
-                    if (np0 == 4) {
-                        double fx0 = run[0], fy0 = run[1];
-                        double fx1 = run[0], fy1 = run[1];
-                        for (int k = 1; k < 4; k++) {
-                            const double cx = run[k*2], cy = run[k*2+1];
-                            if (cx < fx0) fx0 = cx;
-                            if (cx > fx1) fx1 = cx;
-                            if (cy < fy0) fy0 = cy;
-                            if (cy > fy1) fy1 = cy;
-                        }
-                        const double cw = fx1 - fx0, ch = fy1 - fy0;
-                        if (cw > 0.5 && ch > 0.5) {
-                            fillDoubles[fillN * 4 + 0] = fx0;
-                            fillDoubles[fillN * 4 + 1] = fy0;
-                            fillDoubles[fillN * 4 + 2] = cw;
-                            fillDoubles[fillN * 4 + 3] = ch;
-                            fillN++;
-                            if (fillN >= (int)(sizeof(fillDoubles) / sizeof(fillDoubles[0]) / 4)) {
-                                remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
-                                dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
-                                calls++;
-                                fillDrawn++;
-                                fillN = 0;
-                            }
-                        }
-                    }
-                    continue;
-                }
 
                 subpaths++;
-                const int np = np0;
+                const int np = rn / 2;
                 if (np > maxPts) maxPts = np;
                 if (np > 8) nBig++;
                 if (np == 2) c2++;
@@ -2097,6 +2101,17 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 calls++; drawn++;
             }
 
+            // Remember whether the last frame drew anything on the fill layer.
+            //
+            // A layer that is not given a new path keeps drawing the one it has.
+            // A card that has left the screen therefore stays on screen until
+            // some other card happens to be published over it, and the layer
+            // itself, sized to the window, is what the user saw flash across the
+            // screen. Presenting the empty path every frame is one extra call and
+            // is the only way to clear it.
+            const int fillWasDrawn = g_sbFillWasDrawn;
+            g_sbFillWasDrawn = 0;
+
             if (fillN > 0 && fillPath) {
                 remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
                 dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
@@ -2105,7 +2120,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 fillN = 0;
             }
 
-            if (drawn > 0 || txtOps > 0 || fillDrawn > 0) {
+            if (drawn > 0 || txtOps > 0 || fillDrawn > 0 || fillWasDrawn) {
                 // No text run this frame means the app is not in a match, and a
                 // stale count left on screen is worse than no count.
                 if (txtOps == 0) calls += sb_count_label_hide(1);
@@ -2125,7 +2140,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // Present the cards. Its own cached invocation, for the same
                 // reason the stroke layer has one: r_msg_main_raw rebuilds an
                 // invocation per call and waits for the main thread.
-                if (fillDrawn > 0 && r_is_objc_ptr(g_sbFillShape) && fillPath) {
+                if ((fillDrawn > 0 || fillWasDrawn) && r_is_objc_ptr(g_sbFillShape)) {
+                    g_sbFillWasDrawn = fillDrawn > 0;
                     if (!r_is_objc_ptr(g_sbFillInv) && g_sbPerformMainSel && g_sbInvokeSel) {
                         uint64_t setPathSel = r_sel("setPath:");
                         uint64_t sig = r_msg(g_sbFillShape, r_sel("methodSignatureForSelector:"), setPathSel, 0, 0, 0);
@@ -2201,7 +2217,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u trunc=%u txt=%u cards=%u",
+                              @"mergedSub=%u trunc=%u txt=%u cards=%u cardOps=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -2215,7 +2231,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount, nTrunc, txtOps, fillDrawn);
+                              g_sbSubpathCount, nTrunc, txtOps, fillDrawn, cardOps);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {

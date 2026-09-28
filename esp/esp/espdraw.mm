@@ -348,11 +348,13 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     // DISTANCE
     // ---------------------------------------------------------
-    if (isDis && textCallback) {
-        NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
-        // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-        textCallback(callbackContext, distString, ESPTextRoleDistance, CGRectMake(centerX - 60.0f, y + boxHeight + 3.0f, 120.0f, dynFontSize + 6.0f), [UIColor whiteColor], dynFontSize, NO);
-    }
+    // The distance label is not built. It came out as a wide grey banner across
+    // the feet rather than a small figure, and a distance is also the one piece
+    // of text that can be re-derived from the box the moment it is wanted back,
+    // so it is held out of the per frame path until the card is right. The
+    // in-app layer below the game still gets it, which is what it was drawn on
+    // before the overlay mirror existed.
+    (void)dis;
 
     // ---------------------------------------------------------
     // THANH MÁU — ngang, nằm trên đỉnh đầu, một màu.
