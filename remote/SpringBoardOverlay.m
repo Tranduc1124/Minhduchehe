@@ -809,9 +809,22 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
             uint8_t top = 5;
             uint8_t role = 3;                       // counter
             uint8_t slen = (uint8_t)n;
+            // The identity field, eight zero bytes. The record layout is the same
+            // for every text run, so the counter carries one too.
+            //
+            // It did not, and the reader had already moved on. Every run is read
+            // with a fixed layout, so a short record is not detected as short: the
+            // reader simply took the first eight bytes of the next record as the
+            // missing field, which is the start of the first name, and from there
+            // the whole frame was offset. The symptom was txt=1 instead of five,
+            // subpath counts over ninety points when the largest real shape is
+            // seventy three, and rectangles assembled from the bytes of player
+            // names, which is what was flashing white across the screen.
+            uint64_t lkey = 0;
             [d appendBytes:&top length:1];
             [d appendBytes:&role length:1];
             [d appendBytes:&slen length:1];
+            [d appendBytes:&lkey length:8];
             [d appendBytes:&px length:8];
             [d appendBytes:&py length:8];
             [d appendBytes:&w length:8];
