@@ -1275,161 +1275,14 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
-    // [SB-COLOR] proves whether a multi argument selector can carry its
-    // arguments at all, before any second shape layer is attempted.
-    //
-    // The previous six layer attempt drew nothing, and its colour call was
-    // written as r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
-    // rgba, 32, ...), that is one 32 byte pointer. Reading r_msg_main_raw shows
-    // why that cannot work. It does not marshal through the x0..x7 injector at
-    // all: it asks the real method signature for numberOfArguments, allocates a
-    // buffer per argument and calls setArgument:atIndex: once for each. Passing
-    // only a0 meant the remaining three arguments were never written, so the
-    // selector ran with three uninitialised CGFloats and every group got a
-    // colour nobody chose.
-    //
-    // The right call passes four separate eight byte doubles, which is what this
-    // does. The colour is then read back through CGColor and its components
-    // printed, so the device says what actually arrived instead of the log
-    // claiming success on a call that may have produced anything.
-    //
-    //   rgba matching the request -> the transport is fine, a second layer for
-    //                                fill is safe to build
-    //   rgba wrong                 -> the marshalling is still wrong and the
-    //                                number printed here says which part
-    {
-        // Everything is printed under one prefix because the device log filter
-        // takes a single term, and splitting this across two prefixes cost a round.
-        //
-        // What is already established, by the log and not by reasoning:
-        //   got=0.00,0.00,0.00,0.00 while col=1 and cg=1
-        // col being non zero means r_write_remote_arg returned true, because a
-        // false there sets argsOK false and the function returns 0. So the four
-        // doubles were written to SpringBoard and read back matching. The read
-        // side is sound too, because got starts at minus one and the sentinel
-        // never appears. The write is confirmed good and the read is confirmed
-        // good, and the value is still zero, so the argument is lost between the
-        // buffer and the selector reading it.
-        //
-        // That leaves one untested step in r_msg_main_raw: maxUserArgs comes
-        // from numberOfArguments on the signature, and if that is wrong then no
-        // setArgument:atIndex: is ever issued and the selector reads whatever
-        // happens to be in d0 to d3. So numArgs is printed here. The expectation
-        // for a four argument selector plus self and _cmd is six.
-        const uint64_t colSel = r_sel("colorWithRed:green:blue:alpha:");
-        uint64_t sig = r_is_objc_ptr(colSel)
-                      ? r_msg(clsCol, r_sel("methodSignatureForSelector:"), colSel, 0, 0, 0)
-                      : 0;
-        uint64_t numArgs = r_is_objc_ptr(sig)
-                         ? r_msg2(sig, "numberOfArguments", 0, 0, 0, 0) : 0;
-
-        double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
-        // Probe on for this one call only, so r_msg_main_raw reads the arguments
-        // back out of the invocation just before invoking. That is the one step
-        // between "the bytes are in the target's buffer", which is proven, and
-        // "the selector used them", which is not.
-        r_arg_probe_enabled = true;
-        uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
-                                       &want[0], 8, &want[1], 8,
-                                       &want[2], 8, &want[3], 8);
-        r_arg_probe_enabled = false;
-        double invGot[4] = { 0, 0, 0, 0 };
-        for (int i = 0; i < 4 && i < (int)r_arg_probe_n; i++) {
-            uint64_t bits = r_arg_probe_got[i];
-            memcpy(&invGot[i], &bits, 8);
-        }
-        uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
-
-        // Number of components the target's colour actually has. A colour made
-        // from red, green, blue and alpha is normally four or five depending on
-        // whether the space is extended, and the out buffer is sized for that
-        // rather than assuming four.
-        uint64_t ncomp = 0;
-        if (r_is_objc_ptr(cg)) {
-            ncomp = dlsym_remote("CGColorGetNumberOfComponents", cg, 0,0,0,0,0,0,0);
-        }
-
-        // The out buffer is poisoned with a sentinel before the call. This is the
-        // measurement that was missing for four rounds: the buffer came from malloc
-        // and was never written to, and a fresh page reads as sixteen zero bytes,
-        // which is exactly what was logged. A printed zero in a buffer nobody
-        // wrote is not a measurement, and treating it as one is what sent the last
-        // three rounds chasing a colour that may never have been black.
-        double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
-        uint64_t raw[4] = { 0, 0, 0, 0 };
-        bool wrote = false;
-        if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
-            uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
-            if (outBuf) {
-                double sentinel[8] = { -7, -7, -7, -7, -7, -7, -7, -7 };
-                for (int k = 0; k < 3; k++) {
-                    remote_write(outBuf, sentinel, sizeof(sentinel));
-                    dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
-                    remote_read(outBuf, got, sizeof(got));
-                    remote_read(outBuf, raw, 16);
-                    if (got[0] != -7.0) { wrote = true; break; }
-                }
-                dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
-            }
-        }
-
-        // The float layout theory is dead and the raw bytes say so: raw was
-        // sixteen zero bytes, so the out buffer really was zero, and both dbl and
-        // flt read the same zeros. The colour is black, not misread.
-        //
-        // The second invocation told us nothing. It returned the value 1, and
-        // r_is_objc_ptr accepts any pointer above 0x100000000, so asking address 1
-        // for CGColor gave nil and noRet was never measured. That result is dropped
-        // rather than reinterpreted, because reading a conclusion out of a garbage
-        // pointer is how the last two rounds went wrong.
-        //
-        // The measurement moves to a channel that returns text.
-        // +[NSNumber numberWithDouble:] takes one CGFloat through exactly the same
-        // path and hands back an object, and -description on that object prints the
-        // number as characters. The colour test spent three rounds proving that a
-        // printed zero was a real zero and not a misread layout, and every one of
-        // those rounds was spent on the reading rather than on the transport. A
-        // string has no such ambiguity: 1.5 and 0.0 are different strings, and no
-        // byte layout turns one into the other.
-        //
-        // The integer case is the control. It travels through identical code with a
-        // different register class, so T1 alone says whether the difference is
-        // specifically about a floating point value, and T2 alone says whether the
-        // path works at all. If T2 prints 7 then arguments arrive and a double is
-        // the only thing that does not, which is a far narrower fault to fix than
-        // arguments do not arrive.
-        char t1[48] = { 0 };
-        char t2[48] = { 0 };
-        double wantInt = 7.0;
-        double wantDbl = 1.5;
-
-        uint64_t NSNum = r_class("NSNumber");
-        uint64_t nDbl = r_is_objc_ptr(NSNum)
-                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantDbl, 8,
-                                        NULL, 0, NULL, 0, NULL, 0) : 0;
-        uint64_t nInt = r_is_objc_ptr(NSNum)
-                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantInt, 8,
-                                        NULL, 0, NULL, 0, NULL, 0) : 0;
-        if (r_is_objc_ptr(nDbl)) {
-            uint64_t ds = r_msg2_main(nDbl, "description", 0, 0, 0, 0);
-            if (r_is_objc_ptr(ds)) r_read_nsstring(ds, t1, sizeof(t1));
-        }
-        if (r_is_objc_ptr(nInt)) {
-            uint64_t is = r_msg2_main(nInt, "description", 0, 0, 0, 0);
-            if (r_is_objc_ptr(is)) r_read_nsstring(is, t2, sizeof(t2));
-        }
-
-        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu wrote=%d "
-              @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
-              @"ret=%.2f,%.2f,%.2f,%.2f dbl=<%s> int=<%s>",
-              (unsigned long long)numArgs,
-              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
-              (unsigned long long)ncomp, (int)wrote,
-              want[0], want[1], want[2], want[3],
-              invGot[0], invGot[1], invGot[2], invGot[3],
-              got[0], got[1], got[2], got[3],
-              t1, t2);
-    }
+    // The multi argument colour test that used to live here is gone. It was
+    // written to answer whether four separate CGFloat arguments survive the
+    // crossing, the device answered it, and the answer is in this file's history:
+    // they do. [SB-COLOR] lw want=0.75 got=0.75 ok=1 on every boot is the same
+    // read path and still is worth having, because lineWidth is a call this
+    // overlay depends on. Everything else it printed was three lines of noise per
+    // overlay start and several remote calls to produce a conclusion that has not
+    // changed in a dozen builds.
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
@@ -1441,8 +1294,6 @@ int SBoardStartOverlay(void) {
     // the diagnostic was never taken back down, so the overlay has been drawing
     // green ever since. The requested ESP is monochrome white.
     if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
-    NSLog(@"[SB-COLOR] white=%d cg=%d", (int)r_is_objc_ptr(whiteColor),
-          (int)r_is_objc_ptr(whiteCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     // 0.75, down from 1.5. At 1.5 the box reads as a thick slab on a phone
     // screen and the horizontal health bar 2.5pt tall disappears into its own
@@ -1462,7 +1313,7 @@ int SBoardStartOverlay(void) {
     double lwBack = -1.0;
     bool lwOK = r_msg2_main_struct_ret(shape, "lineWidth", &lwBack, 8,
                                        NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-    NSLog(@"[SB-COLOR] lw want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
+    NSLog(@"[SB-LW] want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
@@ -1873,6 +1724,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
             size_t i = 0;
             int curLayer = -1;
+            // Inside the filled section, so these subpaths are cards: they go to
+            // the second layer with a grey fill, never to the stroke layer.
+            int inFill = 0;
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
@@ -1888,6 +1742,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
+                        inFill = 0;
                         continue;
                     }
                     // Op 6 opens a filled subpath: the cards. They go to the
@@ -1924,6 +1779,17 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     // rotated centre, then the UTF-8. Handled before the
                     // coordinate branch because it has a different shape, and
                     // it is not a subpath so it must not fall into one.
+                    //
+                    // Op 6 opens the filled section: the cards. It is a marker
+                    // and nothing else, because the points after it are in the
+                    // same format as every other point in the stream, one op byte
+                    // and two doubles each. The reader that used to be here
+                    // tried to take four bare doubles per rectangle, which is not
+                    // what serFunc emits: a rectangle is four points, so sixty
+                    // eight bytes, not thirty two. It read past the end of its own
+                    // data, which is why one card sometimes drew, four cards never
+                    // did, and frames with four took six hundred milliseconds.
+                    if (op == 6) { inFill = 1; continue; }
                     if (op == 5) {
                         // op 5, role, len, px, py, w, h, utf8[len]
                         if (i + 34 > len) { i = len; break; }
@@ -2033,9 +1899,42 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // code spent 3 calls on it (a remote_write plus moveTo plus
                 // addLines with count=1, which renders nothing).
                 if (rn < 4) continue;
-                subpaths++;
+                const int np0 = rn / 2;
 
-                const int np = rn / 2;
+                if (inFill) {
+                    // A card. Four points, bounding box, into the fill batch,
+                    // which is one CGPathAddRects for the whole frame.
+                    if (np0 == 4) {
+                        double fx0 = run[0], fy0 = run[1];
+                        double fx1 = run[0], fy1 = run[1];
+                        for (int k = 1; k < 4; k++) {
+                            const double cx = run[k*2], cy = run[k*2+1];
+                            if (cx < fx0) fx0 = cx;
+                            if (cx > fx1) fx1 = cx;
+                            if (cy < fy0) fy0 = cy;
+                            if (cy > fy1) fy1 = cy;
+                        }
+                        const double cw = fx1 - fx0, ch = fy1 - fy0;
+                        if (cw > 0.5 && ch > 0.5) {
+                            fillDoubles[fillN * 4 + 0] = fx0;
+                            fillDoubles[fillN * 4 + 1] = fy0;
+                            fillDoubles[fillN * 4 + 2] = cw;
+                            fillDoubles[fillN * 4 + 3] = ch;
+                            fillN++;
+                            if (fillN >= (int)(sizeof(fillDoubles) / sizeof(fillDoubles[0]) / 4)) {
+                                remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
+                                dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
+                                calls++;
+                                fillDrawn++;
+                                fillN = 0;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                subpaths++;
+                const int np = np0;
                 if (np > maxPts) maxPts = np;
                 if (np > 8) nBig++;
                 if (np == 2) c2++;
