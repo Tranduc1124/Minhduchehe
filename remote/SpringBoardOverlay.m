@@ -462,13 +462,13 @@ static uint64_t sb_count_label_hide(int hidden) {
 // corner radius, font and colour are all fixed once chosen.
 // The rotation, and the invocation that carries it, are needed by
 // sb_make_pooled_label, which is below the label pool's other helpers.
-static uint64_t g_sbLabelTransInv = 0;
-static uint64_t g_sbLabelTransBuf = 0;
+static uint64_t g_sbLabelTransInv[SB_LABEL_MAX] = { 0 };
+static uint64_t g_sbLabelTransBuf[SB_LABEL_MAX] = { 0 };
 
 static BOOL sb_cached_invocation(uint64_t label, const char *selName,
                                  uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
 
-static uint64_t sb_make_pooled_label(uint64_t container, int role) {
+static uint64_t sb_make_pooled_label(uint64_t container, int role, int slot) {
     if (!r_is_objc_ptr(container)) return 0;
 
     uint64_t UILabel = r_class("UILabel");
@@ -540,12 +540,19 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     // The rotation, through a cached invocation: two calls and it does not wait,
     // where r_msg_main_raw is around thirteen calls and does, because it presents
     // with waitUntilDone:YES.
-    if (sb_cached_invocation(label, "setTransform:",
-                             &g_sbLabelTransInv, &g_sbLabelTransBuf, 48)) {
+    //
+    // One per label, not one shared. A cached invocation is bound to its target
+    // when it is built, so a single shared one meant the first label got the
+    // rotation and every later label kept the default: their text drew along the
+    // screen's short axis and came out sideways, which is what was reported. The
+    // counter was unaffected because it sets its own transform separately.
+    if (slot >= 0 && slot < SB_LABEL_MAX &&
+        sb_cached_invocation(label, "setTransform:",
+                             &g_sbLabelTransInv[slot], &g_sbLabelTransBuf[slot], 48)) {
         double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
-        remote_write(g_sbLabelTransBuf, tr, sizeof(tr));
-        r_msg2(g_sbLabelTransInv, "setArgument:atIndex:", g_sbLabelTransBuf, 2, 0, 0);
-        r_msg(g_sbLabelTransInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        remote_write(g_sbLabelTransBuf[slot], tr, sizeof(tr));
+        r_msg2(g_sbLabelTransInv[slot], "setArgument:atIndex:", g_sbLabelTransBuf[slot], 2, 0, 0);
+        r_msg(g_sbLabelTransInv[slot], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
 
     r_msg2_main(container, "addSubview:", label, 0, 0, 0);
@@ -1009,8 +1016,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbFillSubpaths = 0;
     g_sbFillWasDrawn = 0;
     g_sbNameFont = 0;
-    g_sbLabelTransInv = 0;
-    g_sbLabelTransBuf = 0;
+    for (int t = 0; t < SB_LABEL_MAX; t++) { g_sbLabelTransInv[t] = 0; g_sbLabelTransBuf[t] = 0; }
     g_sbFillRingAt = 0;
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
     g_sbPathHash = 0;
@@ -1984,7 +1990,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                     break;
                                 }
                                 if (idx >= 0 && sb_labelsMadeThisFrame < 1) {
-                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role);
+                                    g_sbLabelObj[idx] = sb_make_pooled_label(g_sbCanvas, role, idx);
                                     sb_labelsMadeThisFrame++;
                                     if (!r_is_objc_ptr(g_sbLabelObj[idx])) idx = -1;
                                 } else if (idx >= 0) {
@@ -2223,6 +2229,12 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         r_perform_main(g_sbLabelObj[hi], r_sel("setHidden:"), 1, false);
                         calls += 1;
                     }
+                    // Give the key back. A slot that has been claimed keeps a
+                    // non zero key, and a free slot is only ever taken by one with
+                    // a zero key, so without this the pool was consumed one dead
+                    // pawn at a time and never recovered. It is also why a name
+                    // outlived its pawn: the label was hidden but still owned.
+                    g_sbLabelKey[hi] = 0;
                 }
                 if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
 
