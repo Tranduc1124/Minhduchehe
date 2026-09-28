@@ -198,6 +198,54 @@ static const uint64_t SB_CALL_SLOW_US = 100000ULL;
 // Log the first this many publishes unconditionally.
 static const uint64_t SB_CALL_FIRST_N = 3;
 
+// Per call record for the geometry loop, so the question "is a call expensive,
+// or is a call with many points expensive" has an answer from the device
+// instead of from a guess.
+//
+// The [SB-CALL] split showed geom is 99.4% of a 718 ms publish, and that both
+// slow publishes had calls=23 while a fast one had calls=9. Same count, same
+// call kinds, 31021 us per geom call against 657. So cost is not tracking the
+// number of calls. What is left is the size of the argument: CGPathAddLines
+// takes a count of points, and the log has been reporting maxPts=73 on every
+// frame. Each of these records the point count and the wall time of that one
+// call.
+//
+// SB_NP_MAX bounds the recording. The device log has never shown a publish
+// above 58 calls, and a publish past this is so far over budget that its
+// record is not the thing needing explanation.
+#define SB_NP_MAX 96
+static uint32_t g_sbNpArg[SB_NP_MAX];
+static uint64_t g_sbNpUS[SB_NP_MAX];
+static uint8_t  g_sbNpKind[SB_NP_MAX];
+static int g_sbNpCount = 0;
+
+// kind: 0 = CGPathAddLines, 1 = CGPathAddRects. arg is the point count for
+// AddLines and the rectangle count for AddRects.
+static void sb_np_record(int kind, uint32_t arg, uint64_t us) {
+    if (g_sbNpCount >= SB_NP_MAX) return;
+    g_sbNpKind[g_sbNpCount] = (uint8_t)kind;
+    g_sbNpArg[g_sbNpCount] = arg;
+    g_sbNpUS[g_sbNpCount] = us;
+    g_sbNpCount++;
+}
+
+// Timed wrappers. These exist so the timing sits immediately around the remote
+// call and cannot drift into the surrounding bookkeeping, which is exactly the
+// mistake that would make the measurement agree with whatever I expected.
+#define SB_GEOM_LINES(npExpr) \
+    do { \
+        const uint64_t _sbT0 = now_us(); \
+        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, (npExpr), 0,0,0,0); \
+        sb_np_record(0, (uint32_t)(npExpr), now_us() - _sbT0); \
+    } while (0)
+
+#define SB_GEOM_RECTS(pathExpr, countExpr) \
+    do { \
+        const uint64_t _sbT0 = now_us(); \
+        dlsym_remote("CGPathAddRects", (pathExpr), 0, ptsBuf, (countExpr), 0,0,0,0); \
+        sb_np_record(1, (uint32_t)(countExpr), now_us() - _sbT0); \
+    } while (0)
+
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
     "boneLayer", "boneBotLayer", "boneKnockedLayer",
@@ -2052,6 +2100,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // a dlsym_remote for CGPathCreateMutable plus a CGPathRelease of the
             // path that aged out of the hold window.
             const uint64_t tGeomStart = now_us();
+            // Per call records start here, so they cover the geometry loop and
+            // the two trailing batches and nothing before them.
+            g_sbNpCount = 0;
 
             // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
@@ -2408,13 +2459,13 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         // calls each and took the frame from 15 calls to 115.
                         if (curLayer >= 6 && curLayer <= 8) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            SB_GEOM_LINES(2);
                             calls++; drawn++;
                         }
 #if SB_DRAW_BONES
                         else if (curLayer >= 3 && curLayer <= 5) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            SB_GEOM_LINES(2);
                             calls++; drawn++;
                         }
 #endif
@@ -2424,8 +2475,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 if (isRect) {
                     if (rectDoubles + 4 > (int)(sizeof(rectBuf)/sizeof(rectBuf[0]))) {
                         remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                        dlsym_remote("CGPathAddRects", rp, 0, ptsBuf,
-                                     rectDoubles / 4, 0, 0,0,0);
+                        SB_GEOM_RECTS(rp, rectDoubles / 4);
                         calls++; drawn++;
                         rectDoubles = 0;
                     }
@@ -2447,13 +2497,13 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 // never join: that is what the old single-polyline version got
                 // wrong and produced chords across the screen.
                 remote_write(ptsBuf, run, (size_t)rn * 8);
-                dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, np, 0,0,0,0);
+                SB_GEOM_LINES(np);
                 calls++; drawn++;
             }
 
             if (rectDoubles >= 4) {
                 remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
+                SB_GEOM_RECTS(rp, rectDoubles / 4);
                 calls++; drawn++;
             }
             // End of geom. The loop above is every CGPathAddLines and every
@@ -2503,7 +2553,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
             if (fillN > 0 && fillPath) {
                 remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
-                dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
+                SB_GEOM_RECTS(fillPath, fillN);
                 calls++;
                 fillDrawn++;
                 fillN = 0;
@@ -2595,6 +2645,27 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned long long)g_sbLastWaitUS,
                               (unsigned long long)(total > named ? total - named : 0),
                               (unsigned long long)calls);
+                        // [SB-NP] the per call breakdown of geom, so "one call
+                        // is expensive" can be separated from "one call with
+                        // many points is expensive". kind 0 is CGPathAddLines
+                        // and 1 is CGPathAddRects; arg is the point count or
+                        // the rectangle count.
+                        //
+                        // Only on a slow publish, and only the calls that
+                        // actually cost something: a whole frame of 23 records
+                        // is 23 lines, and the cheap ones answer nothing.
+                        for (int i = 0; i < g_sbNpCount; i++) {
+                            if (g_sbNpUS[i] < 1000ULL) continue;   // under 1 ms
+                            NSLog(@"[SB-NP] pub=%llu i=%d kind=%d arg=%u us=%llu "
+                                  @"bytes=%llu",
+                                  (unsigned long long)g_sbPubIndex, i,
+                                  (int)g_sbNpKind[i],
+                                  (unsigned int)g_sbNpArg[i],
+                                  (unsigned long long)g_sbNpUS[i],
+                                  (unsigned long long)((g_sbNpKind[i] == 0
+                                      ? (uint64_t)g_sbNpArg[i] * 16ULL
+                                      : (uint64_t)g_sbNpArg[i] * 32ULL)));
+                        }
                     }
                 }
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
