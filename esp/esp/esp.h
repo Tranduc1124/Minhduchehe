@@ -20,6 +20,13 @@ typedef struct {
     CGMutablePathRef snaplineBotPath;
     CGMutablePathRef snaplineKnockedPath;
     
+    // The grey card behind each name. It is a fill, not a stroke, so it cannot
+    // share the overlay's single stroked layer: a stroke only carries a colour
+    // and a width, and there is nothing in a CGPath that says fill this part and
+    // stroke the rest. One extra layer draws every card in the frame, because
+    // CGPathAddRects is one call for any number of rectangles.
+    CGMutablePathRef cardPath;
+
     CGMutablePathRef hpFillGreenPath;  
     CGMutablePathRef hpFillOrangePath; 
     CGMutablePathRef hpFillRedPath;    
@@ -38,6 +45,7 @@ typedef struct {
     bool snaplineBotDirty;
     bool snaplineKnockedDirty;
     
+    bool cardDirty;
     bool hpFillGreenDirty;
     bool hpFillOrangeDirty;
     bool hpFillRedDirty;

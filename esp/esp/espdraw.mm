@@ -306,11 +306,42 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     // NAME
     // ---------------------------------------------------------
-    if (isName && textCallback) {
+    if (isName) {
         NSString *dispName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (dispName.length > 0) {
-            // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-            textCallback(callbackContext, dispName, ESPTextRoleName, CGRectMake(centerX - 100.0f, y - dynFontSize - 8.0f, 200.0f, dynFontSize + 6.0f), [UIColor whiteColor], dynFontSize, NO);
+            // The card is a filled rectangle drawn here, not a UILabel's
+            // background, and the two have to agree exactly or the text sits off
+            // the edge of its own card.
+            //
+            // It cannot stay a label background. A UILabel's background is the
+            // label's bounds, and the name is measured, so the bounds would have
+            // to follow the text. More to the point a filled shape is the one
+            // thing a CGPath cannot express: the path carries geometry and the
+            // layer carries the paint, so a filled shape needs a layer whose fill
+            // is set. That is one extra layer, and CGPathAddRects draws every
+            // card in the frame in a single call however many there are.
+            const CGFloat padX = 6.0f;
+            const CGFloat cardH = dynFontSize + 6.0f;
+            const CGFloat cardTop = y - dynFontSize - 8.0f;
+
+            UIFont *f = [UIFont fontWithName:NSSENCRYPT("arialbd") size:dynFontSize]
+                     ?: [UIFont boldSystemFontOfSize:dynFontSize];
+            CGFloat nameW = 0.0f;
+            if (f) {
+                nameW = ceil([dispName sizeWithAttributes:@{NSFontAttributeName: f}].width);
+            }
+            if (nameW < 1.0f) nameW = dynFontSize * 4.0f;
+
+            CGPathAddRect(buffers->cardPath, NULL,
+                          CGRectMake(centerX - nameW * 0.5f - padX, cardTop,
+                                     nameW + padX * 2.0f, cardH));
+            buffers->cardDirty = true;
+
+            if (textCallback) {
+                textCallback(callbackContext, dispName, ESPTextRoleName,
+                             CGRectMake(centerX - 100.0f, cardTop, 200.0f, cardH),
+                             [UIColor whiteColor], dynFontSize, NO);
+            }
         }
     }
 

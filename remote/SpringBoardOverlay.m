@@ -343,6 +343,19 @@ static int      g_sbLabelShown[SB_LABEL_MAX]      = { 0 };
 static int      g_sbLabelUsed                    = 0;
 static int      g_sbLabelHigh                    = 0;
 static uint64_t g_sbCardColor                     = 0;
+
+// The fill layer. A CGPath carries geometry and a CALayer carries paint, so
+// there is no way to fill part of a path and stroke the rest: a filled shape
+// needs a layer whose fill is set. One extra layer draws every card in the frame,
+// because CGPathAddRects is a single call for any number of rectangles, which the
+// cost probe confirmed at sixteen rectangles for the price of one.
+static uint64_t g_sbFillShape   = 0;
+static uint64_t g_sbFillPath    = 0;
+static uint64_t g_sbFillRing[SB_PATH_HOLD_FRAMES] = { 0 };
+static int      g_sbFillRingAt  = 0;
+static uint64_t g_sbFillInv     = 0;
+static uint64_t g_sbFillArgBuf  = 0;
+static uint32_t g_sbFillSubpaths = 0;
 static uint64_t g_sbFontSmall                     = 0;
 static uint64_t g_sbFontBig                       = 0;
 
@@ -453,7 +466,11 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
 
     uint64_t UIColor = r_class("UIColor");
-    const bool isCard = (role == ESPTextRoleName);
+    // No background here any more. The card is a filled rectangle in the fill
+    // layer, drawn from the same measurement, and giving the label a background
+    // as well would put a second grey box behind the first one. What is left is
+    // white text on the card the geometry drew.
+    const bool isCard = false;
     if (r_is_objc_ptr(UIColor)) {
         uint64_t clear = r_msg2_main(UIColor, "clearColor", 0, 0, 0, 0);
         uint64_t white = r_msg2_main(UIColor, "whiteColor", 0, 0, 0, 0);
@@ -838,6 +855,24 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         }
     }
 
+    // Op 6 marks a filled layer. Only the card uses it. It is a separate stream
+    // from the stroked geometry because the two go to different layers with
+    // different paint, and a path cannot say which part of it is which.
+    {
+        id cardL = [espView valueForKey:@"cardLayer"];
+        if ([cardL isKindOfClass:[CAShapeLayer class]]) {
+            CGPathRef cp = ((CAShapeLayer *)cardL).path;
+            if (cp && !CGPathIsEmpty(cp)) {
+                uint8_t tag = 6;
+                [d appendBytes:&tag length:1];
+                SerCtx cctx = { .data = d, .landW = ctx.landW, .landH = ctx.landH,
+                                 .lastX = 0, .lastY = 0, .haveLast = 0 };
+                CGPathApply(cp, &cctx, serFunc);
+                emitted = 1;
+            }
+        }
+    }
+
     if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
@@ -905,6 +940,13 @@ static void sb_forget_local_paint_state(void) {
     g_sbLabelUsed = 0;
     g_sbLabelHigh = 0;
     g_sbCardColor = 0;
+    g_sbFillShape = 0;
+    g_sbFillPath = 0;
+    g_sbFillInv = 0;
+    g_sbFillArgBuf = 0;
+    g_sbFillSubpaths = 0;
+    g_sbFillRingAt = 0;
+    for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -1428,6 +1470,31 @@ int SBoardStartOverlay(void) {
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
 
+    // The filled layer for the cards: no stroke at all, grey fill, and it sits
+    // under the stroke layer so a card never draws over a box edge.
+    uint64_t fillShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+    if (r_is_objc_ptr(fillShape)) {
+        r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
+        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
+        uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
+                                             "colorWithRed:green:blue:alpha:",
+                                             &gray[0], 8, &gray[1], 8,
+                                             &gray[2], 8, &gray[3], 8);
+        if (r_is_objc_ptr(grayColor)) {
+            uint64_t gcg = r_msg2_main(grayColor, "CGColor", 0,0,0,0);
+            if (r_is_objc_ptr(gcg)) r_msg2_main(fillShape, "setFillColor:", gcg, 0,0,0);
+        }
+        r_msg2_main(fillShape, "setOpaque:", 0, 0,0,0);
+        double zf = 99.0;
+        r_msg2_main_raw(fillShape, "setZPosition:", &zf, 8, NULL,0,NULL,0,NULL,0);
+        sb_disable_layer_actions(fillShape);
+        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", fillShape, 0,0,0);
+        g_sbFillShape = fillShape;
+        g_sbFillPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+        NSLog(@"[SB-FILL] fill layer=0x%llx path=0x%llx", fillShape, g_sbFillPath);
+    }
+
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
@@ -1753,6 +1820,27 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             rp = freshPath;
             g_sbPersistentPath = freshPath;
 
+            // Scratch for the card batch, same buffer and same primitive as the
+            // stroke batch, kept separate so one flush of each is one call.
+            double fillDoubles[256];
+            int fillN = 0;
+            uint32_t fillDrawn = 0;
+            uint64_t fillPath = 0;
+            if (r_is_objc_ptr(g_sbFillShape)) {
+                uint64_t fp = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                calls++;
+                if (fp) {
+                    if (g_sbFillRing[g_sbFillRingAt]) {
+                        dlsym_remote("CGPathRelease", g_sbFillRing[g_sbFillRingAt], 0,0,0,0,0,0,0);
+                        g_sbFillRing[g_sbFillRingAt] = 0;
+                    }
+                    g_sbFillRing[g_sbFillRingAt] = fp;
+                    g_sbFillRingAt = (g_sbFillRingAt + 1) % SB_PATH_HOLD_FRAMES;
+                    fillPath = fp;
+                    g_sbFillPath = fp;
+                }
+            }
+
             // Scratch for the rectangle batch. ptsBuffer() holds 1024 doubles,
             // so 128 rectangles (4 doubles each) is a safe chunk; larger frames
             // are flushed in several CGPathAddRects calls rather than overrun it.
@@ -1792,6 +1880,36 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
+                        continue;
+                    }
+                    // Op 6 opens a filled subpath: the cards. They go to the
+                    // second layer, which has a grey fill and no stroke, and they
+                    // are all rectangles, so the whole set is one
+                    // CGPathAddRects. That is the cost probe's sixteen
+                    // rectangles for the price of one, applied to the one shape
+                    // that genuinely needs a fill.
+                    if (op == 6) {
+                        while (i < len) {
+                            double fx, fy, fw, fh;
+                            if (i + 32 > len) { i = len; break; }
+                            memcpy(&fx, b + i, 8);      memcpy(&fy, b + i + 8, 8);
+                            memcpy(&fw, b + i + 16, 8);  memcpy(&fh, b + i + 24, 8);
+                            i += 32;
+                            if (fw > 0.5 && fh > 0.5) {
+                                fillDoubles[fillN * 4 + 0] = fx;
+                                fillDoubles[fillN * 4 + 1] = fy;
+                                fillDoubles[fillN * 4 + 2] = fw;
+                                fillDoubles[fillN * 4 + 3] = fh;
+                                fillN++;
+                                if (fillN >= (int)(sizeof(fillDoubles) / sizeof(fillDoubles[0]) / 4)) {
+                                    remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
+                                    dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
+                                    calls++;
+                                    fillDrawn++;
+                                    fillN = 0;
+                                }
+                            }
+                        }
                         continue;
                     }
                     // Text run: one byte of length, two doubles of already
@@ -2072,7 +2190,15 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                 calls++; drawn++;
             }
 
-            if (drawn > 0 || txtOps > 0) {
+            if (fillN > 0 && fillPath) {
+                remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
+                dlsym_remote("CGPathAddRects", fillPath, 0, ptsBuf, fillN, 0,0,0,0);
+                calls++;
+                fillDrawn++;
+                fillN = 0;
+            }
+
+            if (drawn > 0 || txtOps > 0 || fillDrawn > 0) {
                 // No text run this frame means the app is not in a match, and a
                 // stale count left on screen is worse than no count.
                 if (txtOps == 0) calls += sb_count_label_hide(1);
@@ -2088,6 +2214,39 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     }
                 }
                 if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
+
+                // Present the cards. Its own cached invocation, for the same
+                // reason the stroke layer has one: r_msg_main_raw rebuilds an
+                // invocation per call and waits for the main thread.
+                if (fillDrawn > 0 && r_is_objc_ptr(g_sbFillShape) && fillPath) {
+                    if (!r_is_objc_ptr(g_sbFillInv) && g_sbPerformMainSel && g_sbInvokeSel) {
+                        uint64_t setPathSel = r_sel("setPath:");
+                        uint64_t sig = r_msg(g_sbFillShape, r_sel("methodSignatureForSelector:"), setPathSel, 0, 0, 0);
+                        uint64_t NSInvocation = r_class("NSInvocation");
+                        if (r_is_objc_ptr(sig) && r_is_objc_ptr(NSInvocation)) {
+                            uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+                            if (r_is_objc_ptr(inv)) {
+                                r_msg2(inv, "retain", 0, 0, 0, 0);
+                                r_msg2(inv, "setTarget:", g_sbFillShape, 0, 0, 0);
+                                r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
+                                uint64_t ab = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+                                if (ab) {
+                                    r_msg2(inv, "setArgument:atIndex:", ab, 2, 0, 0);
+                                    g_sbFillInv = inv;
+                                    g_sbFillArgBuf = ab;
+                                } else {
+                                    r_msg2(inv, "release", 0, 0, 0, 0);
+                                }
+                            }
+                        }
+                    }
+                    if (r_is_objc_ptr(g_sbFillInv) && g_sbFillArgBuf) {
+                        remote_write64(g_sbFillArgBuf, fillPath);
+                        r_msg2(g_sbFillInv, "setArgument:atIndex:", g_sbFillArgBuf, 2, 0, 0);
+                        r_msg(g_sbFillInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+                        calls += 2;
+                    }
+                }
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
@@ -2135,7 +2294,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
                               @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
                               @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u trunc=%u txt=%u",
+                              @"mergedSub=%u trunc=%u txt=%u cards=%u",
                               g_sbLastSubpaths, rectCount, limbCount,
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -2149,7 +2308,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount, nTrunc, txtOps);
+                              g_sbSubpathCount, nTrunc, txtOps, fillDrawn);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {

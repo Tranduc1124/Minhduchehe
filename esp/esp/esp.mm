@@ -2396,6 +2396,7 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.snaplinePath = ESPCreateMutablePath();
     buffers.snaplineBotPath = ESPCreateMutablePath();
     buffers.snaplineKnockedPath = ESPCreateMutablePath();
+    buffers.cardPath = ESPCreateMutablePath();
     buffers.hpFillGreenPath = ESPCreateMutablePath();
     buffers.hpFillOrangePath = ESPCreateMutablePath();
     buffers.hpFillRedPath = ESPCreateMutablePath();
@@ -2427,6 +2428,7 @@ static inline void ESPGeometryBuffersRelease(ESPGeometryBuffers *buffers) {
     ESPReleasePath(buffers->bonePath); ESPReleasePath(buffers->boneBotPath); ESPReleasePath(buffers->boneKnockedPath);
     ESPReleasePath(buffers->snaplinePath); ESPReleasePath(buffers->snaplineBotPath);
     ESPReleasePath(buffers->snaplineKnockedPath); ESPReleasePath(buffers->hpFillGreenPath);
+    ESPReleasePath(buffers->cardPath);
     ESPReleasePath(buffers->hpFillOrangePath); ESPReleasePath(buffers->hpFillRedPath); 
     ESPReleasePath(buffers->bgFillBlackPath); ESPReleasePath(buffers->alertPath);
 }
@@ -2681,6 +2683,10 @@ void ESPSyncFromPrefs(void) {
 @property (nonatomic, strong) CAShapeLayer *alertNumOrangeLayer;
 @property (nonatomic, strong) CAShapeLayer *alertNumRedLayer;
 
+// The grey card layer. Filled, not stroked, and the only filled layer in the
+// overlay: a CGPath carries no per-shape paint, so anything that has to be a
+// fill rather than an outline needs a layer of its own.
+@property (nonatomic, strong) CAShapeLayer *cardLayer;
 @property (nonatomic, strong) NSMutableArray<CATextLayer *> *textLayerPool;
 // Role for each pooled text layer, index aligned with textLayerPool. Kept
 // beside the layers rather than on them because CATextLayer has nowhere to put
@@ -2969,6 +2975,12 @@ static void ESPDiagHeartbeat(void) {
     self.fovLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ];
     self.aimAssistLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:1.5f zPos:baseZ + 6];
     
+    // The grey card. Stroke nil so it is only ever filled, and the same grey the
+    // overlay's fill layer uses, 0.16 at 0.72 alpha, so the two agree.
+    self.cardLayer = [self buildShapeLayerWithStroke:nil
+                       fill:[UIColor colorWithRed:0.16f green:0.16f blue:0.16f alpha:0.72f]
+                      lineWidth:0 zPos:baseZ + 5];
+
     self.hpFillGreenLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:0.0f green:1.0f blue:0.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5]; 
     self.hpFillOrangeLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor orangeColor] lineWidth:0 zPos:baseZ + 5];
     self.hpFillRedLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor redColor] lineWidth:0 zPos:baseZ + 5];
@@ -2980,7 +2992,7 @@ static void ESPDiagHeartbeat(void) {
     self.alertNumOrangeLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
     self.alertNumRedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
 
-    NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
+    NSArray *layers = @[self.cardLayer, self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
 
     for (CAShapeLayer *layer in layers) {
         [_secureCanvas.layer addSublayer:layer];
@@ -3342,6 +3354,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
         MenuViewApplyPath(self.snaplineLayer, showVisuals ? buffers.snaplinePath : nil, buffers.snaplineDirty);
         MenuViewApplyPath(self.snaplineBotLayer, showVisuals ? buffers.snaplineBotPath : nil, buffers.snaplineBotDirty);
         MenuViewApplyPath(self.snaplineKnockedLayer, showVisuals ? buffers.snaplineKnockedPath : nil, buffers.snaplineKnockedDirty);
+        MenuViewApplyPath(self.cardLayer, showVisuals ? buffers.cardPath : nil, buffers.cardDirty);
         MenuViewApplyPath(self.hpFillGreenLayer, showVisuals ? buffers.hpFillGreenPath : nil, buffers.hpFillGreenDirty);
         MenuViewApplyPath(self.hpFillOrangeLayer, showVisuals ? buffers.hpFillOrangePath : nil, buffers.hpFillOrangeDirty);
         MenuViewApplyPath(self.hpFillRedLayer, showVisuals ? buffers.hpFillRedPath : nil, buffers.hpFillRedDirty);

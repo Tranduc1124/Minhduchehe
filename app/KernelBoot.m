@@ -44,7 +44,17 @@ static void boot_start_esp_host(void) {
 
 static void boot_start_sb_overlay(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s, 5s, 8s, 12s
+        // Zero on the first attempt, then 1, 2 and 4.
+        //
+        // This used to be {3, 2, 3, 4}, so the very first attempt slept three
+        // seconds before trying anything. That was a three second wait for
+        // something that normally works immediately, and it is the whole of the
+        // delay the user sees between the ESP host coming up and the overlay
+        // appearing. The retries were always there for the case where
+        // SpringBoard is not ready yet, and they still are: trying at once and
+        // backing off only if it fails is the same behaviour with the wait
+        // moved to where it is actually needed.
+        static const int delays[] = {0, 1, 2, 4}; // cumulative: 0s, 1s, 3s, 7s
         for (int attempt = 0; attempt < 4; attempt++) {
             sleep(delays[attempt]);
             int sbret = SBoardStartOverlay();
