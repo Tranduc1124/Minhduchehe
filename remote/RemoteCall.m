@@ -1029,7 +1029,17 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
     return true;
 }
 
-void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr)
+// Returns false if the state could not be signed, and in that case the state
+// is left with the unsigned pc/lr in it and must NOT be replied to the target.
+//
+// This used to return void and assign the result unconditionally. remote_pac
+// signalled failure with -1, so a thread_create that failed inside it wrote
+// 0xFFFFFFFFFFFFFFFF into SpringBoard's __pc and the reply handed the target's
+// own thread a jump to nowhere. The comment on the state sanity check below
+// records that this exact shape, a bogus PC and SP, is what took SpringBoard
+// with SIGKILL on 2026-09-26. remote_pac now returns 0 on failure, which is the
+// reason this can tell the two apart.
+bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr)
 {
     reap_dead_port_names_if_needed("sign_state");
 
@@ -1040,25 +1050,30 @@ void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
         uint64_t discLR = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("lr"));
 
         if (pc) {
+            uint64_t signedPC = remote_pac(signingThread, pc, discPC);
+            if (!signedPC) return false;
             uint32_t flags = state->__flags;
             flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
             state->__flags = flags;
-            state->__pc = remote_pac(signingThread, pc, discPC);
+            state->__pc = signedPC;
         }
         if (lr) {
+            uint64_t signedLR = remote_pac(signingThread, lr, discLR);
+            if (!signedLR) return false;
             uint32_t flags = state->__flags;
             flags &= ~(__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR |
                        __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR);
             state->__flags = flags;
-            state->__lr = remote_pac(signingThread, lr, discLR);
+            state->__lr = signedLR;
         }
-        return;
+        return true;
     }
 
     if(!gIsPACSupported) {
         if (pc) state->__pc = pc;
         if (lr) state->__lr = lr;
     }
+    return true;
 }
 
 bool remote_call_current_success(void)
@@ -1165,7 +1180,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
+    if (!sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR)) {
+        RC_DIAG("sign_state failed in temp_internal, no reply sent (name=%s)", name ? name : "?");
+        g_RC_success = false;
+        return 0;
+    }
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1309,7 +1328,16 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
-    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
+    if (!sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN)) {
+        // No reply. The target's thread stays parked in the exception and
+        // nothing bogus is ever written into its PC, and the caller is told the
+        // session is finished so it re-initialises instead of pushing another
+        // call through a wedged thread.
+        RC_DIAG("sign_state failed, abandoning without a reply (name=%s)", name ? name : "?");
+        g_RC_success = false;
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        return 0;
+    }
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1360,7 +1388,15 @@ bool restore_trojan_thread(arm_thread_state64_internal *state)
             (unsigned long long)native_strip(state->__pc),
             (unsigned long long)native_strip(state->__lr));
     state->__flags = exc.threadState.__flags;
-    sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr);
+    if (!sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr)) {
+        // This is the state that puts the target's ORIGINAL thread back on its
+        // own feet. Failing to sign it and replying anyway would resume
+        // SpringBoard's hijacked thread at an unsigned PC, which is the failure
+        // that produced uncatchable crashes rather than a recoverable one.
+        RC_DIAG("restore_trojan_thread: sign_state failed, NOT resuming the original thread");
+        g_RC_success = false;
+        return false;
+    }
     reply_with_state(&exc, state);
     RC_DIAG("restore_trojan_thread reply sent — original thread resumed");
     return true;
@@ -1423,6 +1459,10 @@ void abandon_remote_call_internal(void) {
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
+    // The cached PAC keys belong to that thread. Clearing the thread address
+    // without the keys would leave the next session signing with the previous
+    // occupant's key pair, which produces signatures that authenticate nothing.
+    pac_release_key_cache();
     g_RC_pid = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
@@ -1489,6 +1529,10 @@ int destroy_remote_call_internal(void) {
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
+    // The cached PAC keys belong to that thread. Clearing the thread address
+    // without the keys would leave the next session signing with the previous
+    // occupant's key pair, which produces signatures that authenticate nothing.
+    pac_release_key_cache();
     g_RC_pid = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
@@ -2137,7 +2181,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             g_RC_mainThreadAddr == g_RC_trojanThreadAddr);
 
     arm_thread_state64_internal newState = exc.threadState;
-    sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
+    if (!sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
+        // Nothing has been replied yet at this point, so the target is still
+        // parked in its exception and this is still a clean place to stop. The
+        // caller sees a failed init and the session state is torn down by
+        // destroy_remote_call on the way out.
+        RC_DIAG("creator-park: sign_state failed, aborting init");
+        g_RC_success = false;
+        return -1;
+    }
     RC_DIAG("creator-park signer=0x%llx signedPC=0x%llx signedLR=0x%llx flags=0x%x",
             (unsigned long long)g_RC_trojanThreadAddr,
             (unsigned long long)newState.__pc,
@@ -2398,7 +2450,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         park.__sp = g_RC_originalState.__sp;
         park.__fp = g_RC_originalState.__fp;
         park.__flags = g_RC_originalState.__flags;
-        sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+        if (!sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
+            // thread_set_state is what actually parks the target thread on this
+            // path, so a failed sign here means the park never happens and the
+            // hijacked thread is still running the target's own code. Stop
+            // rather than set_state it with an unsigned PC.
+            RC_DIAG("TRO-swap park: sign_state failed, not parking thread[1]");
+            g_RC_success = false;
+            return -1;
+        }
         RC_DIAG("TRO-swap park thread[1]=0x%llx pc=0x%llx lr=0x%llx",
                 (unsigned long long)g_RC_callThreadAddr,
                 (unsigned long long)park.__pc,

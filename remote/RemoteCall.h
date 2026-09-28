@@ -66,7 +66,11 @@ int init_remote_call_with_first_exception_timeout(const char* process, bool useM
 int init_remote_call_original_thread_only_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
 uint64_t do_remote_call_stable(int timeout, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
 uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
-void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr);
+// Returns false when the state could not be signed. A false return means the
+// state was NOT modified with a signed pc/lr and must not be replied to the
+// target: replying an unsigned or zero pc hands the target's thread a jump to
+// nowhere.
+bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr);
 uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifier);
 bool remote_read(uint64_t src, void *dst, uint64_t size);
 uint64_t remote_read64(uint64_t src);

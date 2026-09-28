@@ -34,6 +34,12 @@
 #import <mach/mach_time.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
+
+// Printed on the 1 Hz heartbeat so a device log says which build produced it
+// without anyone having to remember what was flashed. The app side has its own
+// token in the [HB] line; these two together identify the whole build, because
+// they are separate translation units and can be out of step.
+#define SB_DIAG_BUILD "MEMO1-PACSAFE"
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
 // Publish interval. The measured rate is not set by this number alone but by how
 // it lands against the render loop, and that is what made 30fps unreachable.
@@ -452,7 +458,21 @@ static void serFunc(void *info, const CGPathElement *e) {
 
 // How many label updates go by between two label position pushes. See the block
 // in sb_pooled_label_update.
-#define SB_LABEL_MOVE_EVERY 3
+//
+// 1, i.e. every frame. This was 3, and it is what made the name look detached
+// from the card: the card is a rectangle in the fill layer and is rebuilt every
+// single frame, while the label that is supposed to sit on it was moved once
+// every three. The text therefore trailed its own card by up to three frames
+// and the gap opened up exactly when the camera moved, which is when a reader
+// is looking at it.
+//
+// The decimation was a band-aid against main-thread pressure, added when a
+// publish was spending two thirds of itself in usleep and four NSLogs per
+// remote call inside the global lock. The call itself is two remote calls for a
+// cached invocation that never blocks; the 200 logd round trips a publish used
+// to cost are gone. Paying ten calls a frame to keep the name on its card is the
+// right trade.
+#define SB_LABEL_MOVE_EVERY 1
 static unsigned g_sbLabelFrame = 0;
 
 // Per-pawn labels. A name label is a rounded grey card with white text, which is
@@ -1901,9 +1921,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tGate;
             const int64_t sinceDraw = (g_sbLastPublishUS == 0)
                                    ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
-            NSLog(@"[PUSH-HB] on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
+            NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu next=%lldms since=%lldms",
-                  (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
+                  SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
                   (unsigned long long)g_sbSummaryUpdates,

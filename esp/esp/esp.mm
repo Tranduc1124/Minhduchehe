@@ -2825,7 +2825,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            the matrix is frozen, the drawing is innocent.
 // Bump this every commit that changes measurement, so a device log identifies
 // its own build. Absence of this token = the IPA on the device is older.
-#define ESP_DIAG_BUILD "FLUSH1"
+#define ESP_DIAG_BUILD "MEMO1-PACSAFE"
 
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
