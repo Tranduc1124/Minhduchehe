@@ -324,17 +324,29 @@ static void ESPRenderPawnCore(
     // SpringBoard nhận ra bốn góc và gom vào CGPathAddRects, tức nó tốn
     // đúng một call bất kể có bao nhiêu người trên màn hình.
     //
-    // Cao 2.5pt với nét 0.75 nên hai cạnh trên dưới của nét vẽ trùng lên
-    // nhau: trên một layer chỉ có nét vẽ, thanh vẫn ra là dải đặc chứ không
-    // phải khung rỗng.
+    // Cao 2.5pt thì nó ra một khung rỗng, và đó là lỗi đo được chứ không phải
+    // cảm giác. SpringBoard chỉ có nét vẽ, không có tô: nét 0.75 tô đều lên
+    // cả bốn cạnh, nên một hình chữ nhật cao 2.5 có cạnh trên che từ -0.375
+    // tới +0.375 và cạnh dưới che từ +2.125 tới +2.875, giữa lại hở 1.75pt.
+    // Máy chụp màn hình cho thấy đúng cái khung rỗng đó.
+    //
+    // Muốn nó đặc thì chiều cao phải nhỏ hơn hoặc bằng nét vẽ, để hai cạnh
+    // chồng lên nhau. Một hình chữ nhật cao đúng 0.75 cho dải đặc 1.5pt, quá
+    // mảnh để đọc trên một box cao 60px. Nên khoẻ theo chiều dọc: ba hình
+    // chữ nhật cao 0.75 chồng lên nhau, dải đặc 3pt, vẫn gom trong cùng một
+    // lệnh CGPathAddRects, không tốn thêm call nào.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barH = 2.5f;
+        const CGFloat barH = 0.75f;      // bằng nét vẽ, để hai cạnh dính nhau
         const CGFloat barGap = 1.5f;
+        const CGFloat barW = boxWidth * healthRatio;
+        const CGFloat barTop = y - barGap - 3.0f * barH;
 
-        CGRect fillRect = CGRectMake(x, y - barH - barGap, boxWidth * healthRatio, barH);
-        CGPathAddRect(buffers->hpFillGreenPath, NULL, fillRect);
+        for (int seg = 0; seg < 3; seg++) {
+            CGPathAddRect(buffers->hpFillGreenPath, NULL,
+                          CGRectMake(x, barTop + seg * barH, barW, barH));
+        }
         buffers->hpFillGreenDirty = true;
     }
 }
