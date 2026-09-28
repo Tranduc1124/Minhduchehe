@@ -3072,7 +3072,31 @@ static void ESPDiagHeartbeat(void) {
     if (!fontNameStr) {
         fontNameStr = LoadCountFont(10).fontName; 
     }
-    
+
+    // Shrink the frame to the text for the two roles that carry a background or
+    // have to be read, keeping the centre where the caller put it.
+    //
+    // The name and the distance are given a fixed 200pt wide frame so a centred
+    // CATextLayer would centre its string in it. The overlay uses that frame as
+    // the label's own bounds, and a UILabel's background is its bounds, so the
+    // grey card came out as a 200pt grey bar with forty points of name in the
+    // middle of it. Measuring here costs nothing: the app has the string and
+    // UIKit, so the text is measured once per string and only when the string
+    // changed.
+    if (role == ESPTextRoleName || role == ESPTextRoleDistance) {
+        UIFont *f = [UIFont fontWithName:fontNameStr size:fontSize]
+                 ?: [UIFont boldSystemFontOfSize:fontSize];
+        if (f) {
+            const CGSize sz = [text sizeWithAttributes:@{NSFontAttributeName: f}];
+            if (sz.width > 1.0) {
+                const CGFloat padW = (role == ESPTextRoleName) ? 10.0f : 4.0f;
+                const CGFloat w = ceil(sz.width) + padW;
+                const CGFloat cx = frame.origin.x + frame.size.width * 0.5f;
+                frame = CGRectMake(cx - w * 0.5f, frame.origin.y, w, frame.size.height);
+            }
+        }
+    }
+
     layer.font = (__bridge CFTypeRef)fontNameStr;
     if (![layer.string isEqualToString:text]) layer.string = text;
     if (!CGRectEqualToRect(layer.frame, frame)) layer.frame = frame;

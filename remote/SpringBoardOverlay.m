@@ -330,6 +330,9 @@ static int      g_sbCountShown   = 0;
 static uint64_t g_sbLabelObj[SB_LABEL_MAX]        = { 0 };
 static uint64_t g_sbLabelPosInv[SB_LABEL_MAX]     = { 0 };
 static uint64_t g_sbLabelPosBuf[SB_LABEL_MAX]     = { 0 };
+static uint64_t g_sbLabelBoundsInv[SB_LABEL_MAX]  = { 0 };
+static uint64_t g_sbLabelBoundsBuf[SB_LABEL_MAX]  = { 0 };
+static double   g_sbLabelLastSize[SB_LABEL_MAX][2] = { { 0.0, 0.0 } };
 static double   g_sbLabelLastPos[SB_LABEL_MAX][2] = { { -1.0, -1.0 } };
 static char     g_sbLabelLastText[SB_LABEL_MAX][SB_TEXT_MAX + 1] = { { 0 } };
 static int      g_sbLabelRole[SB_LABEL_MAX]       = { -1 };
@@ -470,13 +473,11 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
     // a UIView's own layer does, and masksToBounds is what clips the fill to it.
     uint64_t layer = r_msg2_main(label, "layer", 0, 0, 0, 0);
     if (r_is_objc_ptr(layer)) {
-        if (isCard) {
-            double radius = SB_CARD_RADIUS;
-            r_msg_main_raw(layer, r_sel("setCornerRadius:"), &radius, 8,
-                           NULL, 0, NULL, 0, NULL, 0);
-            r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
-        }
-        r_msg2_main(layer, "setShouldRasterize:", 0, 0, 0, 0);
+        // The corner radius is not set. setCornerRadius: takes a CGFloat, and
+        // every route to a scalar argument here is r_msg_main_raw, which is
+        // thirteen blocking remote calls. A square card is what a card needs to
+        // be; rounded corners were never asked for and are not worth a
+        // thousandfold of the per frame budget at nine labels.
     }
 
     // Size before the transform, so setFrame: means what it says. Zero bounds is
@@ -491,6 +492,40 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role) {
 
     r_msg2_main(container, "addSubview:", label, 0, 0, 0);
     return label;
+}
+
+// A cached NSInvocation with one persistent 16 or 32 byte argument buffer,
+// exactly as the setPath: present already does. The alternative,
+// r_msg_main_raw, builds a fresh invocation per call: methodSignatureForSelector:
+// plus invocationWithMethodSignature: plus a malloc per argument plus
+// retainArguments plus performSelectorOnMainThread with waitUntilDone:YES plus
+// getReturnValue: plus a free. That is around thirteen remote calls for one
+// setter, and it blocks until SpringBoard's main thread runs it. Measured cost
+// of ignoring that here was calls=186 and ms=6046 on the first frame, a six
+// second stall, with hold=6892ms behind it.
+static BOOL sb_cached_invocation(uint64_t label, const char *selName,
+                                 uint64_t *invOut, uint64_t *bufOut, size_t bufSize) {
+    if (r_is_objc_ptr(*invOut) && *bufOut) return YES;
+    if (!r_is_objc_ptr(label)) return NO;
+    if (!g_sbPerformMainSel || !g_sbInvokeSel) return NO;
+
+    uint64_t sel = r_sel(selName);
+    if (!sel) return NO;
+    uint64_t sig = r_msg(label, r_sel("methodSignatureForSelector:"), sel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+    r_msg2(inv, "setTarget:", label, 0, 0, 0);
+    r_msg2(inv, "setSelector:", sel, 0, 0, 0);
+    uint64_t buf = dlsym_remote("malloc", bufSize, 0,0,0,0,0,0,0);
+    if (!buf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
+    r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+    *invOut = inv;
+    *bufOut = buf;
+    return YES;
 }
 
 static BOOL sb_pooled_pos_invocation(int idx) {
@@ -519,16 +554,24 @@ static BOOL sb_pooled_pos_invocation(int idx) {
     return YES;
 }
 
-static BOOL sb_pooled_label_resize(int idx, double w, double h) {
-    if (idx < 0 || idx >= SB_LABEL_MAX) return NO;
+// Two calls, and only when the size actually changed. r_msg_main_raw would be
+// about thirteen and would block.
+static uint64_t sb_pooled_label_resize(int idx, double w, double h) {
+    if (idx < 0 || idx >= SB_LABEL_MAX) return 0;
     uint64_t label = g_sbLabelObj[idx];
-    if (!r_is_objc_ptr(label)) return NO;
-    double frame[4] = { 0.0, 0.0, w, h };
-    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
-                   NULL, 0, NULL, 0, NULL, 0);
-    g_sbLabelLastPos[idx][0] = -1.0;   // a new size moves the label
-    g_sbLabelLastPos[idx][1] = -1.0;
-    return YES;
+    if (!r_is_objc_ptr(label)) return 0;
+    if (!sb_cached_invocation(label, "setBounds:",
+                              &g_sbLabelBoundsInv[idx], &g_sbLabelBoundsBuf[idx], 32)) {
+        return 0;
+    }
+    if (w == g_sbLabelLastSize[idx][0] && h == g_sbLabelLastSize[idx][1]) return 0;
+    double r[4] = { 0.0, 0.0, w, h };
+    remote_write(g_sbLabelBoundsBuf[idx], r, sizeof(r));
+    r_msg2(g_sbLabelBoundsInv[idx], "setArgument:atIndex:", g_sbLabelBoundsBuf[idx], 2, 0, 0);
+    r_msg(g_sbLabelBoundsInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    g_sbLabelLastSize[idx][0] = w;
+    g_sbLabelLastSize[idx][1] = h;
+    return 2;
 }
 
 // Returns the number of remote calls made, so the publish log counts them.
@@ -542,9 +585,17 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
     // A role change means a different look, and the look is not per frame.
     if (g_sbLabelRole[idx] != role) {
         g_sbLabelRole[idx] = role;
-        if (sb_pooled_label_resize(idx, w, h)) calls += 13;
         g_sbLabelLastText[idx][0] = 0;   // force the text to be re-sent
     }
+
+    // Rounded before comparing. A camera that is nearly still nudges every
+    // position by a fraction of a point, and at a compare on exact doubles that
+    // is a present per label per frame for a move nobody can see.
+    px = floor(px * 2.0) * 0.5;
+    py = floor(py * 2.0) * 0.5;
+    w  = floor(w + 0.5);
+    h  = floor(h + 0.5);
+    calls += sb_pooled_label_resize(idx, w, h);
 
     if (px == g_sbLabelLastPos[idx][0] && py == g_sbLabelLastPos[idx][1]) {
         // Position unchanged, which is the common case when the camera is parked.
@@ -1629,9 +1680,15 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // Pooled label slot handed to this frame's first name, and how many
             // slots exist so far. Labels are made on demand, so a frame with one
             // enemy makes two and a frame with none makes nothing.
+            //
+            // g_sbLabelHigh is deliberately not cleared here. It is the high
+            // water mark from the previous frame, and the loop at the end of this
+            // one walks from txtSlot up to it to hide the labels a shorter frame
+            // no longer used. Zeroing it here meant that loop always compared
+            // against zero and never ran, so a name stuck on screen after the
+            // pawn behind it died. That was a line of mine, added in the same
+            // commit as the pool, and it defeated the pool's own cleanup.
             int txtSlot = 0;
-            if (g_sbLabelUsed == 0) g_sbLabelUsed = 1;   // slot 0 is the counter's
-            g_sbLabelHigh = 0;
 
             // CGPathClear does not exist. It is absent from CoreGraphics.tbd on
             // iOS 17.5, and so is CGPathReset, so there is no way to empty a
