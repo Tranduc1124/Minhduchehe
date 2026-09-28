@@ -1076,11 +1076,6 @@ int SBoardStartOverlay(void) {
 
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
-    // A real UILabel, added as a subview of the same container, so the counter
-    // can be a number in a real font instead of a path that can only be
-    // stroked. Created once; the frame moves per publish, the text only when
-    // the count changes.
-    sb_make_count_label(container);
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
@@ -1106,6 +1101,20 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    // A real UILabel, added as a subview of the same container, so the counter
+    // can be a number in a real font instead of a path that can only be
+    // stroked. The frame moves per publish, the text only when the count
+    // changes.
+    //
+    // It has to be created after sb_forget_local_paint_state, not before. That
+    // function clears g_sbCountLabel, because on a dead session the pointer
+    // refers to a process that no longer exists and must not be reused. It is
+    // also called at the end of this very function, so a label made earlier in
+    // this function was cleared again before the first publish could see it.
+    // The device log agreed and named it exactly: [SB-LABEL] counter label
+    // created, then [SB-TXT] lbl=0 on every frame, four builds after the label
+    // was known to work.
+    sb_make_count_label(container);
     // Measures what one call and one present actually cost, once, before any
     // frame depends on the answer. See sb_cost_probe.
     sb_cost_probe();

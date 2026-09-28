@@ -3418,6 +3418,23 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         [CATransaction commit];
 
+        // Where the number the overlay is about to be told came from. Every
+        // condition that can zero it is in one line, so a zero is explained
+        // rather than guessed at: a bot-only scene with EspBot off is the
+        // expected way to get sum=0 while sixteen rectangles are on screen.
+        {
+            static uint64_t s_cntLogUS = 0;
+            const uint64_t nowC = ESPPhaseNowUS();
+            if (nowC > s_cntLogUS) {
+                s_cntLogUS = nowC + 1000000ULL;
+                NSLog(@"[SB-TXT] src isCount=%d espBotPref=%d disLimit=%.0f real=%d bot=%d sum=%d",
+                      (int)isCount, (int)ESPPrefsBool(@"EspBot", NO),
+                      (double)espDistanceLimit,
+                      (int)stats.realCount, (int)stats.botCount,
+                      (int)(stats.realCount + stats.botCount));
+            }
+        }
+
         // Mirror this frame to the SpringBoard dedicated overlay (if active).
         //
         // The count goes across unconditionally. It used to be gated on isCount,
