@@ -3427,9 +3427,8 @@ static inline uint64_t ESPPhaseNowUS(void) {
             const uint64_t nowC = ESPPhaseNowUS();
             if (nowC > s_cntLogUS) {
                 s_cntLogUS = nowC + 1000000ULL;
-                NSLog(@"[SB-TXT] src isCount=%d espBotPref=%d disLimit=%.0f real=%d bot=%d sum=%d",
-                      (int)isCount, (int)ESPPrefsBool(@"EspBot", NO),
-                      (double)espDistanceLimit,
+                NSLog(@"[SB-TXT] src espBot=%d disLimit=%.0f real=%d bot=%d sum=%d",
+                      (int)isEspBot, (double)espDistanceLimit,
                       (int)stats.realCount, (int)stats.botCount,
                       (int)(stats.realCount + stats.botCount));
             }
@@ -4206,46 +4205,27 @@ static inline uint64_t ESPPhaseNowUS(void) {
             ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? headBonePos : aimPos)
             : tempDisForAim;
 
-        // Count enemies for ESP number only:
-        // - not self / not teammate (already skipped)
-        // - alive (CurHP > 0) — knocked still counts as a person
-        // - within ESP distance
-        // - dedup by pawn
-        // - bots only if EspBot PREF is on (not the forced isEspBot from AimOnBot)
-        // Count: real players only by default; bots only if EspBot switch is ON in prefs
-        // (not the temporary isEspBot forced by AimOnBot — that inflated count by +bots).
-        // EspBot pref once per frame (not every pawn — was re-reading defaults 100×).
-        static bool s_espBotPref = false;
-        static int s_espBotFrame = -1;
-        if (s_espBotFrame != g_cacheFrameCounter) {
-            s_espBotFrame = g_cacheFrameCounter;
-            s_espBotPref = ESPPrefsBool(@"EspBot", NO);
-        }
-        bool shouldCountEnemy = true;
-        if (isBot && !s_espBotPref) shouldCountEnemy = false;
-        if (CurHP <= 0) shouldCountEnemy = false; // CurHP<=0 is terminal; ignore lagged isKnocked for counting ghosts.
-        float countDis = dis;
-        float countLimit = fmaxf(espDistanceLimit, 1.0f);
-        if (shouldCountEnemy && countDis <= countLimit && countDis >= 1.5f) {
-            uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
-            uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
-            static uint64_t s_countSeen[128];
-            static int s_countFrame = -1;
-            static int s_countN = 0;
-            if (s_countFrame != g_cacheFrameCounter) {
-                s_countFrame = g_cacheFrameCounter;
-                s_countN = 0;
-            }
-            bool dup = false;
-            for (int ci = 0; ci < s_countN; ci++) {
-                if (s_countSeen[ci] == dedupKey) { dup = true; break; }
-            }
-            if (!dup && s_countN < 128) {
-                s_countSeen[s_countN++] = dedupKey;
-                if (isBot) stats.botCount++;
-                else stats.realCount++;
-            }
-        }
+        // Count enemies for the number, deduplicated by user id.
+        //
+        // This used to be decided here, from its own rules, before the draw
+        // gate below had been evaluated, and the two disagreed. The draw asks
+        // isEspBot, which line 2513 and line 2614 force to YES when aim-on-bot
+        // or aim-assist is on, while the count asked the raw EspBot preference,
+        // which defaults to NO. A bot-only scene therefore drew four boxes and
+        // counted zero, which is what the device log showed and what the
+        // counter then displayed.
+        //
+        // The comment the old block carried records an earlier attempt at this:
+        // it switched the count onto the raw preference to stop the count being
+        // inflated by the forced flag. That fixed the inflation by creating the
+        // opposite fault. Two rules cannot both be right.
+        //
+        // So the count no longer decides anything. It is applied below, where
+        // wantDraw is already true, which makes it count exactly the pawns the
+        // renderer is about to draw whatever combination of preferences and aim
+        // settings got them there. The number and the boxes are then the same
+        // set by construction, and the distance rule is espDrawLimit, the one the
+        // draw already uses.
 
         // Check Visible: Camera bit OR vehicle passenger — always draw people in cars.
         const bool mounted = treatAsVehicle;
@@ -4265,6 +4245,36 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
         if (CurHP <= 0) continue;
+
+        // Count what is actually drawn, not what a second set of rules says
+        // should be drawn. wantDraw is the renderer's own verdict, already
+        // carrying the bot rule, the visibility rule, the mounted rule and the
+        // distance rule that the boxes on screen were produced by, so this needs
+        // no rule of its own and cannot drift from them.
+        //
+        // Deduplicated by user id because the same player can appear twice in
+        // the pawn list, and the array is per frame so it never has to be
+        // cleared, only rewound.
+        if (wantDraw && dis >= 1.5f) {
+            const uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
+            const uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
+            static uint64_t s_countSeen[128];
+            static int s_countFrame = -1;
+            static int s_countN = 0;
+            if (s_countFrame != g_cacheFrameCounter) {
+                s_countFrame = g_cacheFrameCounter;
+                s_countN = 0;
+            }
+            bool dup = false;
+            for (int ci = 0; ci < s_countN; ci++) {
+                if (s_countSeen[ci] == dedupKey) { dup = true; break; }
+            }
+            if (!dup && s_countN < 128) {
+                s_countSeen[s_countN++] = dedupKey;
+                if (isBot) stats.botCount++;
+                else stats.realCount++;
+            }
+        }
 
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
