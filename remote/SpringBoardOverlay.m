@@ -849,8 +849,9 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
         const uint64_t nowS = now_us();
         if (nowS > s_txtLogUS) {
             s_txtLogUS = nowS + 1000000ULL;
-            NSLog(@"[SB-TXT] lbl=%d cnt=%d landW=%.0f landH=%.0f bytes=%lu emitted=%d",
+            NSLog(@"[SB-TXT] lbl=%d cnt=%d fill=%d landW=%.0f landH=%.0f bytes=%lu emitted=%d",
                   (int)r_is_objc_ptr(g_sbCountLabel), enemyCount,
+                  (int)r_is_objc_ptr(g_sbFillShape),
                   ctx.landW, ctx.landH, (unsigned long)d.length, emitted);
         }
     }
@@ -1470,31 +1471,6 @@ int SBoardStartOverlay(void) {
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
 
-    // The filled layer for the cards: no stroke at all, grey fill, and it sits
-    // under the stroke layer so a card never draws over a box edge.
-    uint64_t fillShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-    if (r_is_objc_ptr(fillShape)) {
-        r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-        if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
-        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
-        uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
-                                             "colorWithRed:green:blue:alpha:",
-                                             &gray[0], 8, &gray[1], 8,
-                                             &gray[2], 8, &gray[3], 8);
-        if (r_is_objc_ptr(grayColor)) {
-            uint64_t gcg = r_msg2_main(grayColor, "CGColor", 0,0,0,0);
-            if (r_is_objc_ptr(gcg)) r_msg2_main(fillShape, "setFillColor:", gcg, 0,0,0);
-        }
-        r_msg2_main(fillShape, "setOpaque:", 0, 0,0,0);
-        double zf = 99.0;
-        r_msg2_main_raw(fillShape, "setZPosition:", &zf, 8, NULL,0,NULL,0,NULL,0);
-        sb_disable_layer_actions(fillShape);
-        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", fillShape, 0,0,0);
-        g_sbFillShape = fillShape;
-        g_sbFillPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-        NSLog(@"[SB-FILL] fill layer=0x%llx path=0x%llx", fillShape, g_sbFillPath);
-    }
-
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
@@ -1533,6 +1509,38 @@ int SBoardStartOverlay(void) {
     // created, then [SB-TXT] lbl=0 on every frame, four builds after the label
     // was known to work.
     sb_make_count_label(container);
+
+    // Created after sb_forget_local_paint_state for the same reason the counter
+    // label is: that function clears every pointer into the previous session, and
+    // it also runs at the end of this function, so anything made before it is
+    // cleared again before the first publish can see it. It cost one round on the
+    // label and one round here, both times silently, and both times the symptom
+    // was a feature that produced nothing.
+    // The filled layer for the cards: no stroke at all, grey fill, and it sits
+    // under the stroke layer so a card never draws over a box edge.
+    uint64_t fillShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+    if (r_is_objc_ptr(fillShape)) {
+        r_msg2_main_raw(fillShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(fillShape, "setStrokeColor:", 0, 0,0,0);
+        double gray[4] = { 0.16, 0.16, 0.16, 0.72 };
+        uint64_t grayColor = r_msg2_main_raw(r_class("UIColor"),
+                                             "colorWithRed:green:blue:alpha:",
+                                             &gray[0], 8, &gray[1], 8,
+                                             &gray[2], 8, &gray[3], 8);
+        if (r_is_objc_ptr(grayColor)) {
+            uint64_t gcg = r_msg2_main(grayColor, "CGColor", 0,0,0,0);
+            if (r_is_objc_ptr(gcg)) r_msg2_main(fillShape, "setFillColor:", gcg, 0,0,0);
+        }
+        r_msg2_main(fillShape, "setOpaque:", 0, 0,0,0);
+        double zf = 99.0;
+        r_msg2_main_raw(fillShape, "setZPosition:", &zf, 8, NULL,0,NULL,0,NULL,0);
+        sb_disable_layer_actions(fillShape);
+        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", fillShape, 0,0,0);
+        g_sbFillShape = fillShape;
+        g_sbFillPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+        NSLog(@"[SB-FILL] fill layer=0x%llx path=0x%llx", fillShape, g_sbFillPath);
+    }
+
     // Measures what one call and one present actually cost, once, before any
     // frame depends on the answer. See sb_cost_probe.
     sb_cost_probe();
