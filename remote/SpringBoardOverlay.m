@@ -143,19 +143,38 @@ static uint64_t g_sbNextPublishUS = 0;
 // through the settling transport. The size is an argument to malloc, not a part
 // of the lookup, so one answer serves every size.
 //
-// Cleared with the rest of the session state: a respawned SpringBoard is a new
-// address space, and a cached function pointer into the old one is worse than
-// no pointer at all.
-static uint64_t g_sbRemoteMalloc = 0;
-
+// Every call allocates. This used to cache the first result and hand the same
+// address to everybody, which is the single worst bug in this file.
+//
+// ptsBuffer() is the first caller in program order and asks for 65536 bytes, so
+// g_sbRemoteMalloc became that 64 KB block and every later sb_remote_malloc(8)
+// returned the same address. Nine sets of globals then aliased one buffer:
+// g_sbMirrorPtsBuf, g_sbSetPathArgBuf, g_sbCountPosBuf, g_sbLabelPosBuf[25],
+// g_sbLabelTextBuf[25], g_sbLabelHideBuf[25], g_sbLabelBoundsBuf[25],
+// g_sbLabelTransBuf[25] and g_sbFillArgBuf.
+//
+// setArgument:atIndex: stores the pointer to the buffer, not the value in it,
+// and the setPath: hand-off is queued with waitUntilDone:NO. So the argument a
+// queued call would read is whatever the next publish wrote into those eight
+// bytes. Label 2's position overwrote label 1's pending argument; the
+// rectangle batch's remote_write(ptsBuf, ...) overwrote the path pointer that
+// the queued setPath: had not run yet.
+//
+// That is why one snapline became two, why a parked camera kept drawing a
+// stale path, and why a layer sized to the window could flash across the
+// screen: the path SpringBoard finally applied was assembled from another
+// frame's numbers. Whether it shows depends entirely on how far behind
+// SpringBoard's main thread happens to be running, which is why the fault was
+// intermittent and got worse as the frame cost rose.
+//
+// The cost of allocating properly is about 140 extra remote calls, all of them
+// inside SBoardStartOverlay, which already makes around 840, and all of them
+// once per session. The memory is about 68 KB in SpringBoard.
 static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 
 static uint64_t sb_remote_malloc(size_t n) {
-    if (!g_sbRemoteMalloc) {
-        g_sbRemoteMalloc = dlsym_remote("malloc", n, 0,0,0,0,0,0,0);
-    }
-    return g_sbRemoteMalloc;
+    return dlsym_remote("malloc", n, 0,0,0,0,0,0,0);
 }
 // Last publish cost, so the log says what the subpath fix actually costs.
 static uint32_t g_sbLastSubpaths = 0;
@@ -1226,7 +1245,6 @@ static void sb_forget_local_paint_state(void) {
     // malloc's address belongs to the process the session pointed at. A
     // respawned SpringBoard is a new address space, so a cached one is a call
     // through a stale pointer rather than a slow one.
-    g_sbRemoteMalloc = 0;
     for (int t = 0; t < SB_LABEL_MAX; t++) { g_sbLabelTransInv[t] = 0; g_sbLabelTransBuf[t] = 0; }
     g_sbFillRingAt = 0;
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbFillRing[k] = 0;
@@ -2807,16 +2825,19 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         // Only on a slow publish, and only the calls that
                         // actually cost something: a whole frame of 23 records
                         // is 23 lines, and the cheap ones answer nothing.
-                        // SB_NP_MAX_LINES caps the per-call dump. The threshold
-                        // is now low enough that most publishes qualify, and a
-                        // publish can hold twenty records over 1 ms, so an
-                        // uncapped loop would bury the [SB-CALL] line it is
-                        // supposed to explain. The worst few name the cost, and
-                        // the total is in the [SB-CALL] line anyway.
+                        // SB_NP_MAX_LINES caps the per-call dump so a normal
+                        // publish cannot bury the [SB-CALL] line it is supposed
+                        // to explain. A publish that is already pathological is
+                        // the opposite case: five records out of fifty-two is not
+                        // an explanation of anything, it is a sample. So a
+                        // publish over 40 ms dumps every record it took, and
+                        // 40 ms is far enough above steady state that the extra
+                        // lines cannot flood a healthy run.
+                        const int npCap = (total > 40000ULL) ? SB_NP_MAX : SB_NP_MAX_LINES;
                         int npPrinted = 0;
                         for (int i = 0; i < g_sbNpCount; i++) {
                             if (g_sbNpUS[i] < 1000ULL) continue;   // under 1 ms
-                            if (npPrinted >= SB_NP_MAX_LINES) break;
+                            if (npPrinted >= npCap) break;
                             npPrinted++;
                             NSLog(@"[SB-NP] pub=%llu i=%d kind=%d arg=%u us=%llu "
                                   @"bytes=%llu",
