@@ -542,7 +542,6 @@ static uint64_t g_sbCountAlignStr = 0;
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
-static int      g_sbCountProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -626,8 +625,18 @@ static BOOL sb_cached_pos_invocation(void) {
 // The counter's own cached invocations, built on first use and kept for the
 // life of the session. Same shape as the pooled labels', and for the same
 // reason: see the note at sb_count_label_text.
-static uint64_t g_sbCountTextInv = 0, g_sbCountTextBuf = 0;
 static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
+// The NSString currently sitting in the layer, held rather than released.
+//
+// This is the CGPath ring's idea applied to the one object argument that had no
+// hold. setPath: is fired fire-and-forget too, and its path is kept alive in
+// g_sbPathRing because the target runs the setter later and the boxes do draw.
+// The counter's NSString was released on the line after the fire instead, so
+// whatever the target eventually read was a released object, and the readback
+// of the layer's string property came back as 0xba3284a2d61cdc55: a kernel
+// address, different on every run. One held string is enough, because a new one
+// replaces an old one rather than accumulating.
+static uint64_t g_sbCountTextNS = 0;
 
 static BOOL sb_cached_invocation(uint64_t label, const char *selName,
                                  uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
@@ -667,73 +676,39 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
     // view setters do not exist on it.
     //
-    // Through a cached invocation, not r_perform_main.
+    // r_msg2_main, the same call this label's own setBackgroundColor: uses, and
+    // the background demonstrably drew. That is the whole reason for choosing
+    // it: on this exact layer, an object argument through r_msg2_main lands,
+    // and an object argument through a fire-and-forget invocation with the
+    // object released straight after it does not. The boxes are the proof from
+    // the other side, because setPath: is fired the same fire-and-forget way
+    // and only works because the path is kept alive in g_sbPathRing.
     //
-    // This file has already run this experiment. setText: and setHidden: were
-    // the last two label setters left on r_perform_main and they were the last
-    // two that misbehaved, and the note next to the pooled labels says so
-    // outright: everything known to work goes through a cached invocation. The
-    // counter kept r_perform_main, so it kept both faults.
-    //
-    // Waiting was tried here and did not fix it. waitUntilDone:YES is correct
-    // for the lifetime, and it removed the one case that could be a dangling
-    // CFString, but the readback after it came back with string holding
-    // 0xba3284a2d61cdcd5, which is not a user address at all: the setter was
-    // never landing on the layer. Cached invocation plus retainArguments is the
-    // path the pooled labels' setText: uses and the one this codebase records
-    // as working, so the counter uses it too.
-    if (sb_cached_invocation(g_sbCountLabel, "setString:",
-                             &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
-        remote_write64(g_sbCountTextBuf, ns);
-        r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
-        r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
-        calls += 3;
-    }
-    dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
+    // So: call it the way the working setter is called, and hold the string.
+    r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
     calls++;
+
+    // One string is held, not a ring of them. A new count replaces the old
+    // count, so holding the previous one until this line is enough to cover
+    // every fire-and-forget setter still in flight, and the cost is one live
+    // NSString for the life of the session.
+    if (g_sbCountTextNS && g_sbCountTextNS != ns) {
+        dlsym_remote("CFRelease", g_sbCountTextNS, 0,0,0,0,0,0,0);
+        calls++;
+    }
+    g_sbCountTextNS = ns;
 
     if (!g_sbCountFirstTextUS && g_sbCountBornUS) {
         g_sbCountFirstTextUS = now_us();
         // The label is built entirely through main-thread setters, so it exists
-        // in this process long before the target has drawn any of it. How long
-        // that gap is the difference between the counter arriving with the
-        // boxes and arriving a second or two after them, and it has only ever
-        // been guessed at.
-        NSLog(@"[SB-LABEL] counter first text after %llums (born->draw)",
-              (unsigned long long)((g_sbCountFirstTextUS - g_sbCountBornUS) / 1000ULL));
+        // in this process well before the target has drawn any of it. That gap
+        // is the delay before the counter is visible.
+        NSLog(@"[SB-LABEL] counter first text after %llums ns=0x%llx",
+              (unsigned long long)((g_sbCountFirstTextUS - g_sbCountBornUS) / 1000ULL),
+              (unsigned long long)ns);
     }
 
-    // Read the label back, once, the first time it has text. bounds, fontSize
-    // and attached were all confirmed ok and the number still does not appear,
-    // so the remaining candidates are the ones those three cannot see: whether
-    // the string actually took, whether the layer is hidden, and whether it is
-    // where it thinks it is. Each is a property read straight out of
-    // SpringBoard's own CALayer, the same way lineWidth, bounds and fontSize
-    // were verified, so this is four more measured facts instead of four more
-    // guesses. Minus one is the sentinel for a read that did not happen.
-    if (!g_sbCountProbed) {
-        g_sbCountProbed = 1;
-        uint64_t strp = r_msg2_main(g_sbCountLabel, "string", 0, 0, 0, 0);
-        uint64_t sup  = r_msg2_main(g_sbCountLabel, "superlayer", 0, 0, 0, 0);
-        // isHidden, not the hidden property. hidden is a BOOL, one byte, and
-        // asking for eight of it fails, which is why the last readback printed
-        // hidden=-1/0. The method returns it in the register instead.
-        uint64_t hid = (uint64_t)r_msg2_main(g_sbCountLabel, "isHidden", 0, 0, 0, 0);
-        double f4[4] = { -1.0, -1.0, -1.0, -1.0 };
-        double p2[2] = { -1.0, -1.0 };
-        const bool fOK = r_msg2_main_struct_ret(g_sbCountLabel, "frame", f4, sizeof(f4),
-                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-        const bool pOK = r_msg2_main_struct_ret(g_sbCountLabel, "position", p2, sizeof(p2),
-                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-        NSLog(@"[SB-CNT] str=0x%llx hidden=%llu frame=%.1f,%.1f %.1fx%.1f/%d "
-              @"pos=%.1f,%.1f/%d super=0x%llx text=%s",
-              (unsigned long long)strp, (unsigned long long)hid,
-              f4[0], f4[1], f4[2], f4[3], (int)fOK,
-              p2[0], p2[1], (int)pOK,
-              (unsigned long long)sup, utf8);
-    }
-
-    strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
+strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
     g_sbCountLastText[sizeof(g_sbCountLastText) - 1] = 0;
     return calls;
 }
@@ -1442,15 +1417,12 @@ static void sb_forget_local_paint_state(void) {
     // exists and reading them would be a use after free.
     g_sbCountPosInv = 0;
     g_sbCountPosBuf = 0;
-    g_sbCountTextInv = 0;
-    g_sbCountTextBuf = 0;
     g_sbCountHideInv = 0;
     g_sbCountHideBuf = 0;
     g_sbCountLabel = 0;
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFirstTextUS = 0;
-    g_sbCountProbed = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
