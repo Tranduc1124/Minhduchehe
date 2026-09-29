@@ -542,6 +542,10 @@ static uint64_t g_sbCountAlignStr = 0;
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
+// The CTFontRef the counter draws with, and whether CTFontCreateWithName has
+// been tried yet, so a target without it is not asked on every session.
+static uint64_t g_sbCountFont = 0;
+static int      g_sbCountFontTried = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -625,6 +629,7 @@ static BOOL sb_cached_pos_invocation(void) {
 // The counter's own cached invocations, built on first use and kept for the
 // life of the session. Same shape as the pooled labels', and for the same
 // reason: see the note at sb_count_label_text.
+static uint64_t g_sbCountTextInv = 0, g_sbCountTextBuf = 0;
 static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
 // The NSString currently sitting in the layer, held rather than released.
 //
@@ -668,6 +673,15 @@ static uint64_t sb_make_nsstring(const char *utf8) {
 static BOOL sb_cached_invocation(uint64_t label, const char *selName,
                                  uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
 
+// A CFStringRef for the font name, held in the target for the session. CTFont's
+// name parameter is a CFStringRef and a bare char pointer would be read as one,
+// so it has to be a real string. Built the same way as every other string here.
+static uint64_t sb_ctfont_name(void) {
+    static uint64_t name = 0;
+    if (!r_is_objc_ptr(name)) name = sb_make_nsstring("Helvetica-Bold");
+    return name;
+}
+
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
@@ -700,22 +714,44 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
     // view setters do not exist on it.
     //
-    // r_msg2_main, the same call this label's own setBackgroundColor: uses, and
-    // the background demonstrably drew. That is the whole reason for choosing
-    // it: on this exact layer, an object argument through r_msg2_main lands,
-    // and an object argument through a fire-and-forget invocation with the
-    // object released straight after it does not. The boxes are the proof from
-    // the other side, because setPath: is fired the same fire-and-forget way
-    // and only works because the path is kept alive in g_sbPathRing.
+    // Through a cached invocation, which is r_msg2 rather than r_msg_main_raw.
     //
-    // So: call it the way the working setter is called, and hold the string.
-    r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
-    calls++;
+    // This is not a guess between two transports, it is what the setters on this
+    // very layer already proved. The three that are read back correct,
+    // setFrame:, setFontSize: and setContentsScale:, all take a struct or a
+    // scalar and all go through r_msg_main_raw. setBackgroundColor: also goes
+    // through r_msg_main_raw and drew. setString: takes an object, and through
+    // r_msg_main_raw it has never once landed.
+    //
+    // The comparison that settles it is one line away in the same file. setPath:
+    // takes an object too, and it is the one that draws every box on screen, and
+    // it goes through sb_cached_invocation, which is a plain r_msg2 to
+    // setArgument:atIndex: and invoke. r_msg_main_raw is the transport whose
+    // argument handling this file has already documented as unreliable, with an
+    // argument probe left in it comparing getArgument: against invoke and
+    // concluding that the invocation holds the values while invoke does not read
+    // them from there.
+    //
+    // The cached invocation was tried here before and failed, but it failed while
+    // the NSString was still the 0xbeb0fdba garbage, so the setter was being
+    // asked to store a pointer that was never a pointer. That is no longer the
+    // case. sb_make_nsstring now returns a real object, and this is the first
+    // run of the cached path with a real one to store.
+    //
+    // The string is held afterwards, the way setPath: is held in g_sbPathRing,
+    // because the invocation is fired with waitUntilDone:NO and the object has
+    // to outlive the queue.
+    if (sb_cached_invocation(g_sbCountLabel, "setString:",
+                             &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
+        remote_write64(g_sbCountTextBuf, ns);
+        r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
+        r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        calls += 3;
+    }
 
-    // One string is held, not a ring of them. A new count replaces the old
-    // count, so holding the previous one until this line is enough to cover
-    // every fire-and-forget setter still in flight, and the cost is one live
-    // NSString for the life of the session.
+    // One string is held, not a ring of them. A new count replaces the old count,
+    // so releasing the previous one here covers every fire-and-forget setter
+    // still in flight, and the cost is one live NSString per session.
     if (g_sbCountTextNS && g_sbCountTextNS != ns) {
         dlsym_remote("CFRelease", g_sbCountTextNS, 0,0,0,0,0,0,0);
         calls++;
@@ -1135,10 +1171,29 @@ static void sb_make_count_label(uint64_t container) {
         // plain number needs neither, and dropping them removes the shape that
         // was arriving before the text did.
         //
-        // Font size, once, at creation. CALayer has no view-level default to
-        // fall back on and there is no UIFont to setFont: on a layer anyway,
-        // so fontSize is the only handle. The UILabel this replaced carried
-        // systemFontOfSize:26 and the migration dropped it.
+        // Font, then font size. Both, and the font is the one that was missing.
+        //
+        // fontSize alone is not a font. CALayer has a font property that is nil
+        // by default, and a CATextLayer with a size and no font has nothing to
+        // rasterise the glyphs with. The UILabel this replaced was handed
+        // setFont: with a real UIFont, and the migration carried the size across
+        // and dropped the font, which is the same shape as the alignment mode
+        // that was crashing SpringBoard: an argument that belonged to the old
+        // class.
+        //
+        // CALayer wants a CTFontRef, not a UIFont, so it is made through
+        // CTFontCreateWithName rather than handed UIFont's result. Held for the
+        // session, like the label itself, and never released, because the layer
+        // keeps a reference to it for as long as it draws.
+        if (!g_sbCountFont && !g_sbCountFontTried) {
+            g_sbCountFontTried = 1;
+            double fsz = SB_COUNT_FONT_SIZE;
+            g_sbCountFont = dlsym_remote("CTFontCreateWithName",
+                                        sb_ctfont_name(), (uint64_t)(uintptr_t)&fsz, 0,
+                                        0, 0, 0, 0, 0);
+        }
+        if (r_is_objc_ptr(g_sbCountFont)) r_msg2_main(label, "setFont:", g_sbCountFont, 0, 0, 0);
+
         double fsz = SB_COUNT_FONT_SIZE;
         r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
                        NULL, 0, NULL, 0, NULL, 0);
@@ -1444,12 +1499,16 @@ static void sb_forget_local_paint_state(void) {
     // exists and reading them would be a use after free.
     g_sbCountPosInv = 0;
     g_sbCountPosBuf = 0;
+    g_sbCountTextInv = 0;
+    g_sbCountTextBuf = 0;
     g_sbCountHideInv = 0;
     g_sbCountHideBuf = 0;
     g_sbCountLabel = 0;
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFirstTextUS = 0;
+    g_sbCountFont = 0;
+    g_sbCountFontTried = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;

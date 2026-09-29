@@ -297,6 +297,13 @@ uint64_t r_arg_probe_n = 0;
 uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
 uint64_t r_arg_probe_alt = 0;
 
+// Written into a target buffer before asking a selector to store a return value
+// there, and read back to prove the mapping is the target's live page rather than
+// a cached alias of an address the target has since recycled. A pattern rather
+// than zero, so that a read which returns "nothing was written" cannot be
+// mistaken for a read that worked and legitimately found zeros.
+#define R_RETPOISON 0x524554504F49534EULL   // "RETP OISN"
+
 static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize)
 {
     if (!remoteBuf || remoteSize == 0) return false;
@@ -628,9 +635,35 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     // the overlay looked as though it had been honoured, but a zero line width
     // falls back to the CALayer default of one, which is close enough to 1.5 that
     // nothing ever looked wrong. It was never actually being set.
-    for (uint64_t i = 0; i < maxUserArgs; i++) {
-        if (argBufs[i]) r_free(argBufs[i]);
-    }
+    //
+    // The argument buffers are freed at the very end of this function, not here.
+    //
+    // They used to be released here, immediately before the return value was
+    // read, and that is the shape that made every one-argument selector look
+    // broken. Both are eight bytes: the argument buffer is malloc'd per
+    // argument and rounded up to eight, and the return buffer is malloc'd and
+    // rounded up to eight the same way. Freeing the first and then asking for
+    // the second handed back the same block. The read then went through
+    // remote_write64 and remote_read64, which this file notes can land in a
+    // stale alias because they go through the vm_map_entry hijack, so what came
+    // back was the contents of that block before it was freed rather than what
+    // getReturnValue: had just written into it.
+    //
+    // That is why it looked so selective. A selector with no arguments never
+    // allocates an argument buffer, so its return buffer cannot collide with
+    // one, and alloc, layer, init and isHidden all came back correct.
+    // initWithUTF8String: takes exactly one argument and came back
+    // 0xbeb0fdbaed5e3215: not a user address, and near identical across runs,
+    // which is what a stale block full of an earlier allocation's bytes looks
+    // like rather than noise. r_is_objc_ptr only asks whether the value clears
+    // 0x100000000, so that passed the check and was written into the layer as
+    // the counter's text, which is why the card drew and the number never did.
+    //
+    // Holding the argument buffers until the return has been read removes the
+    // collision entirely: the two mallocs cannot return the same address while
+    // the first is still live. The buffers are eight bytes each and there are
+    // at most four, so holding them for the length of one return read costs
+    // nothing measurable.
 
     uint64_t ret = 0;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
@@ -639,11 +672,56 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
         uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         retBufLen, 0, 0, 0, 0, 0, 0, 0);
         if (retBuf) {
-            remote_write64(retBuf, 0);
-            r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
-            ret = remote_read64(retBuf);
+            // Clear the page cache, verify, and retry. This is r_write_remote_arg's
+            // answer applied to the read side, which never had it.
+            //
+            // remote_write and remote_read go through the vm_map_entry hijack and
+            // a 256 entry LRU of locally mapped aliases keyed on the page address
+            // alone. A cached alias is reused without checking that the target's
+            // page is still the same object, so a block the target has freed and
+            // handed back maps to the old contents. r_write_remote_arg and
+            // r_alloc_str both call remote_clear_shmem_cache and then read the
+            // target's own bytes back to confirm the transfer landed; this read
+            // did neither, so a stale alias and a correct value were
+            // indistinguishable, and the stale contents got used as the return
+            // value of the selector.
+            //
+            // That is how initWithUTF8String: came back as 0xbeb0fdbaed5e3215
+            // on one run and 0xbeb0fdbaed5e3015 on the next: not a wrong answer
+            // from the selector, but the previous occupant of a recycled block.
+            //
+            // The poison write is the check. getReturnValue: is asked to store a
+            // known pattern; if reading it back does not produce that pattern the
+            // mapping is stale, and the answer to trust is not on it. Three
+            // attempts, each after dropping the cache, exactly as the write path
+            // does. The block is still alive here rather than recycled from a
+            // freed argument buffer, so this is belt and braces on top of the
+            // reordering below, and the two together close both holes.
+            bool got = false;
+            for (int attempt = 0; attempt < 3 && !got; attempt++) {
+                remote_clear_shmem_cache();
+                if (!remote_write64(retBuf, R_RETPOISON)) continue;
+                uint64_t check = remote_read64(retBuf);
+                if (check != R_RETPOISON) continue;
+                r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
+                ret = remote_read64(retBuf);
+                got = true;
+            }
+            if (!got) ret = 0;
             r_free(retBuf);
         }
+    }
+
+    // The argument buffers are released here, after the return value has been
+    // read, and not before it. The reason is in the comment above the return
+    // read: freeing an eight byte argument buffer and then mallocing an eight
+    // byte return buffer hands back the same block, and the read goes through
+    // remote_write64/remote_read64, which can land in a stale alias. That is
+    // what made every one-argument selector return the previous occupant of that
+    // block. Holding them for the length of the read costs nothing and removes
+    // the collision by construction.
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
     }
 
     r_msg2(inv, "release", 0, 0, 0, 0);
@@ -893,20 +971,38 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
         r_main_wait_note("r_msg2_main_struct_ret", r_now_us() - t0);
     }
 
-    for (uint64_t i = 0; i < maxUserArgs; i++) {
-        if (argBufs[i]) r_free(argBufs[i]);
-    }
-
+    // The argument buffers are released after the return has been read, for the
+    // reason given in r_msg_main_raw: freeing an eight byte argument buffer and
+    // then mallocing the return buffer hands back the same block, and the read
+    // runs through the same unverified alias path.
     bool ok = false;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
     if (retLen >= outSize) {
         uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         retLen, 0, 0, 0, 0, 0, 0, 0);
         if (retBuf) {
-            r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
-            ok = remote_read(retBuf, outBuf, outSize);
+            // Same poison, clear and retry as r_msg_main_raw. This path had none
+            // of it, so a struct return that came out of a stale alias was
+            // indistinguishable from a real one. Every caller here is currently a
+            // zero argument selector, so no argument buffer is allocated and the
+            // collision cannot arise yet, but the missing verification was not
+            // what was keeping it safe and would not have kept it safe either.
+            uint8_t poison[8] = { 0x52, 0x45, 0x54, 0x50, 0x4F, 0x49, 0x53, 0x4E };
+            for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+                remote_clear_shmem_cache();
+                if (!remote_write(retBuf, poison, sizeof(poison))) continue;
+                uint8_t back[8];
+                if (!remote_read(retBuf, back, sizeof(back))) continue;
+                if (memcmp(back, poison, sizeof(poison)) != 0) continue;
+                r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
+                ok = remote_read(retBuf, outBuf, outSize);
+            }
             r_free(retBuf);
         }
+    }
+
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
     }
 
     r_msg2(inv, "release", 0, 0, 0, 0);
