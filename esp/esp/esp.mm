@@ -5538,10 +5538,23 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 AimLockClear();
             } else {
                 // Camera mild lead; bullet path uses stronger lead in silent/fire-dir.
-                Vector3 aimPoint = AimTrackAndLeadEx(bestTarget, lookBone, bestDistance, true, /*bulletLead=*/false);
-                if (IsZeroVec(aimPoint)) aimPoint = lookBone;
-
-                bestHeadPos = aimPoint;
+                //
+                // Not tracked here. AimTrackAndLeadEx is a stateful tracker keyed
+                // on the pawn, and AimLookAtHeadLive calls it on the same pawn a
+                // few lines below, on the same frame. Running it twice in one
+                // frame advances g_aimMotion's history twice against one
+                // timestamp, so the second call measures an instantaneous
+                // velocity from a history it had already consumed and feeds that
+                // into the EMA. The fallback below is what this call was for, and
+                // the live path already overwrites aimPoint with its own result
+                // when that result is valid, so this call is only ever needed
+                // when AimLookAtHeadLive fails.
+                //
+                // It is still computed, just after the live attempt, so the
+                // tracker is advanced once per frame and the fallback does not
+                // steal the live path's history.
+                Vector3 aimPoint = Vector3{0, 0, 0};
+                bestHeadPos = lookBone;
                 s_lastAimPawn = bestTarget;
 
                 // Geometry re-check at apply time.
@@ -5590,7 +5603,19 @@ static inline uint64_t ESPPhaseNowUS(void) {
                     if (!IsZeroVec(glued) && looksLikeWorldPos(glued)) {
                         aimPoint = glued;
                         bestHeadPos = glued;
-                    } else if (!IsZeroVec(aimPoint) && looksLikeWorldPos(aimPoint)) {
+                    } else {
+                        // Only now is the fallback worth computing, and only the
+                        // tracker-free version: the live path already ran the
+                        // stateful tracker on this pawn this frame, and running it
+                        // again to produce a value that is usually discarded is
+                        // what corrupted its history.
+                        aimPoint = lookBone;
+                        if (IsZeroVec(aimPoint) || !looksLikeWorldPos(aimPoint)) {
+                            aimPoint = AimTrackAndLead(bestTarget, lookBone, bestDistance, true);
+                        }
+                        if (IsZeroVec(aimPoint) || !looksLikeWorldPos(aimPoint)) {
+                            aimPoint = lookBone;
+                        }
                         bestHeadPos = aimPoint;
                     }
                     // No AimLock thread for Aimbot/Assist — it shook cam after release.
@@ -5623,11 +5648,27 @@ static inline uint64_t ESPPhaseNowUS(void) {
                         }
                         AimSyncFireHit(myPawnObject, fromNow, hit);
                     }
-                    Vector3 from2 = AimCameraOrigin(myPawnObject, myLocation);
-                    Quaternion tq = Quaternion::Normalized(GetRotationToLocation(hit, 0.0f, from2));
-                    if (!(isnan(tq.x) || isnan(tq.y) || isnan(tq.z) || isnan(tq.w))) {
-                        write_aim_rotations(myPawnObject, tq);
-                    }
+                    // No camera write here. There used to be one:
+                    //
+                    //     Quaternion tq = GetRotationToLocation(hit, 0.0f, from2);
+                    //     write_aim_rotations(myPawnObject, tq);
+                    //
+                    // AimLookAtHeadLive above already wrote the camera rotation
+                    // for this frame, aimed at the bone the camera path chose.
+                    // This line then wrote it again, later in the same frame,
+                    // aimed at `hit`, which is a ResolveSilentAimWorldPos
+                    // resolution: a different position from a different aim
+                    // mode. Last write wins, so while firing the crosshair
+                    // followed the silent-aim point and not the bone under it.
+                    // That is the reported "it does not go straight at the
+                    // bone", and it only showed up while shooting, because this
+                    // block is gated on fireWindow.
+                    //
+                    // The block's job is the fire-direction and HitObject
+                    // spoof, which AimSyncFireHit does. Moving the camera is
+                    // not part of that job, and when two subsystems write the
+                    // same rotation in one frame the crosshair belongs to
+                    // neither of them.
                 }
             }
         }
