@@ -670,6 +670,20 @@ static uint64_t sb_make_nsstring(const char *utf8) {
 static BOOL sb_cached_invocation(uint64_t label, const char *selName,
                                  uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
 
+// Every cached NSInvocation argument buffer in this file must be filled through
+// here.
+//
+// A bare remote_write goes through the vm_map_entry hijack and the page cache and
+// can land in a stale alias of an address the target has recycled. It still
+// reports success, the target's real page keeps whatever the previous occupant of
+// that block left there, and the invocation later reads that. For an object
+// argument it is a pointer to freed memory; for a struct it is a plausible looking
+// wrong position. Either way the setter runs and nothing appears, which is the
+// worst failure shape there is and the one this file has been living with.
+static BOOL sb_write_inv_arg(uint64_t buf, const void *data, size_t size) {
+    return r_remote_write_verified(buf, data, size) ? YES : NO;
+}
+
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
@@ -677,7 +691,7 @@ static uint64_t sb_count_label_place(double px, double py) {
     if (px == g_sbCountLastPos[0] && py == g_sbCountLastPos[1]) return 0;
 
     double p[2] = { px, py };
-    remote_write(g_sbCountPosBuf, p, sizeof(p));
+    sb_write_inv_arg(g_sbCountPosBuf, p, sizeof(p));
     r_msg2(g_sbCountPosInv, "setArgument:atIndex:", g_sbCountPosBuf, 2, 0, 0);
     // Only remember the position once the present that carries it has actually
     // been queued. Marking it before the queue would mean a frame that arrives
@@ -810,7 +824,7 @@ static uint64_t sb_count_label_hide(int hidden) {
     // Cached invocation too, for the same reason as setString: above.
     if (sb_cached_invocation(g_sbCountLabel, "setHidden:",
                              &g_sbCountHideInv, &g_sbCountHideBuf, 8)) {
-        remote_write64(g_sbCountHideBuf, hidden ? 1 : 0);
+        sb_write_inv_arg(g_sbCountHideBuf, &(uint64_t){ hidden ? 1 : 0 }, sizeof(uint64_t));
         r_msg2(g_sbCountHideInv, "setArgument:atIndex:", g_sbCountHideBuf, 2, 0, 0);
         r_msg(g_sbCountHideInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
         return 4;
@@ -919,7 +933,7 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role, int slot) {
         sb_cached_invocation(label, "setTransform:",
                              &g_sbLabelTransInv[slot], &g_sbLabelTransBuf[slot], 48)) {
         double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
-        remote_write(g_sbLabelTransBuf[slot], tr, sizeof(tr));
+        sb_write_inv_arg(g_sbLabelTransBuf[slot], tr, sizeof(tr));
         r_msg2(g_sbLabelTransInv[slot], "setArgument:atIndex:", g_sbLabelTransBuf[slot], 2, 0, 0);
         r_msg(g_sbLabelTransInv[slot], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
@@ -1022,7 +1036,7 @@ static uint64_t sb_pooled_label_resize(int idx, double w, double h) {
     }
     if (w == g_sbLabelLastSize[idx][0] && h == g_sbLabelLastSize[idx][1]) return 0;
     double r[4] = { 0.0, 0.0, w, h };
-    remote_write(g_sbLabelBoundsBuf[idx], r, sizeof(r));
+    sb_write_inv_arg(g_sbLabelBoundsBuf[idx], r, sizeof(r));
     r_msg2(g_sbLabelBoundsInv[idx], "setArgument:atIndex:", g_sbLabelBoundsBuf[idx], 2, 0, 0);
     r_msg(g_sbLabelBoundsInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     g_sbLabelLastSize[idx][0] = w;
@@ -1067,7 +1081,7 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
         // queue that can no longer be drained by waiting.
     } else if (sb_pooled_pos_invocation(idx)) {
         double p[2] = { px, py };
-        remote_write(g_sbLabelPosBuf[idx], p, sizeof(p));
+        sb_write_inv_arg(g_sbLabelPosBuf[idx], p, sizeof(p));
         r_msg2(g_sbLabelPosInv[idx], "setArgument:atIndex:", g_sbLabelPosBuf[idx], 2, 0, 0);
         r_msg(g_sbLabelPosInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
         g_sbLabelLastPos[idx][0] = px;
@@ -1091,7 +1105,7 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
                 // pointer is written for setPath:.
                 if (sb_cached_invocation(label, "setText:",
                                          &g_sbLabelTextInv[idx], &g_sbLabelTextBuf[idx], 8)) {
-                    remote_write64(g_sbLabelTextBuf[idx], ns);
+                    sb_write_inv_arg(g_sbLabelTextBuf[idx], &ns, sizeof(ns));
                     r_msg2(g_sbLabelTextInv[idx], "setArgument:atIndex:", g_sbLabelTextBuf[idx], 2, 0, 0);
                     r_msg(g_sbLabelTextInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
                 }
@@ -1105,7 +1119,7 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
     if (!g_sbLabelShown[idx]) {
         if (sb_cached_invocation(label, "setHidden:",
                                  &g_sbLabelHideInv[idx], &g_sbLabelHideBuf[idx], 8)) {
-            remote_write64(g_sbLabelHideBuf[idx], 0);
+            sb_write_inv_arg(g_sbLabelHideBuf[idx], &(uint64_t){ 0 }, sizeof(uint64_t));
             r_msg2(g_sbLabelHideInv[idx], "setArgument:atIndex:", g_sbLabelHideBuf[idx], 2, 0, 0);
             r_msg(g_sbLabelHideInv[idx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
         }
@@ -1195,18 +1209,44 @@ static void sb_make_count_label(uint64_t container) {
         uint64_t redCG = r_is_objc_ptr(red) ? r_msg2_main(red, "CGColor", 0, 0, 0, 0) : 0;
         if (r_is_objc_ptr(redCG)) r_msg2_main(label, "setForegroundColor:", redCG, 0, 0, 0);
 
-        // No background and no corner radius. The counter is a bare number on
-        // screen and the pill behind it was never asked for; it came along with
-        // the CATextLayer migration because a layer can carry one for free. A
-        // plain number needs neither, and dropping them removes the shape that
-        // was arriving before the text did.
+        // A black plate behind the number.
         //
-        // Font, then font size. Both, and the font is the one that was missing.
+        // This is here on purpose and not as decoration. A layer whose text is
+        // not rasterising draws nothing at all, so a number that never appears
+        // and a number that is off screen look identical from the outside. The
+        // plate separates them: if a black rectangle shows up in the right place
+        // and no number is on it, the layer is positioned correctly and the
+        // failure is in drawing the glyphs. If nothing shows at all, it is still
+        // off screen or detached.
         //
-        // fontSize alone is not a font. CALayer has a font property that is nil
-        // by default, and a CATextLayer with a size and no font has nothing to
-        // rasterise the glyphs with. The UILabel this replaced was handed
-        // Font size only. Deliberately no setFont:.
+        // Near opaque rather than solid, so it does not read as a hole punched in
+        // the game. Through r_msg2_main_raw because this takes four CGFloats and
+        // the widened form would send their integer parts, the same mistake that
+        // took the contents scale to 4.2e-45.
+        {
+            double plate[4] = { 0.0, 0.0, 0.0, 0.9 };
+            uint64_t plateColor = r_msg2_main_raw(r_class("UIColor"),
+                                                  "colorWithRed:green:blue:alpha:",
+                                                  &plate[0], 8, &plate[1], 8,
+                                                  &plate[2], 8, &plate[3], 8);
+            uint64_t plateCG = r_is_objc_ptr(plateColor)
+                             ? r_msg2_main(plateColor, "CGColor", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(plateCG)) r_msg2_main(label, "setBackgroundColor:", plateCG, 0, 0, 0);
+
+            double plateRadius = SB_COUNT_H * 0.5;
+            r_msg_main_raw(label, r_sel("setCornerRadius:"), &plateRadius, sizeof(plateRadius),
+                           NULL, 0, NULL, 0, NULL, 0);
+        }
+
+        // Font size only. Deliberately no setFont:, and the reason is worth
+        // keeping: there was a CTFontCreateWithName here and it killed
+        // SpringBoard, because its size argument is a double by value and it was
+        // being handed the address of a double in this process's own stack.
+        // CoreText read eight bytes of our frame as a font size and built a
+        // malformed font, and the main thread died in
+        // -[CATextLayer _createStringDict] at objc_opt_isKindOfClass with
+        // OBJC_CLASS_$_NSFont in x1 and x2, which is a pointer authentication
+        // trap. fontSize is what the layer had and it is enough.
         //
         // There was a CTFontCreateWithName here and it killed SpringBoard.
         // CTFontCreateWithName takes its size as a double by value, and it was
@@ -1352,14 +1392,16 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
     // user cannot see. The readback agreed and nobody read it: position came back
     // as 348, 422, and 422 is past the 414 the container is tall.
     //
-    // So x runs along the long edge, centred, and y sits near the top edge.
+    // So x runs along the long edge, centred, and y is measured down from the
+    // top, because UIKit puts y at zero on the top edge. SB_COUNT_TOP plus half
+    // the height is the centre of the plate, which is what setPosition: takes.
     if (r_is_objc_ptr(g_sbCountLabel) && enemyCount >= 0) {
         char num[8];
         const int n = snprintf(num, sizeof(num), "%d", enemyCount);
         if (n > 0 && n <= SB_TEXT_MAX) {
             const double w = SB_COUNT_W, h = SB_COUNT_H;
             const double px = ctx.landW * 0.5;
-            const double py = ctx.landH - SB_COUNT_TOP - h * 0.5;
+            const double py = SB_COUNT_TOP + h * 0.5;
             uint8_t top = 5;
             uint8_t role = 3;                       // counter
             uint8_t slen = (uint8_t)n;
@@ -1691,7 +1733,7 @@ static void sb_invoke_cached_main_raw(void) {
         if (rp) r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
         return;
     }
-    remote_write64(g_sbSetPathArgBuf, persistentPath());
+    sb_write_inv_arg(g_sbSetPathArgBuf, &(uint64_t){ persistentPath() }, sizeof(uint64_t));
     r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
     // waitUntilDone:NO, always, and never wait on the main thread again.
     //
@@ -3223,7 +3265,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                     g_sbLabelShown[hi] = 0;
                     if (sb_cached_invocation(g_sbLabelObj[hi], "setHidden:",
                                              &g_sbLabelHideInv[hi], &g_sbLabelHideBuf[hi], 8)) {
-                        remote_write64(g_sbLabelHideBuf[hi], 1);
+                        sb_write_inv_arg(g_sbLabelHideBuf[hi], &(uint64_t){ 1 }, sizeof(uint64_t));
                         r_msg2(g_sbLabelHideInv[hi], "setArgument:atIndex:", g_sbLabelHideBuf[hi], 2, 0, 0);
                         r_msg(g_sbLabelHideInv[hi], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
                     }
