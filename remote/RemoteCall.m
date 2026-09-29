@@ -267,6 +267,24 @@ static uint64_t g_rcIpcWaitSlow = 0;      // waits of 1ms or more
 static uint32_t g_rcIpcLastHolderTid = 0;
 static uint32_t g_rcIpcLastWaiterTid = 0;
 
+// Which call hangs, and for how long. The measured shape of the freeze is one
+// call that holds the mutex until the stable-exception timeout, which is
+// g_RC_stableExceptionTimeoutFloorMS = 10000ms, and holdmax landing on 10063ms
+// is that timeout, not a coincidence. Which symbol is stuck is what says
+// whether the hang is in the path build, in the path draw, or in the
+// housekeeping around them, and those three have nothing in common.
+//
+// 500ms is the threshold because a healthy call is under 10ms here, so a half
+// second is already two orders of magnitude out and cannot fire on noise. Only
+// the slowest name is kept, because a flood of names is not the question: the
+// question is which one call can sit there for ten seconds.
+#define RC_SLOW_CALL_US 500000ULL
+#define RC_SLOW_NAME_MAX 64
+static char g_rcSlowName[RC_SLOW_NAME_MAX] = {0};
+static uint64_t g_rcSlowMaxUS = 0;
+static uint64_t g_rcSlowCount = 0;
+static uint32_t g_rcSlowTid = 0;
+
 static inline uint32_t rc_ipc_tid(void)
 {
     return (uint32_t)pthread_mach_thread_np(pthread_self());
@@ -287,14 +305,43 @@ static inline uint64_t rc_ipc_lock_measuring(uint64_t *waitOut)
     return t1;
 }
 
-static inline void rc_ipc_unlock_measuring(uint64_t t1)
+static inline void rc_ipc_unlock_measuring(uint64_t t1, const char *name)
 {
     const uint64_t held = remote_call_diag_now_us() - t1;
     g_rcIpcCalls++;
     g_rcIpcHoldTotalUS += held;
     if (held > g_rcIpcHoldMaxUS) g_rcIpcHoldMaxUS = held;
     g_rcIpcLastHolderTid = rc_ipc_tid();
+    if (held >= RC_SLOW_CALL_US) {
+        g_rcSlowCount++;
+        if (held > g_rcSlowMaxUS) g_rcSlowMaxUS = held;
+        g_rcSlowTid = g_rcIpcLastHolderTid;
+        if (name) {
+            strncpy(g_rcSlowName, name, RC_SLOW_NAME_MAX - 1);
+            g_rcSlowName[RC_SLOW_NAME_MAX - 1] = '\0';
+        } else {
+            g_rcSlowName[0] = '\0';
+        }
+        // Logged at the moment it happens, not only in the heartbeat: the hang
+        // is what kills the session, and a session that is dying may never
+        // reach another heartbeat line.
+        NSLog(@"[RC-SLOW] call=%s held=%llums tid=%u slowcount=%llu",
+              name ?: "(null)", (unsigned long long)(held / 1000ULL),
+              (unsigned)g_rcIpcLastHolderTid, (unsigned long long)g_rcSlowCount);
+    }
     pthread_mutex_unlock(&g_universal_ipc_mutex);
+}
+
+const char *remote_call_slowest_call_name(void)
+{
+    return g_rcSlowName[0] ? g_rcSlowName : "(none)";
+}
+
+void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
+{
+    if (maxUS) *maxUS = g_rcSlowMaxUS;
+    if (count) *count = g_rcSlowCount;
+    if (tid)   *tid = g_rcSlowTid;
 }
 
 void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
@@ -1303,13 +1350,13 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     if (g_RC_vphoneBridge) {
         if (timeout >= 0)
             res = rc_vphone_bridge_call(2, 0, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        rc_ipc_unlock_measuring(_ipcT1);
+        rc_ipc_unlock_measuring(_ipcT1, name);
         return res;
     }
 
     if (!g_RC_creatingExtraThread) {
         res = do_remote_call_temp_internal(timeout, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        rc_ipc_unlock_measuring(_ipcT1);
+        rc_ipc_unlock_measuring(_ipcT1, name);
         return res;
     }
 
@@ -1321,11 +1368,11 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     if (!pcAddr) {
         printf("[%s:%d] Unable to find symbol: %s\n", __FUNCTION__, __LINE__, name);
         g_RC_success = false;
-        rc_ipc_unlock_measuring(_ipcT1);
+        rc_ipc_unlock_measuring(_ipcT1, name);
         return 0;
     }
     res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    rc_ipc_unlock_measuring(_ipcT1);
+    rc_ipc_unlock_measuring(_ipcT1, name);
     return res;
 }
 
@@ -1338,7 +1385,7 @@ uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *na
     const uint64_t _ipcT1 = rc_ipc_lock_measuring(&_ipcWait);
     (void)_ipcWait;
     uint64_t res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    rc_ipc_unlock_measuring(_ipcT1);
+    rc_ipc_unlock_measuring(_ipcT1, name);
     return res;
 }
 

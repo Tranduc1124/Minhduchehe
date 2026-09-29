@@ -2079,11 +2079,15 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             remote_call_main_thread_diag(&ipcOnMain, &ipcHoldMax, &ipcHoldTotal,
                                         &ipcWaitMax, &ipcWaitSlow, &ipcCalls,
                                         &ipcHolderTid, &ipcWaiterTid);
+            uint64_t ipcSlowMax = 0, ipcSlowCount = 0;
+            uint32_t ipcSlowTid = 0;
+            remote_call_slowest_call(&ipcSlowMax, &ipcSlowCount, &ipcSlowTid);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
                   @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms "
                   @"ipc onmain=%llu calls=%llu holdmax=%llums holdtot=%llums "
-                  @"waitmax=%llums waitslow=%llu ht=%u wt=%u",
+                  @"waitmax=%llums waitslow=%llu ht=%u wt=%u "
+                  @"slow=%s %llums x%llu tid=%u",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2105,7 +2109,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   (unsigned long long)(ipcWaitMax / 1000ULL),
                   (unsigned long long)ipcWaitSlow,
                   (unsigned)ipcHolderTid,
-                  (unsigned)ipcWaiterTid);
+                  (unsigned)ipcWaiterTid,
+                  remote_call_slowest_call_name(),
+                  (unsigned long long)(ipcSlowMax / 1000ULL),
+                  (unsigned long long)ipcSlowCount,
+                  (unsigned)ipcSlowTid);
         }
     }
 

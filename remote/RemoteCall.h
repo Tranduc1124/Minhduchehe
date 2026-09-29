@@ -73,6 +73,11 @@ void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
                                  uint64_t *holdTotalUS, uint64_t *waitMaxUS,
                                  uint64_t *waitSlow, uint64_t *calls,
                                  uint32_t *lastHolderTid, uint32_t *lastWaiterTid);
+// The slowest remote call seen so far, and how many have been slow. A call is
+// slow at 500ms, which a healthy one never reaches here. Any out pointer may be
+// NULL; the name returns "(none)" until the first slow call.
+const char *remote_call_slowest_call_name(void);
+void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid);
 // Returns false when the state could not be signed. A false return means the
 // state was NOT modified with a signed pc/lr and must not be replied to the
 // target: replying an unsigned or zero pc hands the target's thread a jump to
