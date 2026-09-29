@@ -547,6 +547,9 @@ static uint64_t g_sbCountBornUS = 0;
 // The UIFont the counter draws with. Held for the session; the layer keeps a
 // reference for as long as it draws.
 static uint64_t g_sbCountFont = 0;
+// How many times the string has been written this session. The retry window
+// in sb_count_label_text runs off this.
+static int      g_sbCountTextSets = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
 static int      g_sbCountStringProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
@@ -720,19 +723,27 @@ static uint64_t sb_count_label_place(double px, double py) {
 
 static uint64_t sb_count_label_text(const char *utf8) {
     if (!r_is_objc_ptr(g_sbCountLabel) || !utf8) return 0;
-    // Deliberately no unchanged-text check.
+
+    // Write it every publish for the first second, then only when it changes.
     //
-    // This used to return early when the text matched g_sbCountLastText, which
-    // meant the string was written to the layer exactly once per distinct count
-    // and never again. If that one write did not land, there was no retry for the
-    // rest of the session and the number never appeared at all, with every other
-    // property on the layer reading back correct. The cost of always writing is
-    // one remote call on a frame that is already talking to the target, and it
-    // makes the whole thing self healing: whatever went wrong the first time is
-    // corrected on the next publish without anything having to diagnose it.
+    // The unconditional version flickered. Setting string on a CATextLayer
+    // invalidates its backing store and setNeedsDisplay asks for the redraw, so
+    // doing both at sixty frames a second is a permanent redraw: the device shows
+    // it as the plate blinking. That was introduced here and it is not acceptable.
     //
-    // The pooled labels keep their check. They are six, they are off by default,
-    // and their position changes every frame anyway.
+    // The unconditional version also allocated a fresh NSMutableString per frame,
+    // four remote calls of pure waste on a frame that is already talking to the
+    // target.
+    //
+    // But the guarded version, which only wrote on change, meant a single write
+    // that did not land was never retried and the number was gone for the rest of
+    // the session. So it retries for a bounded window instead of forever: a second
+    // at sixty frames is sixty attempts, which is more than enough to cover the
+    // first publish arriving before the layer is really live, and after that the
+    // change check keeps the frame cost at nothing.
+    const bool sameText = (strcmp(g_sbCountLastText, utf8) == 0);
+    if (sameText && g_sbCountTextSets > 60) return 0;
+    g_sbCountTextSets++;
 
     // Built without trusting initWithUTF8String:, which returns garbage here.
     // See sb_make_nsstring.
@@ -807,20 +818,32 @@ static uint64_t sb_count_label_text(const char *utf8) {
         path = "r_msg2_main";
     }
 
-    // setNeedsDisplay, and this is the CALayer specific half of the problem.
+    // The readback, on the transport that can be trusted.
     //
-    // A CATextLayer is not a view. It does not draw on setNeedsLayout like a view
-    // does; it draws by rasterising its string into a backing store inside
-    // drawInContext:, and it decides to do that from its own dirty flag. The
-    // device screenshot shows the consequence exactly: the background fills, so
-    // the layer is in the tree, above its siblings, the right size, the right
-    // place, and it has drawn. It has drawn without any glyphs, which is what a
-    // layer looks like when the string is not there when the draw happens.
+    // This is the measurement I should have taken from the start and did not,
+    // because every earlier attempt used r_msg2_main. That path goes through
+    // r_msg_main_raw, which stages the return value in a malloc'd buffer in the
+    // target and reads it back through the vm_map_entry hijack, and it returned
+    // the same 0x1f82546c8 on consecutive runs in which the string sent was a
+    // different object every time. A read that returns the same value no matter
+    // what was written is not a read.
     //
-    // The layer is added and presented before any text exists, because the count
-    // only arrives with the first op 5 record. Whatever setString: did or did not
-    // do, the draw that is already on screen was a draw of an empty string. So
-    // the draw is asked for again explicitly, after the string is in place.
+    // r_msg2 is the other transport: a plain objc_msgSend with the result coming
+    // back in a register, no buffer, nothing to alias. It is the one that has
+    // returned correct objects all along, which is how the label itself, the
+    // container layer and every NSString in this file were made. So the string is
+    // read back through it, once, and compared against what was sent.
+    //
+    // setNeedsDisplay rides along here rather than on its own every frame: a
+    // CATextLayer is not a view, it rasterises into a backing store inside
+    // drawInContext: from its own dirty flag, and asking for that draw on every
+    // publish is what made the plate blink.
+    if (g_sbCountTextSets <= 3) {
+        const uint64_t back = r_msg2(g_sbCountLabel, "string", 0, 0, 0, 0);
+        NSLog(@"[SB-CNT] string=0x%llx sent=0x%llx match=%d via=%s text=%s",
+              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
+              path, utf8);
+    }
     r_msg2_main(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
     calls++;
 
@@ -1730,6 +1753,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFont = 0;
+    g_sbCountTextSets = 0;
     g_sbCountFirstTextUS = 0;
     g_sbCountStringProbed = 0;
     g_sbCountLastPos[0] = -1.0;
