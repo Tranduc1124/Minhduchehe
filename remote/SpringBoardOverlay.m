@@ -667,8 +667,23 @@ static uint64_t sb_count_label_text(const char *utf8) {
     uint64_t nsbuf = r_alloc_str(utf8);
     if (!nsbuf) return 0;
     uint64_t NSStringCls = r_class("NSString");
-    uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
-    uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
+    // r_msg2_main, not r_msg2, and this is the whole fix.
+    //
+    // r_msg2 drives objc_msgSend straight through the call thread and hands back
+    // whatever is in the result register. For alloc on NSString that is fine;
+    // for initWithUTF8String: it came back 0xbeb0fdbaed5e3015, which is not a
+    // user space address, and it was different every run. r_is_objc_ptr only
+    // asks whether the value is above 0x100000000, so that sailed through the
+    // check and was then written into the layer as the text. The counter has
+    // therefore never once held a real string, which is why no amount of
+    // lifetime or invocation handling changed anything: there was nothing to
+    // keep alive.
+    //
+    // r_msg2_main returns valid pointers from this same target: the label's own
+    // alloc and layer both read back real addresses, and setBackgroundColor:
+    // through it drew. So every step of making the string goes through it.
+    uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2_main(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+    uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
     r_free(nsbuf);
     if (!r_is_objc_ptr(ns)) return 0;
 
@@ -989,8 +1004,11 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
         uint64_t nsbuf = r_alloc_str(utf8);
         if (nsbuf) {
             uint64_t NSStringCls = r_class("NSString");
-            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
-            uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
+            // r_msg2_main, not r_msg2, for the reason given beside the counter:
+            // r_msg2 handed back 0xbeb0fdbaed5e3015 from initWithUTF8String:,
+            // and r_is_objc_ptr cannot tell that from a real object.
+            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2_main(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+            uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "initWithUTF8String:", nsbuf, 0, 0, 0) : 0;
             r_free(nsbuf);
             if (r_is_objc_ptr(ns)) {
                 // Through a cached invocation, not r_perform_main.
@@ -1080,9 +1098,9 @@ static void sb_make_count_label(uint64_t container) {
         uint64_t sbuf = r_alloc_str("center");
         if (sbuf) {
             uint64_t NSStringCls = r_class("NSString");
-            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2_main(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
             g_sbCountAlignStr = r_is_objc_ptr(alloc)
-                              ? r_msg2(alloc, "initWithUTF8String:", sbuf, 0, 0, 0) : 0;
+                              ? r_msg2_main(alloc, "initWithUTF8String:", sbuf, 0, 0, 0) : 0;
             r_free(sbuf);
         }
     }
