@@ -741,12 +741,23 @@ static uint64_t sb_count_label_text(const char *utf8) {
     const char *path = "none";
     if (sb_cached_invocation(g_sbCountLabel, "setString:",
                              &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
-        remote_write64(g_sbCountTextBuf, ns);
-        r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
-        r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
-        calls += 3;
-        path = "cached-invocation";
-    } else {
+        // Verified write, not remote_write64. The invocation reads this buffer
+        // when it is invoked, and a bare write can land in a stale alias and
+        // leave the target holding the previous occupant of that block, which for
+        // an object argument is a pointer to freed memory. The setter then
+        // stores a wild pointer and the layer draws nothing, which is exactly
+        // what the readback showed: the setter ran, and the layer ended up
+        // holding a real pointer that was not the one sent.
+        if (r_remote_write_verified(g_sbCountTextBuf, &ns, sizeof(ns))) {
+            r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
+            r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+            calls += 4;
+            path = "cached-invocation";
+        } else {
+            path = "cached-write-failed";
+        }
+    }
+    if (strcmp(path, "cached-invocation") != 0) {
         // r_msg2_main rather than the raw form, because it is the same call the
         // working setters on this layer make and it takes an object argument
         // directly. Its return path is no longer the broken one.

@@ -294,6 +294,29 @@ static uint64_t r_method_signature(uint64_t obj, uint64_t sel)
 
 bool     r_arg_probe_enabled = false;
 uint64_t r_arg_probe_n = 0;
+
+static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize);
+
+// Write into a target buffer the way r_write_remote_arg does, and say whether it
+// arrived.
+//
+// Every caller that fills a cached NSInvocation's argument buffer needs this.
+// Those buffers are filled with a bare remote_write, which goes through the
+// vm_map_entry hijack and the page cache, and can land in a stale alias of an
+// address the target has recycled. The write then reports success, the target's
+// real page is never touched, and the invocation later reads whatever the
+// previous occupant of that block left there.
+//
+// For an object argument that is a pointer to memory that is no longer there, so
+// the selector stores a wild pointer and the layer quietly draws nothing. That is
+// the counter's string: the setter reported success, the layer read back a valid
+// but unrelated object address, and no amount of checking the transport itself
+// would have caught it, because the corruption was in the argument, not in the
+// return path that the previous commit repaired.
+bool r_remote_write_verified(uint64_t remoteBuf, const void *data, size_t size) {
+    if (!remoteBuf || !data || !size) return false;
+    return r_write_remote_arg(remoteBuf, data, size, size);
+}
 uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
 uint64_t r_arg_probe_alt = 0;
 

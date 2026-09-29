@@ -24,6 +24,11 @@ uint64_t r_sel(const char *name);
 uint64_t r_class(const char *name);
 uint64_t r_msg(uint64_t obj, uint64_t sel,
                uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+// Write into a target buffer and confirm it arrived. See the comment on the
+// definition: a bare remote_write into a cached NSInvocation's argument buffer
+// can leave the target holding the previous occupant of that block.
+bool r_remote_write_verified(uint64_t remoteBuf, const void *data, size_t size);
+
 uint64_t r_msg2(uint64_t obj, const char *selName,
                 uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t r_msg_main(uint64_t obj, uint64_t sel,
