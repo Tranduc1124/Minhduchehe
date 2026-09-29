@@ -536,6 +536,12 @@ static uint64_t g_sbCountLabel   = 0;
 // kCAAlignmentCenter, built once. Lives and dies with the session, like the
 // label it is only ever passed to.
 static uint64_t g_sbCountAlignStr = 0;
+// When the label was built, and when text first reached it. The label is made
+// entirely of main-thread setters, so it exists here well before the target has
+// drawn any of it; the gap between these two is the whole of the delay before
+// the counter is visible.
+static uint64_t g_sbCountBornUS = 0;
+static uint64_t g_sbCountFirstTextUS = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -651,10 +657,30 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
     // view setters do not exist on it. The selector change is the whole of the
     // difference between this working and the label silently never appearing.
-    r_perform_main(g_sbCountLabel, r_sel("setString:"), ns, false);
+    //
+    // Wait, do not queue. This is the only place the counter's text is set, and
+    // the NSString handed to setString: is released on the next line. With
+    // waitUntilDone:NO the target's main thread runs the setter whenever it
+    // gets to it, which is after the release, so the layer was being handed a
+    // freed CFString and drew an empty pill: the card arrived and the number
+    // never did. performSelectorOnMainThread does not retain the object it is
+    // given. Waiting costs one main thread turn, and only when the count itself
+    // changed, since the identical-text check above has already returned.
+    r_perform_main(g_sbCountLabel, r_sel("setString:"), ns, true);
     calls++;
     dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
     calls++;
+
+    if (!g_sbCountFirstTextUS && g_sbCountBornUS) {
+        g_sbCountFirstTextUS = now_us();
+        // The label is built entirely through main-thread setters, so it exists
+        // in this process long before the target has drawn any of it. How long
+        // that gap is the difference between the counter arriving with the
+        // boxes and arriving a second or two after them, and it has only ever
+        // been guessed at.
+        NSLog(@"[SB-LABEL] counter first text after %llums (born->draw)",
+              (unsigned long long)((g_sbCountFirstTextUS - g_sbCountBornUS) / 1000ULL));
+    }
 
     strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
     g_sbCountLastText[sizeof(g_sbCountLastText) - 1] = 0;
@@ -816,6 +842,15 @@ static BOOL sb_cached_invocation(uint64_t label, const char *selName,
     uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
     if (!r_is_objc_ptr(inv)) return NO;
     r_msg2(inv, "retain", 0, 0, 0, 0);
+    // retainArguments, once, at build time.
+    //
+    // An NSInvocation holds object arguments as bare pointers unless it is told
+    // to retain them, and these invocations are fired with
+    // performSelectorOnMainThread, which runs them later. So setText: was being
+    // handed the address of an NSString that the caller released on the next
+    // line: card drawn, text missing. One call here, once per cached
+    // invocation, replaces waiting on every frame that changes a name.
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
     r_msg2(inv, "setTarget:", label, 0, 0, 0);
     r_msg2(inv, "setSelector:", sel, 0, 0, 0);
     uint64_t buf = sb_remote_malloc(bufSize);
@@ -963,6 +998,7 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
 
 static void sb_make_count_label(uint64_t container) {
     if (g_sbCountLabel || !r_is_objc_ptr(container)) return;
+    g_sbCountBornUS = now_us();
 
     // CATextLayer, not UILabel.
     //
@@ -1033,26 +1069,16 @@ static void sb_make_count_label(uint64_t container) {
         uint64_t redCG = r_is_objc_ptr(red) ? r_msg2_main(red, "CGColor", 0, 0, 0, 0) : 0;
         if (r_is_objc_ptr(redCG)) r_msg2_main(label, "setForegroundColor:", redCG, 0, 0, 0);
 
-        // The pill. A layer background is a CGColor, so it comes from the
-        // UIColor's CGColor rather than being set directly.
-        double rgba[4] = { SB_CARD_R, SB_CARD_G, SB_CARD_B, SB_CARD_A };
-        uint64_t card = r_msg2_main_raw(UIColor, "colorWithRed:green:blue:alpha:",
-                                        &rgba[0], 8, &rgba[1], 8,
-                                        &rgba[2], 8, &rgba[3], 8);
-        uint64_t cardCG = r_is_objc_ptr(card) ? r_msg2_main(card, "CGColor", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(cardCG)) r_msg2_main(label, "setBackgroundColor:", cardCG, 0, 0, 0);
-
-        // Corner radius, once, here. The old comment said setting it cost
-        // thirteen blocking calls and was not worth it at nine labels a frame,
-        // which was the right arithmetic for a per frame cost and the wrong
-        // place: this is creation, so it is paid once for the life of the label.
-        double radius = SB_COUNT_H * 0.5;
-        r_msg_main_raw(label, r_sel("setCornerRadius:"), &radius, 8,
-                       NULL, 0, NULL, 0, NULL, 0);
-
-        // Font size, once, at creation, for the reason above. CALayer has no
-        // default that matches the pill, and there is no UIFont to setFont: on
-        // a layer anyway, so fontSize is the only handle.
+        // No background and no corner radius. The counter is a bare number on
+        // screen and the pill behind it was never asked for; it came along with
+        // the CATextLayer migration because a layer can carry one for free. A
+        // plain number needs neither, and dropping them removes the shape that
+        // was arriving before the text did.
+        //
+        // Font size, once, at creation. CALayer has no view-level default to
+        // fall back on and there is no UIFont to setFont: on a layer anyway,
+        // so fontSize is the only handle. The UILabel this replaced carried
+        // systemFontOfSize:26 and the migration dropped it.
         double fsz = SB_COUNT_FONT_SIZE;
         r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
                        NULL, 0, NULL, 0, NULL, 0);
@@ -1360,6 +1386,8 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountPosBuf = 0;
     g_sbCountLabel = 0;
     g_sbCountAlignStr = 0;
+    g_sbCountBornUS = 0;
+    g_sbCountFirstTextUS = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
