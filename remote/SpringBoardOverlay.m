@@ -2087,17 +2087,22 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             int ipcW2Stray = 0, ipcW2StrayCode = 0;
             uint64_t ipcW2StrayPc = 0;
             uint32_t ipcW2StrayFlavor = 0;
+            uint32_t ipcW2StraySender = 0;
+            int ipcW2PreStray = 0;
+            uint64_t ipcW2PrePc = 0, ipcW2PreCount = 0;
             remote_call_wait_split_diag(&ipcW1, &ipcW2, &ipcW1TO, &ipcW2TO,
                                         &ipcW1Max, &ipcW2Max,
                                         &ipcW2Stray, &ipcW2StrayPc,
-                                        &ipcW2StrayFlavor, &ipcW2StrayCode);
+                                        &ipcW2StrayFlavor, &ipcW2StrayCode,
+                                        &ipcW2StraySender, &ipcW2PreStray,
+                                        &ipcW2PrePc, &ipcW2PreCount);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
                   @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms "
                   @"ipc onmain=%llu calls=%llu holdmax=%llums holdtot=%llums "
                   @"waitmax=%llums waitslow=%llu ht=%u wt=%u "
                   @"slow=%s %llums x%llu tid=%u "
-                  @"w1=%llums/%lluTO w2=%llums/%lluTO stray=%d/0x%llx/f%u/c%d",
+                  @"w1=%llums/%lluTO w2=%llums/%lluTO stray=%d/0x%llx/f%u/c%d/s0x%x pre=%d/0x%llx/n%llu",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2131,7 +2136,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   ipcW2Stray,
                   (unsigned long long)ipcW2StrayPc,
                   (unsigned)ipcW2StrayFlavor,
-                  ipcW2StrayCode);
+                  ipcW2StrayCode,
+                  (unsigned)ipcW2StraySender,
+                  ipcW2PreStray,
+                  (unsigned long long)ipcW2PrePc,
+                  (unsigned long long)ipcW2PreCount);
         }
     }
 

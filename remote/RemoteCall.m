@@ -364,12 +364,21 @@ static int g_rcW2Stray = 0;
 static uint64_t g_rcW2StrayPc = 0;
 static uint32_t g_rcW2StrayFlavor = 0;
 static int g_rcW2StrayCode = 0;
+static uint32_t g_rcW2StraySender = 0;
+// Snapshot of the first port taken before wait1, so a message found at wait2
+// timeout can be attributed to this call rather than to an earlier leftover.
+static int g_rcW2PreStray = 0;
+static uint64_t g_rcW2PrePc = 0;
+static uint32_t g_rcW2PreSender = 0;
+static uint64_t g_rcW2PreCount = 0;
 
 void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  uint64_t *wait1TO, uint64_t *wait2TO,
                                  uint64_t *wait1MaxUS, uint64_t *wait2MaxUS,
                                  int *w2stray, uint64_t *w2strayPc,
-                                 uint32_t *w2strayFlavor, int *w2strayCode)
+                                 uint32_t *w2strayFlavor, int *w2strayCode,
+                                 uint32_t *w2straySender, int *w2preStray,
+                                 uint64_t *w2prePc, uint64_t *w2preCount)
 {
     if (wait1US)    *wait1US = g_rcWait1US;
     if (wait2US)    *wait2US = g_rcWait2US;
@@ -381,6 +390,10 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
     if (w2strayPc)  *w2strayPc = g_rcW2StrayPc;
     if (w2strayFlavor) *w2strayFlavor = g_rcW2StrayFlavor;
     if (w2strayCode) *w2strayCode = g_rcW2StrayCode;
+    if (w2straySender) *w2straySender = g_rcW2StraySender;
+    if (w2preStray) *w2preStray = g_rcW2PreStray;
+    if (w2prePc)    *w2prePc = g_rcW2PrePc;
+    if (w2preCount) *w2preCount = g_rcW2PreCount;
 }
 
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
@@ -1463,6 +1476,26 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
+    // Baseline for the first port. do_remote_call_temp waits on this port and,
+    // on timeout, walks away without taking the message with it, so a leftover
+    // can sit there for the rest of the session. Draining it before wait1
+    // separates a leftover from a message that arrives during this call: what
+    // is found at wait2 timeout after this point can only be fresh. The sender
+    // port is kept so a repeat offender can be told apart from a one-off.
+    g_rcW2PreStray = 0;
+    g_rcW2PrePc = 0;
+    g_rcW2PreSender = 0;
+    {
+        ExceptionMessage pre;
+        memset(&pre, 0, sizeof(pre));
+        if (wait_exception(g_RC_firstExceptionPort, &pre, 0, false)) {
+            g_rcW2PreStray = 1;
+            g_rcW2PrePc = native_strip(pre.threadState.__pc);
+            g_rcW2PreSender = pre.Head.msgh_remote_port;
+            g_rcW2PreCount++;
+        }
+    }
+
     ExceptionMessage exc;
     RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
     const uint64_t tW1 = remote_call_diag_now_us();
@@ -1565,18 +1598,23 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 g_rcW2StrayPc = opc;
                 g_rcW2StrayFlavor = other.flavor;
                 g_rcW2StrayCode = (int)other.exception;
-                NSLog(@"[RC-W2TO] %s: stray on FIRST port pc=0x%llx lr=0x%llx "
-                      @"exc=%u flavor=%u — reply went to the wrong port",
+                g_rcW2StraySender = other.Head.msgh_remote_port;
+                NSLog(@"[RC-W2TO] %s: FRESH on FIRST port pc=0x%llx lr=0x%llx "
+                      @"exc=%u flavor=%u sender=0x%x pre=%d/0x%llx/%llu — "
+                      @"arrived during this call",
                       name ?: "?", (unsigned long long)opc, (unsigned long long)olr,
-                      (unsigned)other.exception, (unsigned)other.flavor);
+                      (unsigned)other.exception, (unsigned)other.flavor,
+                      (unsigned)other.Head.msgh_remote_port,
+                      g_rcW2PreStray, (unsigned long long)g_rcW2PrePc,
+                      (unsigned long long)g_rcW2PreCount);
                 // Leave it on the port: whoever owns the first port's state
                 // machine has to consume it, and dropping it here would turn a
                 // diagnosable hang into an unrelated hang later.
             } else {
                 g_rcW2Stray = 2;   // 1 = stray found, 2 = both ports empty
-                NSLog(@"[RC-W2TO] %s: no message on either port (pc0x%llx) — "
+                NSLog(@"[RC-W2TO] %s: NOTHING on either port pc0x%llx pre=%d — "
                       @"thread wedged or died without an exception",
-                      name ?: "?", (unsigned long long)pcAddr);
+                      name ?: "?", (unsigned long long)pcAddr, g_rcW2PreStray);
             }
         }
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
