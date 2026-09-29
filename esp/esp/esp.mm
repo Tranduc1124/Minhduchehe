@@ -4298,19 +4298,51 @@ static inline uint64_t ESPPhaseNowUS(void) {
             // upright is what markGhostDead and the bodyCollapsed check above
             // exist to catch, and a leaning or mid-animation pose passes through
             // untouched.
-            const bool upright = isKnocked || treatAsVehicle || (dy >= 0.15f);
-            if (haveStableBL && !upright) {
-                float want = trDisp.bodyLen;
-                float cur  = bodyLen;
-                if (fabsf(cur - want) > 0.22f) {
+            const bool tooTall  = (dy > 1.35f) || (bodyLen > 2.6f);
+            const bool tooShort = (dy < 0.15f) || (bodyLen < 0.28f);
+
+            // A body that is too SHORT is a downed enemy, not broken data.
+            //
+            // Synthesising here is what put a standing-length torso on a prone
+            // player: head minus a flat 0.85 put the hip at ground level or
+            // under it, and the box then stood a metre of empty space above a
+            // head that is a hand's width off the floor. The device screenshot
+            // shows it exactly, a box roughly 0.85 m tall drawn around a
+            // knocked enemy, which is the hardcoded fallback verbatim.
+            //
+            // The earlier attempt at this keyed the exemption on isKnocked, and
+            // that was wrong: isKnocked is the game's flag and it lags, which
+            // the earliest version of this file already noted. A pawn that just
+            // went down has a short dy before the flag flips, so the synthesis
+            // still ran. Measuring the body is the only evidence that does not
+            // arrive late.
+            //
+            // So: rebuild the column only when the column is too tall to be a
+            // body. A short one is left alone and the box shrinks to fit, which
+            // is what a downed enemy should look like. A hip below the head by
+            // almost nothing still needs a floor, otherwise the box inverts.
+            if (tooTall) {
+                if (haveStableBL) {
                     espHipPos = headBonePos;
-                    espHipPos.y -= want;
-                }
-            } else if (!haveStableBL && !upright) {
-                if (bodyLen < 0.28f || bodyLen > 2.6f || dy < 0.15f || dy > 1.35f) {
+                    espHipPos.y -= trDisp.bodyLen;
+                } else {
                     espHipPos = headBonePos;
                     espHipPos.y -= treatAsVehicle ? 1.05f : 0.85f;
                 }
+            } else if (tooShort && haveStableBL) {
+                // Keep it short, but never let head and hip coincide: a zero
+                // height box reads as a line and the inverted one reads as a
+                // box above the player.
+                const float floorLen = fminf(trDisp.bodyLen, 0.42f);
+                if (dy < 0.18f) {
+                    espHipPos = headBonePos;
+                    espHipPos.y -= floorLen;
+                }
+            } else if (tooShort && !haveStableBL && treatAsVehicle) {
+                // A vehicle has no short body to learn from, so give it the
+                // standing fallback it always had.
+                espHipPos = headBonePos;
+                espHipPos.y -= 1.05f;
             }
         }
 
