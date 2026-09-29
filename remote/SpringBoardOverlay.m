@@ -78,6 +78,14 @@ static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
 
+// Identical frame cache. A frame whose bytes match the one already published is
+// already on screen, so it does not cross into SpringBoard at all. Declared here
+// rather than beside the publish because the overlay build invalidates it, and
+// the build is earlier in the file than the publish.
+static uint64_t g_sbLastFrameHash   = 0;
+static int      g_sbHaveLastHash    = 0;
+static uint64_t g_sbIdenticalFrames = 0;   // frames dropped, reported 1 Hz
+
 static uint64_t g_sbPersistentPath = 0;
 // Paths handed to setPath: are still owned by SpringBoard's main thread until
 // it has run, because the present is asynchronous. A ring this long keeps every
@@ -1723,6 +1731,12 @@ int SBoardStartOverlay(void) {
     g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
+    // A freshly built overlay has empty shapes. Drop the identical frame cache
+    // with it: otherwise the first frame after a rebuild hashes to what was
+    // published to a window that no longer exists, matches, is skipped, and the
+    // screen stays blank until an enemy happens to move.
+    g_sbHaveLastHash = 0;
+    g_sbLastFrameHash = 0;
     // Arm the recovery clock here rather than waiting for a publish that may
     // never come, so a session that starts already broken still recovers.
     g_sbLastPublishUS = now_us();
@@ -1868,6 +1882,57 @@ int SBoardStartOverlay(void) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Skip a frame whose payload is identical to the one already on screen.
+//
+// WHY
+//
+// The overlay publishes a frame every tick whether or not anything in it moved.
+// Publishing is not free: it is a set of remote calls into SpringBoard, each one
+// four mach_msg round trips on an exception port plus a thread_create and a
+// thread_terminate for the PAC signature, and each of those runs on
+// SpringBoard's main thread. The code around this function already records that
+// two thirds of a publish used to be usleep and the present.
+//
+// An enemy standing still, or a moment with nobody on screen, produces a byte
+// for byte identical stream every tick. Those frames do not need to cross the
+// process boundary at all: the previous frame is still on screen and nothing
+// about it has changed.
+//
+// The shape of this is not invented here. It is what the reference
+// implementation does, and its own log says so: attempts 36 to 41 per second
+// with skips matching attempts on almost every line, avg_us 3 to 7, and the
+// only expensive lines are the ones with updates greater than zero. It runs its
+// loop at full rate and does nothing on the great majority of them, and it
+// tracks a renderedTrimGen counter to know when a re-render is actually
+// required.
+//
+// WHAT THIS DOES NOT TOUCH
+//
+// Nothing. The comparison is a hash over bytes that are already in this
+// process. No remote call, no lock on the session, nothing on the
+// do_remote_call_stable_addr path, and the failure modes are unchanged because
+// the same code runs for every frame that is not identical. If the hash is
+// wrong in the direction of "identical", the worst case is one stale frame that
+// the next changed frame corrects; the hash includes the length, so a shorter
+// or longer frame can never collide with a different one of the same size by
+// truncation alone.
+//
+// The cache is invalidated whenever the overlay is built or torn down, because
+// a rebuilt overlay has empty shapes and a skipped first frame would leave the
+// screen blank until something moved.
+// ---------------------------------------------------------------------------
+
+static uint64_t sb_frame_hash(const void *bytes, size_t len) {
+    const uint8_t *p = (const uint8_t *)bytes;
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t)len;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;   // 0 means "nothing cached", so never return it
+}
+
 void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
     // Declared here rather than beside the publish acquire further down, because
     // the rebuild below this line is a third caller of SBoardStartOverlay and it
@@ -1922,13 +1987,14 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             const int64_t sinceDraw = (g_sbLastPublishUS == 0)
                                    ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
-                  @"upd=%llu att=%llu skip=%llu next=%lldms since=%lldms",
+                  @"upd=%llu att=%llu skip=%llu ident=%llu next=%lldms since=%lldms",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
                   (unsigned long long)g_sbSummaryUpdates,
                   (unsigned long long)g_sbSummaryAttempts,
                   (unsigned long long)g_sbSummarySkips,
+                  (unsigned long long)g_sbIdenticalFrames,
                   (long long)(nextIn / 1000),
                   (long long)(sinceDraw / 1000));
         }
@@ -2041,6 +2107,18 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
+
+    // Identical to the frame already on screen, so the screen is already right.
+    // g_sbNextPublishUS is set above, so skipping here does not also skip the
+    // interval gate; this is a drop, not a stall.
+    const uint64_t frameHash = sb_frame_hash(frameBytes.bytes, frameBytes.length);
+    if (g_sbHaveLastHash && frameHash == g_sbLastFrameHash) {
+        g_sbIdenticalFrames++;
+        g_sbSummarySkips++;
+        return;
+    }
+    g_sbLastFrameHash = frameHash;
+    g_sbHaveLastHash = 1;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
@@ -2973,6 +3051,8 @@ void SBoardStopOverlay(void) {
     g_sbOverlayOn = NO;
     g_sbWin = 0;
     g_sbShape = 0;
+    g_sbHaveLastHash = 0;
+    g_sbLastFrameHash = 0;
     g_sbCanvas = 0;
     pthread_mutex_unlock(&g_sbLock);
 
