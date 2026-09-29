@@ -89,7 +89,8 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  int *w2stray, uint64_t *w2strayPc,
                                  uint32_t *w2strayFlavor, int *w2strayCode,
                                  uint32_t *w2straySender, int *w2preStray,
-                                 uint64_t *w2prePc, uint64_t *w2preCount);
+                                 uint64_t *w2prePc, uint64_t *w2preCount,
+                                 uint32_t *w1sender, uint64_t *w1pc);
 // Returns false when the state could not be signed. A false return means the
 // state was NOT modified with a signed pc/lr and must not be replied to the
 // target: replying an unsigned or zero pc hands the target's thread a jump to

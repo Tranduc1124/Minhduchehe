@@ -371,6 +371,11 @@ static int g_rcW2PreStray = 0;
 static uint64_t g_rcW2PrePc = 0;
 static uint32_t g_rcW2PreSender = 0;
 static uint64_t g_rcW2PreCount = 0;
+// Identity of the thread that was replied to. Compared against the sender of
+// whatever turns up on the first port, it is the only thing that says whether
+// the thread that took the call is the thread that faulted.
+static uint32_t g_rcW1Sender = 0;
+static uint64_t g_rcW1Pc = 0;
 
 void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  uint64_t *wait1TO, uint64_t *wait2TO,
@@ -378,7 +383,8 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  int *w2stray, uint64_t *w2strayPc,
                                  uint32_t *w2strayFlavor, int *w2strayCode,
                                  uint32_t *w2straySender, int *w2preStray,
-                                 uint64_t *w2prePc, uint64_t *w2preCount)
+                                 uint64_t *w2prePc, uint64_t *w2preCount,
+                                 uint32_t *w1sender, uint64_t *w1pc)
 {
     if (wait1US)    *wait1US = g_rcWait1US;
     if (wait2US)    *wait2US = g_rcWait2US;
@@ -394,6 +400,8 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
     if (w2preStray) *w2preStray = g_rcW2PreStray;
     if (w2prePc)    *w2prePc = g_rcW2PrePc;
     if (w2preCount) *w2preCount = g_rcW2PreCount;
+    if (w1sender)   *w1sender = g_rcW1Sender;
+    if (w1pc)       *w1pc = g_rcW1Pc;
 }
 
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
@@ -1485,6 +1493,8 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     g_rcW2PreStray = 0;
     g_rcW2PrePc = 0;
     g_rcW2PreSender = 0;
+    g_rcW1Sender = 0;
+    g_rcW1Pc = 0;
     {
         ExceptionMessage pre;
         memset(&pre, 0, sizeof(pre));
@@ -1515,6 +1525,13 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
             name ?: "(addr-call)",
             (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
+    // Who replied to, and who is it that then faulted. If a fault arriving on
+    // the first port carries the same sender as this park message, the thread
+    // that took the call is the one that crashed, and the exception port it
+    // faults to is not the one the call waits on. If the senders differ, the
+    // crash belongs to a different injected thread entirely.
+    g_rcW1Sender = exc.Head.msgh_remote_port;
+    g_rcW1Pc = native_strip(exc.threadState.__pc);
 
     // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
     // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
@@ -1600,11 +1617,13 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 g_rcW2StrayCode = (int)other.exception;
                 g_rcW2StraySender = other.Head.msgh_remote_port;
                 NSLog(@"[RC-W2TO] %s: FRESH on FIRST port pc=0x%llx lr=0x%llx "
-                      @"exc=%u flavor=%u sender=0x%x pre=%d/0x%llx/%llu — "
+                      @"exc=%u flavor=%u sender=0x%x w1snd=0x%x w1pc=0x%llx pre=%d/0x%llx/%llu — "
                       @"arrived during this call",
                       name ?: "?", (unsigned long long)opc, (unsigned long long)olr,
                       (unsigned)other.exception, (unsigned)other.flavor,
                       (unsigned)other.Head.msgh_remote_port,
+                      (unsigned)g_rcW1Sender,
+                      (unsigned long long)g_rcW1Pc,
                       g_rcW2PreStray, (unsigned long long)g_rcW2PrePc,
                       (unsigned long long)g_rcW2PreCount);
                 // Leave it on the port: whoever owns the first port's state
@@ -1612,9 +1631,10 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 // diagnosable hang into an unrelated hang later.
             } else {
                 g_rcW2Stray = 2;   // 1 = stray found, 2 = both ports empty
-                NSLog(@"[RC-W2TO] %s: NOTHING on either port pc0x%llx pre=%d — "
-                      @"thread wedged or died without an exception",
-                      name ?: "?", (unsigned long long)pcAddr, g_rcW2PreStray);
+                NSLog(@"[RC-W2TO] %s: NOTHING on either port pc0x%llx w1snd=0x%x "
+                      @"pre=%d — thread wedged or died without an exception",
+                      name ?: "?", (unsigned long long)pcAddr,
+                      (unsigned)g_rcW1Sender, g_rcW2PreStray);
             }
         }
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
