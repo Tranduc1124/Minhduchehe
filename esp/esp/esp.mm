@@ -1503,7 +1503,10 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
             if (isnan(outQ.x) || isnan(outQ.y) || isnan(outQ.z) || isnan(outQ.w)) outQ = targetQ;
         }
     }
-    write_aim_rotations(localPawn, outQ);
+    // Once. This was written twice in a row, which is not a harmless duplicate:
+    // the write is a kernel poke at the rotation fields, so every aim tick was
+    // paying for two and the second landed after the game may already have
+    // consumed the first.
     write_aim_rotations(localPawn, outQ);
     AimSyncFireHit(localPawn, from, aimed);
 
@@ -4260,7 +4263,22 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // Aimbot + Aim Assist + Silent all honor AimPos (Head/Neck/Chest-Body).
         // Prefer GetAimTargetPosMode / ResolveSilentAimWorldPos (live).
         // Ghost: never aim if HP shell is dead (already filtered) or bone not live.
-        Vector3 aimPos = headBonePos;
+        //
+        // The aim position must never come from headBonePos. That value is the
+        // DISPLAY smoother: EspSmoothDisplayPos, a world-space EMA over
+        // PickStableHeadRaw, gated on a per-pawn tracker, with a source-flip
+        // bypass and a learned body length. It is tuned to make a box look calm.
+        // Pointing a crosshair at it couples the crosshair to every decision
+        // that was made to look at boxes, and the failure mode is exactly the
+        // one that was reported: the crosshair sits on an enemy while the point
+        // under it is somewhere no enemy is.
+        //
+        // liveHead and liveHip are the same bone, read raw at the top of this
+        // pawn's pass, before any smoothing and before any tracker state. They
+        // are the only positions here that cannot inherit a display decision.
+        Vector3 rawAnchor = looksLikeWorldPos(liveHead) ? liveHead
+                           : (looksLikeWorldPos(liveHip) ? liveHip : Vector3{0, 0, 0});
+        Vector3 aimPos = rawAnchor;
         bool canAimThisPawn = false;
         if (isAimbot || useAssist || useSilent) {
             Vector3 bone = (useSilent && !isAimbot && !useAssist)
@@ -4269,12 +4287,14 @@ static inline uint64_t ESPPhaseNowUS(void) {
             if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
                 bone = ResolveSilentAimWorldPos(PawnObject, aimPosition);
             }
-            if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) bone = headBonePos;
-            // Reject aim bone far from our live head (track invent / wrong pawn).
-            // Body is lower on torso — allow a bit more distance than pure head.
+            if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) bone = rawAnchor;
+            // Reject an aim bone far from our own raw head. Measured against
+            // rawAnchor, not headBonePos: a guard that compares a candidate
+            // against a smoothed value inherits every way that smoothed value can
+            // be wrong, and then it stops being a guard.
             const float maxBoneDist = (treatAsVehicle ? 3.5f : 2.6f);
-            if (!IsZeroVec(bone) && looksLikeWorldPos(bone) &&
-                Vector3::Distance(bone, headBonePos) < maxBoneDist) {
+            if (!IsZeroVec(bone) && looksLikeWorldPos(bone) && looksLikeWorldPos(rawAnchor) &&
+                Vector3::Distance(bone, rawAnchor) < maxBoneDist) {
                 aimPos = bone;
                 if (aimPosition == 0) headBonePos = bone;
                 canAimThisPawn = true;
@@ -4284,7 +4304,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
         }
 
         float dis = useLocalDistance
-            ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? headBonePos : aimPos)
+            ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? rawAnchor : aimPos)
             : tempDisForAim;
 
         // Count enemies for the number, deduplicated by user id.
