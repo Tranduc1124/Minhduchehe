@@ -66,6 +66,13 @@ int init_remote_call_with_first_exception_timeout(const char* process, bool useM
 int init_remote_call_original_thread_only_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
 uint64_t do_remote_call_stable(int timeout, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
 uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
+// Measurement for the SpringBoard main-thread watchdog kill. See the block
+// above rc_ipc_lock_measuring in RemoteCall.m for what each number means.
+// Any out pointer may be NULL.
+void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
+                                 uint64_t *holdTotalUS, uint64_t *waitMaxUS,
+                                 uint64_t *waitSlow, uint64_t *calls,
+                                 uint32_t *lastHolderTid, uint32_t *lastWaiterTid);
 // Returns false when the state could not be signed. A false return means the
 // state was NOT modified with a signed pc/lr and must not be replied to the
 // target: replying an unsigned or zero pc hands the target's thread a jump to

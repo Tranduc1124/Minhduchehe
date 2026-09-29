@@ -70,6 +70,10 @@ uint64_t g_RC_gadgetPacia = 0;
 static pthread_mutex_t g_universal_ipc_mutex;
 static pthread_once_t g_universal_ipc_mutex_once = PTHREAD_ONCE_INIT;
 
+// Defined further down, next to the comment that explains what it means.
+// Forward declared because the measurement block below reads it.
+bool remote_call_runs_on_target_main_thread(void);
+
 static void init_universal_mutex(void)
 {
     pthread_mutexattr_t attr;
@@ -233,6 +237,79 @@ static uint64_t remote_call_diag_now_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+// Measurement for the SpringBoard main-thread watchdog kill. Nothing here
+// changes behaviour: it is two clock reads around a lock that is already
+// taken, and a few counters.
+//
+// The device report for that kill says:
+//     unresponsive dispatch queue(s): com.apple.main-thread
+//     60 seconds since last successful checkin
+//     thread 1562: turnstile blocked on task pid 850, hops: 2
+// pid 850 is this app. A turnstile belongs to whoever owns the memory the
+// mutex lives in, so "blocked on task pid 850" means a SpringBoard thread is
+// waiting on a pthread mutex that lives in our address space. The only code
+// of ours that a SpringBoard thread can reach is the code the hijack makes it
+// execute, and the only lock on that path is g_universal_ipc_mutex.
+//
+// Two numbers distinguish the two candidate stories. holdMax is how long the
+// target thread is kept inside our code by one call: if the trojan thread is
+// the main thread, that is the main thread being held, and watchdogd kills at
+// 60s of no checkin. waitMax is how long a thread of ours sat blocked on the
+// same mutex, which is the turnstile in the report: a wait that grows without
+// bound is the deadlock, a wait that stays flat is only queueing.
+static uint64_t g_rcIpcCalls = 0;
+static uint64_t g_rcIpcHoldMaxUS = 0;
+static uint64_t g_rcIpcHoldTotalUS = 0;
+static uint64_t g_rcIpcWaitMaxUS = 0;
+static uint64_t g_rcIpcWaitSlow = 0;      // waits of 1ms or more
+static uint32_t g_rcIpcLastHolderTid = 0;
+static uint32_t g_rcIpcLastWaiterTid = 0;
+
+static inline uint32_t rc_ipc_tid(void)
+{
+    return (uint32_t)pthread_mach_thread_np(pthread_self());
+}
+
+static inline uint64_t rc_ipc_lock_measuring(uint64_t *waitOut)
+{
+    const uint64_t t0 = remote_call_diag_now_us();
+    pthread_mutex_lock(&g_universal_ipc_mutex);
+    const uint64_t t1 = remote_call_diag_now_us();
+    const uint64_t waited = t1 - t0;
+    *waitOut = waited;
+    if (waited > g_rcIpcWaitMaxUS) {
+        g_rcIpcWaitMaxUS = waited;
+        g_rcIpcLastWaiterTid = rc_ipc_tid();
+    }
+    if (waited >= 1000ULL) g_rcIpcWaitSlow++;
+    return t1;
+}
+
+static inline void rc_ipc_unlock_measuring(uint64_t t1)
+{
+    const uint64_t held = remote_call_diag_now_us() - t1;
+    g_rcIpcCalls++;
+    g_rcIpcHoldTotalUS += held;
+    if (held > g_rcIpcHoldMaxUS) g_rcIpcHoldMaxUS = held;
+    g_rcIpcLastHolderTid = rc_ipc_tid();
+    pthread_mutex_unlock(&g_universal_ipc_mutex);
+}
+
+void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
+                                 uint64_t *holdTotalUS, uint64_t *waitMaxUS,
+                                 uint64_t *waitSlow, uint64_t *calls,
+                                 uint32_t *lastHolderTid, uint32_t *lastWaiterTid)
+{
+    if (onMain)        *onMain = remote_call_runs_on_target_main_thread() ? 1 : 0;
+    if (holdMaxUS)     *holdMaxUS = g_rcIpcHoldMaxUS;
+    if (holdTotalUS)   *holdTotalUS = g_rcIpcHoldTotalUS;
+    if (waitMaxUS)     *waitMaxUS = g_rcIpcWaitMaxUS;
+    if (waitSlow)      *waitSlow = g_rcIpcWaitSlow;
+    if (calls)         *calls = g_rcIpcCalls;
+    if (lastHolderTid) *lastHolderTid = g_rcIpcLastHolderTid;
+    if (lastWaiterTid) *lastWaiterTid = g_rcIpcLastWaiterTid;
 }
 
 #define RC_DEBUG(...) do { if (remote_call_verbose_logging()) printf(__VA_ARGS__); } while (0)
@@ -1219,18 +1296,20 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
-    pthread_mutex_lock(&g_universal_ipc_mutex);
+    uint64_t _ipcWait = 0;
+    const uint64_t _ipcT1 = rc_ipc_lock_measuring(&_ipcWait);
+    (void)_ipcWait;
     uint64_t res = 0;
     if (g_RC_vphoneBridge) {
         if (timeout >= 0)
             res = rc_vphone_bridge_call(2, 0, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        rc_ipc_unlock_measuring(_ipcT1);
         return res;
     }
 
     if (!g_RC_creatingExtraThread) {
         res = do_remote_call_temp_internal(timeout, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        rc_ipc_unlock_measuring(_ipcT1);
         return res;
     }
 
@@ -1242,11 +1321,11 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     if (!pcAddr) {
         printf("[%s:%d] Unable to find symbol: %s\n", __FUNCTION__, __LINE__, name);
         g_RC_success = false;
-        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        rc_ipc_unlock_measuring(_ipcT1);
         return 0;
     }
     res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    pthread_mutex_unlock(&g_universal_ipc_mutex);
+    rc_ipc_unlock_measuring(_ipcT1);
     return res;
 }
 
@@ -1255,9 +1334,11 @@ uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *na
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
-    pthread_mutex_lock(&g_universal_ipc_mutex);
+    uint64_t _ipcWait = 0;
+    const uint64_t _ipcT1 = rc_ipc_lock_measuring(&_ipcWait);
+    (void)_ipcWait;
     uint64_t res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    pthread_mutex_unlock(&g_universal_ipc_mutex);
+    rc_ipc_unlock_measuring(_ipcT1);
     return res;
 }
 

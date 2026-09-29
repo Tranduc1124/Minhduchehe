@@ -2068,9 +2068,22 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             const int64_t nextIn = (int64_t)g_sbNextPublishUS - (int64_t)tGate;
             const int64_t sinceDraw = (g_sbLastPublishUS == 0)
                                    ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
+            // onmain=1 means the trojan thread IS SpringBoard's main thread, so
+            // every call below holds the main thread for its duration. holdmax
+            // is that duration in ms; waitmax is how long one of our threads
+            // was blocked on the same mutex, which is the turnstile the device
+            // report shows SpringBoard waiting on.
+            uint64_t ipcOnMain = 0, ipcHoldMax = 0, ipcHoldTotal = 0;
+            uint64_t ipcWaitMax = 0, ipcWaitSlow = 0, ipcCalls = 0;
+            uint32_t ipcHolderTid = 0, ipcWaiterTid = 0;
+            remote_call_main_thread_diag(&ipcOnMain, &ipcHoldMax, &ipcHoldTotal,
+                                        &ipcWaitMax, &ipcWaitSlow, &ipcCalls,
+                                        &ipcHolderTid, &ipcWaiterTid);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
-                  @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms",
+                  @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms "
+                  @"ipc onmain=%llu calls=%llu holdmax=%llums holdtot=%llums "
+                  @"waitmax=%llums waitslow=%llu ht=%u wt=%u",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2084,7 +2097,15 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   (unsigned long long)g_sbSkipBusy,
                   g_sbPublishPhase,
                   (long long)(nextIn / 1000),
-                  (long long)(sinceDraw / 1000));
+                  (long long)(sinceDraw / 1000),
+                  (unsigned long long)ipcOnMain,
+                  (unsigned long long)ipcCalls,
+                  (unsigned long long)(ipcHoldMax / 1000ULL),
+                  (unsigned long long)(ipcHoldTotal / 1000ULL),
+                  (unsigned long long)(ipcWaitMax / 1000ULL),
+                  (unsigned long long)ipcWaitSlow,
+                  (unsigned)ipcHolderTid,
+                  (unsigned)ipcWaiterTid);
         }
     }
 
