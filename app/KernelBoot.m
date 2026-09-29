@@ -67,54 +67,11 @@ static void L(NSString *fmt, ...) {
 // GameOffsets.mm returns "FreeFire" unless the MAX variant is selected.
 #define PROBE_GAME_PROC_NAME "FreeFire"
 
-static volatile int g_probeHeartbeat = 0;
-
-// Reports every second, for as long as the probe is inside its call. Stops on
-// its own once the probe returns, so a clean run leaves one short burst of lines
-// and a stuck run leaves them going.
-static void *boot_probe_heartbeat(void *arg) {
-    (void)arg;
-    int last = -1;
-    while (g_probeHeartbeat) {
-        for (int i = 0; i < 10 && g_probeHeartbeat; i++) usleep(100000);
-        if (!g_probeHeartbeat) break;
-        if (++last < 20) {
-            NSLog(@"[PROBE] still inside the call, %ds", last);
-        } else if (last == 20) {
-            NSLog(@"[PROBE] still inside the call, 20s — treating as a hang");
-        }
-    }
-    return NULL;
-}
-
 static void *boot_probe_game_thread(void *arg) {
     (void)arg;
-    // stdout is not a terminal under ESign, so it is fully buffered and a
-    // detached thread that keeps running never reaches a flush. Everything
-    // RemoteCall.m reports about the attempt, including init_remote_call's own
-    // printf, would be sitting in that buffer and the device would show the one
-    // NSLog line and nothing else, which is exactly what a hang looks like.
-    // Line buffering makes each newline a write, so a hang and a success become
-    // distinguishable by where the output stops.
-    setvbuf(stdout, NULL, _IOLBF, 0);
-
     NSLog(@"[PROBE] entering %s from tid=%u", PROBE_GAME_PROC_NAME,
           (uint32_t)pthread_mach_thread_np(pthread_self()));
-
-    // A heartbeat from a second detached thread. If the probe is stuck inside
-    // init_remote_call, this is the only thing that will say so: the probe's own
-    // output stops mid call and the app otherwise looks completely healthy, which
-    // is indistinguishable from "the feature is silent" until someone watches a
-    // counter that should be climbing.
-    static volatile int g_probeHeartbeat = 0;
-    g_probeHeartbeat = 1;
-    pthread_t hb;
-    if (pthread_create(&hb, NULL, (void *(*)(void *))boot_probe_heartbeat, NULL) == 0) {
-        pthread_detach(hb);
-    }
-
     int rc = probe_remote_call_into(PROBE_GAME_PROC_NAME);
-    g_probeHeartbeat = 0;
     NSLog(@"[PROBE] %s verdict rc=%d (%@)", PROBE_GAME_PROC_NAME, rc,
           rc == 0 ? @"REACHED — code ran in the game" : @"NOT REACHED");
     return NULL;
