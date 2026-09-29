@@ -2079,10 +2079,24 @@ static inline Vector3 PickStableHipRaw(uint64_t pawn, PosTrack &tr) {
 static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
-    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
-        return Vector3{0, 0, 0};
-    }
+    // No death-tombstone early return here, deliberately.
+    //
+    // The tombstone is keyed on the pawn POINTER, and a game recycles object
+    // addresses. A pawn that dies and respawns frequently comes back on the
+    // address the previous one used, so `tr.pawn == pawn` matches a fresh live
+    // pawn and this branch returned {0,0,0} for the rest of the hold window,
+    // which is 45 to 120 frames, so up to two seconds. For that whole time the
+    // pawn had no head position, every aim candidate through it failed
+    // looksLikeWorldPos, and the fallback aimed at whatever was left. That is
+    // the reported symptom exactly, and it is tied precisely to the events that
+    // produce address reuse: knocked, died, respawned.
+    //
+    // The tombstone's job is to stop a dead shell's smoothing state being
+    // revived, and markGhostDead already does that: it zeroes headSmoothed,
+    // lastHeadRaw, headVel, lastHeadT, the source holds, hasHead and bodyLenHold
+    // at the moment it writes the tombstone. With that state zeroed and hasHead
+    // false, the code below returns the raw bone when the bone reads live and
+    // {0,0,0} when it does not, which is the real test and it runs every frame.
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -2106,10 +2120,24 @@ static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
 static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
-    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
-        return Vector3{0, 0, 0};
-    }
+    // No death-tombstone early return here, deliberately.
+    //
+    // The tombstone is keyed on the pawn POINTER, and a game recycles object
+    // addresses. A pawn that dies and respawns frequently comes back on the
+    // address the previous one used, so `tr.pawn == pawn` matches a fresh live
+    // pawn and this branch returned {0,0,0} for the rest of the hold window,
+    // which is 45 to 120 frames, so up to two seconds. For that whole time the
+    // pawn had no head position, every aim candidate through it failed
+    // looksLikeWorldPos, and the fallback aimed at whatever was left. That is
+    // the reported symptom exactly, and it is tied precisely to the events that
+    // produce address reuse: knocked, died, respawned.
+    //
+    // The tombstone's job is to stop a dead shell's smoothing state being
+    // revived, and markGhostDead already does that: it zeroes headSmoothed,
+    // lastHeadRaw, headVel, lastHeadT, the source holds, hasHead and bodyLenHold
+    // at the moment it writes the tombstone. With that state zeroed and hasHead
+    // false, the code below returns the raw bone when the bone reads live and
+    // {0,0,0} when it does not, which is the real test and it runs every frame.
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -2136,10 +2164,11 @@ static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
 static inline Vector3 EspSmoothDisplayPos(uint64_t pawn, Vector3 raw, bool isHead) {
     if (!looksLikeWorldPos(raw) || !isVaildPtr(pawn)) return raw;
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // Exact-pawn tombstone: if dead hold is active for THIS pawn, do not smooth or emit.
-    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
-        return Vector3{0,0,0};
-    }
+    // Same reason as the three resolvers above: this tombstone is keyed on an
+    // address the game recycles, so on a respawn it silences a live pawn for up
+    // to the hold window and the box disappears along with the aim. `raw` has
+    // already been checked as a live world position on the line above, which is
+    // the real evidence that this pawn is on screen right now.
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -3999,7 +4028,24 @@ static inline uint64_t ESPPhaseNowUS(void) {
         static int s_deadUntilFrame[96] = {};
         const int deadSlot = (int)(PawnObject % 96ull);
         if (s_deadPawn[deadSlot] == PawnObject && g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
-            continue;
+            // Only honour the tombstone while this pawn still reads as dead.
+            //
+            // The slot is PawnObject % 96, keyed on an address, and the game
+            // recycles addresses: a pawn that respawns onto the one its
+            // predecessor used lands here and `continue`d out of the whole
+            // entity loop. The entity then had no box, no name, and no aim
+            // candidate for the rest of the 45 to 120 frame hold, which is
+            // exactly "it breaks when they get knocked and come back".
+            //
+            // isKnocked is already read for this pawn earlier in the pass. A
+            // live, upright pawn on a recycled address is not the corpse the
+            // tombstone was written for, so the hold is cleared and the pass
+            // continues.
+            if (c.isKnocked) continue;
+            s_deadPawn[deadSlot] = 0;
+            s_deadUntilFrame[deadSlot] = 0;
+            PosTrack &trLive = g_posTrack[PosTrackSlot(PawnObject)];
+            trLive.deadUntilFrame = 0;
         }
         auto markGhostDead = [&](int holdFrames) {
             // Tombstone inside PosTrack by exact pawn (not just %96 bucket).
