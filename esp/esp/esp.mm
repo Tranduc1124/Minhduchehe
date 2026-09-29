@@ -5086,9 +5086,36 @@ static inline uint64_t ESPPhaseNowUS(void) {
             const bool lknock = get_IsKnockedDown(gAimLockTarget);
             Vector3 liveHeadTarget = getPositionExt(getHead(gAimLockTarget));
             const bool hasLiveHead = looksLikeWorldPos(liveHeadTarget);
-            if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
-            const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
-            if (!lhpBad && (lhp > 0) && !(isAimIgnoreKnock && lknock) &&
+            // A live bone is not a live player.
+            //
+            // This used to invent health for the locked pawn:
+            //
+            //     if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
+            //
+            // A knocked or killed pawn keeps its bones in the entity dict and
+            // they keep reading a valid world position, which is the position it
+            // died at or the place it is lying. So a corpse with 0/0 read as a
+            // full-health live target, passed every check below including
+            // lhp > 0, and the crosshair parked on the body. On respawn the lock
+            // still held that position, so the crosshair stayed where the old
+            // body was while the player was somewhere else entirely.
+            //
+            // It also made lhpBad unreachable for exactly the case it existed to
+            // catch, since lhp had already been forced positive.
+            //
+            // And it contradicted this same file: the entity loop at 4100 treats
+            // MaxHP <= 0 as dead and tombstones the pawn for 120 frames. The two
+            // halves of the renderer disagreed about what 0/0 means, and only the
+            // aim half believed the corpse was alive.
+            //
+            // There is no way to tell a broken HP read from a genuine 0/0 from
+            // inside this expression, so the invention is gone and the liveness
+            // test below does the work. A pawn whose HP cannot be read was
+            // already being suppressed by the entity loop, so nothing that used
+            // to draw now stops drawing.
+            const bool lhpBad = (lmax <= 0) || (lmax > 2000) || (lhp < 0) ||
+                                ((lhp == 0 && lmax == 0) && !lknock);
+            if (!lhpBad && (lhp > 0 || lknock) && !(isAimIgnoreKnock && lknock) &&
                 !(isAimIgnoreBot && get_IsBot(gAimLockTarget))) {
                 Vector3 lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
                 if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
