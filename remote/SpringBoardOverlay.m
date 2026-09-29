@@ -490,6 +490,9 @@ static void serFunc(void *info, const CGPathElement *e) {
 // counter was laid out for. SB_COUNT_H is the pill's height, so the text has to
 // be told or it is sized against nothing.
 #define SB_COUNT_FONT_SIZE 26.0
+// The counter's font, as a name. CALayer's font property is a CFTypeRef and
+// QuartzCore resolves a name against fontSize; see sb_make_count_label.
+#define SB_COUNT_FONT_NAME "Helvetica-Bold"
 
 // One counter plus two labels per pawn, name and distance. Created lazily, so a
 // quiet frame costs nothing and a busy one tops out here rather than growing
@@ -541,6 +544,9 @@ static uint64_t g_sbCountAlignStr = 0;
 // drawn any of it; the gap between these two is the whole of the delay before
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
+// The UIFont the counter draws with. Held for the session; the layer keeps a
+// reference for as long as it draws.
+static uint64_t g_sbCountFont = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
 static int      g_sbCountStringProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
@@ -1319,6 +1325,44 @@ static void sb_make_count_label(uint64_t container) {
         double fsz = SB_COUNT_FONT_SIZE;
         r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
                        NULL, 0, NULL, 0, NULL, 0);
+
+        // A font, not just a size, and it is a font NAME.
+        //
+        // Two things were wrong here and the first one was mine from two commits
+        // ago. I wrote that fontSize alone was enough, and justified it with a
+        // crash log showing the layer reaching drawInContext:. That is not proof
+        // of glyphs: drawInContext: is entered for an empty string and for a
+        // nil-font string, and _createStringDict runs before anything is
+        // rasterised. The device screenshot disproves the claim outright: the
+        // plate fills, the layer is above its siblings, bounds and fontSize both
+        // read back correct, and there are no glyphs. fontSize is a number until
+        // there is a font to apply it to.
+        //
+        // The second is the type. CALayer's font is a CFTypeRef and this repo
+        // already has two CATextLayers that draw, and both set it the same way:
+        //
+        //   esp/esp/esp.mm:3209  layer.font = (__bridge CFTypeRef)fontNameStr;
+        //   esp/esp/esp.mm:3563  self.statusLayer.font = (__bridge CFTypeRef)...
+        //                               .fontName;
+        //
+        // A font NAME string, resolved by QuartzCore against fontSize. Not a
+        // CTFontRef and not a UIFont. The pooled labels at :917 pass a UIFont to
+        // setFont: and they are UILabels, which is why that looks like the right
+        // shape; on a CALayer it is the wrong one.
+        //
+        // And explicitly not CTFontCreateWithName, which is what killed
+        // SpringBoard. Its size argument is a double by value and it was being
+        // handed the address of a double in this process's own stack, so CoreText
+        // read eight bytes of our frame as a font size and built something
+        // malformed; the crash was a pointer authentication trap in
+        // -[CATextLayer _createStringDict]. A name string has no bare double in it
+        // to get wrong at all, which is why this form is safe.
+        if (!r_is_objc_ptr(g_sbCountFont)) {
+            g_sbCountFont = sb_make_nsstring(SB_COUNT_FONT_NAME);
+        }
+        if (r_is_objc_ptr(g_sbCountFont)) {
+            r_msg2_main(label, "setFont:", g_sbCountFont, 0, 0, 0);
+        }
     }
 
     // Size first, while the transform is still identity, so setFrame: means what
@@ -1333,6 +1377,30 @@ static void sb_make_count_label(uint64_t container) {
     double frame[4] = { 0.0, 0.0, SB_COUNT_W, SB_COUNT_H };
     r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
                    NULL, 0, NULL, 0, NULL, 0);
+
+    // The position is set here, at creation, not on the first frame that carries
+    // a count.
+    //
+    // This is why the plate shows up in the corner first and then slides across to
+    // the right place. setFrame: 0,0 puts the layer at the container's origin,
+    // which is the top left of the screen, and setPosition: was only ever reached
+    // from the op 5 decode. Every publish before the first count record therefore
+    // draws it in the corner and the user watches it travel.
+    //
+    // The place does not depend on the text. It comes from the screen size, which
+    // is fixed for the device, so there is nothing to wait for and nothing to
+    // learn from a frame that has not arrived yet.
+    //
+    // Container space is 390 wide by 844 tall. Landscape top centre of an 844x390
+    // screen is (422, 42), and sbEmit's map, (sx, sy) -> (landH - sy, sx), turns
+    // that into (390 - 42, 422).
+    {
+        double centre[2] = { (390.0 - SB_COUNT_TOP) - SB_COUNT_H * 0.5, 422.0 };
+        r_msg_main_raw(label, r_sel("setPosition:"), centre, sizeof(centre),
+                       NULL, 0, NULL, 0, NULL, 0);
+        g_sbCountLastPos[0] = centre[0];
+        g_sbCountLastPos[1] = centre[1];
+    }
 
     // Sixteen doubles, not six. A view's setTransform: takes a CGAffineTransform,
     // six, and that is the array this used to carry because the counter was a
@@ -1661,6 +1729,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountLabel = 0;
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
+    g_sbCountFont = 0;
     g_sbCountFirstTextUS = 0;
     g_sbCountStringProbed = 0;
     g_sbCountLastPos[0] = -1.0;
