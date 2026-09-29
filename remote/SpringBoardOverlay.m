@@ -636,7 +636,10 @@ static uint64_t sb_count_label_text(const char *utf8) {
     if (!r_is_objc_ptr(ns)) return 0;
 
     uint64_t calls = 4;   // malloc, memcpy, alloc, initWithUTF8String
-    r_perform_main(g_sbCountLabel, r_sel("setText:"), ns, false);
+    // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
+    // view setters do not exist on it. The selector change is the whole of the
+    // difference between this working and the label silently never appearing.
+    r_perform_main(g_sbCountLabel, r_sel("setString:"), ns, false);
     calls++;
     dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
     calls++;
@@ -949,32 +952,60 @@ static uint64_t sb_pooled_label_update(int idx, int role, double px, double py,
 static void sb_make_count_label(uint64_t container) {
     if (g_sbCountLabel || !r_is_objc_ptr(container)) return;
 
-    uint64_t UILabel = r_class("UILabel");
-    if (!r_is_objc_ptr(UILabel)) return;
-    uint64_t alloc = r_msg2_main(UILabel, "alloc", 0, 0, 0, 0);
+    // CATextLayer, not UILabel.
+    //
+    // A CATextLayer is a CALayer, so it is added to the layer tree rather than as
+    // a subview, and it carries its own backgroundColor and cornerRadius. That is
+    // the reason for the swap: a UILabel's background is the label's bounds, and a
+    // CATextLayer's background is the layer's, so a pill behind the number is one
+    // object instead of a shape in one path and a view in another. Two objects
+    // updated by two paths is exactly what let the name text drift off its card
+    // before, and it cannot drift when there is only one thing to move.
+    //
+    // The text is also CoreText's rather than UIKit's, which is the point of the
+    // reference implementation having a buildAttrStringForText: in its binary.
+    uint64_t CATL = r_class("CATextLayer");
+    if (!r_is_objc_ptr(CATL)) {
+        NSLog(@"[SB-LABEL] CATextLayer not available, counter text stays empty");
+        return;
+    }
+    uint64_t alloc = r_msg2_main(CATL, "alloc", 0, 0, 0, 0);
     uint64_t label = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(label)) return;
 
-    // A label is not interactive by default, but the overlay window is
-    // already non-interactive and this is the property that would matter if
-    // that ever changed: a label that eats a tap is the bug the old overlay
-    // had.
-    r_msg2_main(label, "setUserInteractionEnabled:", 0, 0, 0, 0);
-    r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);   // centre
-    r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
+    r_msg2_main(label, "setWrapped:", 0, 0, 0, 0);        // one line, no wrap
+    r_msg2_main(label, "setTruncationMode:", 0, 0, 0, 0); // none
+    r_msg2_main(label, "setAlignmentMode:", 1, 0, 0, 0);   // centre
+    // Without this the text is rasterised at scale 1 and is visibly soft on a
+    // retina display, which is the most obvious way for it to look worse than
+    // the UILabel it replaced. Read once from the screen, set once here.
+    {
+        double scale = [UIScreen mainScreen].scale;
+        if (scale > 0.5) r_msg2_main(label, "setContentsScale:", scale, 0, 0, 0);
+    }
 
     uint64_t UIColor = r_class("UIColor");
-    uint64_t clear = r_is_objc_ptr(UIColor) ? r_msg2_main(UIColor, "clearColor", 0, 0, 0, 0) : 0;
-    uint64_t red   = r_is_objc_ptr(UIColor) ? r_msg2_main(UIColor, "redColor",   0, 0, 0, 0) : 0;
-    if (r_is_objc_ptr(clear)) r_msg2_main(label, "setBackgroundColor:", clear, 0, 0, 0);
-    if (r_is_objc_ptr(red))   r_msg2_main(label, "setTextColor:", red, 0, 0, 0);
+    if (r_is_objc_ptr(UIColor)) {
+        uint64_t red = r_msg2_main(UIColor, "redColor", 0, 0, 0, 0);
+        uint64_t redCG = r_is_objc_ptr(red) ? r_msg2_main(red, "CGColor", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(redCG)) r_msg2_main(label, "setForegroundColor:", redCG, 0, 0, 0);
 
-    uint64_t UIFont = r_class("UIFont");
-    if (r_is_objc_ptr(UIFont)) {
-        double fs = 26.0;
-        uint64_t font = r_msg_main_raw(UIFont, r_sel("systemFontOfSize:"),
-                                       &fs, 8, NULL, 0, NULL, 0, NULL, 0);
-        if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0, 0, 0);
+        // The pill. A layer background is a CGColor, so it comes from the
+        // UIColor's CGColor rather than being set directly.
+        double rgba[4] = { SB_CARD_R, SB_CARD_G, SB_CARD_B, SB_CARD_A };
+        uint64_t card = r_msg2_main_raw(UIColor, "colorWithRed:green:blue:alpha:",
+                                        &rgba[0], 8, &rgba[1], 8,
+                                        &rgba[2], 8, &rgba[3], 8);
+        uint64_t cardCG = r_is_objc_ptr(card) ? r_msg2_main(card, "CGColor", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(cardCG)) r_msg2_main(label, "setBackgroundColor:", cardCG, 0, 0, 0);
+
+        // Corner radius, once, here. The old comment said setting it cost
+        // thirteen blocking calls and was not worth it at nine labels a frame,
+        // which was the right arithmetic for a per frame cost and the wrong
+        // place: this is creation, so it is paid once for the life of the label.
+        double radius = SB_COUNT_H * 0.5;
+        r_msg_main_raw(label, r_sel("setCornerRadius:"), &radius, 8,
+                       NULL, 0, NULL, 0, NULL, 0);
     }
 
     // Size first, while the transform is still identity, so setFrame: means what
@@ -990,12 +1021,20 @@ static void sb_make_count_label(uint64_t container) {
     r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
                    NULL, 0, NULL, 0, NULL, 0);
 
-    // The rotation that puts the label in the same space the path is in.
+    // The rotation that puts the layer in the same space the path is in.
     double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
     r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
                    NULL, 0, NULL, 0, NULL, 0);
 
-    r_msg2_main(container, "addSubview:", label, 0, 0, 0);
+    // addSublayer:, not addSubview:. It is a layer, and the view method would
+    // fail quietly and leave it detached from anything.
+    uint64_t containerLayer = r_msg2_main(container, "layer", 0, 0, 0, 0);
+    if (r_is_objc_ptr(containerLayer)) {
+        r_msg2_main(containerLayer, "addSublayer:", label, 0, 0, 0);
+    } else {
+        NSLog(@"[SB-LABEL] container has no layer, counter text not attached");
+        return;
+    }
 
     // Read the size straight back out of SpringBoard's own CALayer, the same way
     // lineWidth was verified, so "the label has an area" is a measured fact and
