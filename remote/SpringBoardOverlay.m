@@ -482,6 +482,15 @@ static void serFunc(void *info, const CGPathElement *e) {
 #define SB_COUNT_H   34.0
 #define SB_COUNT_TOP 25.0
 
+// The UILabel this label replaced ended with setFont: on
+// systemFontOfSize:26. The migration to CATextLayer carried the colour, the
+// background, the radius and the scale across and left the font behind, and a
+// CALayer has no view-level default to fall back on: without a fontSize it
+// renders in whatever the layer's default is, which is not the size the
+// counter was laid out for. SB_COUNT_H is the pill's height, so the text has to
+// be told or it is sized against nothing.
+#define SB_COUNT_FONT_SIZE 26.0
+
 // One counter plus two labels per pawn, name and distance. Created lazily, so a
 // quiet frame costs nothing and a busy one tops out here rather than growing
 // without limit inside SpringBoard.
@@ -1006,6 +1015,13 @@ static void sb_make_count_label(uint64_t container) {
         double radius = SB_COUNT_H * 0.5;
         r_msg_main_raw(label, r_sel("setCornerRadius:"), &radius, 8,
                        NULL, 0, NULL, 0, NULL, 0);
+
+        // Font size, once, at creation, for the reason above. CALayer has no
+        // default that matches the pill, and there is no UIFont to setFont: on
+        // a layer anyway, so fontSize is the only handle.
+        double fsz = SB_COUNT_FONT_SIZE;
+        r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
+                       NULL, 0, NULL, 0, NULL, 0);
     }
 
     // Size first, while the transform is still identity, so setFrame: means what
@@ -1043,8 +1059,17 @@ static void sb_make_count_label(uint64_t container) {
     double bBack[4] = { -1.0, -1.0, -1.0, -1.0 };
     const bool bOK = r_msg2_main_struct_ret(label, "bounds", bBack, sizeof(bBack),
                                             NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-    NSLog(@"[SB-LABEL] counter label=0x%llx created bounds=%.1f,%.1f %.1fx%.1f ok=%d",
-          label, bBack[0], bBack[1], bBack[2], bBack[3], (int)bOK);
+    // fontSize is read back for the same reason. Every property above is a
+    // setter whose success is assumed, and a CATextLayer with a colour and a
+    // background but no font is exactly the shape of a label that draws a pill
+    // with nothing in it. Reading it turns that from a suspicion into a fact.
+    double fszBack = -1.0;
+    const bool fOK = r_msg2_main_struct_ret(label, "fontSize", &fszBack, sizeof(fszBack),
+                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    NSLog(@"[SB-LABEL] counter label=0x%llx created bounds=%.1f,%.1f %.1fx%.1f ok=%d "
+          @"fontSize=%.1f ok=%d attached=%d",
+          label, bBack[0], bBack[1], bBack[2], bBack[3], (int)bOK,
+          fszBack, (int)fOK, (int)r_is_objc_ptr(containerLayer));
 
     g_sbCountLabel = label;
 }
