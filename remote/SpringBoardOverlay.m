@@ -2084,15 +2084,19 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             remote_call_slowest_call(&ipcSlowMax, &ipcSlowCount, &ipcSlowTid);
             uint64_t ipcW1 = 0, ipcW2 = 0, ipcW1TO = 0, ipcW2TO = 0;
             uint64_t ipcW1Max = 0, ipcW2Max = 0;
+            uint64_t ipcW2Pc = 0, ipcW2Lr = 0, ipcW2Entry = 0;
+            int ipcW2Readable = 0;
             remote_call_wait_split_diag(&ipcW1, &ipcW2, &ipcW1TO, &ipcW2TO,
-                                        &ipcW1Max, &ipcW2Max);
+                                        &ipcW1Max, &ipcW2Max,
+                                        &ipcW2Pc, &ipcW2Lr, &ipcW2Entry,
+                                        &ipcW2Readable);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
                   @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms "
                   @"ipc onmain=%llu calls=%llu holdmax=%llums holdtot=%llums "
                   @"waitmax=%llums waitslow=%llu ht=%u wt=%u "
                   @"slow=%s %llums x%llu tid=%u "
-                  @"w1=%llums/%lluTO w2=%llums/%lluTO",
+                  @"w1=%llums/%lluTO w2=%llums/%lluTO w2pc=%@",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2122,7 +2126,12 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   (unsigned long long)(ipcW1 / 1000ULL),
                   (unsigned long long)ipcW1TO,
                   (unsigned long long)(ipcW2 / 1000ULL),
-                  (unsigned long long)ipcW2TO);
+                  (unsigned long long)ipcW2TO,
+                  ipcW2Readable
+                      ? [NSString stringWithFormat:@"0x%llx/entry0x%llx",
+                           (unsigned long long)ipcW2Pc,
+                           (unsigned long long)ipcW2Entry]
+                      : @"(unreadable)");
         }
     }
 

@@ -113,6 +113,7 @@ typedef struct RemoteCallState {
     arm_thread_state64_internal originalState;
     uint64_t vmMap;
     uint64_t callThreadAddr;
+    uint64_t callThreadPort;
     uint64_t trojanThreadAddr;
     uint64_t mainThreadAddr;
     int pid;
@@ -170,6 +171,11 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_originalState         (remote_call_current_state()->originalState)
 #define g_RC_vmMap                 (remote_call_current_state()->vmMap)
 #define g_RC_callThreadAddr        (remote_call_current_state()->callThreadAddr)
+// The mach port of the same synthetic thread. Kept because a wait2 timeout
+// means that thread took the call and never came back, and the only way to
+// tell "stuck inside the function" from "finished, trap lost" is to read where
+// its PC is after the fact.
+#define g_RC_callThreadPort        (remote_call_current_state()->callThreadPort)
 #define g_RC_trojanThreadAddr      (remote_call_current_state()->trojanThreadAddr)
 #define g_RC_mainThreadAddr        (remote_call_current_state()->mainThreadAddr)
 #define g_RC_pid                   (remote_call_current_state()->pid)
@@ -358,10 +364,16 @@ static uint64_t g_rcWait1TO = 0;
 static uint64_t g_rcWait2TO = 0;
 static uint64_t g_rcWait1MaxUS = 0;
 static uint64_t g_rcWait2MaxUS = 0;
+static uint64_t g_rcW2TOPc = 0;
+static uint64_t g_rcW2TOLr = 0;
+static uint64_t g_rcW2TOEntry = 0;
+static int g_rcW2TOReadable = 0;
 
 void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  uint64_t *wait1TO, uint64_t *wait2TO,
-                                 uint64_t *wait1MaxUS, uint64_t *wait2MaxUS)
+                                 uint64_t *wait1MaxUS, uint64_t *wait2MaxUS,
+                                 uint64_t *w2toPc, uint64_t *w2toLr,
+                                 uint64_t *w2toEntry, int *w2toReadable)
 {
     if (wait1US)    *wait1US = g_rcWait1US;
     if (wait2US)    *wait2US = g_rcWait2US;
@@ -369,6 +381,10 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
     if (wait2TO)    *wait2TO = g_rcWait2TO;
     if (wait1MaxUS) *wait1MaxUS = g_rcWait1MaxUS;
     if (wait2MaxUS) *wait2MaxUS = g_rcWait2MaxUS;
+    if (w2toPc)     *w2toPc = g_rcW2TOPc;
+    if (w2toLr)     *w2toLr = g_rcW2TOLr;
+    if (w2toEntry)  *w2toEntry = g_rcW2TOEntry;
+    if (w2toReadable) *w2toReadable = g_rcW2TOReadable;
 }
 
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
@@ -1526,6 +1542,41 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");
+        // Where is the thread? A wait2 timeout means it took the call and did
+        // not come back, and "did not come back" has two causes that need
+        // opposite fixes. PC still inside the function means it blocked in
+        // there, on a lock or on a queue the main thread has to drain. PC back
+        // at FAKE_LR_TROJAN means it ran to completion and the trap that should
+        // have come back to us was lost, which is a broken port, not a slow
+        // function. pcAddr is the entry we asked it to run.
+        {
+            arm_thread_state64_internal st;
+            memset(&st, 0, sizeof(st));
+            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            kern_return_t kr = thread_get_state((mach_port_t)g_RC_callThreadPort,
+                                                ARM_THREAD_STATE64,
+                                                (thread_state_t)&st, &cnt);
+            if (kr != KERN_SUCCESS) {
+                NSLog(@"[RC-W2TO] %s: thread_get_state failed kr=0x%x port=0x%x",
+                      name ?: "?", (unsigned)kr, (unsigned)g_RC_callThreadPort);
+            } else {
+                const uint64_t pc = native_strip(st.__pc);
+                const uint64_t lr = native_strip(st.__lr);
+                const uint64_t sp = native_strip(st.__sp);
+                g_rcW2TOPc = pc;
+                g_rcW2TOLr = lr;
+                g_rcW2TOEntry = pcAddr;
+                g_rcW2TOReadable = 1;
+                NSLog(@"[RC-W2TO] %s: stuck PC=0x%llx LR=0x%llx SP=0x%llx entry=0x%llx fakeLR=0x%llx "
+                      @"verdict=%@",
+                      name ?: "?", (unsigned long long)pc, (unsigned long long)lr,
+                      (unsigned long long)sp, (unsigned long long)pcAddr,
+                      (unsigned long long)FAKE_LR_TROJAN,
+                      (pc == (uint64_t)FAKE_LR_TROJAN) ? @"returned-but-trap-lost"
+                                                       : (pc == pcAddr ? @"never-entered"
+                                                                       : @"blocked-inside"));
+            }
+        }
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
         // abandon/reinit. Leaving success=false prevents further publishes.
         g_RC_success = false;
@@ -2689,6 +2740,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         RC_DIAG("parked thread[1] at 0x301 via TRO-swap set_state (no port)");
     }
     (void)parkedViaGuard;
+    // Kept so a wait2 timeout can read where the thread's PC actually is.
+    // Without the port there is no way to tell a thread stuck inside the
+    // function from one that finished and whose trap was lost.
+    g_RC_callThreadPort = callThreadPort;
 
     RC_DIAG("Calling restore_trojan_thread...");
     if (!restore_trojan_thread(&g_RC_originalState)) {
