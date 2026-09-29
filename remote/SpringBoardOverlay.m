@@ -542,6 +542,7 @@ static uint64_t g_sbCountAlignStr = 0;
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
+static int      g_sbCountProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -680,6 +681,35 @@ static uint64_t sb_count_label_text(const char *utf8) {
         // been guessed at.
         NSLog(@"[SB-LABEL] counter first text after %llums (born->draw)",
               (unsigned long long)((g_sbCountFirstTextUS - g_sbCountBornUS) / 1000ULL));
+    }
+
+    // Read the label back, once, the first time it has text. bounds, fontSize
+    // and attached were all confirmed ok and the number still does not appear,
+    // so the remaining candidates are the ones those three cannot see: whether
+    // the string actually took, whether the layer is hidden, and whether it is
+    // where it thinks it is. Each is a property read straight out of
+    // SpringBoard's own CALayer, the same way lineWidth, bounds and fontSize
+    // were verified, so this is four more measured facts instead of four more
+    // guesses. Minus one is the sentinel for a read that did not happen.
+    if (!g_sbCountProbed) {
+        g_sbCountProbed = 1;
+        uint64_t strp = r_msg2_main(g_sbCountLabel, "string", 0, 0, 0, 0);
+        uint64_t sup  = r_msg2_main(g_sbCountLabel, "superlayer", 0, 0, 0, 0);
+        double f4[4] = { -1.0, -1.0, -1.0, -1.0 };
+        double p2[2] = { -1.0, -1.0 };
+        double hid = -1.0;
+        const bool fOK = r_msg2_main_struct_ret(g_sbCountLabel, "frame", f4, sizeof(f4),
+                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        const bool pOK = r_msg2_main_struct_ret(g_sbCountLabel, "position", p2, sizeof(p2),
+                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        const bool hOK = r_msg2_main_struct_ret(g_sbCountLabel, "hidden", &hid, sizeof(hid),
+                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        NSLog(@"[SB-CNT] str=0x%llx hidden=%.0f/%d frame=%.1f,%.1f %.1fx%.1f/%d "
+              @"pos=%.1f,%.1f/%d super=0x%llx text=%s",
+              (unsigned long long)strp, hid, (int)hOK,
+              f4[0], f4[1], f4[2], f4[3], (int)fOK,
+              p2[0], p2[1], (int)pOK,
+              (unsigned long long)sup, utf8);
     }
 
     strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
@@ -1388,6 +1418,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFirstTextUS = 0;
+    g_sbCountProbed = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
