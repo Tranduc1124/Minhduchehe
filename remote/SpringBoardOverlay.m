@@ -542,10 +542,6 @@ static uint64_t g_sbCountAlignStr = 0;
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
-// The CTFontRef the counter draws with, and whether CTFontCreateWithName has
-// been tried yet, so a target without it is not asked on every session.
-static uint64_t g_sbCountFont = 0;
-static int      g_sbCountFontTried = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -672,15 +668,6 @@ static uint64_t sb_make_nsstring(const char *utf8) {
 
 static BOOL sb_cached_invocation(uint64_t label, const char *selName,
                                  uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
-
-// A CFStringRef for the font name, held in the target for the session. CTFont's
-// name parameter is a CFStringRef and a bare char pointer would be read as one,
-// so it has to be a real string. Built the same way as every other string here.
-static uint64_t sb_ctfont_name(void) {
-    static uint64_t name = 0;
-    if (!r_is_objc_ptr(name)) name = sb_make_nsstring("Helvetica-Bold");
-    return name;
-}
 
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
@@ -1176,24 +1163,23 @@ static void sb_make_count_label(uint64_t container) {
         // fontSize alone is not a font. CALayer has a font property that is nil
         // by default, and a CATextLayer with a size and no font has nothing to
         // rasterise the glyphs with. The UILabel this replaced was handed
-        // setFont: with a real UIFont, and the migration carried the size across
-        // and dropped the font, which is the same shape as the alignment mode
-        // that was crashing SpringBoard: an argument that belonged to the old
-        // class.
+        // Font size only. Deliberately no setFont:.
         //
-        // CALayer wants a CTFontRef, not a UIFont, so it is made through
-        // CTFontCreateWithName rather than handed UIFont's result. Held for the
-        // session, like the label itself, and never released, because the layer
-        // keeps a reference to it for as long as it draws.
-        if (!g_sbCountFont && !g_sbCountFontTried) {
-            g_sbCountFontTried = 1;
-            double fsz = SB_COUNT_FONT_SIZE;
-            g_sbCountFont = dlsym_remote("CTFontCreateWithName",
-                                        sb_ctfont_name(), (uint64_t)(uintptr_t)&fsz, 0,
-                                        0, 0, 0, 0, 0);
-        }
-        if (r_is_objc_ptr(g_sbCountFont)) r_msg2_main(label, "setFont:", g_sbCountFont, 0, 0, 0);
-
+        // There was a CTFontCreateWithName here and it killed SpringBoard.
+        // CTFontCreateWithName takes its size as a double by value, and it was
+        // being handed the address of a double in this process's own stack, so
+        // CoreText read eight bytes of our frame as a font size and built a
+        // malformed font. The device log shows both halves of it: a thread of
+        // ours inside CTFontCreateWithName called from thread_start, and then
+        // SpringBoard's main thread dying in -[CATextLayer _createStringDict] at
+        // objc_opt_isKindOfClass with OBJC_CLASS_$_NSFont in x1 and x2, which is
+        // a pointer authentication trap on the font it had just been handed.
+        //
+        // fontSize alone is what the layer had before, and it was enough: the
+        // same crash log shows the counter reaching drawInContext: and
+        // CABackingStoreUpdate_ on com.apple.main-thread, which is a layer on
+        // screen building its string dictionary. The text path was working. This
+        // was an argument that belonged to no API at all.
         double fsz = SB_COUNT_FONT_SIZE;
         r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
                        NULL, 0, NULL, 0, NULL, 0);
@@ -1507,8 +1493,6 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFirstTextUS = 0;
-    g_sbCountFont = 0;
-    g_sbCountFontTried = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
