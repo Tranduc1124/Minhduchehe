@@ -623,6 +623,15 @@ static BOOL sb_cached_pos_invocation(void) {
     return YES;
 }
 
+// The counter's own cached invocations, built on first use and kept for the
+// life of the session. Same shape as the pooled labels', and for the same
+// reason: see the note at sb_count_label_text.
+static uint64_t g_sbCountTextInv = 0, g_sbCountTextBuf = 0;
+static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
+
+static BOOL sb_cached_invocation(uint64_t label, const char *selName,
+                                 uint64_t *invOut, uint64_t *bufOut, size_t bufSize);
+
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
@@ -656,19 +665,30 @@ static uint64_t sb_count_label_text(const char *utf8) {
 
     uint64_t calls = 4;   // malloc, memcpy, alloc, initWithUTF8String
     // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
-    // view setters do not exist on it. The selector change is the whole of the
-    // difference between this working and the label silently never appearing.
+    // view setters do not exist on it.
     //
-    // Wait, do not queue. This is the only place the counter's text is set, and
-    // the NSString handed to setString: is released on the next line. With
-    // waitUntilDone:NO the target's main thread runs the setter whenever it
-    // gets to it, which is after the release, so the layer was being handed a
-    // freed CFString and drew an empty pill: the card arrived and the number
-    // never did. performSelectorOnMainThread does not retain the object it is
-    // given. Waiting costs one main thread turn, and only when the count itself
-    // changed, since the identical-text check above has already returned.
-    r_perform_main(g_sbCountLabel, r_sel("setString:"), ns, true);
-    calls++;
+    // Through a cached invocation, not r_perform_main.
+    //
+    // This file has already run this experiment. setText: and setHidden: were
+    // the last two label setters left on r_perform_main and they were the last
+    // two that misbehaved, and the note next to the pooled labels says so
+    // outright: everything known to work goes through a cached invocation. The
+    // counter kept r_perform_main, so it kept both faults.
+    //
+    // Waiting was tried here and did not fix it. waitUntilDone:YES is correct
+    // for the lifetime, and it removed the one case that could be a dangling
+    // CFString, but the readback after it came back with string holding
+    // 0xba3284a2d61cdcd5, which is not a user address at all: the setter was
+    // never landing on the layer. Cached invocation plus retainArguments is the
+    // path the pooled labels' setText: uses and the one this codebase records
+    // as working, so the counter uses it too.
+    if (sb_cached_invocation(g_sbCountLabel, "setString:",
+                             &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
+        remote_write64(g_sbCountTextBuf, ns);
+        r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
+        r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        calls += 3;
+    }
     dlsym_remote("CFRelease", ns, 0,0,0,0,0,0,0);
     calls++;
 
@@ -695,18 +715,19 @@ static uint64_t sb_count_label_text(const char *utf8) {
         g_sbCountProbed = 1;
         uint64_t strp = r_msg2_main(g_sbCountLabel, "string", 0, 0, 0, 0);
         uint64_t sup  = r_msg2_main(g_sbCountLabel, "superlayer", 0, 0, 0, 0);
+        // isHidden, not the hidden property. hidden is a BOOL, one byte, and
+        // asking for eight of it fails, which is why the last readback printed
+        // hidden=-1/0. The method returns it in the register instead.
+        uint64_t hid = (uint64_t)r_msg2_main(g_sbCountLabel, "isHidden", 0, 0, 0, 0);
         double f4[4] = { -1.0, -1.0, -1.0, -1.0 };
         double p2[2] = { -1.0, -1.0 };
-        double hid = -1.0;
         const bool fOK = r_msg2_main_struct_ret(g_sbCountLabel, "frame", f4, sizeof(f4),
                                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         const bool pOK = r_msg2_main_struct_ret(g_sbCountLabel, "position", p2, sizeof(p2),
                                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-        const bool hOK = r_msg2_main_struct_ret(g_sbCountLabel, "hidden", &hid, sizeof(hid),
-                                                NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-        NSLog(@"[SB-CNT] str=0x%llx hidden=%.0f/%d frame=%.1f,%.1f %.1fx%.1f/%d "
+        NSLog(@"[SB-CNT] str=0x%llx hidden=%llu frame=%.1f,%.1f %.1fx%.1f/%d "
               @"pos=%.1f,%.1f/%d super=0x%llx text=%s",
-              (unsigned long long)strp, hid, (int)hOK,
+              (unsigned long long)strp, (unsigned long long)hid,
               f4[0], f4[1], f4[2], f4[3], (int)fOK,
               p2[0], p2[1], (int)pOK,
               (unsigned long long)sup, utf8);
@@ -721,8 +742,15 @@ static uint64_t sb_count_label_hide(int hidden) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
     if (g_sbCountShown == !hidden) return 0;
     g_sbCountShown = !hidden;
-    r_perform_main(g_sbCountLabel, r_sel("setHidden:"), (hidden ? 1 : 0), false);
-    return 1;
+    // Cached invocation too, for the same reason as setString: above.
+    if (sb_cached_invocation(g_sbCountLabel, "setHidden:",
+                             &g_sbCountHideInv, &g_sbCountHideBuf, 8)) {
+        remote_write64(g_sbCountHideBuf, hidden ? 1 : 0);
+        r_msg2(g_sbCountHideInv, "setArgument:atIndex:", g_sbCountHideBuf, 2, 0, 0);
+        r_msg(g_sbCountHideInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        return 4;
+    }
+    return 0;
 }
 
 // A pooled label, for the per-pawn name and distance text.
@@ -1414,6 +1442,10 @@ static void sb_forget_local_paint_state(void) {
     // exists and reading them would be a use after free.
     g_sbCountPosInv = 0;
     g_sbCountPosBuf = 0;
+    g_sbCountTextInv = 0;
+    g_sbCountTextBuf = 0;
+    g_sbCountHideInv = 0;
+    g_sbCountHideBuf = 0;
     g_sbCountLabel = 0;
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
