@@ -4279,27 +4279,47 @@ static inline uint64_t ESPPhaseNowUS(void) {
             if (trDisp.bodyLenHold > 0) trDisp.bodyLenHold--;
 
             const bool haveStableBL = (trDisp.bodyLen >= 0.45f && trDisp.bodyLen <= 1.25f);
-            if (bodyLen < 0.28f || bodyLen > 2.6f || dy < 0.15f || dy > 1.35f) {
-                if (haveStableBL) {
-                    espHipPos = headBonePos;
-                    espHipPos.y -= trDisp.bodyLen;
-                } else {
-                    espHipPos = headBonePos;
-                    espHipPos.y -= treatAsVehicle ? 1.05f : 0.85f;
-                }
-            } else if (haveStableBL) {
+
+            // A knocked or prone pawn is short, and that is correct, not broken.
+            //
+            // This block used to run unconditionally, so a downed enemy whose
+            // head-to-hip dy is under 0.15 tripped the guard and had a hip
+            // synthesised for it: the head, minus a learned 0.45-1.25 m body
+            // length, or minus a flat 0.85. A prone enemy is roughly that short,
+            // so the synthesised hip landed at or below ground level, and the
+            // learned bodyLen was then refreshed from a pair that was not a body.
+            // The box grew a phantom torso and the aim inherited the result,
+            // which is the report: the crosshair climbs well above a downed
+            // enemy and the box around one is wrong.
+            //
+            // Only rebuild the column when the pawn is actually upright. dy is
+            // measured against the smoothed head, and a mounted or vehicle pawn
+            // is upright by definition, so both are exempt. Collapsed-while-
+            // upright is what markGhostDead and the bodyCollapsed check above
+            // exist to catch, and a leaning or mid-animation pose passes through
+            // untouched.
+            const bool upright = isKnocked || treatAsVehicle || (dy >= 0.15f);
+            if (haveStableBL && !upright) {
                 float want = trDisp.bodyLen;
                 float cur  = bodyLen;
                 if (fabsf(cur - want) > 0.22f) {
                     espHipPos = headBonePos;
                     espHipPos.y -= want;
                 }
+            } else if (!haveStableBL && !upright) {
+                if (bodyLen < 0.28f || bodyLen > 2.6f || dy < 0.15f || dy > 1.35f) {
+                    espHipPos = headBonePos;
+                    espHipPos.y -= treatAsVehicle ? 1.05f : 0.85f;
+                }
             }
         }
 
         // Always use real local↔enemy distance when we have a local world anchor.
+        // Measured against the raw anchor, so the range cull cannot be moved by
+        // the display smoother either.
         float tempDisForAim = useLocalDistance
-            ? Vector3::Distance(myLocation, headBonePos)
+            ? Vector3::Distance(myLocation, looksLikeWorldPos(liveHead) ? liveHead
+                                                                        : (looksLikeWorldPos(liveHip) ? liveHip : headBonePos))
             : 0.0f;
         // On vehicle distance can be noisy; only skip clearly insane ranges.
         // Min-distance cull skipped for vehicle/collapsed (passenger next to you).
