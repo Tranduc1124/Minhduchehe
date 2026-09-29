@@ -643,7 +643,50 @@ static uint64_t g_sbCountTextInv = 0, g_sbCountTextBuf = 0;
 static uint64_t g_sbCountTextNS = 0;
 static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
 
+
+
+
 // A CGFloat as the sixty four bits the target will read back out of the register.
+//
+// Read this before adding a call to sb_make_count_label. There are three
+// transports and they are not interchangeable, and picking the wrong one either
+// aborts SpringBoard or silently does nothing.
+//
+//   r_msg2_main  the selector runs on the target's MAIN thread. Correct for every
+//                setter on a CALayer or a view. Costs an NSInvocation per call and
+//                a blocking waitUntilDone:YES.
+//
+//   r_msg2       the selector runs on the synthetic CALL thread, in a register,
+//                with no buffer in the target at all. Its return value is the only
+//                one in this file that can be trusted: r_msg_main_raw stages the
+//                result in a malloc'd buffer inside the target and reads it back
+//                through the vm_map_entry hijack, which has been caught returning
+//                the same constant no matter what was written.
+//
+//                Use it for pure accessors: class, alloc, init, layer, -CGColor,
+//                +whiteColor, and reading a property back. Never for a setter.
+//                Every CALayer setter goes through CA::Layer::begin_change, which
+//                opens a transaction, and CoreAnimation asserts on that off the
+//                main thread. The device log names it exactly:
+//
+//                  CoreAnimation: CA_ASSERT_MAIN_THREAD_TRANSACTIONS is set and an
+//                  implicit transaction wasn't created on a main thread.
+//                  -[CALayer setContentsScale:] <- CA::Layer::begin_change <-
+//                  CA::Transaction::ensure_implicit <- abort
+//
+//                SpringBoard died six times in a row on that.
+//
+//   r_msg_main_raw  the selector runs on the main thread, and a struct argument is
+//                staged as its real bytes, so a CGFloat arrives as a CGFloat. This
+//                is the only correct way to pass a double, because r_msg2_main
+//                takes uint64_t and sends the integer part: a contents scale of 3.0
+//                went across as the integer 3 and the target read 4.2e-45.
+//
+// So: setters with a double go through r_msg_main_raw, setters with an object go
+// through r_msg2_main, and r_msg2 is only ever a getter.
+//
+// A double as the sixty four bits the caller wants in a register is
+// sb_fbits below, for the cases where the selector is an accessor taking a scalar.
 //
 // r_msg2 is a plain objc_msgSend: the argument goes in a register and the result
 // comes back in one. A double is just eight bytes, so passing its bit pattern is
@@ -831,7 +874,7 @@ static uint64_t sb_count_label_text(const char *utf8) {
         // r_msg2_main rather than the raw form, because it is the same call the
         // working setters on this layer make and it takes an object argument
         // directly. Its return path is no longer the broken one.
-        r_msg2(g_sbCountLabel, "setString:", ns, 0, 0, 0);
+        r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
         calls++;
         path = "r_msg2_main";
     }
@@ -856,7 +899,7 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // CATextLayer is not a view, it rasterises into a backing store inside
     // drawInContext: from its own dirty flag, and asking for that draw on every
     // publish is what made the plate blink.
-    r_msg2(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
+    r_msg2_main(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
     calls++;
 
     // One string is held, not a ring of them. A new count replaces the old count,
@@ -1279,7 +1322,10 @@ static void sb_make_count_label(uint64_t container) {
     // exactly the shape of a layer that is fine and cannot draw.
     {
         double scale = [UIScreen mainScreen].scale;
-        if (scale > 0.5) r_msg2(label, "setContentsScale:", sb_fbits(scale), 0, 0, 0);
+        if (scale > 0.5) {
+            r_msg_main_raw(label, r_sel("setContentsScale:"), &scale, sizeof(scale),
+                           NULL, 0, NULL, 0, NULL, 0);
+        }
     }
 
     uint64_t UIColor = r_class("UIColor");
@@ -1304,7 +1350,7 @@ static void sb_make_count_label(uint64_t container) {
         // the colour is not the reason.
         uint64_t white = r_msg2(UIColor, "whiteColor", 0, 0, 0, 0);
         uint64_t whiteCG = r_is_objc_ptr(white) ? r_msg2(white, "CGColor", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(whiteCG)) r_msg2(label, "setForegroundColor:", whiteCG, 0, 0, 0);
+        if (r_is_objc_ptr(whiteCG)) r_msg2_main(label, "setForegroundColor:", whiteCG, 0, 0, 0);
 
         // Above its siblings, which it was not.
     //
@@ -1316,7 +1362,9 @@ static void sb_make_count_label(uint64_t container) {
     // 200 puts it clear of both, and it is set before addSublayer: so the layer
     // is never presented even once underneath.
     {
-        r_msg2(label, "setZPosition:", sb_fbits(200.0), 0, 0, 0);
+        double z = 200.0;
+        r_msg_main_raw(label, r_sel("setZPosition:"), &z, sizeof(z),
+                       NULL, 0, NULL, 0, NULL, 0);
     }
 
     // A black plate behind the number.
@@ -1344,9 +1392,11 @@ static void sb_make_count_label(uint64_t container) {
                                               sb_fbits(0.0), sb_fbits(0.9));
             const uint64_t plateCG = r_is_objc_ptr(plateColor)
                                    ? r_msg2(plateColor, "CGColor", 0, 0, 0, 0) : 0;
-            if (r_is_objc_ptr(plateCG)) r_msg2(label, "setBackgroundColor:", plateCG, 0, 0, 0);
+            if (r_is_objc_ptr(plateCG)) r_msg2_main(label, "setBackgroundColor:", plateCG, 0, 0, 0);
 
-            r_msg2(label, "setCornerRadius:", sb_fbits(SB_COUNT_H * 0.5), 0, 0, 0);
+            double plateRadius = SB_COUNT_H * 0.5;
+            r_msg_main_raw(label, r_sel("setCornerRadius:"), &plateRadius, sizeof(plateRadius),
+                           NULL, 0, NULL, 0, NULL, 0);
         }
 
         // Font size, and then a font, below. Two things were wrong here for most
@@ -1381,7 +1431,8 @@ static void sb_make_count_label(uint64_t container) {
         // -[CATextLayer _createStringDict]. A name string carries no bare double,
         // so that whole class of mistake cannot happen.
         const double fsz = SB_COUNT_FONT_SIZE;
-        r_msg2(label, "setFontSize:", sb_fbits(fsz), 0, 0, 0);
+        r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, sizeof(fsz),
+                       NULL, 0, NULL, 0, NULL, 0);
         if (!r_is_objc_ptr(g_sbCountFont)) {
             g_sbCountFont = sb_make_nsstring(SB_COUNT_FONT_NAME);
         }
