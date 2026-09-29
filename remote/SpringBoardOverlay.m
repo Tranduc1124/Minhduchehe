@@ -1996,6 +1996,24 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
     }
     if (!espView) return;
 
+    // A stuck busy flag is the one failure that is silent and permanent: no
+    // publish runs, no error is raised, the session keeps reporting healthy, and
+    // the overlay keeps showing whatever was on screen when it wedged. That is
+    // exactly what the identical frame cache did for a while, by returning after
+    // the flag was taken, and nothing in the counters said so directly: skip was
+    // climbing, phase was 0, and reading those two together was the only thing
+    // that identified it. This states it outright instead.
+    if (__sync_fetch_and_add(&s_remoteBusy, 0) != 0 && g_sbPublishPhase == 0) {
+        static uint64_t s_stuckAt = 0;
+        const uint64_t nowStuck = now_us();
+        if (nowStuck > s_stuckAt) {
+            s_stuckAt = nowStuck + 2000000ULL;   // 2s
+            NSLog(@"[PUSH-STUCK] busy flag held with phase=0 — no publish is running; "
+                  @"skipBusy=%llu. Every frame is being dropped and the screen is stale.",
+                  (unsigned long long)g_sbSkipBusy);
+        }
+    }
+
     // Unconditional 1 Hz state dump. Every other [SB-PUSH] line sits inside the
     // success path, so a publish loop that never completes logs nothing at all
     // and the overlay state becomes invisible. That is exactly what happened:
@@ -2125,6 +2143,30 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         return;
     }
 
+    // Identical to the frame already on screen, so the screen is already right.
+    //
+    // This has to run BEFORE s_remoteBusy is taken, and that ordering is the
+    // whole point of this block. It was originally placed after the take, and a
+    // return from there left the flag held with no publish behind it, so every
+    // later frame was dropped as a busy collision and the overlay froze on a
+    // still image for the rest of the session while the session itself kept
+    // reporting on=1 ok=1 fail=0. The symptom looked exactly like a remote call
+    // that never returned, and the phase counter added to tell those apart read
+    // ph=0, which is what finally showed the block had never been entered.
+    //
+    // g_sbNextPublishUS is set before the return so that a skipped frame still
+    // costs one interval, rather than turning into a tight retry loop.
+    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+    NSData *frameBytes = [ops copy];
+    const uint64_t frameHash = sb_frame_hash(frameBytes.bytes, frameBytes.length);
+    if (g_sbHaveLastHash && frameHash == g_sbLastFrameHash) {
+        g_sbIdenticalFrames++;
+        g_sbSummarySkips++;
+        return;
+    }
+    g_sbLastFrameHash = frameHash;
+    g_sbHaveLastHash = 1;
+
     // s_remoteBusy is declared at the top of this function, because the rearm
     // block above takes the same flag. One flag, two paths, and a rebuild can
     // never run while a publish is in flight.
@@ -2141,21 +2183,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         return;
     }
     const uint64_t tAcquire = now_us();
-
-    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
-    NSData *frameBytes = [ops copy];
-
-    // Identical to the frame already on screen, so the screen is already right.
-    // g_sbNextPublishUS is set above, so skipping here does not also skip the
-    // interval gate; this is a drop, not a stall.
-    const uint64_t frameHash = sb_frame_hash(frameBytes.bytes, frameBytes.length);
-    if (g_sbHaveLastHash && frameHash == g_sbLastFrameHash) {
-        g_sbIdenticalFrames++;
-        g_sbSummarySkips++;
-        return;
-    }
-    g_sbLastFrameHash = frameHash;
-    g_sbHaveLastHash = 1;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
