@@ -714,7 +714,19 @@ static uint64_t sb_count_label_place(double px, double py) {
 
 static uint64_t sb_count_label_text(const char *utf8) {
     if (!r_is_objc_ptr(g_sbCountLabel) || !utf8) return 0;
-    if (strcmp(g_sbCountLastText, utf8) == 0) return 0;
+    // Deliberately no unchanged-text check.
+    //
+    // This used to return early when the text matched g_sbCountLastText, which
+    // meant the string was written to the layer exactly once per distinct count
+    // and never again. If that one write did not land, there was no retry for the
+    // rest of the session and the number never appeared at all, with every other
+    // property on the layer reading back correct. The cost of always writing is
+    // one remote call on a frame that is already talking to the target, and it
+    // makes the whole thing self healing: whatever went wrong the first time is
+    // corrected on the next publish without anything having to diagnose it.
+    //
+    // The pooled labels keep their check. They are six, they are off by default,
+    // and their position changes every frame anyway.
 
     // Built without trusting initWithUTF8String:, which returns garbage here.
     // See sb_make_nsstring.
@@ -788,6 +800,23 @@ static uint64_t sb_count_label_text(const char *utf8) {
         calls++;
         path = "r_msg2_main";
     }
+
+    // setNeedsDisplay, and this is the CALayer specific half of the problem.
+    //
+    // A CATextLayer is not a view. It does not draw on setNeedsLayout like a view
+    // does; it draws by rasterising its string into a backing store inside
+    // drawInContext:, and it decides to do that from its own dirty flag. The
+    // device screenshot shows the consequence exactly: the background fills, so
+    // the layer is in the tree, above its siblings, the right size, the right
+    // place, and it has drawn. It has drawn without any glyphs, which is what a
+    // layer looks like when the string is not there when the draw happens.
+    //
+    // The layer is added and presented before any text exists, because the count
+    // only arrives with the first op 5 record. Whatever setString: did or did not
+    // do, the draw that is already on screen was a draw of an empty string. So
+    // the draw is asked for again explicitly, after the string is in place.
+    r_msg2_main(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
+    calls++;
 
     // One string is held, not a ring of them. A new count replaces the old count,
     // so releasing the previous one here covers every fire-and-forget setter
