@@ -61,6 +61,19 @@ int disable_excguard_kill(uint64_t task);
 // processes with the same name (e.g. system vs per-user cfprefsd) and we
 // need to target a specific one. Reset to 0 by init_remote_call.
 extern uint64_t g_RC_targetProcOverride;
+
+// ---------------------------------------------------------------------------
+// probe_remote_call_into: proof that the hijack works against a process other
+// than SpringBoard, on a second thread, with the live session untouched.
+//
+// Returns 0 when the session came up AND getpid returned a non-zero pid, which
+// is the only evidence that code ran in the target. Returns -1 on any failure,
+// having torn the probe session down first.
+//
+// It must be called on its own thread and it allocates its own RemoteCallState.
+// See the body for why that is not optional.
+int probe_remote_call_into(const char *process);
+
 int init_remote_call(const char* process, bool useMigFilterBypass);
 int init_remote_call_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
 int init_remote_call_original_thread_only_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);

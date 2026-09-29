@@ -2552,6 +2552,92 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// PROOF THAT THE HIJACK REACHES A PROCESS OTHER THAN SPRINGBOARD
+//
+// WHY THIS NEEDS ITS OWN STATE, AND NOT OPTIONALLY
+//
+// g_RC_defaultState is a plain static, not thread local, and
+// g_RC_currentState is a thread local pointer that falls back to it when null:
+//
+//     static RemoteCallState g_RC_defaultState = { ... };
+//     static __thread RemoteCallState *g_RC_currentState;
+//
+// So a thread that has never pushed a state silently shares the one struct the
+// live SpringBoard session is using. Running init_remote_call from such a thread
+// would overwrite taskAddr, the two exception ports, the trojan thread, the shmem
+// cache and g_RC_pid field by field while SpringBoard is mid call. That is not a
+// failed probe, it is a hard reset: the main thread ends up parked on an
+// exception port belonging to a session that no longer exists.
+//
+// remote_call_push_state is static in this file for exactly that reason, so the
+// probe has to live here rather than in a caller. A thread of its own plus a
+// state of its own is what makes two simultaneous sessions safe, and the second
+// session is the whole point: it is what lets a future overlay keep talking to
+// SpringBoard from one thread while another runs inside the game.
+//
+// WHAT IT DOES AND DOES NOT TOUCH
+//
+// It reads g_kexploit_ready, already true, and g_RC_targetProcOverride, which it
+// never sets because the process is named directly. Every field init_remote_call
+// writes is reached through the per state macros, so all of it lands in the
+// probe's own allocation. do_remote_call_stable takes g_universal_ipc_mutex, the
+// one lock genuinely shared with SpringBoard, so the two sessions serialise
+// against each other there rather than interleaving.
+//
+// It installs nothing, draws nothing, touches no aim, and never outlives the
+// call: the session is destroyed and the state freed before returning. If the
+// probe ever gets to draw an overlay, that code does not exist yet and this is
+// not it.
+// ---------------------------------------------------------------------------
+int probe_remote_call_into(const char *process)
+{
+    if (!process || !*process) return -1;
+
+    // Mirrors the initialisers on g_RC_defaultState, because a zeroed state
+    // would read as a broken one: success is what tells the call wrappers they
+    // may run at all, and the timeout floor is what stops a slow first
+    // exception from being mistaken for a dead target.
+    RemoteCallState *st = calloc(1, sizeof(*st));
+    if (!st) {
+        printf("[PROBE] calloc failed for '%s'\n", process);
+        return -1;
+    }
+    st->success = true;
+    st->stableExceptionTimeoutFloorMS = 10000;
+
+    RemoteCallState *prev = remote_call_push_state(st);
+
+    int rc = init_remote_call(process, false);
+    printf("[PROBE] init_remote_call('%s') -> %d (pid=%d success=%d)\n",
+           process, rc, g_RC_pid, (int)g_RC_success);
+
+    uint64_t observedPid = 0;
+    if (rc == 0) {
+        // getpid is the cheapest honest witness there is: it is a leaf C
+        // function in libsystem, so a non-zero result means the thread was
+        // parked, resumed, and returned a value through the whole path. No
+        // guesswork about whether the address was even reached.
+        observedPid = do_remote_call_stable(200, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
+        printf("[PROBE] getpid in '%s' -> %llu (session says pid=%d)\n",
+               process, (unsigned long long)observedPid, g_RC_pid);
+    }
+
+    // Teardown before the state goes away, or the target keeps a live exception
+    // port pointing at memory we are about to free. Same reason
+    // destroy_remote_call has to run while its state is still current.
+    destroy_remote_call_internal();
+
+    remote_call_pop_state(prev);
+    free(st);
+
+    const int ok = (rc == 0 && observedPid != 0) ? 0 : -1;
+    printf("[PROBE] verdict '%s': %s (init=%d getpid=%llu)\n",
+           process, ok == 0 ? "REACHED" : "NOT REACHED",
+           rc, (unsigned long long)observedPid);
+    return ok;
+}
+
 int init_remote_call_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS)
 {
     RemoteCallState *state = remote_call_current_state();
