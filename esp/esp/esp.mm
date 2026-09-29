@@ -1377,13 +1377,27 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     Vector3 head = liveHead;
     bool headOk = false;
     if (looksLikeWorldPos(liveHead)) {
-        Vector3 anchor = looksLikeWorldPos(hip) ? hip : root;
+        // A plausible head is a plausible head. It used to also have to agree
+        // with the hip: the anchor was the hip, and the head had to be within
+        // 6 m of it and above it by no more than -0.6. The hip is a skinned
+        // bone and it lags hard strafes, which this file says so more than
+        // once. So a live head plus a lagging hip reads as a disagreement, the
+        // head is thrown away, and the aim falls to root+0.85 or hip+0.55,
+        // which is a torso, not a skull. That is the reported "always off by
+        // one position, never the head", and it happens identically whether the
+        // enemy is standing or knocked because the fault is the hip, not the
+        // pose.
+        //
+        // The guard exists to reject a head that is nowhere near the body. Root
+        // is the authority for that, not the lagging bone, and a head within
+        // 4 m above the root and roughly level with it is a head.
+        Vector3 anchor = looksLikeWorldPos(root) ? root : hip;
         if (!looksLikeWorldPos(anchor)) {
             headOk = true;
         } else {
             float dx = liveHead.x - anchor.x, dy = liveHead.y - anchor.y, dz = liveHead.z - anchor.z;
-            float d2 = dx*dx + dy*dy + dz*dz;
-            if (d2 < 6.0f * 6.0f && liveHead.y >= anchor.y - 0.6f) headOk = true;
+            float dXZ2 = dx*dx + dz*dz;
+            if (dXZ2 < 4.0f * 4.0f && liveHead.y >= anchor.y - 0.6f) headOk = true;
         }
     }
     if (!headOk) {
@@ -2251,18 +2265,57 @@ extern "C" void ToggleSpeedX50(bool enable) {
 
 // Single clean write per call. Double-writes + multi-burst made the camera thrash
 // even when bullets (silent/fire-dir) were already accurate.
+// Which of the aim rotation fields to force. Default is all of them, which is
+// what the code has always done, so behaviour is unchanged unless you turn one
+// off. It is a mask rather than a set of ifdefs because the fastest way to find
+// which field the crosshair is actually rendered from is to turn one off and
+// look, and that needs a rebuild each time otherwise.
+//
+// The suspicion is 0x5C4. 0x5B4 and 0x5C4 are exactly 16 bytes apart, which is
+// one Quaternion, so they are two adjacent quaternion slots rather than two
+// independent fields, and a Unity shooter commonly keeps the camera rotation
+// next to the weapon rotation or next to its own interpolated crosshair rotation.
+// Forcing the same raw value into both makes the game interpolate against a
+// value that is already pinned, and the residual reads as a constant pitch
+// offset, which is what "aims at the sky" looks like. Clearing
+// SB_AIM_MASK_HARD_5C4 is the first thing to try.
+//
+// [SB-AIMOFF] prints the resolved offsets once per session so a device log says
+// what the offsets actually are on this build and version, rather than us
+// guessing which pair aliases.
+#define SB_AIM_MASK_PRIMARY     0x01
+#define SB_AIM_MASK_AUX         0x02
+#define SB_AIM_MASK_HARD_5B4    0x04
+#define SB_AIM_MASK_HARD_5C4    0x08
+#define SB_AIM_MASK_CURRENT     0x10
+#define SB_AIM_MASK_HARD_19A4   0x20
+#ifndef SB_AIM_WRITE_MASK
+#define SB_AIM_WRITE_MASK (SB_AIM_MASK_PRIMARY | SB_AIM_MASK_AUX | \
+                           SB_AIM_MASK_HARD_5B4 | SB_AIM_MASK_HARD_5C4 | \
+                           SB_AIM_MASK_CURRENT | SB_AIM_MASK_HARD_19A4)
+#endif
+
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
-    WriteAddr<Quaternion>(player + kAimRotation, out);
-    WriteAddr<Quaternion>(player + kAimRotationAux, out);
-    if (kAimRotation != 0x5B4) {
+    static int s_offsetLogged = 0;
+    if (!s_offsetLogged) {
+        s_offsetLogged = 1;
+        NSLog(@"[SB-AIMOFF] kAimRotation=0x%llx aux=0x%llx current=0x%llx hard5B4=0x5B4 hard5C4=0x5C4 hard19A4=0x19A4 mask=0x%x",
+              (unsigned long long)kAimRotation, (unsigned long long)kAimRotationAux,
+              (unsigned long long)kCurrentAimRotation, (unsigned)(SB_AIM_WRITE_MASK));
+    }
+    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_PRIMARY)
+        WriteAddr<Quaternion>(player + kAimRotation, out);
+    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_AUX)
+        WriteAddr<Quaternion>(player + kAimRotationAux, out);
+    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_5B4) && kAimRotation != 0x5B4)
         WriteAddr<Quaternion>(player + 0x5B4, out);
+    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_5C4) && kAimRotation != 0x5C4)
         WriteAddr<Quaternion>(player + 0x5C4, out);
-    }
-    WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
-    if (kCurrentAimRotation != 0x19A4) {
+    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_CURRENT)
+        WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
+    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_19A4) && kCurrentAimRotation != 0x19A4)
         WriteAddr<Quaternion>(player + 0x19A4, out);
-    }
 }
 
 void set_aim(uint64_t player, Quaternion rotation, float speed, int mode, bool forceInstant) {
@@ -4429,7 +4482,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         // Check Visible: Camera bit OR vehicle passenger — always draw people in cars.
         const bool mounted = treatAsVehicle;
-        bool espVisible = !isEspCheckVisible || isFPP || isCamVis || isKnocked || mounted;
+        // || isKnocked used to be here. A knocked pawn is on the ground, not
+        // exempt from being visible: the flag made every knocked pawn pass the
+        // check unconditionally, so a pawn whose bones had already stopped
+        // reading still produced a box and a snapline with nothing in it. Pose
+        // says nothing about whether the game is drawing the player. mounted is
+        // kept, because a vehicle is legitimately drawn through cover it blocks.
+        bool espVisible = !isEspCheckVisible || isFPP || isCamVis || mounted;
 
         // Phase-1: store world-space snapshot only. W2S + draw happen AFTER a fresh
         // view matrix sample so overlay tracks cam (no "stick then snap").
@@ -4702,16 +4761,44 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 const float dy = HeadPos.y - HipPos.y;
                 const float dxz = sqrtf((HeadPos.x - HipPos.x) * (HeadPos.x - HipPos.x) +
                                        (HeadPos.z - HipPos.z) * (HeadPos.z - HipPos.z));
-                const bool hipOk = bodyLen >= 0.30f && bodyLen <= 1.35f &&
-                                   dy >= 0.20f && dy <= 1.25f && dxz <= 0.85f;
-                if (!hipOk) {
+                // A body that is too SHORT is a downed enemy, not broken data.
+                //
+                // The guard used to reject on both sides, and the remedy for both
+                // sides was a standing-length constant. So a knocked pawn, whose
+                // head-to-hip dy is about a tenth of a metre, failed the dy floor,
+                // had its hip replaced with head minus 0.88, and then had its feet
+                // put a further 0.92 below that. The box came out 1.80 m tall
+                // around a body lying on the ground.
+                //
+                // Only an over-tall column is rebuilt now. Root, the network
+                // authority, is the rejector for dxz rather than the lagging hip,
+                // and it is the same shape of test the Pro path uses.
+                const bool hipTooTall  = (dy > 1.25f) || (bodyLen > 1.35f);
+                const bool hipTooShort = (dy < 0.20f) || (bodyLen < 0.30f);
+                if (hipTooTall || (hipTooShort && dxz > 0.85f)) {
                     HipPos = HeadPos;
                     HipPos.y -= s.treatAsVehicle ? 1.00f : 0.88f;
+                } else if (hipTooShort) {
+                    // Prone: keep it short, but keep head and hip apart so the box
+                    // has a floor and cannot invert above the player.
+                    HipPos.y -= fminf(0.45f, fmaxf(0.22f, dy > 0.0f ? dy : 0.22f));
                 }
             }
             // Synthetic feet under hip (world) — stable height, not swinging ankles.
+            //
+            // Measured from the hip, so a prone body keeps a prone foot instead of
+            // inheriting a full 0.92 stand under a hip that is barely below the
+            // head. This is the second half of the same 1.80 m box.
             Vector3 FootPos = HipPos;
-            FootPos.y -= s.treatAsVehicle ? 0.55f : 0.92f;
+            {
+                const float hipDrop = HeadPos.y - HipPos.y;
+                if (hipDrop < 0.55f && !s.treatAsVehicle) {
+                    // Prone: feet a little below the hip, never a full stride.
+                    FootPos.y -= fminf(0.40f, fmaxf(0.12f, hipDrop * 0.6f));
+                } else {
+                    FootPos.y -= s.treatAsVehicle ? 0.55f : 0.92f;
+                }
+            }
             HeadPos.y += 0.08f; // helmet pad in world, not screen inflate
             Vector3 w2sHead = WorldToScreenLayer(HeadPos, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
             Vector3 w2sHip = WorldToScreenLayer(HipPos, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
@@ -5335,15 +5422,24 @@ static inline uint64_t ESPPhaseNowUS(void) {
         Vector3 liveHeadCheck = getPositionExt(getHead(pawn));
         const bool hasLiveHead = looksLikeWorldPos(liveHeadCheck);
 
-        if (hasLiveHead && hp <= 0 && maxHp <= 0) {
-            hp = 200; maxHp = 200;
-        } else if (hasLiveHead && maxHp <= 0) {
-            maxHp = 200; if (hp <= 0) hp = 200;
-        }
-
-        // Dead / unreadable / garbage HP shell → drop lock (no ghost aim).
-        if (!hasLiveHead && (maxHp <= 0 || maxHp > 2000)) return false;
-        if (!hasLiveHead && (hp == 0 && maxHp == 0)) return false;
+        // This block used to promote a corpse:
+        //
+        //     if (hasLiveHead && hp <= 0 && maxHp <= 0) { hp = 200; maxHp = 200; }
+        //     else if (hasLiveHead && maxHp <= 0) { maxHp = 200; if (hp <= 0) hp = 200; }
+        //
+        // The identical block was already removed from the sticky re-eval a few
+        // hundred lines above and that removal was not propagated here. A knocked
+        // or killed pawn keeps its bones in the dict reading a valid position, so
+        // hasLiveHead is true, the 0/0 read was rewritten as a healthy 200, and
+        // every liveness test below then passed. This lambda gates the camera
+        // write at three call sites, so a corpse passed the gate and the camera
+        // parked on where the body was. knocked is computed on the line above and
+        // was never consulted by either branch.
+        //
+        // A live bone is not a live player. The HP fields decide.
+        const bool hpBad = (maxHp <= 0) || (maxHp > 2000) || (hp < 0) ||
+                           ((hp == 0 && maxHp == 0) && !knocked);
+        if (hpBad) return false;
         if (!hasLiveHead && (hp <= 0)) return false;
         if (hp > 2000 || (maxHp > 0 && hp > maxHp + 50)) return false;
         if (isAimIgnoreKnock && knocked) return false;
@@ -5585,7 +5681,17 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 // It is still computed, just after the live attempt, so the
                 // tracker is advanced once per frame and the fallback does not
                 // steal the live path's history.
-                Vector3 aimPoint = Vector3{0, 0, 0};
+                // aimPoint must hold the bone from here on. The FOV circle, the
+                // 180 test and the assist radius all project it, and they are
+                // evaluated BELOW, before AimLookAtHeadLive has written anything.
+                // It was initialised to {0,0,0} so the stateful tracker would only
+                // run on the fallback path, which left every one of those gates
+                // projecting the world origin instead of the enemy, and the origin
+                // is never inside the FOV circle. The gate is then force-enabled
+                // while firing or scoping, so it was inert exactly when the aim
+                // was live. lookBone is the bone the live path aims at, so the
+                // gates now test the same point the camera is about to get.
+                Vector3 aimPoint = lookBone;
                 bestHeadPos = lookBone;
                 s_lastAimPawn = bestTarget;
 

@@ -64,6 +64,7 @@ Vector3 WorldToScreenLayer(Vector3 obj, float *matrix, float vpW, float vpH, flo
 #define ESP_POS_MEMO_SLOTS 128
 static uint64_t g_posMemoTag = 0;
 static uint64_t g_posMemoKey[ESP_POS_MEMO_SLOTS];
+static uint64_t g_posMemoStamp[ESP_POS_MEMO_SLOTS];
 static Vector3 g_posMemoVal[ESP_POS_MEMO_SLOTS];
 
 // Hits and misses, printed once a second. The change above is only worth having
@@ -102,6 +103,15 @@ static inline bool esp_pos_memo_get(uint64_t key, Vector3 *out) {
     if (g_posMemoTag == 0) return false;              // no frame open yet
     const size_t slot = (size_t)(key >> 3) & (ESP_POS_MEMO_SLOTS - 1);
     if (g_posMemoKey[slot] != key) return false;
+    // The stamp is what makes this per-frame. Without it the cache is permanent:
+    // the key is a transform pointer, which is stable for the life of a pawn, so
+    // the first value ever walked for that pointer would be returned for the rest
+    // of the session. The counter that ESPFrameMemoBegin bumps is not consulted
+    // per entry, so nothing expired. That froze a bone at wherever it was the
+    // first time it was read, which is the same shape as the aim fault, and it
+    // also meant a failed walk cached its zero forever, so a bone that failed
+    // once never resolved again and the aim fell to the synthesised root or hip.
+    if (g_posMemoStamp[slot] != g_posMemoTag) return false;
     *out = g_posMemoVal[slot];
     g_posMemoHit++;
     return true;
@@ -111,6 +121,7 @@ static inline void esp_pos_memo_put(uint64_t key, Vector3 v) {
     if (g_posMemoTag == 0) return;
     const size_t slot = (size_t)(key >> 3) & (ESP_POS_MEMO_SLOTS - 1);
     g_posMemoKey[slot] = key;
+    g_posMemoStamp[slot] = g_posMemoTag;
     g_posMemoVal[slot] = v;
     g_posMemoMiss++;
 }
