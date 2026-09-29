@@ -122,6 +122,18 @@ static uint64_t g_sbSkipGate    = 0;   // arrived inside SB_MIN_PUBLISH_INTERVAL
 static uint64_t g_sbSkipMerge   = 0;   // mergePaths could not build a stream
 static uint64_t g_sbSkipBusy    = 0;   // a previous publish is still running
 
+// How far the in-flight publish got. The busy flag is taken before the block is
+// dispatched and released in its @finally, so a flag that is never released
+// means the block never finished, which means a remote call inside it is not
+// coming back. These remote calls wait for SpringBoard's main thread, so a main
+// thread that is stuck turns one publish into a permanent block and the overlay
+// into a still image with the session still reporting healthy. Which call it is
+// cannot be inferred from the counters around it, so the block says.
+//
+// 0 = none in flight, 1 = entered, 2 = geometry, 3 = labels,
+// 4 = flush and present, 5 = finished.
+static volatile int g_sbPublishPhase = 0;
+
 // Self-heal state for the overlay. A single transient remote-call failure used
 // to clear g_sbOverlayOn for the rest of the process lifetime, and nothing
 // re-armed it: boot_start_sb_overlay only retries at 3s, 5s, 8s and 12s. The
@@ -2001,7 +2013,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                                    ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
-                  @"S=%llu G=%llu M=%llu B=%llu next=%lldms since=%lldms",
+                  @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2013,6 +2025,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   (unsigned long long)g_sbSkipGate,
                   (unsigned long long)g_sbSkipMerge,
                   (unsigned long long)g_sbSkipBusy,
+                  g_sbPublishPhase,
                   (long long)(nextIn / 1000),
                   (long long)(sinceDraw / 1000));
         }
@@ -2146,6 +2159,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
+        g_sbPublishPhase = 1;
         @try {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
             if (!r_is_objc_ptr(g_sbShape)) return;
@@ -2334,6 +2348,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // a dlsym_remote for CGPathCreateMutable plus a CGPathRelease of the
             // path that aged out of the hold window.
             const uint64_t tGeomStart = now_us();
+            g_sbPublishPhase = 2;
             // Per call records start here, so they cover the geometry loop and
             // the two trailing batches and nothing before them.
             g_sbNpCount = 0;
@@ -2498,7 +2513,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                         // labels. The stream puts all of the op 5 records after
                         // the stroke geometry and before the op 6 cards, so this
                         // one read is the boundary for the whole group.
-                        if (tLabelStart == 0) tLabelStart = now_us();
+                        if (tLabelStart == 0) { tLabelStart = now_us(); g_sbPublishPhase = 3; }
                         // op 5, role, len, key(8), px, py, w, h, utf8[len]
                         if (i + 42 > len) { i = len; break; }
                         const uint8_t role = b[i++];
@@ -2843,6 +2858,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             if (txtSlot > g_sbLabelHigh) g_sbLabelHigh = txtSlot;
             // End of label.
             const uint64_t tFlushStart = now_us();
+            g_sbPublishPhase = 4;
 
             if (fillN > 0 && fillPath) {
                 remote_write(ptsBuf, fillDoubles, (size_t)fillN * 32);
@@ -3061,6 +3077,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // hold = how long the busy flag was held, which is the delay a
             // frame arriving right now would have to wait.
             g_sbHoldUS += now_us() - tAcquire;
+            g_sbPublishPhase = 0;
             __sync_lock_release(&s_remoteBusy);
         }
     });
