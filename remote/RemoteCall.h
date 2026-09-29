@@ -86,11 +86,9 @@ void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid);
 void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  uint64_t *wait1TO, uint64_t *wait2TO,
                                  uint64_t *wait1MaxUS, uint64_t *wait2MaxUS,
-                                 int *w2stray, uint64_t *w2strayPc,
-                                 uint32_t *w2strayFlavor, int *w2strayCode,
-                                 uint32_t *w2straySender, int *w2preStray,
-                                 uint64_t *w2prePc, uint64_t *w2preCount,
-                                 uint32_t *w1sender, uint64_t *w1pc);
+                                 int *w2stray, uint32_t *w1sender, uint64_t *w1pc,
+                                 uint64_t *borrowed, uint64_t *released,
+                                 uint64_t *kept);
 // Returns false when the state could not be signed. A false return means the
 // state was NOT modified with a signed pc/lr and must not be replied to the
 // target: replying an unsigned or zero pc hands the target's thread a jump to

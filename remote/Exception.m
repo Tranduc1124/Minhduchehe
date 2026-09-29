@@ -20,16 +20,6 @@
 #define EXCEPTION_MSG_SIZE              0x160
 #define EXCEPTION_REPLY_SIZE            0x13c
 
-// mach_msg_peek is a real kernel trap but the iOS SDK no longer declares it,
-// so it is declared here rather than pulled in. It is the only way to look at a
-// queued message without taking it off the port.
-extern kern_return_t mach_msg_peek(mach_port_t msgin,
-                                   mach_msg_header_t *msg,
-                                   mach_msg_size_t msgsize,
-                                   mach_msg_size_t *left,
-                                   mach_msg_timeout_t timeout,
-                                   mach_port_t notify);
-
 mach_port_t create_exception_port(void)
 {
     mach_port_options_t options = {
@@ -80,25 +70,16 @@ bool wait_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer, int 
     return true;
 }
 
-// Look at whatever is queued on a port without taking it.
+// There is deliberately no peek here.
 //
-// wait_exception removes the message. A Mach exception message IS the stopped
-// thread: taking it off the port and then not replying leaves that thread
-// stopped forever, still parked on the fault it took, holding whatever it was
-// holding. So anything that only wants to know whether a port has traffic must
-// peek. Using wait_exception to inspect would manufacture the exact freeze
-// being chased.
-bool peek_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer) {
-    if (!exceptionPort || !excBuffer)
-        return false;
-    memset(excBuffer, 0, sizeof(*excBuffer));
-    mach_msg_size_t left = 0;
-    kern_return_t kr = mach_msg_peek(exceptionPort, &excBuffer->Head,
-                                     (mach_msg_size_t)sizeof(*excBuffer), &left,
-                                     0, MACH_PORT_NULL);
-    return kr == KERN_SUCCESS;
-}
-
+// Inspecting a port without taking its message matters: a Mach exception
+// message IS the stopped thread, so dequeuing one and not replying leaves that
+// thread stopped for good. mach_msg_peek would be the right call and is not
+// exported by libSystem on iOS, so it does not link. Re-sending the message
+// after receiving it would work, but it trades a guaranteed-correct failure
+// mode for one where a failed re-send loses the message outright and strands the
+// thread, which is the thing being debugged. Not worth it on a diagnostic path.
+//
 bool exception_state_is_sane(ExceptionMessage *exc)
 {
     if (!exc)

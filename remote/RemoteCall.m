@@ -358,33 +358,27 @@ static uint64_t g_rcWait1TO = 0;
 static uint64_t g_rcWait2TO = 0;
 static uint64_t g_rcWait1MaxUS = 0;
 static uint64_t g_rcWait2MaxUS = 0;
-// 0 = no wait2 timeout yet, 1 = a message was found stranded on the first
-// port, 2 = both ports were empty.
+// 0 = no wait2 timeout yet, 1 = init released its borrowed threads,
+// 2 = it did not.
 static int g_rcW2Stray = 0;
-static uint64_t g_rcW2StrayPc = 0;
-static uint32_t g_rcW2StrayFlavor = 0;
-static int g_rcW2StrayCode = 0;
-static uint32_t g_rcW2StraySender = 0;
-// Snapshot of the first port taken before wait1, so a message found at wait2
-// timeout can be attributed to this call rather than to an earlier leftover.
-static int g_rcW2PreStray = 0;
-static uint64_t g_rcW2PrePc = 0;
-static uint32_t g_rcW2PreSender = 0;
-static uint64_t g_rcW2PreCount = 0;
-// Identity of the thread that was replied to. Compared against the sender of
-// whatever turns up on the first port, it is the only thing that says whether
-// the thread that took the call is the thread that faulted.
+// Identity of the thread that was replied to. Reported on a wait2 timeout so
+// the thread that took the work is named even though the one that faulted is
+// not reachable from here.
 static uint32_t g_rcW1Sender = 0;
 static uint64_t g_rcW1Pc = 0;
+// How many threads init borrowed, gave back, and kept as the call thread. The
+// release is the fix, so its result has to be visible: a timeout with
+// released=0 means the fix did not take rather than that something else broke.
+static uint64_t g_rcBorrowedTotal = 0;
+static uint64_t g_rcBorrowedReleased = 0;
+static uint64_t g_rcBorrowedKept = 0;
 
 void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
                                  uint64_t *wait1TO, uint64_t *wait2TO,
                                  uint64_t *wait1MaxUS, uint64_t *wait2MaxUS,
-                                 int *w2stray, uint64_t *w2strayPc,
-                                 uint32_t *w2strayFlavor, int *w2strayCode,
-                                 uint32_t *w2straySender, int *w2preStray,
-                                 uint64_t *w2prePc, uint64_t *w2preCount,
-                                 uint32_t *w1sender, uint64_t *w1pc)
+                                 int *w2stray, uint32_t *w1sender, uint64_t *w1pc,
+                                 uint64_t *borrowed, uint64_t *released,
+                                 uint64_t *kept)
 {
     if (wait1US)    *wait1US = g_rcWait1US;
     if (wait2US)    *wait2US = g_rcWait2US;
@@ -393,15 +387,11 @@ void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
     if (wait1MaxUS) *wait1MaxUS = g_rcWait1MaxUS;
     if (wait2MaxUS) *wait2MaxUS = g_rcWait2MaxUS;
     if (w2stray)    *w2stray = g_rcW2Stray;
-    if (w2strayPc)  *w2strayPc = g_rcW2StrayPc;
-    if (w2strayFlavor) *w2strayFlavor = g_rcW2StrayFlavor;
-    if (w2strayCode) *w2strayCode = g_rcW2StrayCode;
-    if (w2straySender) *w2straySender = g_rcW2StraySender;
-    if (w2preStray) *w2preStray = g_rcW2PreStray;
-    if (w2prePc)    *w2prePc = g_rcW2PrePc;
-    if (w2preCount) *w2preCount = g_rcW2PreCount;
     if (w1sender)   *w1sender = g_rcW1Sender;
     if (w1pc)       *w1pc = g_rcW1Pc;
+    if (borrowed)   *borrowed = g_rcBorrowedTotal;
+    if (released)   *released = g_rcBorrowedReleased;
+    if (kept)       *kept = g_rcBorrowedKept;
 }
 
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
@@ -1484,30 +1474,8 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
-    // Baseline for the first port. do_remote_call_temp waits on this port and,
-    // on timeout, walks away without taking the message with it, so a leftover
-    // can sit there for the rest of the session. Peeking before wait1 separates
-    // a leftover from a message that arrives during this call: comparing the
-    // sender and PC of what is found at wait2 timeout against this snapshot
-    // says whether it is the same message or a new one.
-    //
-    // Peek, not receive. The message is the stopped thread; dequeuing it
-    // without replying would strand that thread inside SpringBoard for good,
-    // which is the very freeze being diagnosed.
-    g_rcW2PreStray = 0;
-    g_rcW2PrePc = 0;
-    g_rcW2PreSender = 0;
     g_rcW1Sender = 0;
     g_rcW1Pc = 0;
-    {
-        ExceptionMessage pre;
-        if (peek_exception(g_RC_firstExceptionPort, &pre)) {
-            g_rcW2PreStray = 1;
-            g_rcW2PrePc = native_strip(pre.threadState.__pc);
-            g_rcW2PreSender = pre.Head.msgh_remote_port;
-            g_rcW2PreCount++;
-        }
-    }
 
     ExceptionMessage exc;
     RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
@@ -1591,62 +1559,29 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");
-        // wait_exception does not filter: it returns whatever arrived on the
-        // port it was handed. A timeout therefore means nothing at all arrived,
-        // not that the wrong kind of message arrived. But the two injected
-        // threads carry different exception ports, and the call thread is
-        // sometimes one of those injected threads rather than the synthetic
-        // one, so a trap from it can land on the first port while the call is
-        // parked waiting on the second. Both ports are ours, so a non-blocking
-        // drain of the first one settles that without needing a handle into
-        // the target's address space: a message sitting there means the reply
-        // went to the wrong port, and an empty port means the thread produced
-        // no exception at all and either wedged or died hard.
+        // What is known for certain here: the call thread took the work, was
+        // replied to, and never came back. Both messages this line reports were
+        // genuinely received on the second port, so reading them costs nothing
+        // and destroys nothing.
         //
-        // Reading the call thread's own PC is not an option here. callThreadPort
-        // comes from pthread_mach_thread_np executed inside SpringBoard, so it
-        // is a name in the target's ipc space and thread_get_state on it from
-        // this process returns KERN_INVALID_ARGUMENT, which says nothing about
-        // the thread's fate. That was measured and it was the wrong question.
-        {
-            ExceptionMessage other;
-            if (peek_exception(g_RC_firstExceptionPort, &other)) {
-                const uint64_t opc = native_strip(other.threadState.__pc);
-                const uint64_t olr = native_strip(other.threadState.__lr);
-                g_rcW2Stray = 1;
-                g_rcW2StrayPc = opc;
-                g_rcW2StrayFlavor = other.flavor;
-                g_rcW2StrayCode = (int)other.exception;
-                g_rcW2StraySender = other.Head.msgh_remote_port;
-                // same=1 means the message now queued is byte for byte the one
-                // that was already queued before this call started, so it is an
-                // old leftover and has nothing to do with the timeout.
-                const int same = (g_rcW2PreStray &&
-                                  g_rcW2PreSender == g_rcW2StraySender &&
-                                  g_rcW2PrePc == opc) ? 1 : 0;
-                NSLog(@"[RC-W2TO] %s: on FIRST port pc=0x%llx lr=0x%llx "
-                      @"exc=%u flavor=%u sender=0x%x w1snd=0x%x w1pc=0x%llx "
-                      @"pre=%d/0x%llx/0x%x same=%d",
-                      name ?: "?", (unsigned long long)opc, (unsigned long long)olr,
-                      (unsigned)other.exception, (unsigned)other.flavor,
-                      (unsigned)other.Head.msgh_remote_port,
-                      (unsigned)g_rcW1Sender,
-                      (unsigned long long)g_rcW1Pc,
-                      g_rcW2PreStray, (unsigned long long)g_rcW2PrePc,
-                      (unsigned)g_rcW2PreSender, same);
-                // It stays on the port. The first port has a state machine of
-                // its own and dequeuing its message here, without replying,
-                // would leave that thread stopped in SpringBoard for good,
-                // which is the very freeze being diagnosed.
-            } else {
-                g_rcW2Stray = 2;   // 1 = stray found, 2 = both ports empty
-                NSLog(@"[RC-W2TO] %s: NOTHING queued on either port pc0x%llx "
-                      @"w1snd=0x%x pre=%d — thread wedged or died, or its message "
-                      @"was taken by another waiter",
-                      name ?: "?", (unsigned long long)pcAddr,
-                      (unsigned)g_rcW1Sender, g_rcW2PreStray);
-            }
-        }
+        // What used to be here, and why it is gone: a probe of the first port to
+        // see whether a message from some other thread had piled up on it. That
+        // probe found the cause, EXC_BAD_ACCESS on a port with no consumer, and
+        // init now hands those threads back, so the port should have no traffic
+        // at all. Probing it again is not possible without a primitive that
+        // does not link: mach_msg_peek is not exported by libSystem on iOS, and
+        // receiving-then-resending trades a clean failure for one where a
+        // failed re-send loses the message and strands the thread. borrowed
+        // says how many threads init gave back, so a nonzero count here means
+        // the release did not take.
+        g_rcW2Stray = g_rcBorrowedReleased ? 1 : 2;
+        NSLog(@"[RC-W2TO] %s: no return, call pc=0x%llx w1snd=0x%x w1pc=0x%llx "
+              @"borrowed=%llu released=%llu kept=%llu",
+              name ?: "?", (unsigned long long)pcAddr,
+              (unsigned)g_rcW1Sender, (unsigned long long)g_rcW1Pc,
+              (unsigned long long)g_rcBorrowedTotal,
+              (unsigned long long)g_rcBorrowedReleased,
+              (unsigned long long)g_rcBorrowedKept);
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
         // abandon/reinit. Leaving success=false prevents further publishes.
         g_RC_success = false;
@@ -2878,8 +2813,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                         (unsigned long long)addr);
             }
         }
-        RC_DIAG("init released %llu borrowed thread(s), kept %llu as call thread",
-                (unsigned long long)released, (unsigned long long)kept);
+        g_rcBorrowedReleased = released;
+        g_rcBorrowedKept = kept;
+        g_rcBorrowedTotal = released + kept;
+        // NSLog, not RC_DIAG: the release is the fix, so whether it took has to
+        // be readable without turning diagnostics on. released=0 with borrowed
+        // threads present means the freeze is unfixed, not that it moved.
+        NSLog(@"[RC-INIT] borrowed=%llu released=%llu kept=%llu (kept is the call thread)",
+              (unsigned long long)g_rcBorrowedTotal,
+              (unsigned long long)g_rcBorrowedReleased,
+              (unsigned long long)g_rcBorrowedKept);
     }
 
     g_RC_success = true;
