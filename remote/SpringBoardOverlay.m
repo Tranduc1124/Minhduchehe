@@ -636,18 +636,36 @@ static BOOL sb_cached_pos_invocation(void) {
 // life of the session. Same shape as the pooled labels', and for the same
 // reason: see the note at sb_count_label_text.
 static uint64_t g_sbCountTextInv = 0, g_sbCountTextBuf = 0;
-static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
-// The NSString currently sitting in the layer, held rather than released.
-//
-// This is the CGPath ring's idea applied to the one object argument that had no
-// hold. setPath: is fired fire-and-forget too, and its path is kept alive in
-// g_sbPathRing because the target runs the setter later and the boxes do draw.
-// The counter's NSString was released on the line after the fire instead, so
-// whatever the target eventually read was a released object, and the readback
-// of the layer's string property came back as 0xba3284a2d61cdc55: a kernel
-// address, different on every run. One held string is enough, because a new one
-// replaces an old one rather than accumulating.
+// The NSString currently sitting in the layer, held rather than released: the
+// invocation is fired with waitUntilDone:NO, so the object has to outlive the
+// queue. One string is enough, because a new count replaces the old one.
+
 static uint64_t g_sbCountTextNS = 0;
+static uint64_t g_sbCountHideInv = 0, g_sbCountHideBuf = 0;
+
+// A CGFloat as the sixty four bits the target will read back out of the register.
+//
+// r_msg2 is a plain objc_msgSend: the argument goes in a register and the result
+// comes back in one. A double is just eight bytes, so passing its bit pattern is
+// exact and needs no buffer in the target at all.
+//
+// This matters more than it looks. The other way to send a double is
+// r_msg_main_raw, which stages it in a malloc'd buffer inside the target, hands
+// the invocation a pointer to that buffer, invokes, and reads the result back out
+// of a second malloc'd buffer. Both of those go through the vm_map_entry hijack
+// and the page cache, and the read side has already been caught returning a
+// constant that did not depend on what was written. A value in a register cannot
+// be stale in that way, because it never went to memory in another process.
+//
+// r_msg2_main takes uint64_t arguments and so sends the integer part of a double,
+// which is how a contents scale of 3.0 once arrived as 4.2e-45 and the layer
+// rasterised nothing at all. sb_fbits is the fix for that too, and unlike the raw
+// path it costs one remote call instead of thirteen.
+static uint64_t sb_fbits(double d) {
+    uint64_t bits = 0;
+    memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
 
 // Build a live NSString inside the target, out of calls whose return value is
 // known to be good.
@@ -813,7 +831,7 @@ static uint64_t sb_count_label_text(const char *utf8) {
         // r_msg2_main rather than the raw form, because it is the same call the
         // working setters on this layer make and it takes an object argument
         // directly. Its return path is no longer the broken one.
-        r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
+        r_msg2(g_sbCountLabel, "setString:", ns, 0, 0, 0);
         calls++;
         path = "r_msg2_main";
     }
@@ -838,13 +856,7 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // CATextLayer is not a view, it rasterises into a backing store inside
     // drawInContext: from its own dirty flag, and asking for that draw on every
     // publish is what made the plate blink.
-    if (g_sbCountTextSets <= 3) {
-        const uint64_t back = r_msg2(g_sbCountLabel, "string", 0, 0, 0, 0);
-        NSLog(@"[SB-CNT] string=0x%llx sent=0x%llx match=%d via=%s text=%s",
-              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
-              path, utf8);
-    }
-    r_msg2_main(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
+    r_msg2(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
     calls++;
 
     // One string is held, not a ring of them. A new count replaces the old count,
@@ -866,18 +878,21 @@ static uint64_t sb_count_label_text(const char *utf8) {
               (unsigned long long)ns, path);
     }
 
-    // Read the string back once, and only the first time.
+    // Read the string back on the register transport.
     //
-    // Off by default, and the reason is worth recording. It printed a constant
-    // 0x1f82546c8 across runs in which the string sent was a different object
-    // every time, so it was never reading the layer at all. Two conclusions were
-    // drawn from it and both were wrong, the second of them confidently: that
-    // the setter had run and stored a different object. A read that returns the
-    // same value regardless of what was written is not a measurement, and leaving
-    // it in invites the next person to make the same mistake.
-    // Retired rather than left behind. A read that returns the same value
-    // regardless of what was written is not a measurement, and leaving it in
-    // invites the next person to make the same mistake.
+    // Every earlier attempt used r_msg2_main, which stages the result in a
+    // malloc'd buffer in the target and reads it back through the vm_map_entry
+    // hijack. That returned the same 0x1f82546c8 on consecutive runs in which the
+    // string sent was a different object every time, so it was never reading the
+    // layer, and two conclusions were drawn from it that were both wrong. r_msg2
+    // returns in a register, so there is nothing in another process's memory that
+    // can be stale.
+    if (g_sbCountTextSets <= 3) {
+        const uint64_t back = r_msg2(g_sbCountLabel, "string", 0, 0, 0, 0);
+        NSLog(@"[SB-CNT] string=0x%llx sent=0x%llx match=%d via=%s text=%s",
+              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
+              path, utf8);
+    }
 
     strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
     g_sbCountLastText[sizeof(g_sbCountLastText) - 1] = 0;
@@ -1264,17 +1279,32 @@ static void sb_make_count_label(uint64_t container) {
     // exactly the shape of a layer that is fine and cannot draw.
     {
         double scale = [UIScreen mainScreen].scale;
-        if (scale > 0.5) {
-            r_msg_main_raw(label, r_sel("setContentsScale:"), &scale, sizeof(scale),
-                           NULL, 0, NULL, 0, NULL, 0);
-        }
+        if (scale > 0.5) r_msg2(label, "setContentsScale:", sb_fbits(scale), 0, 0, 0);
     }
 
     uint64_t UIColor = r_class("UIColor");
     if (r_is_objc_ptr(UIColor)) {
-        uint64_t red = r_msg2_main(UIColor, "redColor", 0, 0, 0, 0);
-        uint64_t redCG = r_is_objc_ptr(red) ? r_msg2_main(red, "CGColor", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(redCG)) r_msg2_main(label, "setForegroundColor:", redCG, 0, 0, 0);
+        // The text colour, built through registers, and white.
+        //
+        // It was red, fetched through r_msg2_main, and that is two mistakes.
+        // r_msg2_main stages the result in a malloc'd buffer inside the target and
+        // reads it back through the vm_map_entry hijack, which has already been
+        // caught returning the same constant no matter what was written. So the
+        // CGColor could be garbage, and r_is_objc_ptr only asks whether the value
+        // clears 0x100000000, so garbage passes the check and gets handed to
+        // setForegroundColor:. A CATextLayer whose foreground colour is not a
+        // colour falls back to black.
+        //
+        // The plate is black. Black glyphs on a black plate is a layer that draws
+        // perfectly and shows nothing, which is exactly what the device shows and
+        // exactly what I spent several commits blaming on the font.
+        //
+        // r_msg2 returns through a register, so nothing can be stale. And white on
+        // black is the largest contrast available, so if this is still not visible
+        // the colour is not the reason.
+        uint64_t white = r_msg2(UIColor, "whiteColor", 0, 0, 0, 0);
+        uint64_t whiteCG = r_is_objc_ptr(white) ? r_msg2(white, "CGColor", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(whiteCG)) r_msg2(label, "setForegroundColor:", whiteCG, 0, 0, 0);
 
         // Above its siblings, which it was not.
     //
@@ -1286,9 +1316,7 @@ static void sb_make_count_label(uint64_t container) {
     // 200 puts it clear of both, and it is set before addSublayer: so the layer
     // is never presented even once underneath.
     {
-        double z = 200.0;
-        r_msg_main_raw(label, r_sel("setZPosition:"), &z, sizeof(z),
-                       NULL, 0, NULL, 0, NULL, 0);
+        r_msg2(label, "setZPosition:", sb_fbits(200.0), 0, 0, 0);
     }
 
     // A black plate behind the number.
@@ -1302,84 +1330,58 @@ static void sb_make_count_label(uint64_t container) {
         // off screen or detached.
         //
         // Near opaque rather than solid, so it does not read as a hole punched in
-        // the game. Through r_msg2_main_raw because this takes four CGFloats and
-        // the widened form would send their integer parts, the same mistake that
-        // took the contents scale to 4.2e-45.
+        // the game.
+        //
+        // Four CGFloats in registers, not through r_msg2_main_raw. The raw form
+        // would send their integer parts, which is how the contents scale once
+        // arrived as 4.2e-45; sb_fbits sends the real eight bytes of each double
+        // and never allocates anything in the target, so there is no buffer to go
+        // stale. One remote call instead of thirteen.
         {
-            double plate[4] = { 0.0, 0.0, 0.0, 0.9 };
-            uint64_t plateColor = r_msg2_main_raw(r_class("UIColor"),
-                                                  "colorWithRed:green:blue:alpha:",
-                                                  &plate[0], 8, &plate[1], 8,
-                                                  &plate[2], 8, &plate[3], 8);
-            uint64_t plateCG = r_is_objc_ptr(plateColor)
-                             ? r_msg2_main(plateColor, "CGColor", 0, 0, 0, 0) : 0;
-            if (r_is_objc_ptr(plateCG)) r_msg2_main(label, "setBackgroundColor:", plateCG, 0, 0, 0);
+            const uint64_t plateColor = r_msg2(r_class("UIColor"),
+                                              "colorWithRed:green:blue:alpha:",
+                                              sb_fbits(0.0), sb_fbits(0.0),
+                                              sb_fbits(0.0), sb_fbits(0.9));
+            const uint64_t plateCG = r_is_objc_ptr(plateColor)
+                                   ? r_msg2(plateColor, "CGColor", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(plateCG)) r_msg2(label, "setBackgroundColor:", plateCG, 0, 0, 0);
 
-            double plateRadius = SB_COUNT_H * 0.5;
-            r_msg_main_raw(label, r_sel("setCornerRadius:"), &plateRadius, sizeof(plateRadius),
-                           NULL, 0, NULL, 0, NULL, 0);
+            r_msg2(label, "setCornerRadius:", sb_fbits(SB_COUNT_H * 0.5), 0, 0, 0);
         }
 
-        // Font size only. Deliberately no setFont:, and the reason is worth
-        // keeping: there was a CTFontCreateWithName here and it killed
-        // SpringBoard, because its size argument is a double by value and it was
-        // being handed the address of a double in this process's own stack.
-        // CoreText read eight bytes of our frame as a font size and built a
-        // malformed font, and the main thread died in
-        // -[CATextLayer _createStringDict] at objc_opt_isKindOfClass with
-        // OBJC_CLASS_$_NSFont in x1 and x2, which is a pointer authentication
-        // trap. fontSize is what the layer had and it is enough.
+        // Font size, and then a font, below. Two things were wrong here for most
+        // of this layer's life and the first was mine. I wrote that fontSize alone
+        // was enough, and justified it with a crash log showing the layer reaching
+        // -[CATextLayer drawInContext:]. That is not evidence of glyphs:
+        // drawInContext: is entered for an empty string and for a nil-font string,
+        // and _createStringDict runs before anything is rasterised. The device
+        // screenshot disproves the claim outright: the plate fills, which means the
+        // layer is in the tree, above its siblings, the right size, in the right
+        // place, and it has drawn. It has drawn without glyphs, which is what a
+        // layer looks like when it has a background but no font.
+        // backgroundColor is filled by CoreAnimation regardless of text state.
+        // Glyphs are not.
         //
-        // There was a CTFontCreateWithName here and it killed SpringBoard.
-        // CTFontCreateWithName takes its size as a double by value, and it was
-        // being handed the address of a double in this process's own stack, so
-        // CoreText read eight bytes of our frame as a font size and built a
-        // malformed font. The device log shows both halves of it: a thread of
-        // ours inside CTFontCreateWithName called from thread_start, and then
-        // SpringBoard's main thread dying in -[CATextLayer _createStringDict] at
-        // objc_opt_isKindOfClass with OBJC_CLASS_$_NSFont in x1 and x2, which is
-        // a pointer authentication trap on the font it had just been handed.
-        //
-        // fontSize alone is what the layer had before, and it was enough: the
-        // same crash log shows the counter reaching drawInContext: and
-        // CABackingStoreUpdate_ on com.apple.main-thread, which is a layer on
-        // screen building its string dictionary. The text path was working. This
-        // was an argument that belonged to no API at all.
-        double fsz = SB_COUNT_FONT_SIZE;
-        r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, 8,
-                       NULL, 0, NULL, 0, NULL, 0);
-
-        // A font, not just a size, and it is a font NAME.
-        //
-        // Two things were wrong here and the first one was mine from two commits
-        // ago. I wrote that fontSize alone was enough, and justified it with a
-        // crash log showing the layer reaching drawInContext:. That is not proof
-        // of glyphs: drawInContext: is entered for an empty string and for a
-        // nil-font string, and _createStringDict runs before anything is
-        // rasterised. The device screenshot disproves the claim outright: the
-        // plate fills, the layer is above its siblings, bounds and fontSize both
-        // read back correct, and there are no glyphs. fontSize is a number until
-        // there is a font to apply it to.
-        //
-        // The second is the type. CALayer's font is a CFTypeRef and this repo
-        // already has two CATextLayers that draw, and both set it the same way:
+        // The type matters as much as the presence. CALayer's font is a CFTypeRef
+        // and this repo has two CATextLayers that already draw, both setting it the
+        // same way:
         //
         //   esp/esp/esp.mm:3209  layer.font = (__bridge CFTypeRef)fontNameStr;
-        //   esp/esp/esp.mm:3563  self.statusLayer.font = (__bridge CFTypeRef)...
-        //                               .fontName;
+        //   esp/esp/esp.mm:3563  statusLayer.font = (__bridge CFTypeRef)...fontName;
         //
-        // A font NAME string, resolved by QuartzCore against fontSize. Not a
-        // CTFontRef and not a UIFont. The pooled labels at :917 pass a UIFont to
-        // setFont: and they are UILabels, which is why that looks like the right
-        // shape; on a CALayer it is the wrong one.
+        // A font NAME string, which QuartzCore resolves against fontSize. Not a
+        // CTFontRef and not a UIFont. The pooled labels hand a UIFont to setFont:
+        // and that only looks like the right shape because those are UILabels.
         //
         // And explicitly not CTFontCreateWithName, which is what killed
-        // SpringBoard. Its size argument is a double by value and it was being
+        // SpringBoard: its size argument is a double by value and it was being
         // handed the address of a double in this process's own stack, so CoreText
         // read eight bytes of our frame as a font size and built something
-        // malformed; the crash was a pointer authentication trap in
-        // -[CATextLayer _createStringDict]. A name string has no bare double in it
-        // to get wrong at all, which is why this form is safe.
+        // malformed, and the main thread died on a pointer authentication trap in
+        // -[CATextLayer _createStringDict]. A name string carries no bare double,
+        // so that whole class of mistake cannot happen.
+        const double fsz = SB_COUNT_FONT_SIZE;
+        r_msg2(label, "setFontSize:", sb_fbits(fsz), 0, 0, 0);
         if (!r_is_objc_ptr(g_sbCountFont)) {
             g_sbCountFont = sb_make_nsstring(SB_COUNT_FONT_NAME);
         }
