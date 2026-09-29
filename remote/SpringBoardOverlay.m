@@ -542,6 +542,7 @@ static uint64_t g_sbCountAlignStr = 0;
 // the counter is visible.
 static uint64_t g_sbCountBornUS = 0;
 static uint64_t g_sbCountFirstTextUS = 0;
+static int      g_sbCountStringProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -728,12 +729,30 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // The string is held afterwards, the way setPath: is held in g_sbPathRing,
     // because the invocation is fired with waitUntilDone:NO and the object has
     // to outlive the queue.
+    //
+    // With a fallback, because the cached invocation can decline.
+    //
+    // sb_cached_invocation returns NO when g_sbPerformMainSel or g_sbInvokeSel
+    // have not been resolved yet, and that block used to just fall through. The
+    // counter then never had its text set at all, while still logging that text
+    // had arrived, which is the worst shape a diagnostic can have: it reported
+    // the one thing that had not happened. The other transport is tried instead,
+    // and whichever one ran is named.
+    const char *path = "none";
     if (sb_cached_invocation(g_sbCountLabel, "setString:",
                              &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
         remote_write64(g_sbCountTextBuf, ns);
         r_msg2(g_sbCountTextInv, "setArgument:atIndex:", g_sbCountTextBuf, 2, 0, 0);
         r_msg(g_sbCountTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
         calls += 3;
+        path = "cached-invocation";
+    } else {
+        // r_msg2_main rather than the raw form, because it is the same call the
+        // working setters on this layer make and it takes an object argument
+        // directly. Its return path is no longer the broken one.
+        r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
+        calls++;
+        path = "r_msg2_main";
     }
 
     // One string is held, not a ring of them. A new count replaces the old count,
@@ -750,9 +769,27 @@ static uint64_t sb_count_label_text(const char *utf8) {
         // The label is built entirely through main-thread setters, so it exists
         // in this process well before the target has drawn any of it. That gap
         // is the delay before the counter is visible.
-        NSLog(@"[SB-LABEL] counter first text after %llums ns=0x%llx",
+        NSLog(@"[SB-LABEL] counter first text after %llums ns=0x%llx via=%s",
               (unsigned long long)((g_sbCountFirstTextUS - g_sbCountBornUS) / 1000ULL),
-              (unsigned long long)ns);
+              (unsigned long long)ns, path);
+    }
+
+    // Read the string back once, and only the first time, because a log that
+    // says text arrived is worth nothing if the property did not take.
+    //
+    // Every other property on this layer has been read back at some point and
+    // came back correct: bounds, frame, position, superlayer, fontSize. The one
+    // that was never verified is the one that decides whether a number appears,
+    // and it is verified now through a return path that is no longer the broken
+    // one. string is a zero argument selector, so it allocates no argument
+    // buffer and cannot collide with one, and the mapping is proven live by a
+    // poison write before the value is taken.
+    if (!g_sbCountStringProbed) {
+        g_sbCountStringProbed = 1;
+        const uint64_t back = r_msg2_main(g_sbCountLabel, "string", 0, 0, 0, 0);
+        NSLog(@"[SB-CNT] string readback=0x%llx sent=0x%llx match=%d via=%s text=%s",
+              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
+              path, utf8);
     }
 
 strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
@@ -1493,6 +1530,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFirstTextUS = 0;
+    g_sbCountStringProbed = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
