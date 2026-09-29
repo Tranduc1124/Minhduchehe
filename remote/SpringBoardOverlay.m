@@ -533,6 +533,9 @@ static unsigned g_sbLabelFrame = 0;
 #define SB_CARD_B      0.16
 #define SB_CARD_A      0.72
 static uint64_t g_sbCountLabel   = 0;
+// kCAAlignmentCenter, built once. Lives and dies with the session, like the
+// label it is only ever passed to.
+static uint64_t g_sbCountAlignStr = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
@@ -983,8 +986,39 @@ static void sb_make_count_label(uint64_t container) {
     if (!r_is_objc_ptr(label)) return;
 
     r_msg2_main(label, "setWrapped:", 0, 0, 0, 0);        // one line, no wrap
-    r_msg2_main(label, "setTruncationMode:", 0, 0, 0, 0); // none
-    r_msg2_main(label, "setAlignmentMode:", 1, 0, 0, 0);   // centre
+    r_msg2_main(label, "setTruncationMode:", 0, 0, 0, 0); // none, and an enum
+    // Alignment is an NSString on CATextLayer, not an integer. The UILabel this
+    // replaced took an integer through setTextAlignment:, and the migration
+    // carried the 1 across to a selector of the same name on a different class.
+    // QuartzCore's setter CFEquals the argument, so 1 was dereferenced as a
+    // CFStringRef and SpringBoard's main thread died:
+    //
+    //   EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE at 0x9
+    //   CFEqual <- CA::Layer::setter <- -[CATextLayer setAlignmentMode:]
+    //           <- __invoking___ <- -[NSInvocation invoke]
+    //           <- __NSThreadPerformPerform <- com.apple.main-thread
+    //
+    // That is the same PC, 0x1908e9f68, that every wait2 timeout kept
+    // reporting as an EXC_BAD_ACCESS on a thread that was not the call thread.
+    // It was SpringBoard's main thread, running this line, queued through
+    // performSelectorOnMainThread. Not corruption and not a borrowed thread
+    // faulting: our own setter, killing the main thread, which is why every
+    // remote call after it blocked until the ten second floor.
+    //
+    // kCAAlignmentCenter is the string "center". Made once and kept, like the
+    // label it belongs to.
+    if (!r_is_objc_ptr(g_sbCountAlignStr)) {
+        uint64_t sbuf = r_alloc_str("center");
+        if (sbuf) {
+            uint64_t NSStringCls = r_class("NSString");
+            uint64_t alloc = r_is_objc_ptr(NSStringCls) ? r_msg2(NSStringCls, "alloc", 0, 0, 0, 0) : 0;
+            g_sbCountAlignStr = r_is_objc_ptr(alloc)
+                              ? r_msg2(alloc, "initWithUTF8String:", sbuf, 0, 0, 0) : 0;
+            r_free(sbuf);
+        }
+    }
+    if (r_is_objc_ptr(g_sbCountAlignStr))
+        r_msg2_main(label, "setAlignmentMode:", g_sbCountAlignStr, 0, 0, 0);
     // Without this the text is rasterised at scale 1 and is visibly soft on a
     // retina display, which is the most obvious way for it to look worse than
     // the UILabel it replaced. Read once from the screen, set once here.
@@ -1037,8 +1071,17 @@ static void sb_make_count_label(uint64_t container) {
     r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
                    NULL, 0, NULL, 0, NULL, 0);
 
-    // The rotation that puts the layer in the same space the path is in.
-    double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+    // Sixteen doubles, not six. A view's setTransform: takes a CGAffineTransform,
+    // six, and that is the array this used to carry because the counter was a
+    // UILabel. CATextLayer is a CALayer, whose setTransform: takes a
+    // CATransform3D: sixteen, a 4x4 matrix. Passing six left m34 through m44 as
+    // whatever the argument buffer happened to hold, and m44 is the scale.
+    static const double tr[16] = {
+        0.0,  1.0,  0.0, 0.0,     // m11 m12 m13 m14
+       -1.0,  0.0,  0.0, 0.0,     // m21 m22 m23 m24
+        0.0,  0.0,  1.0, 0.0,     // m31 m32 m33 m34
+        0.0,  0.0,  0.0, 1.0,     // m41 m42 m43 m44
+    };
     r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
                    NULL, 0, NULL, 0, NULL, 0);
 
@@ -1316,6 +1359,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbCountPosInv = 0;
     g_sbCountPosBuf = 0;
     g_sbCountLabel = 0;
+    g_sbCountAlignStr = 0;
     g_sbCountLastPos[0] = -1.0;
     g_sbCountLastPos[1] = -1.0;
     g_sbCountLastText[0] = 0;
