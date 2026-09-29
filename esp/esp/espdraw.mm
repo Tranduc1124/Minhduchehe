@@ -352,13 +352,24 @@ static void ESPRenderPawnCore(
                                      nameCardW, cardH));
             buffers->cardDirty = true;
 
-            if (textCallback) {
-                textCallback(callbackContext, dispName, ESPTextRoleName,
-                             (uint64_t)PawnObject,
-                             CGRectMake(centerX - nameCardW * 0.5f, cardTop,
-                                        nameCardW, cardH),
-                             [UIColor whiteColor], nameFS, NO);
-            }
+            // The name is not sent any more.
+            //
+            // A UILabel per name in SpringBoard cannot be made to sit on its own
+            // card. The label and the card are two separate objects updated by
+            // two separate paths, so anything that delays one of them shows as
+            // the text leaving the box, and the label has to be moved every
+            // frame to keep up, which is the cost that made it worth replacing
+            // in the first place.
+            //
+            // The card still draws, it is the rectangle above, so the overlay
+            // reads as a box with a caption area and no caption. The replacement
+            // is meant to be glyph geometry in the same path as the card, which
+            // is why this is a deletion rather than a style change: the text
+            // wants to be part of the shape, not a view floating over it.
+            //
+            // dispName, nameFS and textCallback are all still used by the rest of
+            // this function, so nothing above is dead.
+            (void)textCallback;
         }
     }
 
