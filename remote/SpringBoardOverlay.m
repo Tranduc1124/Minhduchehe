@@ -2082,12 +2082,17 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             uint64_t ipcSlowMax = 0, ipcSlowCount = 0;
             uint32_t ipcSlowTid = 0;
             remote_call_slowest_call(&ipcSlowMax, &ipcSlowCount, &ipcSlowTid);
+            uint64_t ipcW1 = 0, ipcW2 = 0, ipcW1TO = 0, ipcW2TO = 0;
+            uint64_t ipcW1Max = 0, ipcW2Max = 0;
+            remote_call_wait_split_diag(&ipcW1, &ipcW2, &ipcW1TO, &ipcW2TO,
+                                        &ipcW1Max, &ipcW2Max);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
                   @"upd=%llu att=%llu skip=%llu ident=%llu "
                   @"S=%llu G=%llu M=%llu B=%llu ph=%d next=%lldms since=%lldms "
                   @"ipc onmain=%llu calls=%llu holdmax=%llums holdtot=%llums "
                   @"waitmax=%llums waitslow=%llu ht=%u wt=%u "
-                  @"slow=%s %llums x%llu tid=%u",
+                  @"slow=%s %llums x%llu tid=%u "
+                  @"w1=%llums/%lluTO w2=%llums/%lluTO",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -2113,7 +2118,11 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   remote_call_slowest_call_name(),
                   (unsigned long long)(ipcSlowMax / 1000ULL),
                   (unsigned long long)ipcSlowCount,
-                  (unsigned)ipcSlowTid);
+                  (unsigned)ipcSlowTid,
+                  (unsigned long long)(ipcW1 / 1000ULL),
+                  (unsigned long long)ipcW1TO,
+                  (unsigned long long)(ipcW2 / 1000ULL),
+                  (unsigned long long)ipcW2TO);
         }
     }
 

@@ -337,6 +337,40 @@ const char *remote_call_slowest_call_name(void)
     return g_rcSlowName[0] ? g_rcSlowName : "(none)";
 }
 
+// Which of the two waits ate the time.
+//
+// A call parks a synthetic thread in an exception, hands it the function to
+// run, then waits for the thread to come back with the result. That is two
+// waits, and a 10 second hold is one of them hitting newTimeout, which is
+// g_RC_stableExceptionTimeoutFloorMS. The symbol is not the cause of the wait:
+// the device log shows objc_msgSend and malloc both holding for ten seconds,
+// and malloc never touches objc or a main thread, so what is common to them is
+// the transport, not the callee.
+//
+// wait1 timing out means the thread never picked up the call at all: the
+// session is dead before any work is done. wait2 timing out means it took the
+// call and never came back, which is a wedged or descheduled thread. Those
+// two have different fixes, so which one it is has to be measured rather than
+// guessed from the symbol name.
+static uint64_t g_rcWait1US = 0;
+static uint64_t g_rcWait2US = 0;
+static uint64_t g_rcWait1TO = 0;
+static uint64_t g_rcWait2TO = 0;
+static uint64_t g_rcWait1MaxUS = 0;
+static uint64_t g_rcWait2MaxUS = 0;
+
+void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
+                                 uint64_t *wait1TO, uint64_t *wait2TO,
+                                 uint64_t *wait1MaxUS, uint64_t *wait2MaxUS)
+{
+    if (wait1US)    *wait1US = g_rcWait1US;
+    if (wait2US)    *wait2US = g_rcWait2US;
+    if (wait1TO)    *wait1TO = g_rcWait1TO;
+    if (wait2TO)    *wait2TO = g_rcWait2TO;
+    if (wait1MaxUS) *wait1MaxUS = g_rcWait1MaxUS;
+    if (wait2MaxUS) *wait2MaxUS = g_rcWait2MaxUS;
+}
+
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
 {
     if (maxUS) *maxUS = g_rcSlowMaxUS;
@@ -1419,7 +1453,14 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     ExceptionMessage exc;
     RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
-    if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
+    const uint64_t tW1 = remote_call_diag_now_us();
+    const bool got1 = wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false);
+    g_rcWait1US += remote_call_diag_now_us() - tW1;
+    if (remote_call_diag_now_us() - tW1 > g_rcWait1MaxUS) {
+        g_rcWait1MaxUS = remote_call_diag_now_us() - tW1;
+    }
+    if (!got1) {
+        g_rcWait1TO++;
         RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
@@ -1475,7 +1516,13 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     ExceptionMessage exc2;
     RC_DIAG("stable/%s wait2 begin", name ?: "(addr-call)");
-    if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
+    const uint64_t tW2 = remote_call_diag_now_us();
+    const bool got2 = wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false);
+    const uint64_t w2 = remote_call_diag_now_us() - tW2;
+    g_rcWait2US += w2;
+    if (w2 > g_rcWait2MaxUS) g_rcWait2MaxUS = w2;
+    if (!got2) {
+        g_rcWait2TO++;
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");

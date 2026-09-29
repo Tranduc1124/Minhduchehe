@@ -78,6 +78,14 @@ void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
 // NULL; the name returns "(none)" until the first slow call.
 const char *remote_call_slowest_call_name(void);
 void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid);
+// Splits the time of a remote call into its two exception waits. wait1 is the
+// target thread picking the call up, wait2 is it coming back with the result.
+// A timeout count on one side rather than the other says whether the thread
+// never took the call or never returned from it, and those are different bugs.
+// Any out pointer may be NULL.
+void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
+                                 uint64_t *wait1TO, uint64_t *wait2TO,
+                                 uint64_t *wait1MaxUS, uint64_t *wait2MaxUS);
 // Returns false when the state could not be signed. A false return means the
 // state was NOT modified with a signed pc/lr and must not be replied to the
 // target: replying an unsigned or zero pc hands the target's thread a jump to
