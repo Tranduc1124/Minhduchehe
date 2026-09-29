@@ -109,6 +109,19 @@ static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
 static uint64_t g_sbSummaryUpdates = 0;
 
+// g_sbSummarySkips is the sum of every reason a frame was dropped, which makes
+// it useless for finding one: a gate that is wide open and a builder that fails
+// forever both show up as the same rising number. These split it.
+//
+// The one that matters is skipMerge. mergePaths turns the app's view into the
+// byte stream, and it returning NO is permanent rather than transient, so a
+// merge that starts failing is a frozen overlay with the session still reported
+// healthy: on=1 ever=1 fail=0 ls=1 ok=1 and no frame since.
+static uint64_t g_sbSkipSession = 0;   // no local session, or the session is dead
+static uint64_t g_sbSkipGate    = 0;   // arrived inside SB_MIN_PUBLISH_INTERVAL_US
+static uint64_t g_sbSkipMerge   = 0;   // mergePaths could not build a stream
+static uint64_t g_sbSkipBusy    = 0;   // a previous publish is still running
+
 // Self-heal state for the overlay. A single transient remote-call failure used
 // to clear g_sbOverlayOn for the rest of the process lifetime, and nothing
 // re-armed it: boot_start_sb_overlay only retries at 3s, 5s, 8s and 12s. The
@@ -1987,7 +2000,8 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             const int64_t sinceDraw = (g_sbLastPublishUS == 0)
                                    ? -1 : (int64_t)(tGate - g_sbLastPublishUS);
             NSLog(@"[PUSH-HB] build=SB-%s on=%d ever=%d fail=%d sdead=%d ls=%d ok=%d "
-                  @"upd=%llu att=%llu skip=%llu ident=%llu next=%lldms since=%lldms",
+                  @"upd=%llu att=%llu skip=%llu ident=%llu "
+                  @"S=%llu G=%llu M=%llu B=%llu next=%lldms since=%lldms",
                   SB_DIAG_BUILD, (int)g_sbOverlayOn, g_sbEverOn, g_sbConsecFail, g_sbSessionDead,
                   (int)remote_call_has_local_state(),
                   (int)remote_call_current_success(),
@@ -1995,6 +2009,10 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                   (unsigned long long)g_sbSummaryAttempts,
                   (unsigned long long)g_sbSummarySkips,
                   (unsigned long long)g_sbIdenticalFrames,
+                  (unsigned long long)g_sbSkipSession,
+                  (unsigned long long)g_sbSkipGate,
+                  (unsigned long long)g_sbSkipMerge,
+                  (unsigned long long)g_sbSkipBusy,
                   (long long)(nextIn / 1000),
                   (long long)(sinceDraw / 1000));
         }
@@ -2068,6 +2086,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
     }
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
         // Session died (SB respawn?). Drop until restart.
+        g_sbSkipSession++;
         g_sbSummarySkips++;
         return;
     }
@@ -2077,6 +2096,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
 
     uint64_t t = now_us();
     if (t < g_sbNextPublishUS) {
+        g_sbSkipGate++;
         g_sbSummarySkips++;
         return;
     }
@@ -2085,6 +2105,9 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
     if (!mergePaths(espView, ops, enemyCount)) {
+        // The builder, not the transport. If this is the one climbing, the
+        // overlay is not blocked, it is being handed nothing.
+        g_sbSkipMerge++;
         g_sbSummarySkips++;
         return;
     }
@@ -2100,6 +2123,7 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
         // period of 16.6ms the flag should be free again in time, and a
         // bdrops that climbs says it is not.
         g_sbBusyDrops++;
+        g_sbSkipBusy++;
         g_sbSummarySkips++;
         return;
     }
