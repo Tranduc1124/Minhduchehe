@@ -1486,10 +1486,14 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     // Baseline for the first port. do_remote_call_temp waits on this port and,
     // on timeout, walks away without taking the message with it, so a leftover
-    // can sit there for the rest of the session. Draining it before wait1
-    // separates a leftover from a message that arrives during this call: what
-    // is found at wait2 timeout after this point can only be fresh. The sender
-    // port is kept so a repeat offender can be told apart from a one-off.
+    // can sit there for the rest of the session. Peeking before wait1 separates
+    // a leftover from a message that arrives during this call: comparing the
+    // sender and PC of what is found at wait2 timeout against this snapshot
+    // says whether it is the same message or a new one.
+    //
+    // Peek, not receive. The message is the stopped thread; dequeuing it
+    // without replying would strand that thread inside SpringBoard for good,
+    // which is the very freeze being diagnosed.
     g_rcW2PreStray = 0;
     g_rcW2PrePc = 0;
     g_rcW2PreSender = 0;
@@ -1497,8 +1501,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     g_rcW1Pc = 0;
     {
         ExceptionMessage pre;
-        memset(&pre, 0, sizeof(pre));
-        if (wait_exception(g_RC_firstExceptionPort, &pre, 0, false)) {
+        if (peek_exception(g_RC_firstExceptionPort, &pre)) {
             g_rcW2PreStray = 1;
             g_rcW2PrePc = native_strip(pre.threadState.__pc);
             g_rcW2PreSender = pre.Head.msgh_remote_port;
@@ -1607,8 +1610,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         // the thread's fate. That was measured and it was the wrong question.
         {
             ExceptionMessage other;
-            memset(&other, 0, sizeof(other));
-            if (wait_exception(g_RC_firstExceptionPort, &other, 0, false)) {
+            if (peek_exception(g_RC_firstExceptionPort, &other)) {
                 const uint64_t opc = native_strip(other.threadState.__pc);
                 const uint64_t olr = native_strip(other.threadState.__lr);
                 g_rcW2Stray = 1;
@@ -1616,23 +1618,31 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 g_rcW2StrayFlavor = other.flavor;
                 g_rcW2StrayCode = (int)other.exception;
                 g_rcW2StraySender = other.Head.msgh_remote_port;
-                NSLog(@"[RC-W2TO] %s: FRESH on FIRST port pc=0x%llx lr=0x%llx "
-                      @"exc=%u flavor=%u sender=0x%x w1snd=0x%x w1pc=0x%llx pre=%d/0x%llx/%llu — "
-                      @"arrived during this call",
+                // same=1 means the message now queued is byte for byte the one
+                // that was already queued before this call started, so it is an
+                // old leftover and has nothing to do with the timeout.
+                const int same = (g_rcW2PreStray &&
+                                  g_rcW2PreSender == g_rcW2StraySender &&
+                                  g_rcW2PrePc == opc) ? 1 : 0;
+                NSLog(@"[RC-W2TO] %s: on FIRST port pc=0x%llx lr=0x%llx "
+                      @"exc=%u flavor=%u sender=0x%x w1snd=0x%x w1pc=0x%llx "
+                      @"pre=%d/0x%llx/0x%x same=%d",
                       name ?: "?", (unsigned long long)opc, (unsigned long long)olr,
                       (unsigned)other.exception, (unsigned)other.flavor,
                       (unsigned)other.Head.msgh_remote_port,
                       (unsigned)g_rcW1Sender,
                       (unsigned long long)g_rcW1Pc,
                       g_rcW2PreStray, (unsigned long long)g_rcW2PrePc,
-                      (unsigned long long)g_rcW2PreCount);
-                // Leave it on the port: whoever owns the first port's state
-                // machine has to consume it, and dropping it here would turn a
-                // diagnosable hang into an unrelated hang later.
+                      (unsigned)g_rcW2PreSender, same);
+                // It stays on the port. The first port has a state machine of
+                // its own and dequeuing its message here, without replying,
+                // would leave that thread stopped in SpringBoard for good,
+                // which is the very freeze being diagnosed.
             } else {
                 g_rcW2Stray = 2;   // 1 = stray found, 2 = both ports empty
-                NSLog(@"[RC-W2TO] %s: NOTHING on either port pc0x%llx w1snd=0x%x "
-                      @"pre=%d — thread wedged or died without an exception",
+                NSLog(@"[RC-W2TO] %s: NOTHING queued on either port pc0x%llx "
+                      @"w1snd=0x%x pre=%d — thread wedged or died, or its message "
+                      @"was taken by another waiter",
                       name ?: "?", (unsigned long long)pcAddr,
                       (unsigned)g_rcW1Sender, g_rcW2PreStray);
             }
@@ -2831,6 +2841,46 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
     RC_DIAG("stable memset done");
+
+    // Hand back the threads init borrowed, before the session goes live.
+    //
+    // The injection loop bound g_RC_firstExceptionPort and set AST_GUARD on
+    // every thread it walked, and nothing ever took either off again. In steady
+    // state no code waits on that port at all: do_remote_call_temp is reached
+    // only from init and teardown, and the two peeks added for this diagnosis
+    // are non-destructive. So the first time one of those borrowed threads
+    // faults on its own, the kernel stops it and queues a message that nobody
+    // in this process will ever consume or reply to, and that thread stays
+    // stopped for the rest of the session still holding whatever it held.
+    //
+    // Measured on 2026-09-29 17:28, which is what this fixes: an
+    // EXC_BAD_ACCESS at one fixed PC landed on that port while an objc_msgSend
+    // was in flight, from a sender that was not the call thread, and the call
+    // then sat in wait2 until the ten second floor and killed the session. A
+    // stopped thread in SpringBoard is not a slow overlay, it is a SpringBoard
+    // holding a lock nobody will release.
+    //
+    // MACH_PORT_NULL restores the thread's default exception port, which is
+    // SpringBoard's own handler, so a natural fault there is handled normally
+    // instead of being swallowed by us. The call thread is exempt: its port is
+    // the mechanism, not a leftover.
+    {
+        uint64_t released = 0, kept = 0;
+        for (NSNumber *num in g_RC_threadList) {
+            const uint64_t addr = num.unsignedLongLongValue;
+            if (!is_kaddr_valid(addr)) continue;
+            if (addr == g_RC_callThreadAddr) { kept++; continue; }
+            clear_guard_exception(addr);
+            if (set_exception_port_on_thread(MACH_PORT_NULL, addr, useMigFilterBypass)) {
+                released++;
+            } else {
+                RC_DIAG("release of borrowed thread 0x%llx failed — it stays ours",
+                        (unsigned long long)addr);
+            }
+        }
+        RC_DIAG("init released %llu borrowed thread(s), kept %llu as call thread",
+                (unsigned long long)released, (unsigned long long)kept);
+    }
 
     g_RC_success = true;
     RC_DEBUG("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
