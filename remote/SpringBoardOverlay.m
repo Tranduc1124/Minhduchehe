@@ -785,25 +785,20 @@ static uint64_t sb_count_label_text(const char *utf8) {
               (unsigned long long)ns, path);
     }
 
-    // Read the string back once, and only the first time, because a log that
-    // says text arrived is worth nothing if the property did not take.
+    // Read the string back once, and only the first time.
     //
-    // Every other property on this layer has been read back at some point and
-    // came back correct: bounds, frame, position, superlayer, fontSize. The one
-    // that was never verified is the one that decides whether a number appears,
-    // and it is verified now through a return path that is no longer the broken
-    // one. string is a zero argument selector, so it allocates no argument
-    // buffer and cannot collide with one, and the mapping is proven live by a
-    // poison write before the value is taken.
-    if (!g_sbCountStringProbed) {
-        g_sbCountStringProbed = 1;
-        const uint64_t back = r_msg2_main(g_sbCountLabel, "string", 0, 0, 0, 0);
-        NSLog(@"[SB-CNT] string readback=0x%llx sent=0x%llx match=%d via=%s text=%s",
-              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
-              path, utf8);
-    }
+    // Off by default, and the reason is worth recording. It printed a constant
+    // 0x1f82546c8 across runs in which the string sent was a different object
+    // every time, so it was never reading the layer at all. Two conclusions were
+    // drawn from it and both were wrong, the second of them confidently: that
+    // the setter had run and stored a different object. A read that returns the
+    // same value regardless of what was written is not a measurement, and leaving
+    // it in invites the next person to make the same mistake.
+    // Retired rather than left behind. A read that returns the same value
+    // regardless of what was written is not a measurement, and leaving it in
+    // invites the next person to make the same mistake.
 
-strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
+    strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
     g_sbCountLastText[sizeof(g_sbCountLastText) - 1] = 0;
     return calls;
 }
@@ -1340,16 +1335,31 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
     // the landscape width, 25pt from the top. It never moves, so the label
     // costs two calls once and then nothing, however long the match runs.
     //
-    // px and py are the label's own centre, because it carries the path
-    // rotation as its CALayer transform. Swapping w and h as well would rotate
-    // the text twice.
+    // px and py are the label's own centre, in the container's coordinate space.
+    //
+    // Which is to say: NOT swapped. A CALayer's position is expressed in its
+    // superlayer's space, and the quarter turn this label carries is its own
+    // transform, which rotates the label's contents and nothing else. It does
+    // not rotate the axes the position is measured along. The comment that used
+    // to be here said otherwise, and swapped them, which put the label at
+    // x = 372, y = 448 in a container that is 414 points tall.
+    //
+    // That is off the bottom of the screen, and it explains everything that was
+    // left unexplained. The layer was attached, sized, rotated, placed, unhidden
+    // and given a string, and a SpringBoard crash log shows it being asked to
+    // draw: -[CATextLayer drawInContext:] into CABackingStoreUpdate_ on
+    // com.apple.main-thread. It was drawing the whole time, just somewhere the
+    // user cannot see. The readback agreed and nobody read it: position came back
+    // as 348, 422, and 422 is past the 414 the container is tall.
+    //
+    // So x runs along the long edge, centred, and y sits near the top edge.
     if (r_is_objc_ptr(g_sbCountLabel) && enemyCount >= 0) {
         char num[8];
         const int n = snprintf(num, sizeof(num), "%d", enemyCount);
         if (n > 0 && n <= SB_TEXT_MAX) {
             const double w = SB_COUNT_W, h = SB_COUNT_H;
-            const double px = ctx.landH - SB_COUNT_TOP - h * 0.5;
-            const double py = ctx.landW * 0.5;
+            const double px = ctx.landW * 0.5;
+            const double py = ctx.landH - SB_COUNT_TOP - h * 0.5;
             uint8_t top = 5;
             uint8_t role = 3;                       // counter
             uint8_t slen = (uint8_t)n;
