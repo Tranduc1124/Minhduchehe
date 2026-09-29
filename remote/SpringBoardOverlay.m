@@ -687,20 +687,29 @@ static BOOL sb_write_inv_arg(uint64_t buf, const void *data, size_t size) {
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
-    if (!sb_cached_pos_invocation()) return 0;
     if (px == g_sbCountLastPos[0] && py == g_sbCountLastPos[1]) return 0;
 
+    // Straight through, like every setter on this layer that has ever read back
+    // correct: setFrame:, setFontSize:, setContentsScale: and setCornerRadius: all
+    // go through r_msg_main_raw with the real bytes of the struct, and all four
+    // read back the value that was set.
+    //
+    // The cached invocation is gone from the counter. It was three separate
+    // pieces of machinery, each with its own malloc'd argument buffer in the
+    // target and each a chance to write into a stale alias and quietly do
+    // nothing, and its fire-and-forget present meant the position was only ever
+    // eventually true. This blocks instead, so by the time the publish returns
+    // the layer is where it was put.
+    //
+    // The pooled labels keep theirs. They are six of them, built once, and their
+    // arguments are rewritten every frame on a buffer that is reused, so the
+    // exposure is different and they are not on the display path today.
     double p[2] = { px, py };
-    sb_write_inv_arg(g_sbCountPosBuf, p, sizeof(p));
-    r_msg2(g_sbCountPosInv, "setArgument:atIndex:", g_sbCountPosBuf, 2, 0, 0);
-    // Only remember the position once the present that carries it has actually
-    // been queued. Marking it before the queue would mean a frame that arrives
-    // before the invocation is ready silently never draws the label again, which
-    // is exactly the class of bug where the overlay works once and then freezes.
-    r_msg(g_sbCountPosInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    r_msg_main_raw(g_sbCountLabel, r_sel("setPosition:"),
+                   p, sizeof(p), NULL, 0, NULL, 0, NULL, 0);
     g_sbCountLastPos[0] = px;
     g_sbCountLastPos[1] = py;
-    return 2;
+    return 1;
 }
 
 static uint64_t sb_count_label_text(const char *utf8) {
@@ -1209,7 +1218,22 @@ static void sb_make_count_label(uint64_t container) {
         uint64_t redCG = r_is_objc_ptr(red) ? r_msg2_main(red, "CGColor", 0, 0, 0, 0) : 0;
         if (r_is_objc_ptr(redCG)) r_msg2_main(label, "setForegroundColor:", redCG, 0, 0, 0);
 
-        // A black plate behind the number.
+        // Above its siblings, which it was not.
+    //
+    // The container layer holds three things: the stroke CAShapeLayer at
+    // zPosition 100, the fill CAShapeLayer at 99, and this text layer, whose
+    // zPosition was never set and so is 0. It was being drawn underneath both.
+    // Nothing sets an anchorPoint either, so this is only about ordering.
+    //
+    // 200 puts it clear of both, and it is set before addSublayer: so the layer
+    // is never presented even once underneath.
+    {
+        double z = 200.0;
+        r_msg_main_raw(label, r_sel("setZPosition:"), &z, sizeof(z),
+                       NULL, 0, NULL, 0, NULL, 0);
+    }
+
+    // A black plate behind the number.
         //
         // This is here on purpose and not as decoration. A layer whose text is
         // not rasterising draws nothing at all, so a number that never appears
@@ -1392,16 +1416,32 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
     // user cannot see. The readback agreed and nobody read it: position came back
     // as 348, 422, and 422 is past the 414 the container is tall.
     //
-    // So x runs along the long edge, centred, and y is measured down from the
-    // top, because UIKit puts y at zero on the top edge. SB_COUNT_TOP plus half
-    // the height is the centre of the plate, which is what setPosition: takes.
+    // Rotated, because the counter is added to the container view's layer and
+    // that container is 390 wide by 844 tall: [UIScreen mainScreen].bounds read
+    // inside SpringBoard comes back portrait, and the container's long edge is
+    // its height. Every piece of ESP geometry goes through sbEmit, which maps a
+    // landscape point to the container as (landH - sy, sx). The counter has no
+    // geometry behind it, so the same map has to be applied by hand or the value
+    // is in the wrong coordinate space from the start.
+    //
+    // The comment that used to be here, and that this replaces, claimed the swap
+    // was unnecessary because a layer's position is expressed in its superlayer's
+    // space. That part is true and it is why this has to be swapped. What that
+    // comment then did was write a landscape horizontal of 422 straight onto an
+    // x axis whose valid range ends at 390, and it justified it with a container
+    // height of 414 that had never been measured. The container is 844 tall.
+    // Position read back as 348, 422, which is this value, and it was rejected as
+    // off screen because of that invented 414.
+    //
+    // Top centre of an 844x390 landscape screen is (422, 42). Through the map
+    // that is container (390 - 42, 422).
     if (r_is_objc_ptr(g_sbCountLabel) && enemyCount >= 0) {
         char num[8];
         const int n = snprintf(num, sizeof(num), "%d", enemyCount);
         if (n > 0 && n <= SB_TEXT_MAX) {
             const double w = SB_COUNT_W, h = SB_COUNT_H;
-            const double px = ctx.landW * 0.5;
-            const double py = SB_COUNT_TOP + h * 0.5;
+            const double px = ctx.landH - SB_COUNT_TOP - h * 0.5;
+            const double py = ctx.landW * 0.5;
             uint8_t top = 5;
             uint8_t role = 3;                       // counter
             uint8_t slen = (uint8_t)n;
@@ -2200,37 +2240,56 @@ int SBoardStartOverlay(void) {
     // twenty labels at this cost is a five second start, which is the very wait
     // this build was supposed to be removing; the on demand path stays for
     // anything beyond six.
-    for (int i = 0; i < SB_LABEL_PRESPAWN; i++) {
-        const uint64_t pre = sb_make_pooled_label(container, ESPTextRoleName, i);
-        if (!r_is_objc_ptr(pre)) break;
-        g_sbLabelObj[i] = pre;
-        g_sbLabelUsed++;
+    // Deferred, not skipped. Run one block past the first publish.
+    //
+    // The accounting for the two to three second delay between the boxes appearing
+    // and the counter appearing puts this loop at 2322 ms of it, eighty two per
+    // cent. Six labels, each thirteen outer remote calls of which nine are
+    // r_msg2_main, each of which expands into a full NSInvocation round trip with
+    // seven settles and a blocking waitUntilDone:YES on SpringBoard's main thread.
+    // Then five cached invocations per label on top, thirty in all.
+    //
+    // It was placed here on the reasoning that a slower start costs nothing. It
+    // does not, because this function runs before the first publish, so every
+    // millisecond here is a millisecond the user stares at a half drawn overlay.
+    // And it is not on the display path at all: the counter has its own label and
+    // the boxes are a shape layer. Nothing the pool draws can appear before the
+    // first publish goes out, so building it before that publish buys nothing and
+    // costs everything.
+    //
+    // So the publish goes first and the pool fills in behind it, on its own queue.
+    // The names are off by default anyway, so in the common case this work is not
+    // needed at all; when they are switched on, the labels exist within a frame or
+    // two of the request instead of two seconds before the match.
+    //
+    // One block past the publish, not two: the first publish is dispatched from
+    // another thread and the queue here has to land strictly after it has taken
+    // s_remoteBusy, or the two would serialise on the remote mutex anyway and the
+    // change would buy nothing.
+    dispatch_block_t poolBlock = dispatch_block_create(0, ^{
+        for (int i = 0; i < SB_LABEL_PRESPAWN; i++) {
+            const uint64_t pre = sb_make_pooled_label(container, ESPTextRoleName, i);
+            if (!r_is_objc_ptr(pre)) break;
+            g_sbLabelObj[i] = pre;
+            g_sbLabelUsed++;
 
-        // Build its invocations now, not when the label is first used.
-        //
-        // A cached invocation costs a method signature lookup, an
-        // invocationWithMethodSignature: and a remote malloc the first time, and
-        // each of those goes through r_msg2, which settles three milliseconds
-        // before it runs. A label needs five: position, bounds, text, hidden and
-        // transform. Built on demand that is about six hundred milliseconds of
-        // construction spread over the first seconds of a match, one label at a
-        // time, and the device log shows it as frames of sixty to a hundred and
-        // seventy milliseconds with the label count climbing from zero across
-        // them. Nineteen remote calls do not cost a hundred and seventeen
-        // milliseconds; a constructor does, and from the outside it looks exactly
-        // like a slow frame.
-        (void)sb_cached_invocation(pre, "setPosition:",
-                                   &g_sbLabelPosInv[i], &g_sbLabelPosBuf[i], 16);
-        (void)sb_cached_invocation(pre, "setBounds:",
-                                   &g_sbLabelBoundsInv[i], &g_sbLabelBoundsBuf[i], 32);
-        (void)sb_cached_invocation(pre, "setText:",
-                                   &g_sbLabelTextInv[i], &g_sbLabelTextBuf[i], 8);
-        (void)sb_cached_invocation(pre, "setHidden:",
-                                   &g_sbLabelHideInv[i], &g_sbLabelHideBuf[i], 8);
-        (void)sb_cached_invocation(pre, "setTransform:",
-                                   &g_sbLabelTransInv[i], &g_sbLabelTransBuf[i], 48);
+            (void)sb_cached_invocation(pre, "setPosition:",
+                                       &g_sbLabelPosInv[i], &g_sbLabelPosBuf[i], 16);
+            (void)sb_cached_invocation(pre, "setBounds:",
+                                       &g_sbLabelBoundsInv[i], &g_sbLabelBoundsBuf[i], 32);
+            (void)sb_cached_invocation(pre, "setText:",
+                                       &g_sbLabelTextInv[i], &g_sbLabelTextBuf[i], 8);
+            (void)sb_cached_invocation(pre, "setHidden:",
+                                       &g_sbLabelHideInv[i], &g_sbLabelHideBuf[i], 8);
+            (void)sb_cached_invocation(pre, "setTransform:",
+                                       &g_sbLabelTransInv[i], &g_sbLabelTransBuf[i], 48);
+        }
+        NSLog(@"[SB-LABEL] pre-spawned pool=%d of %d (deferred)", g_sbLabelUsed, SB_LABEL_PRESPAWN);
+    });
+    if (poolBlock) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), poolBlock);
     }
-    NSLog(@"[SB-LABEL] pre-spawned pool=%d of %d", g_sbLabelUsed, SB_LABEL_PRESPAWN);
 
     // Created after sb_forget_local_paint_state for the same reason the counter
     // label is: that function clears every pointer into the previous session, and

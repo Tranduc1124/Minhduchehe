@@ -2777,53 +2777,23 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
     RC_DIAG("stable memset done");
 
-    // Hand back the threads init borrowed, before the session goes live.
+    // The borrowed threads are deliberately left bound to this port.
     //
-    // The injection loop bound g_RC_firstExceptionPort and set AST_GUARD on
-    // every thread it walked, and nothing ever took either off again. In steady
-    // state no code waits on that port at all: do_remote_call_temp is reached
-    // only from init and teardown, and the two peeks added for this diagnosis
-    // are non-destructive. So the first time one of those borrowed threads
-    // faults on its own, the kernel stops it and queues a message that nobody
-    // in this process will ever consume or reply to, and that thread stays
-    // stopped for the rest of the session still holding whatever it held.
+    // It was tried the other way: 93c125e9 set MACH_PORT_NULL on every thread init
+    // had touched, to stop a natural fault from being swallowed by a queue with no
+    // reader. That was never validated, and it touches exactly the thing that now
+    // kills SpringBoard.
     //
-    // Measured on 2026-09-29 17:28, which is what this fixes: an
-    // EXC_BAD_ACCESS at one fixed PC landed on that port while an objc_msgSend
-    // was in flight, from a sender that was not the call thread, and the call
-    // then sat in wait2 until the ten second floor and killed the session. A
-    // stopped thread in SpringBoard is not a slow overlay, it is a SpringBoard
-    // holding a lock nobody will release.
+    // The crash is EXC_BAD_ACCESS / SIGBUS at 0x401, which is FAKE_LR_TROJAN, on a
+    // thread this project created with thread_start. That address is the return
+    // trap the whole design depends on: the synthetic call thread runs the
+    // selector, returns to 0x401, and the exception is caught on
+    // secondExceptionPort. Reaching it as a fatal SIGBUS means the thread had no
+    // exception port covering it at that moment, which is a thread losing its
+    // binding rather than a thread faulting somewhere unexpected.
     //
-    // MACH_PORT_NULL restores the thread's default exception port, which is
-    // SpringBoard's own handler, so a natural fault there is handled normally
-    // instead of being swallowed by us. The call thread is exempt: its port is
-    // the mechanism, not a leftover.
-    {
-        uint64_t released = 0, kept = 0;
-        for (NSNumber *num in g_RC_threadList) {
-            const uint64_t addr = num.unsignedLongLongValue;
-            if (!is_kaddr_valid(addr)) continue;
-            if (addr == g_RC_callThreadAddr) { kept++; continue; }
-            clear_guard_exception(addr);
-            if (set_exception_port_on_thread(MACH_PORT_NULL, addr, useMigFilterBypass)) {
-                released++;
-            } else {
-                RC_DIAG("release of borrowed thread 0x%llx failed — it stays ours",
-                        (unsigned long long)addr);
-            }
-        }
-        g_rcBorrowedReleased = released;
-        g_rcBorrowedKept = kept;
-        g_rcBorrowedTotal = released + kept;
-        // NSLog, not RC_DIAG: the release is the fix, so whether it took has to
-        // be readable without turning diagnostics on. released=0 with borrowed
-        // threads present means the freeze is unfixed, not that it moved.
-        NSLog(@"[RC-INIT] borrowed=%llu released=%llu kept=%llu (kept is the call thread)",
-              (unsigned long long)g_rcBorrowedTotal,
-              (unsigned long long)g_rcBorrowedReleased,
-              (unsigned long long)g_rcBorrowedKept);
-    }
+    // Unverified code that rebinds exception ports on live threads is not worth
+    // the risk of keeping while that is unexplained. back to 7ac7c454 behaviour.
 
     g_RC_success = true;
     RC_DEBUG("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
