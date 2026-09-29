@@ -117,12 +117,6 @@ static void boot_start_sb_overlay(void) {
             if (sbret == 0) {
                 NSLog(@"[BOOT] SpringBoard overlay OK attempt %d", attempt + 1);
                 L(@"OK SpringBoard overlay live (attempt %d).", attempt + 1);
-                // Unconditional, so a build that never ran the probe is
-                // distinguishable from one that ran it and said nothing. Without
-                // this line, silence means two opposite things and the log cannot
-                // tell them apart.
-                NSLog(@"[PROBE] compiled with PROBE_GAME_PROCESS=%d target=%s",
-                      (int)PROBE_GAME_PROCESS, PROBE_GAME_PROC_NAME);
                 // Only once the baseline is known good, so a probe failure is
                 // attributable to the probe.
                 boot_start_game_probe();

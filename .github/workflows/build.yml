@@ -4,13 +4,6 @@ on:
   push:
     branches: [ '**' ]
   workflow_dispatch:
-    inputs:
-      probe_game_process:
-        description: 'Game process probe (1 = enter FreeFire and report, 0 = off)'
-        required: false
-        default: '0'
-        type: choice
-        options: ['0', '1']
 
 permissions:
   contents: write
@@ -45,13 +38,8 @@ jobs:
       - name: Build
         run: |
           cd "$GITHUB_WORKSPACE"
-          PROBE=0
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            PROBE="${{ inputs.probe_game_process }}"
-          fi
-          echo "PROBE_GAME_PROCESS=$PROBE"
           make -f Makefile.app clean || true
-          make -f Makefile.app package FINALPACKAGE=1 PROBE_GAME_PROCESS="$PROBE" 2>&1 | tail -80
+          make -f Makefile.app package FINALPACKAGE=1 2>&1 | tail -80
           echo "=== packages ==="
           ls -la packages/ || true
           echo "=== find ipa ==="

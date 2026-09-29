@@ -42,18 +42,6 @@ $(APPLICATION_NAME)_FILES += XPF/external/ChOma/src/arm64.c XPF/external/ChOma/s
 
 # --- Flags ---
 $(APPLICATION_NAME)_CFLAGS += -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -Wno-unused-value -Wno-module-import-in-extern-c -Wno-unknown-warning-option -Wno-unguarded-availability-new -Wno-return-type -Wno-macro-redefined -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types -Wno-format -Wno-unused-but-set-variable -Wno-delete-incomplete
-
-# Game process probe. Off unless asked for, and settable from the command line
-# so that turning it on never requires editing a source file and never survives
-# by accident:
-#
-#   make -f Makefile.app package PROBE_GAME_PROCESS=1
-#
-# The value is also echoed into the log at runtime as
-# "[PROBE] compiled with PROBE_GAME_PROCESS=N", because a build that was never
-# switched on and a probe that ran and stayed silent look identical otherwise.
-PROBE_GAME_PROCESS ?= 0
-$(APPLICATION_NAME)_CFLAGS += -DPROBE_GAME_PROCESS=$(PROBE_GAME_PROCESS)
 $(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany
 $(APPLICATION_NAME)_CFLAGS += -Iesp -Iesp/esp -Iesp/esp/espdraw
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD) -I$(PWD)/remote -I$(PWD)/XPF/src -I$(PWD)/XPF/external/ChOma/include
