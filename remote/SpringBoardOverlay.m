@@ -1104,9 +1104,23 @@ static void sb_make_count_label(uint64_t container) {
     // Without this the text is rasterised at scale 1 and is visibly soft on a
     // retina display, which is the most obvious way for it to look worse than
     // the UILabel it replaced. Read once from the screen, set once here.
+    //
+    // Through r_msg_main_raw, not r_msg2_main, and that is the whole line.
+    // r_msg2_main takes its arguments as uint64_t, so handing it a CGFloat
+    // sends the integer part: a scale of 3.0 went across as the integer 3, and
+    // the target read those eight bytes as a double, which is 4.2e-45. A layer
+    // with a contents scale of zero rasterises nothing at all, so the pill drew
+    // because a background is filled rather than rasterised, and the number never
+    // appeared because text is drawn from a rasterised contents. Every other
+    // check on this layer had already come back correct: bounds, fontSize,
+    // attached, position, hidden, and a genuine NSString address, which is
+    // exactly the shape of a layer that is fine and cannot draw.
     {
         double scale = [UIScreen mainScreen].scale;
-        if (scale > 0.5) r_msg2_main(label, "setContentsScale:", scale, 0, 0, 0);
+        if (scale > 0.5) {
+            r_msg_main_raw(label, r_sel("setContentsScale:"), &scale, sizeof(scale),
+                           NULL, 0, NULL, 0, NULL, 0);
+        }
     }
 
     uint64_t UIColor = r_class("UIColor");
