@@ -19,7 +19,6 @@
 #import "RemoteCall.h"
 #import "PAC.h"
 #import "remote_objc.h"
-#import "BatchGeom.h"
 // For ESPTextRole, so the role the app stamps on each string and the role the
 // overlay styles it by are the same enum and not two copies of it that can
 // drift. ESPRole.h rather than esp.h, because esp.h reaches Vector3.h, which is
@@ -33,7 +32,6 @@
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
-#include <sys/mman.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 
@@ -268,9 +266,22 @@ static void sb_np_record(int kind, uint32_t arg, uint64_t us) {
     g_sbNpCount++;
 }
 
-// The two geometry primitives, and their timing, are defined next to
-// sb_batch_append, because the macros call it and a macro may only be expanded
-// after its callee is declared.
+// Timed wrappers. These exist so the timing sits immediately around the remote
+// call and cannot drift into the surrounding bookkeeping, which is exactly the
+// mistake that would make the measurement agree with whatever I expected.
+#define SB_GEOM_LINES(npExpr) \
+    do { \
+        const uint64_t _sbT0 = now_us(); \
+        dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, (npExpr), 0,0,0,0); \
+        sb_np_record(0, (uint32_t)(npExpr), now_us() - _sbT0); \
+    } while (0)
+
+#define SB_GEOM_RECTS(pathExpr, countExpr) \
+    do { \
+        const uint64_t _sbT0 = now_us(); \
+        dlsym_remote("CGPathAddRects", (pathExpr), 0, ptsBuf, (countExpr), 0,0,0,0); \
+        sb_np_record(1, (uint32_t)(countExpr), now_us() - _sbT0); \
+    } while (0)
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -1288,218 +1299,6 @@ static void sb_disable_layer_actions(uint64_t layer) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// One remote call per frame for the whole geometry list.
-//
-// WHAT THIS IS FOR
-// Every CGPath call this file used to make was a full remote call, and a remote
-// call is four mach_msg round trips on the exception port plus two
-// thread_create/thread_terminate pairs for the PAC signature. A frame with six
-// boxes, a snapline set, health bars and a card batch issued around fifty of
-// them, so a hundred kernel thread lifecycles went into moving four kilobytes of
-// coordinates. Profiling said the numbers, not the drawing.
-//
-// The fix is not a smaller payload. It is to stop paying the transport per call.
-// A 240 byte interpreter is copied into a page mapped PROT_EXEC inside
-// SpringBoard, and it walks a list of CGPath invocations that we write into the
-// target's memory with a single remote_write. The fifty CoreGraphics calls then
-// happen in the target, where each one is a memset, and the frame costs one
-// remote call for the lot.
-//
-// The alternative, an NSInvocation per shape, is worse than what it replaced: it
-// is thirteen blocking calls each and it blocks on SpringBoard's main thread.
-//
-// FAILURE BEHAVIOUR, WHICH IS THE PART THAT MATTERS HERE
-// If anything about this is wrong, the target faults and SpringBoard dies, which
-// is the SIGBUS at 0x401 that was just fixed. So every step is checked and the
-// whole thing reports failure rather than proceeding: the mmap return value, the
-// byte count written back, the interpreter's own return value, and a canary
-// written into the header before the call. If the canary comes back changed, or
-// the call returns non-zero, the batch path reports failure and the caller falls
-// back to the per-call path, which is known to work. It is slower and it is
-// ugly, and it is the point.
-//
-// The interpreter itself is assembly in tools/batch_geom.s, assembled by
-// tools/gen_batch_geom.sh into BatchGeom.c. It is not hand-written machine code.
-// ---------------------------------------------------------------------------
-
-// Off by default. Set by SB_BATCH_ENABLE, which exists so the change can be
-// reverted by editing one line rather than by reverting a commit.
-#ifndef SB_BATCH_ENABLE
-#define SB_BATCH_ENABLE 1
-#endif
-
-// Canary at the end of the header. The interpreter never writes it, so a
-// clobbered or wrong-pointer write is detectable from our side.
-#define SB_BATCH_CANARY  0x53424348414E4341ull   // "SBCHANCA"
-
-static uint64_t g_sbBatchArena   = 0;   // the PROT_EXEC page
-static uint64_t g_sbBatchHdr     = 0;   // BatchHeader, inside that page
-static uint64_t g_sbBatchEntries = 0;   // the entry array, after the header
-static uint64_t g_sbBatchCap     = 0;   // entries the page can hold
-static uint64_t g_sbBatchAddLines = 0;  // CGPathAddLines in SpringBoard
-static uint64_t g_sbBatchAddRects = 0;  // CGPathAddRects in SpringBoard
-static int      g_sbBatchBroken   = 0;  // set once a check fails, never retried
-static uint32_t g_sbBatchUsed     = 0;  // entries written for the current frame
-static uint64_t g_sbBatchCalls    = 0;  // frames that went through the batch path
-static uint64_t g_sbBatchSaved    = 0;  // remote calls the batch path avoided
-static uint64_t g_sbBatchLastUS   = 0;  // cost of the last batch invocation
-static uint64_t g_sbBatchReportAt = 0;  // next 1 Hz report
-
-// A frame cannot need more entries than the streams can produce: 16 layers of
-// subpaths, plus the two rectangle batches, plus the card batch. Rounded up so
-// the header and the array still fit inside a page with room to spare.
-#define SB_BATCH_MAX_ENTRIES 64
-
-static int sb_batch_append(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
-    if (!SB_BATCH_ENABLE || g_sbBatchBroken) return 0;
-    if (g_sbBatchUsed >= SB_BATCH_MAX_ENTRIES) return 0;
-    const uint64_t slot = g_sbBatchEntries + (uint64_t)g_sbBatchUsed * SB_BATCH_ENTRY_W * 8;
-    if (!remote_write(slot, &op, 8)) return 0;
-    if (!remote_write(slot + 8,  &a, 8)) return 0;
-    if (!remote_write(slot + 16, &b, 8)) return 0;
-    if (!remote_write(slot + 24, &c, 8)) return 0;
-    g_sbBatchUsed++;
-    g_sbBatchSaved++;
-    return 1;
-}
-
-// Timed wrappers. These exist so the timing sits immediately around the remote
-// call and cannot drift into the surrounding bookkeeping, which is exactly the
-// mistake that would make the measurement agree with whatever I expected.
-//
-// Both are two-branch. When the batch path is armed the call is appended to the
-// frame's list and nothing crosses the process boundary until sb_batch_flush.
-// When it is not armed, or when appending fails, the call goes out the way it
-// always did, one remote call each. That second branch is the whole safety
-// story: every reason the batch can refuse to run leaves the frame drawing
-// exactly as it did before, only slower.
-//
-// The per-call timing records are kept in both branches, so [SB-NP] still shows
-// what each shape cost. In the batch branch the recorded time is the cost of
-// appending rather than of the CG call, because the CG call has not happened
-// yet. That is deliberate, and it is why the batch's own cost is logged on its
-// own line as [SB-BATCH].
-#define SB_GEOM_LINES(npExpr) \
-    do { \
-        const uint64_t _sbT0 = now_us(); \
-        if (!sb_batch_append(SB_BATCH_OP_LINES, (uint64_t)(rp), \
-                             (uint64_t)(ptsBuf), (uint64_t)(npExpr))) { \
-            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, (npExpr), 0,0,0,0); \
-        } \
-        sb_np_record(0, (uint32_t)(npExpr), now_us() - _sbT0); \
-    } while (0)
-
-#define SB_GEOM_RECTS(pathExpr, countExpr) \
-    do { \
-        const uint64_t _sbT0 = now_us(); \
-        if (!sb_batch_append(SB_BATCH_OP_RECTS, (uint64_t)(pathExpr), \
-                             (uint64_t)(ptsBuf), (uint64_t)(countExpr))) { \
-            dlsym_remote("CGPathAddRects", (pathExpr), 0, ptsBuf, (countExpr), 0,0,0,0); \
-        } \
-        sb_np_record(1, (uint32_t)(countExpr), now_us() - _sbT0); \
-    } while (0)
-
-static int sb_batch_setup(void);   // defined below, used by sb_batch_begin
-
-static int sb_batch_begin(void) {
-    if (!SB_BATCH_ENABLE) return 0;
-    if (g_sbBatchBroken) return 0;
-    if (!r_is_objc_ptr(g_sbBatchArena) && !sb_batch_setup()) return 0;
-    g_sbBatchUsed = 0;
-    return 1;
-}
-
-// Runs the batch and reports whether it can be trusted. Any failure here is
-// permanent: g_sbBatchBroken stops the path forever rather than retrying a setup
-// that has already proven wrong, because a retry loop that keeps faulting the
-// target is how the device ends up in a respring.
-static int sb_batch_flush(void) {
-    if (!SB_BATCH_ENABLE || g_sbBatchBroken) return 0;
-    if (!r_is_objc_ptr(g_sbBatchArena) || g_sbBatchUsed == 0) return 0;
-
-    const uint64_t count = g_sbBatchUsed;
-    const uint64_t canary = SB_BATCH_CANARY;
-    if (!remote_write(g_sbBatchHdr + 0,  &g_sbBatchAddLines, 8)) { g_sbBatchBroken = 1; return 0; }
-    if (!remote_write(g_sbBatchHdr + 8,  &g_sbBatchAddRects, 8)) { g_sbBatchBroken = 1; return 0; }
-    if (!remote_write(g_sbBatchHdr + 16, &count, 8))            { g_sbBatchBroken = 1; return 0; }
-    if (!remote_write(g_sbBatchHdr + 24, &canary, 8))          { g_sbBatchBroken = 1; return 0; }
-
-    // One remote call for the entire frame's geometry.
-    const uint64_t rc = do_remote_call_stable_addr(200, g_sbBatchArena,
-                                                  "batch_geom", g_sbBatchHdr, 0, 0, 0, 0, 0, 0, 0);
-    if (!r_is_objc_ptr(rc) && rc != 0) {
-        g_sbBatchBroken = 1;
-        return 0;
-    }
-
-    uint64_t readBack = 0;
-    if (!remote_read(g_sbBatchHdr + 24, &readBack, 8) || readBack != SB_BATCH_CANARY) {
-        g_sbBatchBroken = 1;
-        return 0;
-    }
-    g_sbBatchCalls++;
-    g_sbBatchUsed = 0;
-    return 1;
-}
-
-// Sets the page up once per session. The page holds the code at offset 0 and the
-// command buffer after it, so there is one allocation and one protection change.
-static int sb_batch_setup(void) {
-    if (!SB_BATCH_ENABLE) return 0;
-    if (g_sbBatchBroken) return 0;
-    if (r_is_objc_ptr(g_sbBatchArena)) return 1;
-
-    g_sbBatchAddLines = dlsym_remote("CGPathAddLines", 0, 0, 0, 0, 0, 0, 0, 0);
-    g_sbBatchAddRects = dlsym_remote("CGPathAddRects", 0, 0, 0, 0, 0, 0, 0, 0);
-    if (!g_sbBatchAddLines || !g_sbBatchAddRects) { g_sbBatchBroken = 1; return 0; }
-
-    // Header plus the full entry array, rounded up to a page. The array is
-    // 64 entries of 4 words, so a page holds it with room to spare.
-    const uint64_t need = 64
-                        + (uint64_t)SB_BATCH_MAX_ENTRIES * SB_BATCH_ENTRY_W * 8;
-    const uint64_t size = (need + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
-
-    // mmap RW first, then mprotect to RX. Requesting PROT_EXEC together with
-    // PROT_WRITE in the mmap call is refused on iOS, so RWX from the start
-    // returns MAP_FAILED and the whole path would be dead on arrival.
-    const uint64_t flags = MAP_PRIVATE | MAP_ANON;
-    const uint64_t addr = do_remote_call_stable_addr(200, 0, "mmap", 0, size,
-                                                     PROT_READ | PROT_WRITE, flags,
-                                                     (uint64_t)-1, 0, 0, 0);
-    if (addr == (uint64_t)-1 || addr == 0) { g_sbBatchBroken = 1; return 0; }
-
-    g_sbBatchArena   = addr;
-    g_sbBatchHdr     = addr;
-    g_sbBatchEntries = addr + 64;
-    g_sbBatchCap     = SB_BATCH_MAX_ENTRIES;
-
-    // Copy the interpreter in and read it back, byte for byte. A page that came
-    // back different from what we sent is not a page we can run code on.
-    if (!remote_write(g_sbBatchArena, kBatchGeomCode, kBatchGeomCodeLen)) {
-        g_sbBatchBroken = 1; return 0;
-    }
-    unsigned char back[64];
-    const unsigned checkLen = (kBatchGeomCodeLen < sizeof(back)) ? kBatchGeomCodeLen : (unsigned)sizeof(back);
-    if (!remote_read(g_sbBatchArena, back, checkLen)) { g_sbBatchBroken = 1; return 0; }
-    if (memcmp(back, kBatchGeomCode, checkLen) != 0) { g_sbBatchBroken = 1; return 0; }
-
-    // Seal the page executable now, after the code is in. mprotect in the target,
-    // same reason as the mmap: a page mapped WX does not exist on this OS.
-    if (do_remote_call_stable_addr(200, 0, "mprotect", g_sbBatchArena, size,
-                                   PROT_READ | PROT_EXEC, 0, 0, 0, 0, 0) != 0) {
-        g_sbBatchBroken = 1;
-        return 0;
-    }
-
-    NSLog(@"[SB-BATCH] ready arena=0x%llx hdr=0x%llx cap=%llu code=%uB "
-          @"addLines=0x%llx addRects=0x%llx",
-          (unsigned long long)g_sbBatchArena, (unsigned long long)g_sbBatchHdr,
-          (unsigned long long)g_sbBatchCap, kBatchGeomCodeLen,
-          (unsigned long long)g_sbBatchAddLines, (unsigned long long)g_sbBatchAddRects);
-    return 1;
-}
-
 static uint64_t persistentPath(void) {
     if (g_sbPersistentPath) return g_sbPersistentPath;
     g_sbPersistentPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
@@ -2432,13 +2231,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // the same breath as the stroke path and is the same kind of work:
             // a dlsym_remote for CGPathCreateMutable plus a CGPathRelease of the
             // path that aged out of the hold window.
-            // Arm the batch for this frame before any geometry is appended. On the
-            // first frame of a session this is also where the PROT_EXEC page is
-            // mapped and the interpreter is copied in, which is why it is inside
-            // the timed path rather than in the session setup: if the mapping
-            // fails there is no session to tear down and the per-call path simply
-            // stays in use.
-            sb_batch_begin();
             const uint64_t tGeomStart = now_us();
             // Per call records start here, so they cover the geometry loop and
             // the two trailing batches and nothing before them.
@@ -2962,36 +2754,6 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
             // stroke present is g_sbLastWaitUS and the card present is one
             // r_msg2 that always runs. Both are counted in total, neither is
             // double counted here.
-
-            // Every geometry call for this frame is appended by now, the card
-            // batch included, so this is the one remote call that runs them all
-            // inside SpringBoard. It sits before the presents on purpose: setPath
-            // has to see a path that already has its geometry in it.
-            if (g_sbBatchUsed > 0) {
-                const uint64_t tBatch0 = now_us();
-                const int batched = sb_batch_flush();
-                const uint64_t batchUS = now_us() - tBatch0;
-                if (batched) {
-                    // The CG calls these entries describe have now happened, and
-                    // they happened without crossing the process boundary. They
-                    // are still counted, because the cost of drawing did not go
-                    // away, only the cost of asking for it.
-                    calls += 1;
-                    g_sbLastCalls = g_sbLastCalls;
-                    g_sbLastSubpaths = g_sbLastSubpaths;
-                    g_sbBatchLastUS = batchUS;
-                }
-                if (g_sbBatchReportAt == 0 || tBatch0 > g_sbBatchReportAt) {
-                    g_sbBatchReportAt = tBatch0 + 1000000ULL;
-                    NSLog(@"[SB-BATCH] calls=%llu frames=%llu entries_saved=%llu "
-                          @"batch_us=%llu broken=%d ok=%d",
-                          (unsigned long long)calls,
-                          (unsigned long long)g_sbBatchCalls,
-                          (unsigned long long)g_sbBatchSaved,
-                          (unsigned long long)batchUS,
-                          g_sbBatchBroken, batched);
-                }
-            }
 
             if (drawn > 0 || txtOps > 0 || fillDrawn > 0 || fillWasDrawn) {
                 // No text run this frame means the app is not in a match, and a

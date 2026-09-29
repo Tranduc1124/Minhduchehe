@@ -34,7 +34,6 @@ $(APPLICATION_NAME)_FILES += app/KernelBoot.m app/BootLogPopup.m
 # --- kernel exploit ---
 $(APPLICATION_NAME)_FILES += kexploit/kexploit_opa334.m kexploit/krw.m kexploit/kutils.m kexploit/offsets.m kexploit/vnode.m
 $(APPLICATION_NAME)_FILES += remote/RemoteCall.m remote/Thread.m remote/VM.m remote/PAC.m remote/MigFilterBypassThread.m remote/Exception.m remote/remote_objc.m remote/SpringBoardOverlay.m
-$(APPLICATION_NAME)_FILES += remote/BatchGeom.c
 $(APPLICATION_NAME)_FILES += sandbox_escape.m platformize.m
 $(APPLICATION_NAME)_FILES += utils/file.c utils/hexdump.c utils/process.c
 $(APPLICATION_NAME)_FILES += kpf/patchfinder.m
