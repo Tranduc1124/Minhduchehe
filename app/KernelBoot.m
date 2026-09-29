@@ -10,8 +10,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <unistd.h>
-#import <pthread.h>
-#import <mach/mach.h>
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
 #import "../sandbox_escape.h"
@@ -34,60 +32,6 @@ static void L(NSString *fmt, ...) {
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     dispatch_async(dispatch_get_main_queue(), ^{ kernelBootLog(s); });
-}
-
-// ---------------------------------------------------------------------------
-// Game process probe, off by default.
-//
-// This asks one question and then leaves: can the hijack enter a process that is
-// not SpringBoard, without disturbing the session that is already live? If it
-// can, then drawing inside the game becomes reachable, and that is a different
-// proposition from drawing over it from outside, where every shape costs a round
-// trip and text costs six.
-//
-// It is a probe and not a feature. Nothing is installed, nothing is drawn, no aim
-// is touched, and the session is destroyed before the call returns. It exists so
-// the answer is measured on the device instead of argued from source.
-//
-// The gate is a compile time 0 so the shipped build carries this file inert, and
-// so backing it out is a one line change rather than a revert. It also only runs
-// after SBoardStartOverlay has already returned 0, because a probe that fails
-// while the baseline is broken cannot tell you which of the two is at fault.
-//
-// The thread is created explicitly rather than reused. init_remote_call is not
-// wrapped in g_universal_ipc_mutex and the probe keeps its own RemoteCallState, so
-// running it on the boot queue would have it allocating a second session while
-// the overlay thread is still establishing the first.
-// ---------------------------------------------------------------------------
-#ifndef PROBE_GAME_PROCESS
-#define PROBE_GAME_PROCESS 0
-#endif
-
-// The name tipar-normal uses for the non MAX build: esp/drawing_view/
-// GameOffsets.mm returns "FreeFire" unless the MAX variant is selected.
-#define PROBE_GAME_PROC_NAME "FreeFire"
-
-static void *boot_probe_game_thread(void *arg) {
-    (void)arg;
-    NSLog(@"[PROBE] entering %s from tid=%u", PROBE_GAME_PROC_NAME,
-          (uint32_t)pthread_mach_thread_np(pthread_self()));
-    int rc = probe_remote_call_into(PROBE_GAME_PROC_NAME);
-    NSLog(@"[PROBE] %s verdict rc=%d (%@)", PROBE_GAME_PROC_NAME, rc,
-          rc == 0 ? @"REACHED — code ran in the game" : @"NOT REACHED");
-    return NULL;
-}
-
-static void boot_start_game_probe(void) {
-#if PROBE_GAME_PROCESS
-    pthread_t th;
-    if (pthread_create(&th, NULL, boot_probe_game_thread, NULL) != 0) {
-        NSLog(@"[PROBE] pthread_create failed, probe skipped");
-        return;
-    }
-    pthread_detach(th);
-#else
-    (void)boot_probe_game_thread;
-#endif
 }
 
 static void boot_start_esp_host(void) {
@@ -117,9 +61,6 @@ static void boot_start_sb_overlay(void) {
             if (sbret == 0) {
                 NSLog(@"[BOOT] SpringBoard overlay OK attempt %d", attempt + 1);
                 L(@"OK SpringBoard overlay live (attempt %d).", attempt + 1);
-                // Only once the baseline is known good, so a probe failure is
-                // attributable to the probe.
-                boot_start_game_probe();
                 return;
             }
             RemoteCallInitFailure fail = remote_call_last_init_failure();
