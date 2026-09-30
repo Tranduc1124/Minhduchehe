@@ -1490,6 +1490,10 @@ static bool park_remote_thread_via_exc_guard(uint64_t targetThread,
     arm_thread_state64_internal park = exc.threadState;
     park.__pc = stateToInstall->__pc;
     park.__lr = stateToInstall->__lr;
+    // x8 is the INDIRECT_RESULT address and means nothing to a parked thread.
+    // It arrives from whatever the callee was doing when it trapped, which is
+    // not a value this file chose and not one it can free.
+    park.__x[8] = 0;
     RC_DIAG("EXC_GUARD park: trap SP=0x%llx FP=0x%llx install PC=0x%llx LR=0x%llx",
             (unsigned long long)native_strip(park.__sp),
             (unsigned long long)native_strip(park.__fp),
@@ -1847,6 +1851,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     g_RC_lastTempX0 = exc2.threadState.__x[0];
 
     uint64_t retValue = exc2.threadState.__x[0];
+    // x8 cleared, same reason as the stable path: it is the INDIRECT_RESULT
+    // address, it means nothing after the callee returns, and whatever is in it
+    // now is a buffer the caller has already freed. Republishing it parks the
+    // thread holding a pointer to a released block.
+    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
@@ -2099,6 +2108,23 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     g_RC_lastTempExcCode = exc2.codeFirst;
     g_RC_lastTempX0 = exc2.threadState.__x[0];
     // Re-park: reply keeps thread blocked in exception until next hijack.
+    //
+    // x8 is cleared here and not left as the callee returned it. x8 is the arm64
+    // INDIRECT_RESULT register: it is the address a function returning a struct
+    // wider than 16 bytes writes into, and its contents mean nothing once that
+    // function has returned. The address it holds here is a buffer the caller
+    // allocated in the target and has already freed by the time this runs, so
+    // re-publishing it parks the thread with a pointer to a released block. The
+    // next call reads that x8, and a selector that returns a struct writes
+    // through it. The 2026-09-30 18:05 device log is that: two objc_msgSend
+    // calls returned cleanly with codeFirst = 0x101, the third faulted with
+    // codeFirst = 1 and codeSecond = 0x200057295bb2f0, a heap address, with the
+    // faulting PC inside objc_msgSend.
+    //
+    // Zero is the correct value for a thread that is parked rather than running:
+    // the callee has returned, so there is no indirect result outstanding, and
+    // the transport sets x8 explicitly on every call that does have one.
+    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
@@ -2939,6 +2965,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 drainHits,
                 (unsigned long long)native_strip(exc2.threadState.__pc),
                 (unsigned long long)native_strip(exc2.threadState.__lr));
+        exc2.threadState.__x[8] = 0;   // INDIRECT_RESULT, meaningless while parked
         reply_with_state(&exc2, &exc2.threadState);
     }
     RC_DIAG("pre-creator drain done hits=%d", drainHits);
@@ -2957,6 +2984,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             g_RC_mainThreadAddr == g_RC_trojanThreadAddr);
 
     arm_thread_state64_internal newState = exc.threadState;
+    newState.__x[8] = 0;      // INDIRECT_RESULT, meaningless while parked
     if (!sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
         // Nothing has been replied yet at this point, so the target is still
         // parked in its exception and this is still a clean place to stop. The
