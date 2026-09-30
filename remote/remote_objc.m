@@ -1102,39 +1102,84 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     if (!sel) return false;
     r_settle();
 
-    // Already on the main thread. See r_msg_main_direct. This one cannot simply
-    // hand the register back, because a struct wider than eight bytes is not in
-    // a register and there is no return buffer to read it out of without an
-    // invocation. So the direct path is only for the narrow case, and the wide
-    // case reports failure instead of deadlocking SpringBoard. A caller that
-    // needs the wide case has to move the call off the main thread, and the log
-    // line below is what says which caller that is.
+    // Already on the main thread. See r_msg_main_direct.
+    //
+    // A struct wider than 16 bytes is not returned in a register. arm64 passes
+    // the address to write it into in x8, the INDIRECT_RESULT register, and the
+    // callee returns nothing. So the direct path has to supply that address and
+    // it did not: x8 kept whatever the previous call left in it, the runtime
+    // wrote the struct to that address, it was not mapped, and the write faulted.
+    // The 2026-09-30 17:43 device log has three objc_msgSend faults in a row
+    // carrying codeSecond = 0x200075cfd74ed0 and 0x200075cf92ecb0, PC inside
+    // objc_msgSend, x0 heap shaped rather than scalar, for exactly this. The
+    // selectors are -bounds on a label (CGRect, 16 bytes) and -bounds on
+    // UIScreen (CGRect, 32); both are past the 16 byte limit that decides
+    // whether a return fits in x0 and x1.
+    //
+    // The address handed to x8 is malloced in the target. r_call_stable is the
+    // only call made on the way there, so the pointer is live for the whole trip
+    // and is not the SP-0x100 stack slot, which is the pthread out pointer and is
+    // already spoken for. malloc and free are the same calls this file makes
+    // everywhere else and the same calls the 17:43 run made successfully.
     if (remote_call_runs_on_target_main_thread()) {
-        static uint64_t s_wideWarned = 0;
         uint64_t sigD = r_method_signature(obj, sel);
         if (!r_is_objc_ptr(sigD)) return false;
         uint64_t retLen = r_msg2(sigD, "methodReturnLength", 0, 0, 0, 0);
-        // A struct wider than a register is not in a register at all, so the
-        // direct path cannot produce it. The caller gets false and a log line
-        // naming the selector, which is what tells us which call has to move
-        // off the main thread.
-        if (retLen == 0 || retLen > 8 || retLen < outSize) {
-            if (s_wideWarned != (uint64_t)sel) {
-                s_wideWarned = (uint64_t)sel;
-                NSLog(@"[RemoteObjC] main thread, no direct path for a %llu byte return "
-                      @"from %s — needs a call off the main thread",
-                      (unsigned long long)retLen, selName ? selName : "(null)");
-            }
+        if (retLen == 0 || retLen < outSize) {
+            NSLog(@"[RemoteObjC] %s returns %llu bytes, asked for %zu — refusing",
+                  selName ? selName : "(null)", (unsigned long long)retLen, outSize);
             return false;
         }
-        uint64_t ret = r_msg(obj, sel,
-                             r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
-                             r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
-        // The value came back in a register, so it is already here. The round
-        // trip needed remote_read because its return value lived in a buffer it
-        // had malloced in the target; there is no buffer to read here.
-        __builtin_memcpy(outBuf, &ret, outSize);
-        return true;
+        if (retLen <= 16) {
+            // Fits in x0 and x1. There is nothing to set up.
+            uint64_t ret = r_msg(obj, sel,
+                                 r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
+                                 r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
+            __builtin_memcpy(outBuf, &ret, outSize);
+            return true;
+        }
+        uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
+                                        retLen, 0, 0, 0, 0, 0, 0, 0);
+        if (!retBuf) {
+            NSLog(@"[RemoteObjC] %s struct return: malloc(%llu) failed",
+                  selName ? selName : "(null)", (unsigned long long)retLen);
+            return false;
+        }
+        // Poison first, and check the poison landed, so a read that silently
+        // returned the previous occupant of a recycled block cannot be mistaken
+        // for the struct. Same pattern the round trip below already uses.
+        static const uint8_t kPoison[8] = { 0x52, 0x45, 0x54, 0x50, 0x4F, 0x49, 0x53, 0x4E };
+        remote_clear_shmem_cache();
+        bool armed = remote_write(retBuf, kPoison, sizeof(kPoison));
+        if (armed) {
+            remote_clear_shmem_cache();
+            uint8_t back[8];
+            armed = remote_read(retBuf, back, sizeof(back))
+                 && memcmp(back, kPoison, sizeof(kPoison)) == 0;
+        }
+        if (!armed) {
+            r_free(retBuf);
+            NSLog(@"[RemoteObjC] %s struct return: 0x%llx would not hold the poison",
+                  selName ? selName : "(null)", (unsigned long long)retBuf);
+            return false;
+        }
+
+        remote_call_set_indirect_result_ptr(retBuf);
+        r_msg(obj, sel,
+              r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
+              r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
+        remote_call_set_indirect_result_ptr(0);
+
+        remote_clear_shmem_cache();
+        bool ok = remote_read(retBuf, outBuf, outSize);
+        if (!ok) {
+            // Logged before the free: r_free hands the block back, and after it
+            // the address names whoever took it rather than where the struct was.
+            NSLog(@"[RemoteObjC] %s struct return: read of %zu bytes at 0x%llx failed",
+                  selName ? selName : "(null)", outSize, (unsigned long long)retBuf);
+        }
+        r_free(retBuf);
+        return ok;
     }
 
     uint64_t sig = r_method_signature(obj, sel);

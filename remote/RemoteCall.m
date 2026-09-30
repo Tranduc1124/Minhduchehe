@@ -169,6 +169,27 @@ __thread uint64_t g_RC_bootstrapPid = 0;
 // A flag rather than a goto, because the create block declares things that are still
 // in scope after it and a jump into their initialisation is the kind of thing that
 // compiles and then does something else.
+// x8 for the next call: the arm64 INDIRECT_RESULT register.
+//
+// When a function returns a struct wider than 16 bytes, the caller passes the
+// address to write the struct into in x8, and the callee returns nothing. That
+// is not an argument and not a result, so it does not belong in the x0..x7
+// signature, and every call site in this file passes nothing for it.
+//
+// The 2026-09-30 17:43 device log is what it looks like when x8 holds a stale
+// value. Three objc_msgSend calls in a row faulted with
+// codeSecond = 0x200075cfd74ed0 and 0x200075cf92ecb0, PC inside objc_msgSend,
+// and x0 heap shaped rather than scalar. The runtime wrote the returned struct
+// to whatever x8 said, that address was not mapped, and the write faulted. The
+// selectors that hit this are -bounds on a label (CGRect, 16 bytes) and -bounds
+// on UIScreen (CGRect, 32 bytes); both are over the 16 byte limit that decides
+// whether a return fits in x0 and x1.
+//
+// Zero means no struct return, which is every call that does not opt in, so
+// the default path is unchanged.
+uint64_t g_RC_indirectResultPtr = 0;
+void remote_call_set_indirect_result_ptr(uint64_t p) { g_RC_indirectResultPtr = p; }
+
 static bool g_RC_createDead = false;
 // Which path produced the call thread, for the failure report. "create", "reuse1" or
 // empty, and empty means neither happened.
@@ -1766,6 +1787,8 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
+    exc.threadState.__x[8] = g_RC_indirectResultPtr;
+    g_RC_indirectResultPtr = 0;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
     RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x",
             name ?: "?",
@@ -1972,6 +1995,8 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
+    exc.threadState.__x[8] = g_RC_indirectResultPtr;
+    g_RC_indirectResultPtr = 0;
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.

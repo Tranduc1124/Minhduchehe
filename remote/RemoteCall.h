@@ -71,6 +71,11 @@ int init_remote_call_with_first_exception_timeout(const char* process, bool useM
 int init_remote_call_original_thread_only_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
 uint64_t do_remote_call_stable(int timeout, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
 uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
+
+// Set x8, the arm64 INDIRECT_RESULT register, for the next call. A function
+// returning a struct wider than 16 bytes writes the struct to the address in
+// x8 rather than returning it in a register. Zero means no struct return.
+void remote_call_set_indirect_result_ptr(uint64_t p);
 // Measurement for the SpringBoard main-thread watchdog kill. See the block
 // above rc_ipc_lock_measuring in RemoteCall.m for what each number means.
 // Any out pointer may be NULL.
