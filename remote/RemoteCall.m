@@ -121,6 +121,10 @@ static __thread uint32_t g_RC_lastInitFailurePid = 0;
 // because the PAC signer's internal wait and the target's exception wait are
 // governed by completely different numbers, and the signer was the wrong one.
 static __thread int g_RC_lastTempStep = 0;
+// The one call that is allowed through the session gate even though the session has
+// already failed: the pthread_exit that takes the synthetic call thread down during
+// teardown. It is set only around that call. See destroy_remote_call_internal.
+static bool g_RC_teardownCall = false;
 // How many times the bootstrap getpid was tried before the init gave up. Zero for
 // any other failure. Only exists so the failure can say how hard it tried.
 static __thread int g_RC_bootstrapAttempts = 0;
@@ -2029,7 +2033,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     // the pthread_exit below: "A session that has already failed is the common
     // case here, and issuing a remote call on it is issuing a call whose reply
     // nobody can trust." It belongs on every call, not only the last one.
-    if (!g_RC_success) {
+    if (!g_RC_success && !g_RC_teardownCall) {
         RC_DIAG("stable/%s refused, session already failed (step=%d) — port untouched",
                 name ?: "(addr-call)", (int)g_RC_lastTempStep);
         g_RC_lastTempStep = 25;
@@ -2447,12 +2451,38 @@ int destroy_remote_call_internal(void) {
     // collects. Leaking a port is recoverable; a SIGBUS in SpringBoard is not.
     bool callThreadMayStillBeRunning = false;
     if (g_RC_creatingExtraThread) {
-        // Only wake the thread at all if the session still looks healthy. A
-        // session that has already failed is the common case here, and issuing
-        // a remote call on it is issuing a call whose reply nobody can trust.
-        if (g_RC_success) {
-            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
-        }
+        // Always send this one, whatever the session's own verdict is.
+        //
+        // It used to be behind `if (g_RC_success)`, on the reasoning that a
+        // failed session's reply cannot be trusted. That reasoning is about the
+        // answer, and this call does not want an answer: it wants the thread to
+        // stop existing. Skipping it leaves the synthetic call thread parked on
+        // FAKE_LR_TROJAN with nothing but the second exception port between it
+        // and a SIGBUS, and a park that is never taken down accumulates one per
+        // session.
+        //
+        // 2026-09-30 22:03:29 SpringBoard-2026-09-30-220332.ips, pid 541:
+        //
+        //   exception   EXC_BAD_ACCESS SIGBUS "UNKNOWN_0x101 at 0x401"
+        //   vmRegionInfo "0x401 is not in any region"
+        //   termination  Bus error: 10, byProc "exc handler"
+        //
+        // 0x401 is FAKE_LR_TROJAN, the return address this file signs onto
+        // every call. The report is the fourth overlay attempt of that run being
+        // torn down: three earlier attempts had already faulted, so all three
+        // had set g_RC_success = false, so all three had skipped this call, and
+        // the app was killed with four SpringBoard threads parked on 0x401.
+        //
+        // The refusal gate added in 490187cf9 is what made g_RC_success false
+        // before teardown, and it is why this stopped being intermittent.
+        // g_RC_teardownCall lets exactly this one call past that gate. The
+        // thread is signed pc=pthread_exit lr=FAKE_LR_TROJAN and pthread_exit
+        // does not return, so the link register is never used; and the second
+        // port is deliberately left installed below, so a thread that faults
+        // before it gets there is caught instead of fatal.
+        g_RC_teardownCall = true;
+        do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        g_RC_teardownCall = false;
         callThreadMayStillBeRunning = true;
     }
     else {
