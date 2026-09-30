@@ -93,6 +93,9 @@ int destroy_remote_call_internal(void);
 // is earlier in this file.
 static void g_RC_keep_port_alive_forever(mach_port_t port);
 void abandon_remote_call_internal(void);
+// The real init. init_remote_call() is a thin wrapper that holds the IPC mutex
+// across it; see the comment on the wrapper for why that is the whole point.
+static int init_remote_call_unlocked(const char* process, bool useMigFilterBypass);
 
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
@@ -1359,7 +1362,22 @@ void abandon_remote_call_internal(void) {
     // argument.
     g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
 
-    destroy_exception_port(g_RC_firstExceptionPort);
+    // Same rule for the first port, and it matters more here because
+    // fail_after_creator_park calls this function after restore_trojan_thread has
+    // already returned false. g_RC_trojanThreadAddr is non-zero in exactly that
+    // case, which means SpringBoard's main thread is still parked inside an
+    // exception that was delivered to this port. Destroying the port there leaves
+    // the main thread of the process we were asked not to kill blocked forever on
+    // a dead name, with no way back and nothing left to catch it.
+    //
+    // The failure mode is a watchdog kill rather than the 0x401 SIGBUS the second
+    // port causes, so it has been invisible: it shows up as SpringBoard hanging and
+    // being restarted, which looks like the app being slow.
+    if (g_RC_trojanThreadAddr) {
+        g_RC_keep_port_alive_forever(g_RC_firstExceptionPort);
+    } else {
+        destroy_exception_port(g_RC_firstExceptionPort);
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1512,7 +1530,15 @@ int destroy_remote_call_internal(void) {
     // the leak is ours and not SpringBoard's.
     g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
 
-    destroy_exception_port(g_RC_firstExceptionPort);
+    // See abandon_remote_call_internal. The extra-thread branch above never calls
+    // restore_trojan_thread, so coming through here with g_RC_trojanThreadAddr
+    // non-zero means the main thread is still hijacked, and destroying the port it
+    // is parked on is how SpringBoard's main thread dies.
+    if (g_RC_trojanThreadAddr) {
+        g_RC_keep_port_alive_forever(g_RC_firstExceptionPort);
+    } else {
+        destroy_exception_port(g_RC_firstExceptionPort);
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1795,7 +1821,49 @@ static NSArray<NSNumber *> *collect_all_task_threads(uint64_t taskAddr) {
 }
 
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
+//
+// This wrapper exists only to take the IPC mutex. The body below runs unlocked, and
+// the body below used to be this function, which meant init had no serialisation at
+// all while every other entry point in the file had it.
+//
+// That is what killed SpringBoard. There are three callers and none of them
+// exclude each other: app/KernelBoot.m on a utility queue, SpringBoardOverlay.m's
+// re-arm on a utility queue, and SpringBoardOverlay.m's render-thread retry at line
+// 575 which fires synchronously whenever a session is still coming up. The render
+// thread's guard checks g_sbOverlayOn and then releases g_sbLock before doing any of
+// the work, so that check protects nothing.
+//
+// Two overlapping inits do this to each other, and every step is a few instructions:
+//   - init #1 blocks up to 15 s inside wait_exception, and 20 s inside
+//     restore_trojan_thread.
+//   - init #2 starts underneath it, overwrites g_RC_firstExceptionPort and
+//     g_RC_secondExceptionPort at the top of the body, and installs the NEW port on
+//     the NEW call thread at the install site.
+//   - init #1 then finishes and tears down, draining whatever
+//     g_RC_secondExceptionPort now points at. If that is the port init #2 just
+//     installed, the drain thread 73e0ca6ea added eats session #2's exception
+//     messages.
+//   - a call thread from either session is left parked on a port that is now dead,
+//     has no receiver, or belongs to the other session. It returns to FAKE_LR_TROJAN,
+//     0x401, faults, and there is nobody to catch it.
+//
+// That is the crash: pc = far = 0x401, lr a PAC-signed 0x401, esr "PC alignment",
+// an unnamed thread whose only frame above the fault is thread_start. It happens
+// after ten to thirty-six minutes because it needs a session to fail and then the
+// re-arm backoff to walk from 3 s to 60 s through several generations.
+//
+// The mutex is already PTHREAD_MUTEX_RECURSIVE and every remote call inside this
+// body takes it, so nesting is not the problem; init was simply the one entry point
+// that never took it.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
+    pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
+    pthread_mutex_lock(&g_universal_ipc_mutex);
+    int rc = init_remote_call_unlocked(process, useMigFilterBypass);
+    pthread_mutex_unlock(&g_universal_ipc_mutex);
+    return rc;
+}
+
+static int init_remote_call_unlocked(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
     remote_call_note_init_failure(RemoteCallInitFailureNone, 0);
     g_RC_vphoneBridge = false;

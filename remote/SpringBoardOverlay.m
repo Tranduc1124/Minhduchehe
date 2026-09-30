@@ -76,6 +76,36 @@ static uint32_t g_sbPathHash = 0;
 static NSUInteger g_sbLastPathBytes = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Serialises building a session, which g_sbLock does not and cannot.
+//
+// g_sbLock is taken to read g_sbOverlayOn and released two lines later, then
+// re-taken at the end to publish the result. That shape protects the flag and
+// nothing else, and three callers reach here without excluding each other:
+// KernelBoot.m on a utility queue, the re-arm on a utility queue, and the
+// render thread at the line below, which calls this synchronously whenever a
+// session is still coming up.
+//
+// Two of them inside init_remote_call is what the crash was. The render thread's
+// retry does not wait for the async init on the utility queue to finish, so it
+// starts a second one underneath it: the second overwrites the port globals and
+// installs its port on its own call thread while the first is still blocked in
+// wait_exception, and whichever one tears down first then hands the other's port
+// to a drain thread and zeroes everything. A call thread from either session is
+// left parked on a port with no receiver, returns to FAKE_LR_TROJAN 0x401 and
+// faults into nothing.
+//
+// Recursive, because the render-thread caller lives inside a publish block and the
+// re-arm path can nest.
+static pthread_mutex_t g_sbInitLock;
+static pthread_once_t  g_sbInitLockOnce = PTHREAD_ONCE_INIT;
+static void sb_init_lock_setup(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_sbInitLock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
 // Fl0rk: gDrawViewGeometryPathInvocation + invoke_cached_main_raw
 static uint64_t g_sbSetPathInv = 0;
 static uint64_t g_sbSetPathArgBuf = 0;
@@ -436,7 +466,22 @@ static int sb_open_session(void) {
     return 0;
 }
 
+// The build, split out so SBoardStartOverlay can hold a lock across all of it.
+// Its eleven early returns are why: adding a matching unlock to each one would
+// be eleven chances to miss one.
+static int SBoardStartOverlayBuild(void);
+
 int SBoardStartOverlay(void) {
+    // Held for the whole build, including every destroy_remote_call on the eleven
+    // failure exits below. The reason is in the comment on g_sbInitLock.
+    pthread_once(&g_sbInitLockOnce, sb_init_lock_setup);
+    pthread_mutex_lock(&g_sbInitLock);
+    int rc = SBoardStartOverlayBuild();
+    pthread_mutex_unlock(&g_sbInitLock);
+    return rc;
+}
+
+static int SBoardStartOverlayBuild(void) {
     pthread_mutex_lock(&g_sbLock);
     if (g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return 0; }
     pthread_mutex_unlock(&g_sbLock);
