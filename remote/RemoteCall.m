@@ -1933,8 +1933,11 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
+    RC_DIAG("stable/%s wait1 caught exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx (expect 0x301)",
             name ?: "(addr-call)",
+            (unsigned)exc.exception,
+            (unsigned long long)exc.codeFirst,
+            (unsigned long long)exc.codeSecond,
             (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
     // Who replied to, and who is it that then faulted. If a fault arriving on
@@ -2044,11 +2047,22 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
-    RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
+    // exc/code/codeFirst/codeSecond are the discriminant. A return into 0x401 and
+    // a bad access raised while still inside the callee both land here, and the
+    // 2026-09-30 17:23 log recorded PC=0x18524f020 with LR=0x401 — a real
+    // address inside objc_msgSend, not the fake link register — while printing
+    // only the PC. That line cannot tell those apart, and the difference decides
+    // whether the answer is "the call returned" or "the call faulted and x0 is
+    // whatever it had loaded". The temp path logs this; this path did not.
+    RC_DIAG("stable/%s wait2 exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx x0=0x%llx flags=0x%x",
             name ?: "(addr-call)",
+            (unsigned)exc2.exception,
+            (unsigned long long)exc2.codeFirst,
+            (unsigned long long)exc2.codeSecond,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
-            (unsigned long long)retValue);
+            (unsigned long long)retValue,
+            (unsigned)exc2.threadState.__flags);
     // Recorded here as well, and for the reason the temp path records it. The
     // report prints a program counter, an exception type and x0, and on this path
     // all three were carried over from whichever temp call ran last. So a failure
