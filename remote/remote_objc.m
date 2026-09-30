@@ -127,6 +127,11 @@ static const char *r_sel_name(uint64_t sel)
 // Defined below, next to the other timers in this file.
 static uint64_t r_now_us(void);
 
+// Defined below with the other main thread tracing. Every call this file makes
+// on a hijacked target thread goes through r_call_stable, so that is where the
+// name of the call in flight has to be printed.
+static void r_call_mark(const char *fnName, uint64_t sel);
+
 // How much r_settle() is actually costing, per second. gSettleUS is a number in
 // a header, and 50ms in front of every r_msg2 and r_msg2_main is a lot of
 // waiting that leaves no trace anywhere, so count the sleeps and the microseconds
@@ -168,6 +173,31 @@ static uint64_t r_call_stable(int timeout, const char *fnName,
                               uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
+    // The name of the call that is about to run on the hijacked target thread.
+    //
+    // r_main_perf_mark below names the main thread perform sites, and the log for
+    // the kill on 2026-09-30 15:11 came back with no SB-LAST line at all, which
+    // looked like proof that nothing was ever handed to the main thread. It is
+    // not proof, it is the observer being in the wrong place. All four of those
+    // marks sit after the early return that
+    //
+    //     if (remote_call_runs_on_target_main_thread()) { ... return; }
+    //
+    // takes, and that branch is the one this session runs on, because the trojan
+    // thread is the target's first thread, which is its main thread. So the
+    // direct path returns before any of them run and the log says nothing, and
+    // the hang it was added to find stays invisible.
+    //
+    // r_call_stable is the one place every call passes through on the way to the
+    // target, including the two that are not messages at all, objc_getClass and
+    // the selector registration, and it already carries the callee name. So the
+    // call in flight is named here, on entry, before it can wedge anything: the
+    // last line printed before SpringBoard stops checking in is the call that
+    // wedged it.
+    //
+    // PUSH tagged, or the filter drops it. Same shape as r_main_perf_mark: a
+    // callee is printed the first time it is seen and then once every 250 ms.
+    r_call_mark(fnName, a1);
     pthread_mutex_lock(&gRemoteCallLock);
     uint64_t ret = do_remote_call_stable(timeout, fnName,
                                          a0, a1, a2, a3,
@@ -506,6 +536,41 @@ static void r_main_perf_mark(const char *site, uint64_t sel, int wait)
         s_seen[s_seenN++] = sel;
     }
     printf("[PUSH][SB-LAST] %s sel=%s wait=%d\n", site, r_sel_name(sel), wait);
+}
+
+// The call in flight on the hijacked target thread.
+//
+// The keyed pair is the callee name and the first argument, because a1 is the
+// selector for objc_msgSend and nothing for every other callee, so one key names
+// the exact call either way. Printed on entry, so a call that never returns is
+// still named.
+static void r_call_mark(const char *fnName, uint64_t a1)
+{
+    static uint64_t s_seenFn[24];
+    static uint64_t s_seenArg[24];
+    static int s_seenN;
+    static uint64_t s_lastPrintUS;
+
+    uint64_t now = r_now_us();
+    bool fresh = true;
+    for (int i = 0; i < s_seenN; i++) {
+        if (s_seenFn[i] == (uint64_t)(uintptr_t)fnName &&
+            s_seenArg[i] == a1) { fresh = false; break; }
+    }
+    bool due = (!s_lastPrintUS) || (now - s_lastPrintUS) >= 250000ull;
+    if (!fresh && !due) return;
+    s_lastPrintUS = now;
+    if (fresh && s_seenN < (int)(sizeof(s_seenFn) / sizeof(s_seenFn[0]))) {
+        s_seenFn[s_seenN] = (uint64_t)(uintptr_t)fnName;
+        s_seenArg[s_seenN] = a1;
+        s_seenN++;
+    }
+    // The selector name is only asked for on the message path. r_sel_name walks
+    // the local cache and never calls the target, which matters here: the call
+    // being named may be the one that has the target wedged.
+    const char *selTxt = "n/a";
+    if (fnName && strcmp(fnName, "objc_msgSend") == 0) selTxt = r_sel_name(a1);
+    printf("[PUSH][SB-CALL] %s sel=%s\n", fnName ? fnName : "(null)", selTxt);
 }
 
 static void r_main_wait_note(const char *what, uint64_t sel, uint64_t waitedUS)
