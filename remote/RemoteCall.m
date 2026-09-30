@@ -143,6 +143,10 @@ __thread uint64_t g_RC_bootstrapPid = 0;
 //      a kernel address
 //   8  no port at all, and there is no inject thread[1] to fall back to
 //   9  no port at all, and thread[1] is invalid or is the signing thread itself
+//  10  no target buffer to write the pthread_t into
+//  11  the create was sent and did not come back from where a return comes from
+//  12  the signature for the start routine could not be produced
+//  13  the callee's symbol did not resolve, so the call was not sent at all
 //
 // Without this, "synthetic call thread kobject invalid" is one sentence for nine
 // different failures, four of which are documented in this file as expected on some
@@ -346,6 +350,23 @@ const char *remote_call_last_init_failure_detail(void)
             case 9:  step = "thread[1] invalid or is the signing thread"; break;
             case 10: step = "no target buffer for the out pointer"; break;
             case 11: step = "create faulted instead of returning"; break;
+            default: step = "unclassified"; break;
+        }
+        snprintf(detail, sizeof(detail),
+                 "callThread=%s retPC=0x%llx raw=0x%llx want=0x%llx",
+                 step, (unsigned long long)g_RC_lastTempRetPC,
+                 (unsigned long long)g_RC_lastTempRetPC_raw,
+                 (unsigned long long)FAKE_LR_TROJAN_CREATOR);
+        return detail;
+    }
+
+    if (g_RC_lastInitFailure == RemoteCallInitFailurePthreadCreate) {
+        const char *step;
+        switch (g_RC_callThreadStep) {
+            case 10: step = "no target buffer for the out pointer"; break;
+            case 11: step = "create faulted instead of returning"; break;
+            case 12: step = "start routine signature (remote_pac 0x301) failed"; break;
+            case 13: step = "callee symbol did not resolve, call refused"; break;
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
@@ -1464,6 +1485,28 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
 
     g_RC_lastTempStep = 0;
+
+    // A callee with no address is never sent.
+    //
+    // sign_state signs the PC only when pc is non-zero, because zero is not a code
+    // address, and it leaves __pc alone when it is given zero. So a name that does
+    // not resolve produces a state whose PC is whatever the thread was already
+    // parked at, which here is the trap address 0x101. The thread re-faults at the
+    // place it was already faulted, that arrives on the port this function is about
+    // to read, and it is delivered as the return: the second wait completes, the
+    // return value is a register the function never set, and the caller is told a
+    // call happened.
+    //
+    // That is the exact failure this engine spent the last two rounds learning to
+    // name, in its purest form, and it was still reachable here. The stable path
+    // has always refused a null address; only this one did not.
+    if (!pcAddr) {
+        g_RC_lastTempStep = 13;
+        RC_DIAG("temp/%s has no address (dlsym returned 0) — refusing to send",
+                name ?: "?");
+        g_RC_success = false;
+        return 0;
+    }
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
@@ -2825,6 +2868,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         uint64_t startRoutine = remoteCrashSigned;
         const char *startKind = "pac_0x301";
         if (!startRoutine || startRoutine == (uint64_t)-1) {
+            g_RC_callThreadStep = 12;
             RC_DIAG("remote_pac(FAKE_PC_TROJAN) failed — cannot create call thread");
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
