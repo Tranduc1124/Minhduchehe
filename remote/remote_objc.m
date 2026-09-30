@@ -8,7 +8,6 @@
 #import <pthread.h>
 #import <stdlib.h>
 #import <string.h>
-#import <time.h>
 #import <unistd.h>
 
 extern uint64_t remote_read64(uint64_t src);
@@ -84,121 +83,15 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
     pthread_mutex_unlock(&gObjCCacheLock);
 }
 
-// The name behind a selector pointer, for the ones this file made.
-//
-// r_sel caches name -> value and nothing cached the other direction, so every
-// main thread perform in this file logged as "objc_msgSend" and a wedged main
-// thread could not be attributed to a selector. The watchdog report names the
-// queue and the thread:
-//
-//     unresponsive dispatch queue(s): com.apple.main-thread
-//     60 seconds since last successful checkin
-//     thread 1561: turnstile blocked on task pid 494, hops: 2
-//
-// 1561 is the main thread and the report does not say what it was running, so
-// it cannot say which call has to move off the main thread. The cache already
-// holds a name for every selector the overlay resolves, so walking it backwards
-// is enough. An unknown selector prints as 0x<value>: asking the target to name
-// it is a remote call, and a remote call is the thing that is already in
-// trouble at the moment this is needed.
-#define R_SELNAME_MAX 128
-static const char *r_sel_name(uint64_t sel)
-{
-    static __thread char s_name[R_SELNAME_MAX];
-    if (!sel) return "(null)";
-    s_name[0] = '\0';
-    int pid = remote_call_current_pid();
-    pthread_mutex_lock(&gObjCCacheLock);
-    for (int i = 0; i < R_OBJC_CACHE_CAP; i++) {
-        if (gSelCache[i].value == sel && gSelCache[i].name[0] &&
-            (pid <= 0 || gSelCache[i].pid == pid)) {
-            strncpy(s_name, gSelCache[i].name, sizeof(s_name) - 1);
-            s_name[sizeof(s_name) - 1] = '\0';
-            break;
-        }
-    }
-    pthread_mutex_unlock(&gObjCCacheLock);
-    if (!s_name[0]) {
-        snprintf(s_name, sizeof(s_name), "0x%llx", (unsigned long long)sel);
-    }
-    return s_name;
-}
-
-// Defined below, next to the other timers in this file.
-static uint64_t r_now_us(void);
-
-// Defined below with the other main thread tracing. Every call this file makes
-// on a hijacked target thread goes through r_call_stable, so that is where the
-// name of the call in flight has to be printed.
-static void r_call_mark(const char *fnName, uint64_t sel);
-
-// How much r_settle() is actually costing, per second. gSettleUS is a number in
-// a header, and 50ms in front of every r_msg2 and r_msg2_main is a lot of
-// waiting that leaves no trace anywhere, so count the sleeps and the microseconds
-// and print the window once a second.
-//
-// r_settle() itself is unchanged and gSettleUS is unchanged: this only makes the
-// sleep that already happens visible on the device.
-static void r_settle_note(uint64_t sleptUS)
-{
-    static uint64_t s_lastUS;
-    static uint64_t s_windowN;
-    static uint64_t s_windowUS;
-
-    uint64_t now = r_now_us();
-    if (s_lastUS == 0) s_lastUS = now;
-    s_windowN++;
-    s_windowUS += sleptUS;
-    if ((now - s_lastUS) < 1000000ull) return;
-
-    // NSLog, not printf. See the note at r_call_mark: stdout is invisible on a
-    // non-jailbroken sideload, so every PUSH line here used printf and none of
-    // them ever reached the log.
-    NSLog(@"[PUSH][SB-SETTLE] n=%llu us=%llu",
-          (unsigned long long)s_windowN, (unsigned long long)s_windowUS);
-    s_lastUS = now;
-    s_windowN = 0;
-    s_windowUS = 0;
-}
-
 static void r_settle(void)
 {
-    if (gSettleUS) {
-        usleep(gSettleUS);
-        r_settle_note((uint64_t)gSettleUS);
-    }
+    if (gSettleUS) usleep(gSettleUS);
 }
 
 static uint64_t r_call_stable(int timeout, const char *fnName,
                               uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    // The name of the call that is about to run on the hijacked target thread.
-    //
-    // r_main_perf_mark below names the main thread perform sites, and the log for
-    // the kill on 2026-09-30 15:11 came back with no SB-LAST line at all, which
-    // looked like proof that nothing was ever handed to the main thread. It is
-    // not proof, it is the observer being in the wrong place. All four of those
-    // marks sit after the early return that
-    //
-    //     if (remote_call_runs_on_target_main_thread()) { ... return; }
-    //
-    // takes, and that branch is the one this session runs on, because the trojan
-    // thread is the target's first thread, which is its main thread. So the
-    // direct path returns before any of them run and the log says nothing, and
-    // the hang it was added to find stays invisible.
-    //
-    // r_call_stable is the one place every call passes through on the way to the
-    // target, including the two that are not messages at all, objc_getClass and
-    // the selector registration, and it already carries the callee name. So the
-    // call in flight is named here, on entry, before it can wedge anything: the
-    // last line printed before SpringBoard stops checking in is the call that
-    // wedged it.
-    //
-    // PUSH tagged so the log filter keeps it, and printed with NSLog below, not
-    // printf, because printf is invisible here. Same shape as r_main_perf_mark: a
-    // callee is printed the first time it is seen and then once every 250 ms.
-    r_call_mark(fnName, a1);
     pthread_mutex_lock(&gRemoteCallLock);
     uint64_t ret = do_remote_call_stable(timeout, fnName,
                                          a0, a1, a2, a3,
@@ -363,41 +256,6 @@ static uint64_t r_method_signature(uint64_t obj, uint64_t sel)
                                  types, 0, 0, 0);
 }
 
-bool     r_arg_probe_enabled = false;
-uint64_t r_arg_probe_n = 0;
-
-static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize);
-
-// Write into a target buffer the way r_write_remote_arg does, and say whether it
-// arrived.
-//
-// Every caller that fills a cached NSInvocation's argument buffer needs this.
-// Those buffers are filled with a bare remote_write, which goes through the
-// vm_map_entry hijack and the page cache, and can land in a stale alias of an
-// address the target has recycled. The write then reports success, the target's
-// real page is never touched, and the invocation later reads whatever the
-// previous occupant of that block left there.
-//
-// For an object argument that is a pointer to memory that is no longer there, so
-// the selector stores a wild pointer and the layer quietly draws nothing. That is
-// the counter's string: the setter reported success, the layer read back a valid
-// but unrelated object address, and no amount of checking the transport itself
-// would have caught it, because the corruption was in the argument, not in the
-// return path that the previous commit repaired.
-bool r_remote_write_verified(uint64_t remoteBuf, const void *data, size_t size) {
-    if (!remoteBuf || !data || !size) return false;
-    return r_write_remote_arg(remoteBuf, data, size, size);
-}
-uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
-uint64_t r_arg_probe_alt = 0;
-
-// Written into a target buffer before asking a selector to store a return value
-// there, and read back to prove the mapping is the target's live page rather than
-// a cached alias of an address the target has since recycled. A pattern rather
-// than zero, so that a read which returns "nothing was written" cannot be
-// mistaken for a read that worked and legitimately found zeros.
-#define R_RETPOISON 0x524554504F49534EULL   // "RETP OISN"
-
 static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize)
 {
     if (!remoteBuf || remoteSize == 0) return false;
@@ -416,220 +274,9 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
         memcpy(localBuf, arg, copySize);
     }
 
-    // remote_write goes through the vm_map_entry hijack, so it can silently land
-    // in a stale alias and leave the target's real page untouched, and the file
-    // says so at the top of this one. This function called it exactly once and
-    // trusted the return, so a write that went nowhere looked identical to a write
-    // that worked.
-    //
-    // The device log separated the two. A colour built from four doubles for
-    // 0,1,0,1 came back as a valid UIColor with a valid CGColor, and reading the
-    // components out of SpringBoard gave 0,0,0,0 rather than the -1 the sentinel
-    // starts at. A read that fails leaves the sentinel, so remote_read works and
-    // the target genuinely holds zeros. The write is the half that never arrived.
-    // The argument was then handed to setArgument:atIndex:, which is a pointer to
-    // bytes the target never received, so the selector ran on zeroes.
-    //
-    // r_alloc_str in this same file already had the answer for the string case:
-    // clear the cache, retry, and verify by reading the target's own bytes back.
-    // This does the same, comparing the value rather than a length, so a CGFloat
-    // is checked as well as a C string.
-    bool ok = false;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        remote_clear_shmem_cache();
-        if (!remote_write(remoteBuf, localBuf, remoteSize)) continue;
-
-        uint8_t vstack[64];
-        void *vbuf = vstack;
-        void *vheap = NULL;
-        if (remoteSize > sizeof(vstack)) {
-            vheap = calloc(1, remoteSize);
-            if (!vheap) break;
-            vbuf = vheap;
-        }
-        bool match = remote_read(remoteBuf, vbuf, remoteSize) &&
-                     memcmp(vbuf, localBuf, remoteSize) == 0;
-        if (vheap) free(vheap);
-        if (match) { ok = true; break; }
-        // Only reached when the target did not receive the bytes. Logged once
-        // per distinct buffer so a persistent failure is visible in the device
-        // log instead of showing up later as a colour or a size that silently
-        // came out wrong.
-        static uint64_t s_lastWarned = 0;
-        if (remoteBuf != s_lastWarned) {
-            s_lastWarned = remoteBuf;
-            NSLog(@"[RemoteObjC] remote_write did not reach target buf=0x%llx size=%zu "
-                  "after %d attempts", (unsigned long long)remoteBuf, remoteSize,
-                  attempt + 1);
-        }
-    }
-
+    bool ok = remote_write(remoteBuf, localBuf, remoteSize);
     if (localBuf != stackBuf) free(localBuf);
     return ok;
-}
-
-// Widen a value of `size` bytes to a register width, the way the argument
-// buffers are already widened when they are written with setArgument:atIndex:.
-static uint64_t r_widen_arg(const void *p, size_t size)
-{
-    if (!p) return 0;
-    uint64_t v = 0;
-    size_t n = (size > 8) ? 8 : size;
-    __builtin_memcpy(&v, p, n);
-    return v;
-}
-
-static uint64_t r_now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
-}
-
-// How long the blocking dispatch to SpringBoard's main thread took, how many
-// there have been, and the worst one so far. Every waitUntilDone:YES dispatch
-// in this file reports here, and this is the number that decides who is holding
-// the main thread.
-//
-// The file header says only a waitUntilDone:NO perform is supposed to touch
-// SpringBoard's main thread. That is not what the code does: every helper below
-// ends in performSelectorOnMainThread:...waitUntilDone:YES, which parks the
-// calling thread until the main thread runs the block. So the claim and the code
-// disagree, and the watchdog report is what the disagreement costs:
-//
-//     unresponsive dispatch queue(s): com.apple.main-thread
-//     60 seconds since last successful checkin
-//
-// Read the number two ways. Worst in the low milliseconds across a whole session
-// means the main thread is servicing us promptly and the hang is not this, so
-// stop looking here. Worst in the seconds, or a summary that stops repeating
-// while the overlay is still running, means the dispatch is what wedges the main
-// thread and the fix is to take these off the main thread.
-//
-// PUSH tagged. MO_DAU.txt: a printf without the tag is dropped by the PUSH log
-// filter, and then the number is never seen again.
-#define R_MAIN_WAIT_SLOW_US 50000ull
-
-// The last thing handed to SpringBoard's main thread.
-//
-// The watchdog report names the queue, the thread and the turnstile, and not
-// the selector, so on its own it cannot say which call is the one that wedges
-// the main thread. Two rules keep this from becoming a per frame flood on a 15
-// fps overlay: a selector is printed the first time it is seen, and after that
-// only once every 250 ms. The overlay resolves a bounded set of selectors, so
-// the first rule alone covers every call the session makes, and the second
-// covers the run up to a hang.
-static void r_main_perf_mark(const char *site, uint64_t sel, int wait)
-{
-    static uint64_t s_seen[24];
-    static int s_seenN;
-    static uint64_t s_lastPrintUS;
-
-    uint64_t now = r_now_us();
-    bool fresh = true;
-    for (int i = 0; i < s_seenN; i++) {
-        if (s_seen[i] == sel) { fresh = false; break; }
-    }
-    bool due = (!s_lastPrintUS) || (now - s_lastPrintUS) >= 250000ull;
-    if (!fresh && !due) return;
-    s_lastPrintUS = now;
-    if (fresh && s_seenN < (int)(sizeof(s_seen) / sizeof(s_seen[0]))) {
-        s_seen[s_seenN++] = sel;
-    }
-    NSLog(@"[PUSH][SB-LAST] %s sel=%s wait=%d", site, r_sel_name(sel), wait);
-}
-
-// The call in flight on the hijacked target thread.
-//
-// The keyed pair is the callee name and the first argument, because a1 is the
-// selector for objc_msgSend and nothing for every other callee, so one key names
-// the exact call either way. Printed on entry, so a call that never returns is
-// still named.
-static void r_call_mark(const char *fnName, uint64_t a1)
-{
-    static uint64_t s_seenFn[24];
-    static uint64_t s_seenArg[24];
-    static int s_seenN;
-    static uint64_t s_lastPrintUS;
-
-    uint64_t now = r_now_us();
-    bool fresh = true;
-    for (int i = 0; i < s_seenN; i++) {
-        if (s_seenFn[i] == (uint64_t)(uintptr_t)fnName &&
-            s_seenArg[i] == a1) { fresh = false; break; }
-    }
-    bool due = (!s_lastPrintUS) || (now - s_lastPrintUS) >= 250000ull;
-    if (!fresh && !due) return;
-    s_lastPrintUS = now;
-    if (fresh && s_seenN < (int)(sizeof(s_seenFn) / sizeof(s_seenFn[0]))) {
-        s_seenFn[s_seenN] = (uint64_t)(uintptr_t)fnName;
-        s_seenArg[s_seenN] = a1;
-        s_seenN++;
-    }
-    // The selector name is only asked for on the message path. r_sel_name walks
-    // the local cache and never calls the target, which matters here: the call
-    // being named may be the one that has the target wedged.
-    const char *selTxt = "n/a";
-    if (fnName && strcmp(fnName, "objc_msgSend") == 0) selTxt = r_sel_name(a1);
-    NSLog(@"[PUSH][SB-CALL] %s sel=%s", fnName ? fnName : "(null)", selTxt);
-}
-
-static void r_main_wait_note(const char *what, uint64_t sel, uint64_t waitedUS)
-{
-    static uint64_t s_count;
-    static uint64_t s_maxUS;
-    static uint64_t s_totalUS;
-    s_count++;
-    s_totalUS += waitedUS;
-    if (waitedUS > s_maxUS) {
-        s_maxUS = waitedUS;
-        NSLog(@"[PUSH][SB-WAIT] new worst %s %s %lluus n=%llu total=%lluus",
-              what, r_sel_name(sel), (unsigned long long)waitedUS,
-              (unsigned long long)s_count, (unsigned long long)s_totalUS);
-    }
-    if (waitedUS >= R_MAIN_WAIT_SLOW_US) {
-        NSLog(@"[PUSH][SB-WAIT] slow %s %s %lluus n=%llu worst=%lluus",
-              what, r_sel_name(sel), (unsigned long long)waitedUS,
-              (unsigned long long)s_count, (unsigned long long)s_maxUS);
-    }
-    if ((s_count % 200) == 0) {
-        NSLog(@"[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus last=%s %s",
-              (unsigned long long)s_count, (unsigned long long)s_maxUS,
-              (unsigned long long)s_totalUS, what, r_sel_name(sel));
-    }
-}
-
-// Run a main thread message without going through NSInvocation, when the thread
-// running this call is already the target's main thread. Returns true and stores
-// the selector's return value in outRet; false means the caller must use the
-// normal round trip.
-//
-// A remote call runs on the trojan thread, and that is the target's first
-// thread, which is the main thread. So "perform this on the main thread and
-// wait for it" is a main thread waiting for the main thread. The main thread
-// cannot get back to its runloop to drain the queue, the wait never ends,
-// backboardd stops getting checkins and SpringBoard is killed at sixty seconds.
-// The device log for the kill that is being fixed here:
-//
-//     unresponsive dispatch queue(s): com.apple.main-thread
-//     60 seconds since last successful checkin
-//     thread 1552: mach_msg receive on port 0x73e840b4c063f347
-//     thread 1552: turnstile blocked on task pid 296, hops: 2
-//
-// A direct objc_msgSend from this thread is already a main thread call, so the
-// round trip buys nothing that was wanted and costs the deadlock.
-static bool r_msg_main_direct(uint64_t obj, uint64_t sel,
-                              const void *a0, size_t a0Size,
-                              const void *a1, size_t a1Size,
-                              const void *a2, size_t a2Size,
-                              const void *a3, size_t a3Size,
-                              uint64_t *outRet)
-{
-    if (!remote_call_runs_on_target_main_thread()) return false;
-    *outRet = r_msg(obj, sel,
-                    r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
-                    r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
-    return true;
 }
 
 uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
@@ -639,12 +286,6 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
                         const void *a3, size_t a3Size)
 {
     if (!r_is_objc_ptr(obj) || !sel) return 0;
-
-    uint64_t directRet = 0;
-    if (r_msg_main_direct(obj, sel, a0, a0Size, a1, a1Size,
-                          a2, a2Size, a3, a3Size, &directRet)) {
-        return directRet;
-    }
 
     uint64_t sig = r_method_signature(obj, sel);
     if (!r_is_objc_ptr(sig)) return 0;
@@ -667,9 +308,6 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
-    // The argument buffers must outlive invoke, see the comment at the free
-    // below. Held here so the error paths can release them too.
-    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -678,219 +316,28 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
             argsOK = false;
             continue;
         }
-        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
+        r_free(argBuf);
     }
 
     if (!argsOK) {
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            if (argBufs[i]) r_free(argBufs[i]);
-        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
 
-    // retainArguments is NOT called here, and that is the fix, not an omission.
-    //
-    // It used to be, one line below where it stands now, which is after every
-    // setArgument:atIndex: above. The order is the whole bug.
-    //
-    // The argument frame of an NSInvocation is rebuilt by retainArguments, so an
-    // invocation whose arguments were set and then retained invokes against a
-    // frame that no longer holds them. The probe further down this function
-    // measured exactly that shape and reached exactly that conclusion: the frame
-    // holds the values, getArgument:atIndex: reads them back correctly, and
-    // invoke does not use them, which can only mean invoke is reading the frame
-    // retainArguments left behind rather than the one setArgument:atIndex: wrote.
-    // Its own note names the consequence and the one-line experiment that was
-    // never run: "If skipping it produces the right colour, then calling it is
-    // what moves the arguments somewhere invoke cannot see, and the fix is to
-    // stop calling it for scalar arguments."
-    //
-    // That experiment is no longer needed, because the transport that does work
-    // is in the same repo and differs in exactly one respect: the cached
-    // invocation behind setPath:, setString: and setHidden: calls retainArguments
-    // once, when the invocation is built and its frame is still empty, and never
-    // again. Every present then rewrites the argument and re-sets it with
-    // setArgument:atIndex: with no retainArguments after it. Those selectors run
-    // and their values land. This one called it after the arguments were in place
-    // and nothing it carried ever arrived.
-    //
-    // It is not a problem for a scalar either, which is what the note above
-    // suspected, because a scalar argument is not affected by retention: this
-    // function's own comment further down says "retainArguments only retains
-    // arguments that are objects, so a CGFloat argument is read straight out of
-    // this buffer when invoke runs", which is true and is exactly why the
-    // buffer has to outlive the call. Retention governs lifetime, not the bytes
-    // the frame is read from, so a CGFloat that arrives as zero is not an
-    // argument that was not retained. It is a frame that was rebuilt.
-    //
-    // Dropping it costs nothing for the object arguments either. It only ever
-    // kept an argument object alive across a fire-and-forget present, and every
-    // caller here already owns its objects: the argument buffers are freed at the
-    // very end of this function, after the return value has been read, and the
-    // objects in them are held by whoever made them.
-    //
-    // What this was costing, measured on the counter layer. Every one of its
-    // setters came through here, and every one of them was a silent no-op:
-    //
-    //   setFrame:        the CGRect arrived as zero, so the layer had no bounds,
-    //                    and a CALayer with zero bounds draws nothing at all
-    //   setFontSize:     arrived as 0.0, so no glyphs were ever rasterised
-    //   setContentsScale: arrived as 0.0, so nothing rasterised at any size
-    //   setZPosition:    arrived as 0, under the two shape layers at 99 and 100
-    //   setPosition:     arrived as (0,0)
-    //   setBackgroundColor:, setForegroundColor:, setFont:,
-    //   setAlignmentMode:, addSublayer:
-    //                    arrived as nil, so the layer was never given a plate, a
-    //                    colour, a font, an alignment, or a parent
-    //
-    // A layer in that state is indistinguishable, from outside, from a layer that
-    // was never created: nothing appears, not the text and not the plate, with no
-    // error anywhere. The setters that were believed to be working were not.
-    // setLineWidth: had already been caught doing this and being mistaken for
-    // working, because a line width of zero falls back to the CALayer default of
-    // one, which is close enough to the 1.5 that was asked for that nothing ever
-    // looked wrong. It was never actually being set.
-    //
-    // So the fix is one deleted call in each of the three NSInvocation paths in
-    // this file. The setters stay on the target's main thread, which is where they
-    // have to be: every CALayer setter opens a transaction and CoreAnimation
-    // aborts on that off the main thread. Nothing here moves a setter onto the
-    // call thread.
-
-    if (r_arg_probe_enabled) {
-        r_arg_probe_n = maxUserArgs;
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            r_arg_probe_got[i] = 0;
-            if (!argBufs[i]) continue;
-            uint64_t outBuf = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
-            if (!outBuf) continue;
-            // Poison the buffer first, so a getArgument that writes nothing is
-            // distinguishable from one that wrote zero.
-            remote_write64(outBuf, 0);
-            r_msg2(inv, "getArgument:atIndex:", outBuf, i + 2, 0, 0);
-            r_arg_probe_got[i] = remote_read64(outBuf);
-            r_free(outBuf);
-        }
-
-        // Second invocation, identical in every way except that retainArguments
-        // is not called. Same buffers, same pointers, same order.
-        //
-        // The probe above measured getArgument:atIndex: reading 0,1,0,1 out of
-        // the invocation, and the selector then produced a colour whose
-        // components were sixteen literal zero bytes rather than a misread
-        // layout, since flt and dbl agreed and raw was all zero. So the
-        // invocation holds the values and invoke does not use them, which means
-        // invoke reads somewhere getArgument does not read.
-        //
-        // The only step between the two is retainArguments, and its documented
-        // job is to keep object arguments alive, which is nothing to do with a
-        // CGFloat. If skipping it produces the right colour, then calling it is
-        // what moves the arguments somewhere invoke cannot see, and the fix is
-        // to stop calling it for scalar arguments. If both invocations are black
-        // then it is not retainArguments and the fault is inside invoke itself.
-        r_arg_probe_alt = 0;
-        {
-            uint64_t inv2 = r_msg_retained_return(NSInvocation,
-                                                   r_sel("invocationWithMethodSignature:"),
-                                                   sig, 0, 0, 0);
-            if (r_is_objc_ptr(inv2)) {
-                r_msg2(inv2, "setTarget:", obj, 0, 0, 0);
-                r_msg2(inv2, "setSelector:", sel, 0, 0, 0);
-                for (uint64_t i = 0; i < maxUserArgs; i++) {
-                    if (argBufs[i]) {
-                        r_msg2(inv2, "setArgument:atIndex:", argBufs[i], i + 2, 0, 0);
-                    }
-                }
-                uint64_t ps2 = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
-                uint64_t iv2 = r_sel("invoke");
-                if (ps2 && iv2) r_msg(inv2, ps2, iv2, 0, 1, 0);
-
-                uint64_t rl2 = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
-                if (rl2 > 0 && rl2 <= 8) {
-                    uint64_t rb2 = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
-                    if (rb2) {
-                        remote_write64(rb2, 0);
-                        r_msg2(inv2, "getReturnValue:", rb2, 0, 0, 0);
-                        r_arg_probe_alt = remote_read64(rb2);
-                        r_free(rb2);
-                    }
-                }
-                r_msg2(inv2, "release", 0, 0, 0, 0);
-            }
-        }
-    }
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            if (argBufs[i]) r_free(argBufs[i]);
-        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
-    // waitUntilDone:YES, timed. This parks the EXTRA thread until SpringBoard's
-    // main thread runs the block, so this call's duration is the main thread's
-    // latency as seen by the overlay. r_main_wait_note says what to do with it.
-    r_main_perf_mark("r_msg_main_raw", sel, 1);
-    {
-        uint64_t t0 = r_now_us();
-        r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg_main_raw", sel, r_now_us() - t0);
-    }
-
-    // Only now is it safe to free. setArgument:atIndex: stores the pointer and
-    // copies nothing, and retainArguments only retains arguments that are
-    // objects, so a CGFloat argument is read straight out of this buffer when
-    // invoke runs. Freeing it before invoke is why every number this transport
-    // carried arrived as zero.
-    //
-    // The device log proved it rather than suggesting it. Creating a colour with
-    // colorWithRed:green:blue:alpha: and four separate doubles for 0,1,0,1
-    // returned a valid object and a valid CGColor, and reading the components
-    // back out of SpringBoard gave 0,0,0,0:
-    //
-    //   [SB-COLOR] want=0.00,1.00,0.00,1.00 got=0.00,0.00,0.00,0.00 col=1 cg=1
-    //
-    // This also explains a long standing oddity. setLineWidth: was given 1.5 and
-    // the overlay looked as though it had been honoured, but a zero line width
-    // falls back to the CALayer default of one, which is close enough to 1.5 that
-    // nothing ever looked wrong. It was never actually being set.
-    //
-    // The argument buffers are freed at the very end of this function, not here.
-    //
-    // They used to be released here, immediately before the return value was
-    // read, and that is the shape that made every one-argument selector look
-    // broken. Both are eight bytes: the argument buffer is malloc'd per
-    // argument and rounded up to eight, and the return buffer is malloc'd and
-    // rounded up to eight the same way. Freeing the first and then asking for
-    // the second handed back the same block. The read then went through
-    // remote_write64 and remote_read64, which this file notes can land in a
-    // stale alias because they go through the vm_map_entry hijack, so what came
-    // back was the contents of that block before it was freed rather than what
-    // getReturnValue: had just written into it.
-    //
-    // That is why it looked so selective. A selector with no arguments never
-    // allocates an argument buffer, so its return buffer cannot collide with
-    // one, and alloc, layer, init and isHidden all came back correct.
-    // initWithUTF8String: takes exactly one argument and came back
-    // 0xbeb0fdbaed5e3215: not a user address, and near identical across runs,
-    // which is what a stale block full of an earlier allocation's bytes looks
-    // like rather than noise. r_is_objc_ptr only asks whether the value clears
-    // 0x100000000, so that passed the check and was written into the layer as
-    // the counter's text, which is why the card drew and the number never did.
-    //
-    // Holding the argument buffers until the return has been read removes the
-    // collision entirely: the two mallocs cannot return the same address while
-    // the first is still live. The buffers are eight bytes each and there are
-    // at most four, so holding them for the length of one return read costs
-    // nothing measurable.
+    r_msg(inv, performSel, invokeSel, 0, 1, 0);
 
     uint64_t ret = 0;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
@@ -899,56 +346,11 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
         uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         retBufLen, 0, 0, 0, 0, 0, 0, 0);
         if (retBuf) {
-            // Clear the page cache, verify, and retry. This is r_write_remote_arg's
-            // answer applied to the read side, which never had it.
-            //
-            // remote_write and remote_read go through the vm_map_entry hijack and
-            // a 256 entry LRU of locally mapped aliases keyed on the page address
-            // alone. A cached alias is reused without checking that the target's
-            // page is still the same object, so a block the target has freed and
-            // handed back maps to the old contents. r_write_remote_arg and
-            // r_alloc_str both call remote_clear_shmem_cache and then read the
-            // target's own bytes back to confirm the transfer landed; this read
-            // did neither, so a stale alias and a correct value were
-            // indistinguishable, and the stale contents got used as the return
-            // value of the selector.
-            //
-            // That is how initWithUTF8String: came back as 0xbeb0fdbaed5e3215
-            // on one run and 0xbeb0fdbaed5e3015 on the next: not a wrong answer
-            // from the selector, but the previous occupant of a recycled block.
-            //
-            // The poison write is the check. getReturnValue: is asked to store a
-            // known pattern; if reading it back does not produce that pattern the
-            // mapping is stale, and the answer to trust is not on it. Three
-            // attempts, each after dropping the cache, exactly as the write path
-            // does. The block is still alive here rather than recycled from a
-            // freed argument buffer, so this is belt and braces on top of the
-            // reordering below, and the two together close both holes.
-            bool got = false;
-            for (int attempt = 0; attempt < 3 && !got; attempt++) {
-                remote_clear_shmem_cache();
-                if (!remote_write64(retBuf, R_RETPOISON)) continue;
-                uint64_t check = remote_read64(retBuf);
-                if (check != R_RETPOISON) continue;
-                r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
-                ret = remote_read64(retBuf);
-                got = true;
-            }
-            if (!got) ret = 0;
+            remote_write64(retBuf, 0);
+            r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
+            ret = remote_read64(retBuf);
             r_free(retBuf);
         }
-    }
-
-    // The argument buffers are released here, after the return value has been
-    // read, and not before it. The reason is in the comment above the return
-    // read: freeing an eight byte argument buffer and then mallocing an eight
-    // byte return buffer hands back the same block, and the read goes through
-    // remote_write64/remote_read64, which can land in a stale alias. That is
-    // what made every one-argument selector return the previous occupant of that
-    // block. Holding them for the length of the read costs nothing and removes
-    // the collision by construction.
-    for (uint64_t i = 0; i < maxUserArgs; i++) {
-        if (argBufs[i]) r_free(argBufs[i]);
     }
 
     r_msg2(inv, "release", 0, 0, 0, 0);
@@ -993,13 +395,6 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
     if (!sel) return;
     r_settle();
 
-    // Already on the main thread, so the call is already a main thread call.
-    // See r_msg_main_direct for why the round trip must not be taken here.
-    if (remote_call_runs_on_target_main_thread()) {
-        r_msg(obj, sel, a0, a1, a2, a3);
-        return;
-    }
-
     uint64_t sig = 0;
     {
         uint64_t sigSel = r_sel("methodSignatureForSelector:");
@@ -1023,8 +418,6 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
 
     bool argsOK = true;
     uint64_t userArgs[4] = { a0, a1, a2, a3 };
-    // Held until after invoke. See the comment at the free in r_msg_main_raw.
-    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         8, 0, 0, 0, 0, 0, 0, 0);
@@ -1032,46 +425,21 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
-        argBufs[i] = argBuf;
-        // Same verified writer as the other two sites, so a stale alias is
-        // retried here too rather than becoming a silent zero pointer.
-        if (r_write_remote_arg(argBuf, &userArgs[i], sizeof(userArgs[i]), 8)) {
+        if (remote_write64(argBuf, userArgs[i])) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
+        r_free(argBuf);
     }
 
-    if (!argsOK) {
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            if (argBufs[i]) r_free(argBufs[i]);
-        }
-        return;
-    }
+    if (!argsOK) return;
 
-    // Same omission as r_msg_main_raw, and for the same reason: retainArguments
-    // after setArgument:atIndex: rebuilds the frame the invocation is read from.
-    // See the long note at that call site. The argument buffers are freed below,
-    // after the present has returned, so the bytes are alive either way.
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
-    if (performSel && invokeSel) {
-        // waitUntilDone is 1, not 0. The argument buffers are only valid until
-        // the invocation has run, and this function has no way to learn when a
-        // queued invocation finished, so it must be told to wait. The previous 0
-        // meant the buffers below were freed while the main thread had not yet
-        // read them.
-        r_main_perf_mark("r_msg2_main_async", sel, 1);
-        uint64_t t0 = r_now_us();
-        r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg2_main_async", sel, r_now_us() - t0);
-    }
-    // Safe now that invoke has returned. See the comment at the free in
-    // r_msg_main_raw.
-    for (uint64_t i = 0; i < maxUserArgs; i++) {
-        if (argBufs[i]) r_free(argBufs[i]);
-    }
+    if (performSel && invokeSel) r_msg(inv, performSel, invokeSel, 0, 0, 0);
 }
 
 uint64_t r_msg2_main_raw(uint64_t obj, const char *selName,
@@ -1102,86 +470,6 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     if (!sel) return false;
     r_settle();
 
-    // Already on the main thread. See r_msg_main_direct.
-    //
-    // A struct wider than 16 bytes is not returned in a register. arm64 passes
-    // the address to write it into in x8, the INDIRECT_RESULT register, and the
-    // callee returns nothing. So the direct path has to supply that address and
-    // it did not: x8 kept whatever the previous call left in it, the runtime
-    // wrote the struct to that address, it was not mapped, and the write faulted.
-    // The 2026-09-30 17:43 device log has three objc_msgSend faults in a row
-    // carrying codeSecond = 0x200075cfd74ed0 and 0x200075cf92ecb0, PC inside
-    // objc_msgSend, x0 heap shaped rather than scalar, for exactly this. The
-    // selectors are -bounds on a label (CGRect, 16 bytes) and -bounds on
-    // UIScreen (CGRect, 32); both are past the 16 byte limit that decides
-    // whether a return fits in x0 and x1.
-    //
-    // The address handed to x8 is malloced in the target. r_call_stable is the
-    // only call made on the way there, so the pointer is live for the whole trip
-    // and is not the SP-0x100 stack slot, which is the pthread out pointer and is
-    // already spoken for. malloc and free are the same calls this file makes
-    // everywhere else and the same calls the 17:43 run made successfully.
-    if (remote_call_runs_on_target_main_thread()) {
-        uint64_t sigD = r_method_signature(obj, sel);
-        if (!r_is_objc_ptr(sigD)) return false;
-        uint64_t retLen = r_msg2(sigD, "methodReturnLength", 0, 0, 0, 0);
-        if (retLen == 0 || retLen < outSize) {
-            NSLog(@"[RemoteObjC] %s returns %llu bytes, asked for %zu — refusing",
-                  selName ? selName : "(null)", (unsigned long long)retLen, outSize);
-            return false;
-        }
-        if (retLen <= 16) {
-            // Fits in x0 and x1. There is nothing to set up.
-            uint64_t ret = r_msg(obj, sel,
-                                 r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
-                                 r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
-            __builtin_memcpy(outBuf, &ret, outSize);
-            return true;
-        }
-        uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
-                                        retLen, 0, 0, 0, 0, 0, 0, 0);
-        if (!retBuf) {
-            NSLog(@"[RemoteObjC] %s struct return: malloc(%llu) failed",
-                  selName ? selName : "(null)", (unsigned long long)retLen);
-            return false;
-        }
-        // Poison first, and check the poison landed, so a read that silently
-        // returned the previous occupant of a recycled block cannot be mistaken
-        // for the struct. Same pattern the round trip below already uses.
-        static const uint8_t kPoison[8] = { 0x52, 0x45, 0x54, 0x50, 0x4F, 0x49, 0x53, 0x4E };
-        remote_clear_shmem_cache();
-        bool armed = remote_write(retBuf, kPoison, sizeof(kPoison));
-        if (armed) {
-            remote_clear_shmem_cache();
-            uint8_t back[8];
-            armed = remote_read(retBuf, back, sizeof(back))
-                 && memcmp(back, kPoison, sizeof(kPoison)) == 0;
-        }
-        if (!armed) {
-            r_free(retBuf);
-            NSLog(@"[RemoteObjC] %s struct return: 0x%llx would not hold the poison",
-                  selName ? selName : "(null)", (unsigned long long)retBuf);
-            return false;
-        }
-
-        remote_call_set_indirect_result_ptr(retBuf);
-        r_msg(obj, sel,
-              r_widen_arg(a0, a0Size), r_widen_arg(a1, a1Size),
-              r_widen_arg(a2, a2Size), r_widen_arg(a3, a3Size));
-        remote_call_set_indirect_result_ptr(0);
-
-        remote_clear_shmem_cache();
-        bool ok = remote_read(retBuf, outBuf, outSize);
-        if (!ok) {
-            // Logged before the free: r_free hands the block back, and after it
-            // the address names whoever took it rather than where the struct was.
-            NSLog(@"[RemoteObjC] %s struct return: read of %zu bytes at 0x%llx failed",
-                  selName ? selName : "(null)", outSize, (unsigned long long)retBuf);
-        }
-        r_free(retBuf);
-        return ok;
-    }
-
     uint64_t sig = r_method_signature(obj, sel);
     if (!r_is_objc_ptr(sig)) return false;
 
@@ -1203,8 +491,6 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
-    // Held until after invoke. See the comment at the free in r_msg_main_raw.
-    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -1213,75 +499,39 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
-        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
+        r_free(argBuf);
     }
 
     if (!argsOK) {
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            if (argBufs[i]) r_free(argBufs[i]);
-        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
 
-    // Dropped, like the other two NSInvocation paths in this file. Calling
-    // retainArguments after the arguments are in the frame rebuilds that frame,
-    // and invoke then reads a frame the setters never wrote. See r_msg_main_raw.
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
-        for (uint64_t i = 0; i < maxUserArgs; i++) {
-            if (argBufs[i]) r_free(argBufs[i]);
-        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
-    // waitUntilDone:YES, timed. See r_main_wait_note.
-    r_main_perf_mark("r_msg2_main_struct_ret", sel, 1);
-    {
-        uint64_t t0 = r_now_us();
-        r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg2_main_struct_ret", sel, r_now_us() - t0);
-    }
+    r_msg(inv, performSel, invokeSel, 0, 1, 0);
 
-    // The argument buffers are released after the return has been read, for the
-    // reason given in r_msg_main_raw: freeing an eight byte argument buffer and
-    // then mallocing the return buffer hands back the same block, and the read
-    // runs through the same unverified alias path.
     bool ok = false;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
     if (retLen >= outSize) {
         uint64_t retBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         retLen, 0, 0, 0, 0, 0, 0, 0);
         if (retBuf) {
-            // Same poison, clear and retry as r_msg_main_raw. This path had none
-            // of it, so a struct return that came out of a stale alias was
-            // indistinguishable from a real one. Every caller here is currently a
-            // zero argument selector, so no argument buffer is allocated and the
-            // collision cannot arise yet, but the missing verification was not
-            // what was keeping it safe and would not have kept it safe either.
-            uint8_t poison[8] = { 0x52, 0x45, 0x54, 0x50, 0x4F, 0x49, 0x53, 0x4E };
-            for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-                remote_clear_shmem_cache();
-                if (!remote_write(retBuf, poison, sizeof(poison))) continue;
-                uint8_t back[8];
-                if (!remote_read(retBuf, back, sizeof(back))) continue;
-                if (memcmp(back, poison, sizeof(poison)) != 0) continue;
-                r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
-                ok = remote_read(retBuf, outBuf, outSize);
-            }
+            r_msg2(inv, "getReturnValue:", retBuf, 0, 0, 0);
+            ok = remote_read(retBuf, outBuf, outSize);
             r_free(retBuf);
         }
-    }
-
-    for (uint64_t i = 0; i < maxUserArgs; i++) {
-        if (argBufs[i]) r_free(argBufs[i]);
     }
 
     r_msg2(inv, "release", 0, 0, 0, 0);
@@ -1292,42 +542,12 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
 {
     if (!r_is_objc_ptr(obj) || !sel) return 0;
     if (remote_call_uses_vphone_bridge()) {
-        // objc_msgSend_main is the target's own main thread helper and it takes
-        // no wait flag, so routing wait==NO through it made a caller that asked
-        // for a non-blocking perform block on the target's main thread anyway.
-        // Only wait==YES goes there now.
-        //
-        // The path below is what a non-blocking perform is, so this is the same
-        // call the caller asked for and not a new lifetime pattern for object:
-        // the argument holds exactly as long as the caller's own contract says
-        // it does, and a caller that frees it needs the target to have run the
-        // selector first asks for wait==YES.
-        if (wait) return r_msg_main(obj, sel, object, 0, 0, 0);
-        uint64_t bridgePerformSel =
-            r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
-        if (!bridgePerformSel) return 0;
-        return r_msg(obj, bridgePerformSel, sel, object, 0, 0);
-    }
-
-    // Already on the main thread, so performing the selector here is the same
-    // call the main thread would have made. With wait set this used to be a
-    // guaranteed self deadlock. See r_msg_main_direct.
-    if (remote_call_runs_on_target_main_thread()) {
-        return r_msg(obj, sel, object, 0, 0, 0);
+        return r_msg_main(obj, sel, object, 0, 0, 0);
     }
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     if (!performSel) return 0;
-    if (!wait) {
-        r_main_perf_mark("r_perform_main", sel, 0);
-        return r_msg(obj, performSel, sel, object, 0, 0);
-    }
-    // waitUntilDone:YES, timed. See r_main_wait_note.
-    r_main_perf_mark("r_perform_main", sel, 1);
-    uint64_t t0 = r_now_us();
-    uint64_t r = r_msg(obj, performSel, sel, object, 1, 0);
-    r_main_wait_note("r_perform_main", sel, r_now_us() - t0);
-    return r;
+    return r_msg(obj, performSel, sel, object, wait ? 1 : 0, 0);
 }
 
 uint64_t r_cfstr(const char *s)
@@ -1380,64 +600,19 @@ bool r_responds_main(uint64_t obj, const char *selName)
     return (r & 0xff) != 0;
 }
 
-// Reads an instance variable straight out of the object's own memory and asks
-// nothing of the target for the value, which is the whole point of it.
-//
-// The reason this exists is that the return value of an objc message sent into
-// the target is not always readable on this side. A class method comes back
-// intact, +[CAShapeLayer layer] returned 0x30087bb40 on 2026-09-30 and the shape
-// that value built went on to draw. An instance getter on the same transport, on
-// the same session, moments later, did not: the container's -[UIView layer]
-// handed back a pointer out of the shared cache, and the -[CALayer
-// addSublayer:] sent to that pointer died at objc_msgSend+0x20 reading a bogus
-// isa and branching to 0x1.
-//
-// A property whose getter is a synthesised ivar read has its answer in the
-// object. Reading it costs three calls into libobjc, all of which return
-// integers or pointers libobjc owns, and then a plain read of our own. None of
-// that can hand back a stale pointer, because none of it asks for one.
-//
-// The property name is not always the ivar name. A synthesised @property
-// produces _foo for the ivar, and class_getInstanceVariable matches exactly, so
-// "layer" finds nothing on UIView and "_layer" finds it. Try the name as given
-// first and the underscored one second, so callers can pass either and callers
-// that already pass the real ivar name keep working unchanged.
 uint64_t r_ivar_value(uint64_t obj, const char *ivarName)
 {
     if (!r_is_objc_ptr(obj)) return 0;
     uint64_t cls = r_call_stable(R_TIMEOUT, "object_getClass", obj, 0, 0, 0, 0, 0, 0, 0);
     if (!cls) return 0;
-
-    size_t len = strlen(ivarName);
-    char *underscored = (char *)malloc(len + 2);
-    uint64_t ivar = 0;
-    if (underscored) {
-        underscored[0] = '_';
-        memcpy(underscored + 1, ivarName, len + 1);
-        uint64_t nameBuf = r_alloc_str(underscored);
-        free(underscored);
-        if (nameBuf) {
-            ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
-                                 cls, nameBuf, 0, 0, 0, 0, 0, 0);
-            r_free(nameBuf);
-        }
-    }
-    if (!ivar) {
-        uint64_t nameBuf = r_alloc_str(ivarName);
-        if (!nameBuf) return 0;
-        ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
-                             cls, nameBuf, 0, 0, 0, 0, 0, 0);
-        r_free(nameBuf);
-    }
+    uint64_t nameBuf = r_alloc_str(ivarName);
+    if (!nameBuf) return 0;
+    uint64_t ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
+                                  cls, nameBuf, 0, 0, 0, 0, 0, 0);
+    r_free(nameBuf);
     if (!ivar) return 0;
-
-    // ivar_getOffset answers a ptrdiff_t, which comes back as a small integer.
-    // A huge one means libobjc handed back something that is not an Ivar, and
-    // adding it to obj would read a random address in the target.
     uint64_t offset = r_call_stable(R_TIMEOUT, "ivar_getOffset",
                                     ivar, 0, 0, 0, 0, 0, 0, 0);
-    if (offset > 0x10000) return 0;
-
     return remote_read64(obj + offset);
 }
 

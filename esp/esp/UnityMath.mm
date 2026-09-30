@@ -1,6 +1,5 @@
 #import "UnityMath.h"
 #import "offset.h"
-#include <time.h>
 
 #pragma mark - Function Unity
 
@@ -39,98 +38,7 @@ Vector3 WorldToScreenLayer(Vector3 obj, float *matrix, float vpW, float vpH, flo
     return v;
 }
 
-// ---------------------------------------------------------------------------
-// Per-frame memo for getPositionExt.
-//
-// getPositionExt is the one place every bone read goes through, and it is the
-// most expensive read in the frame: it walks the transform's parent chain and
-// costs two kernel reads per level, up to kMaxTransformDepth levels, plus
-// seven before the loop. getBoneTrans calls it up to three times, tryTransformPos
-// probes it twice, and IsActivelyMounted re-derives the head and the hip that
-// the caller has just computed for itself. A pawn therefore has its own head
-// position walked several times in one frame, and a frame costs the game reads
-// that no draw pass will ever use.
-//
-// The memo is keyed on the transform pointer and stamped with a frame counter
-// that ESPFrameMemoBegin bumps once per updateFrame, so a value lives for
-// exactly one frame. Within a frame the answer is deterministic anyway: the
-// chain is walked from the same pointers, so the second walk cannot disagree
-// with the first except by catching the game mid-update, and a frame that sees
-// one pawn in two different poses is worse than one that does not.
-//
-// This is memoisation only. No read is skipped that would not have produced the
-// same number, and nothing here touches the kernel side.
-// ---------------------------------------------------------------------------
-#define ESP_POS_MEMO_SLOTS 128
-static uint64_t g_posMemoTag = 0;
-static uint64_t g_posMemoKey[ESP_POS_MEMO_SLOTS];
-static uint64_t g_posMemoStamp[ESP_POS_MEMO_SLOTS];
-static Vector3 g_posMemoVal[ESP_POS_MEMO_SLOTS];
-
-// Hits and misses, printed once a second. The change above is only worth having
-// if it is measurably removing walks, and "it should be faster" is not a number,
-// so the count is on the device rather than in a claim. tag=PUSH because the log
-// filter drops anything without it.
-//
-// clock_gettime, not mach_absolute_time: the latter counts ticks, which are not
-// nanoseconds on this hardware, so a nanosecond window built on it is a window
-// of arbitrary length and the line would print at a rate nobody can predict.
-static uint64_t g_posMemoHit = 0, g_posMemoMiss = 0;
-static uint64_t g_posMemoNextUS = 0;
-
-static inline uint64_t esp_memo_now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-void ESPFrameMemoBegin(void) {
-    g_posMemoTag++;
-    const uint64_t now = esp_memo_now_us();
-    if (g_posMemoNextUS == 0) { g_posMemoNextUS = now + 1000000ULL; return; }
-    if (now < g_posMemoNextUS) return;
-    g_posMemoNextUS = now + 1000000ULL;
-    const uint64_t total = g_posMemoHit + g_posMemoMiss;
-    printf("[PUSH][POSMEMO] hit=%llu miss=%llu hitpct=%llu frames=%llu\n",
-           (unsigned long long)g_posMemoHit, (unsigned long long)g_posMemoMiss,
-           (unsigned long long)(total ? (100ULL * g_posMemoHit) / total : 0ULL),
-           (unsigned long long)g_posMemoTag);
-    g_posMemoHit = 0;
-    g_posMemoMiss = 0;
-}
-
-static inline bool esp_pos_memo_get(uint64_t key, Vector3 *out) {
-    if (g_posMemoTag == 0) return false;              // no frame open yet
-    const size_t slot = (size_t)(key >> 3) & (ESP_POS_MEMO_SLOTS - 1);
-    if (g_posMemoKey[slot] != key) return false;
-    // The stamp is what makes this per-frame. Without it the cache is permanent:
-    // the key is a transform pointer, which is stable for the life of a pawn, so
-    // the first value ever walked for that pointer would be returned for the rest
-    // of the session. The counter that ESPFrameMemoBegin bumps is not consulted
-    // per entry, so nothing expired. That froze a bone at wherever it was the
-    // first time it was read, which is the same shape as the aim fault, and it
-    // also meant a failed walk cached its zero forever, so a bone that failed
-    // once never resolved again and the aim fell to the synthesised root or hip.
-    if (g_posMemoStamp[slot] != g_posMemoTag) return false;
-    *out = g_posMemoVal[slot];
-    g_posMemoHit++;
-    return true;
-}
-
-static inline void esp_pos_memo_put(uint64_t key, Vector3 v) {
-    if (g_posMemoTag == 0) return;
-    const size_t slot = (size_t)(key >> 3) & (ESP_POS_MEMO_SLOTS - 1);
-    g_posMemoKey[slot] = key;
-    g_posMemoStamp[slot] = g_posMemoTag;
-    g_posMemoVal[slot] = v;
-    g_posMemoMiss++;
-}
-
-// The walk itself, unchanged. Every exit returns the vector it had built so
-// far, which is why the memo wraps this rather than sitting inside it: six
-// early returns would each need their own store, and one missed store is a
-// stale read rather than a slow one.
-static Vector3 esp_position_walk(uint64_t transObj2) {
+Vector3 getPositionExt(uint64_t transObj2) {
     Vector3 result{};
     if (!isVaildPtr((uintptr_t)transObj2)) return result;
 
@@ -183,14 +91,6 @@ static Vector3 esp_position_walk(uint64_t transObj2) {
     }
 
     return result;
-}
-
-Vector3 getPositionExt(uint64_t transObj2) {
-    Vector3 hit{};
-    if (esp_pos_memo_get(transObj2, &hit)) return hit;
-    Vector3 v = esp_position_walk(transObj2);
-    esp_pos_memo_put(transObj2, v);
-    return v;
 }
 
 static BOOL NickClusterIsIconOrEmoji(NSString *cluster) {

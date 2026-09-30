@@ -82,7 +82,7 @@ void RenderTotalEnemyCount(ESPAddTextCallback textCallback, void *callbackContex
     NSString *countStr = [NSString stringWithFormat:@"%d", totalCount];
 
     // [FIX LAG]: Bỏ tính toán size font, cấp khung rộng và ép tự căn giữa (NO)
-    textCallback(callbackContext, countStr, ESPTextRoleCounter, 0, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
+    textCallback(callbackContext, countStr, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
 }
 
 // ==========================================
@@ -177,6 +177,13 @@ static void ESPRenderPawnCore(
 
     float worldHeight = fabsf(HeadPos.y - RightToePos.y);
 
+    Vector3 L_Ankle      = getPositionExt(getLeftAnkle(PawnObject));
+    Vector3 R_Ankle      = getPositionExt(getRightAnkle(PawnObject));
+    Vector3 L_ForeArm    = getPositionExt(getLeftElbow(PawnObject));
+    Vector3 R_ForeArm    = getPositionExt(getRightElbow(PawnObject));
+    Vector3 L_Hand       = getPositionExt(getLeftHand(PawnObject));
+    Vector3 R_Hand       = getPositionExt(getRightHand(PawnObject));
+
     Vector3 HeadTop = HeadPos; HeadTop.y += 0.2f;
     Vector3 w2sHead    = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
     Vector3 w2sToe     = WorldToScreenLayer(RightToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
@@ -227,30 +234,49 @@ static void ESPRenderPawnCore(
     if (boxHeight < 6.0f) boxHeight = 6.0f;
     if (boxWidth < 4.0f) boxWidth = 4.0f;
 
-    // Cố định, và là đúng số mà label bên SpringBoard dùng. Trước đây nó là
-    // khoảng cách nhân với clamp 4.5 đến 10, ở cuối khoảng đó đọc không ra,
-    // mà label thì không tự đổi cỡ được, nên bất cứ số nào khác ở đây chỉ là
-    // một số mà hai bên không thống nhất.
-    CGFloat dynFontSize = 11.0f;
-
-    // Đo một lần, dùng chung cho card, thanh máu và khung label. Ba thứ phải
-    // thống nhất về chiều rộng của cái tên, và mỗi thứ từng có một ý riêng.
-    CGFloat nameCardW = 0.0f, nameCardH = 0.0f, nameCardTop = 0.0f;
+    CGFloat dynFontSize = fmaxf(4.5f, fminf(10.0f, 350.0f / fmaxf(dis, 1.0f)));
     float centerX = x + boxWidth * 0.5f;
 
     // ---------------------------------------------------------
-    // BONE — bỏ hẳn.
-    //
-    // Một người là 13 đoạn xương, mỗi đoạn là một CGPathAddLines riêng vì
-    // các đoạn không liền nhau. Đó là 13 remote call cho mỗi người, và log
-    // 13:32 ghi rõ sub=69 limb=56 calls=67: gần như toàn bộ khung hình là
-    // xương. Bỏ xương không chỉ cho đúng ngoại hình, nó cắt số call mà
-    // không thay đổi bất cứ thứ gì khác.
-    //
-    // Sáu lần đọc bộ nhớ lấy khớp tay chân cũng đi cùng, vì chúng chỉ tồn
-    // tại cho hình xương. Không có chúng thì khung hình đọc ít đi sáu địa
-    // chỉ mỗi người mỗi lần vẽ, ở một vòng lặp đang chạy 30 lần giây.
+    // BONE
     // ---------------------------------------------------------
+    if (isBone) {
+        Vector3 wHead   = WorldToScreenLayer(HeadPos,   matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wLE     = WorldToScreenLayer(L_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wRE     = WorldToScreenLayer(R_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wLH     = WorldToScreenLayer(L_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wRH     = WorldToScreenLayer(R_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wLA     = WorldToScreenLayer(L_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wRA     = WorldToScreenLayer(R_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+        Vector3 wLT     = w2sLeftToe;
+        Vector3 wRT     = w2sToe;
+
+        CGPoint pHead = CGPointMake(wHead.x, wHead.y);
+        CGPoint pHip  = CGPointMake(w2sHip.x,  w2sHip.y);
+        CGPoint pNeck = CGPointMake(pHead.x + (pHip.x - pHead.x) * 0.15f, pHead.y + (pHip.y - pHead.y) * 0.15f);
+        CGPoint pLE = CGPointMake(wLE.x, wLE.y);
+        CGPoint pRE = CGPointMake(wRE.x, wRE.y);
+        CGPoint pLS = CGPointMake(pNeck.x + (pLE.x - pNeck.x) * 0.3f, pNeck.y + (pLE.y - pNeck.y) * 0.3f);
+        CGPoint pRS = CGPointMake(pNeck.x + (pRE.x - pNeck.x) * 0.3f, pNeck.y + (pRE.y - pNeck.y) * 0.3f);
+        CGPoint pLH = CGPointMake(wLH.x, wLH.y);
+        CGPoint pRH = CGPointMake(wRH.x, wRH.y);
+        CGPoint pLK = CGPointMake(pHip.x + (wLA.x - pHip.x) * 0.45f, pHip.y + (wLA.y - pHip.y) * 0.45f);
+        CGPoint pRK = CGPointMake(pHip.x + (wRA.x - pHip.x) * 0.45f, pHip.y + (wRA.y - pHip.y) * 0.45f);
+        CGPoint pLA = CGPointMake(wLA.x, wLA.y);
+        CGPoint pRA = CGPointMake(wRA.x, wRA.y);
+        CGPoint pLT = CGPointMake(wLT.x, wLT.y);
+        CGPoint pRT = CGPointMake(wRT.x, wRT.y);
+
+        CGFloat headToHip = fabs(pHead.y - pHip.y);
+        CGFloat headRadius = fmaxf(headToHip / 4.5f, 1.0f);
+        ESPAddCircle(buffers->bonePath, CGPointMake(pHead.x, pHead.y - headRadius * 0.5f), headRadius);
+        ESPAddLine(buffers->bonePath, pNeck, pHip);
+        ESPAddLine(buffers->bonePath, pNeck, pLS); ESPAddLine(buffers->bonePath, pLS, pLE); ESPAddLine(buffers->bonePath, pLE, pLH);
+        ESPAddLine(buffers->bonePath, pNeck, pRS); ESPAddLine(buffers->bonePath, pRS, pRE); ESPAddLine(buffers->bonePath, pRE, pRH);
+        ESPAddLine(buffers->bonePath, pHip, pLK); ESPAddLine(buffers->bonePath, pLK, pLA); ESPAddLine(buffers->bonePath, pLA, pLT);
+        ESPAddLine(buffers->bonePath, pHip, pRK); ESPAddLine(buffers->bonePath, pRK, pRA); ESPAddLine(buffers->bonePath, pRA, pRT);
+        buffers->boneDirty = true;
+    }
 
     // ---------------------------------------------------------
     // WEAPON
@@ -271,7 +297,7 @@ static void ESPRenderPawnCore(
             NSString *wname = WeaponNameForPlayerNS(PawnObject);
             if (wname && wname.length > 0) {
                 // [FIX LAG]: Cấp khung cố định và căn giữa bằng NO
-                textCallback(callbackContext, wname, ESPTextRoleWeapon, 0, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
+                textCallback(callbackContext, wname, CGRectMake(wCX - 50.0f, wTY - wIconH - 2, 100.0f, wIconH), [UIColor yellowColor], 6.5f, NO);
             }
         }
     }
@@ -280,20 +306,7 @@ static void ESPRenderPawnCore(
     // LINE
     // ---------------------------------------------------------
     if (isLine) {
-        // The line starts below the red counter, not through the middle of it.
-        //
-        // The counter is a real UILabel in SpringBoard, 34pt tall and 25pt from
-        // the top of the landscape view, and this used to start at 35. The device
-        // screenshot showed the two overlapping, the line leaving from the middle
-        // of the number. 25 + 34 is the bottom of the label, and four points of
-        // clearance puts the line clear of it.
-        //
-        // SB_COUNT_TOP and SB_COUNT_H are the overlay's numbers and live in
-        // SpringBoardOverlay.m. They are repeated here rather than shared because
-        // the two files do not include each other. If the counter ever moves, this
-        // has to move with it.
-        const float kCounterBottom = 25.0f + 34.0f;
-        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, kCounterBottom + 4.0f);
+        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
         CGPoint boxTopCenter = CGPointMake(centerX, y);
 
         if (isKnocked) { ESPAddLine(buffers->snaplineKnockedPath, lineStart, boxTopCenter); buffers->snaplineKnockedDirty = true; }
@@ -314,129 +327,46 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     // NAME
     // ---------------------------------------------------------
-    if (isName) {
+    if (isName && textCallback) {
         NSString *dispName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (dispName.length > 0) {
-            // The card is a filled rectangle drawn here, not a UILabel's
-            // background, and the two have to agree exactly or the text sits off
-            // the edge of its own card.
-            //
-            // It cannot stay a label background. A UILabel's background is the
-            // label's bounds, and the name is measured, so the bounds would have
-            // to follow the text. More to the point a filled shape is the one
-            // thing a CGPath cannot express: the path carries geometry and the
-            // layer carries the paint, so a filled shape needs a layer whose fill
-            // is set. That is one extra layer, and CGPathAddRects draws every
-            // card in the frame in a single call however many there are.
-            // One size, and the same font the overlay's label uses: the
-            // SpringBoard label sets boldSystemFontOfSize:11, so measuring with
-            // anything else makes the card and the text disagree.
-            const CGFloat nameFS = dynFontSize;
-            const CGFloat padX = 10.0f;          // chữ không sát mép
-            const CGFloat cardH = nameFS + 4.0f;
-            const CGFloat cardTop = y - nameFS - 7.0f;
-
-            UIFont *f = [UIFont boldSystemFontOfSize:nameFS];
-            CGFloat nameW = 0.0f;
-            if (f) {
-                nameW = ceil([dispName sizeWithAttributes:@{NSFontAttributeName: f}].width);
-            }
-            if (nameW < 1.0f) nameW = nameFS * 4.0f;
-
-            nameCardW = nameW + padX * 2.0f;
-            nameCardH = cardH;
-            nameCardTop = cardTop;
-
-            CGPathAddRect(buffers->cardPath, NULL,
-                          CGRectMake(centerX - nameCardW * 0.5f, cardTop,
-                                     nameCardW, cardH));
-            buffers->cardDirty = true;
-
-            // The name is not sent any more.
-            //
-            // A UILabel per name in SpringBoard cannot be made to sit on its own
-            // card. The label and the card are two separate objects updated by
-            // two separate paths, so anything that delays one of them shows as
-            // the text leaving the box, and the label has to be moved every
-            // frame to keep up, which is the cost that made it worth replacing
-            // in the first place.
-            //
-            // The card still draws, it is the rectangle above, so the overlay
-            // reads as a box with a caption area and no caption. The replacement
-            // is meant to be glyph geometry in the same path as the card, which
-            // is why this is a deletion rather than a style change: the text
-            // wants to be part of the shape, not a view floating over it.
-            //
-            // dispName, nameFS and textCallback are all still used by the rest of
-            // this function, so nothing above is dead.
-            (void)textCallback;
+            // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
+            textCallback(callbackContext, dispName, CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f, 200.0f, dynFontSize + 4.0f), [UIColor yellowColor], dynFontSize, NO);
         }
     }
 
     // ---------------------------------------------------------
     // DISTANCE
     // ---------------------------------------------------------
-    // The distance label is not built. It came out as a wide grey banner across
-    // the feet rather than a small figure, and a distance is also the one piece
-    // of text that can be re-derived from the box the moment it is wanted back,
-    // so it is held out of the per frame path until the card is right. The
-    // in-app layer below the game still gets it, which is what it was drawn on
-    // before the overlay mirror existed.
-    (void)dis;
-
-    // ---------------------------------------------------------
-    // THANH MÁU — ngang, nằm trên đỉnh đầu, một màu.
-    //
-    // Trước đây là một thanh dọc 2pt bám bên trái box, chia ba đoạn màu
-    // theo lượng máu. Cả ba điều đó sai với yêu cầu: nó dọc chứ không
-    // ngang, nó không nằm trên đầu, và ba màu là ba layer riêng trong khi
-    // SpringBoard chỉ có một CAShapeLayer nên tất cả đều bị gộp về một màu
-    // viền duy nhất. Ba layer cho ba màu là ba lần present để rồi không
-    // thấy màu nào cả.
-    //
-    // Nên còn một đường, một màu. Thanh là hình chữ nhật nên decoder ở
-    // SpringBoard nhận ra bốn góc và gom vào CGPathAddRects, tức nó tốn
-    // đúng một call bất kể có bao nhiêu người trên màn hình.
-    //
-    // Cao 2.5pt thì nó ra một khung rỗng, và đó là lỗi đo được chứ không phải
-    // cảm giác. SpringBoard chỉ có nét vẽ, không có tô: nét 0.75 tô đều lên
-    // cả bốn cạnh, nên một hình chữ nhật cao 2.5 có cạnh trên che từ -0.375
-    // tới +0.375 và cạnh dưới che từ +2.125 tới +2.875, giữa lại hở 1.75pt.
-    // Máy chụp màn hình cho thấy đúng cái khung rỗng đó.
-    //
-    // Muốn nó đặc thì chiều cao phải nhỏ hơn hoặc bằng nét vẽ, để hai cạnh
-    // chồng lên nhau. Một hình chữ nhật cao đúng 0.75 cho dải đặc 1.5pt, quá
-    // mảnh để đọc trên một box cao 60px. Nên khoẻ theo chiều dọc: ba hình
-    // chữ nhật cao 0.75 chồng lên nhau, dải đặc 3pt, vẫn gom trong cùng một
-    // lệnh CGPathAddRects, không tốn thêm call nào.
-    // ---------------------------------------------------------
-    // Thanh máu là một sợi mảnh nằm ngay mép dưới card, dài bằng đúng card.
-    // Không tốn thêm call nào: cả hai layer đã gom mọi hình chữ nhật trong
-    // khung vào cùng một lệnh CGPathAddRects.
-    //
-    // Phần trống nằm trên layer tô đặc cùng card, nên cùng màu xám và đọc ra
-    // một khối. Phần máu nằm trên layer nét, một hình chữ nhật cao đúng bằng
-    // bề dày nét nên hai cạnh dính nhau và ra một sợi đặc chứ không phải khung.
-    // Trước đây là ba sợi 0.75 chồng nhau, dải 3pt trên đầu mỗi box, trông như
-    // một cái biển.
-    if (isHealth && nameCardW > 1.0f) {
-        const float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barX = centerX - nameCardW * 0.5f;
-        const CGFloat barTop = nameCardTop + nameCardH;
-        const CGFloat trackH = 1.5f;
-
-        CGPathAddRect(buffers->cardPath, NULL,
-                      CGRectMake(barX, barTop, nameCardW, trackH));
-        buffers->cardDirty = true;
-
-        const CGFloat fillW = nameCardW * healthRatio;
-        if (fillW > 0.4f) {
-            CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                          CGRectMake(barX, barTop, fillW, 0.75f));
-            buffers->hpFillGreenDirty = true;
-        }
+    if (isDis && textCallback) {
+        NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
+        // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
+        textCallback(callbackContext, distString, CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f, 200.0f, dynFontSize + 4.0f), [UIColor whiteColor], dynFontSize, NO);
     }
 
+    // ---------------------------------------------------------
+    // THANH MÁU
+    // ---------------------------------------------------------
+    if (isHealth) {
+        float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
+        const CGFloat barWidth = 2.0f;
+
+        CGFloat barX = x - barWidth - 1.0f;
+        CGFloat barHeight = boxHeight;
+        CGFloat filledTop = y + barHeight - (barHeight * healthRatio);
+
+        CGRect fillRect = CGRectMake(barX, filledTop, barWidth, barHeight * healthRatio);
+        if (CurHP >= 150) {
+            CGPathAddRect(buffers->hpFillGreenPath, NULL, fillRect);
+            buffers->hpFillGreenDirty = true;
+        } else if (CurHP >= 75) {
+            CGPathAddRect(buffers->hpFillOrangePath, NULL, fillRect);
+            buffers->hpFillOrangeDirty = true;
+        } else if (CurHP > 0) {
+            CGPathAddRect(buffers->hpFillRedPath, NULL, fillRect);
+            buffers->hpFillRedDirty = true;
+        }
+    }
 }
 
 // ==========================================

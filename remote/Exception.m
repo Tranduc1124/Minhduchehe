@@ -70,16 +70,6 @@ bool wait_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer, int 
     return true;
 }
 
-// There is deliberately no peek here.
-//
-// Inspecting a port without taking its message matters: a Mach exception
-// message IS the stopped thread, so dequeuing one and not replying leaves that
-// thread stopped for good. mach_msg_peek would be the right call and is not
-// exported by libSystem on iOS, so it does not link. Re-sending the message
-// after receiving it would work, but it trades a guaranteed-correct failure
-// mode for one where a failed re-send loses the message outright and strands the
-// thread, which is the thing being debugged. Not worth it on a diagnostic path.
-//
 bool exception_state_is_sane(ExceptionMessage *exc)
 {
     if (!exc)

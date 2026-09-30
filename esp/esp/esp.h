@@ -4,7 +4,6 @@
 
 #import "GameLogic.h"
 #import "WeaponTextures.h"
-#import "ESPRole.h"
 
 typedef struct {
     CGMutablePathRef boxPath;
@@ -20,13 +19,6 @@ typedef struct {
     CGMutablePathRef snaplineBotPath;
     CGMutablePathRef snaplineKnockedPath;
     
-    // The grey card behind each name. It is a fill, not a stroke, so it cannot
-    // share the overlay's single stroked layer: a stroke only carries a colour
-    // and a width, and there is nothing in a CGPath that says fill this part and
-    // stroke the rest. One extra layer draws every card in the frame, because
-    // CGPathAddRects is one call for any number of rectangles.
-    CGMutablePathRef cardPath;
-
     CGMutablePathRef hpFillGreenPath;  
     CGMutablePathRef hpFillOrangePath; 
     CGMutablePathRef hpFillRedPath;    
@@ -45,7 +37,6 @@ typedef struct {
     bool snaplineBotDirty;
     bool snaplineKnockedDirty;
     
-    bool cardDirty;
     bool hpFillGreenDirty;
     bool hpFillOrangeDirty;
     bool hpFillRedDirty;
@@ -60,15 +51,9 @@ typedef struct {
     CGMutablePathRef aimAssistPath; 
 } ESPFrameStats;
 
-// key is the identity of the thing the text belongs to, so the overlay can keep
-// one label per pawn rather than one label per distinct string. Every bot in
-// this game is called BOT, so matching labels by their text gave all of them a
-// single label that they took turns writing. Zero means no identity.
 typedef void (*ESPAddTextCallback)(
     void *context,
     NSString *string,
-    int role,
-    uint64_t key,
     CGRect frame,
     UIColor *color,
     CGFloat fontSize,

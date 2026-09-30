@@ -18,22 +18,6 @@
 #import "../remote/RemoteCall.h"
 #import "KeepAlive.h"
 
-// The build this binary is. Bumped by hand, and it is here because the absence of it
-// cost a whole round: a screenshot of the console could not be attributed to a commit,
-// so a fix that was already in the tree looked like one that had not been taken.
-//
-// At the top of the file, above every use. It was at the bottom, then just above
-// kernelBootStart, and both were wrong: a macro is not a declaration, so there is no
-// forward reference, and the first use is in boot_start_sb_overlay which comes before
-// kernelBootStart. The build caught it twice in two days, and the check that caught it
-// is the one that covers app/ — which the first version of this file's own commit did
-// not run.
-//
-// Keep it short and unique. Nine characters, on the first line of the console, so it
-// is the first thing a screenshot shows and the only thing needed to say which binary
-// produced it.
-#define KB_BUILD_ID "r131-216c959"
-
 kernel_boot_log_fn kernelBootLog = NULL;
 
 static BOOL  g_booting   = NO;
@@ -60,17 +44,7 @@ static void boot_start_esp_host(void) {
 
 static void boot_start_sb_overlay(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        // Zero on the first attempt, then 1, 2 and 4.
-        //
-        // This used to be {3, 2, 3, 4}, so the very first attempt slept three
-        // seconds before trying anything. That was a three second wait for
-        // something that normally works immediately, and it is the whole of the
-        // delay the user sees between the ESP host coming up and the overlay
-        // appearing. The retries were always there for the case where
-        // SpringBoard is not ready yet, and they still are: trying at once and
-        // backing off only if it fails is the same behaviour with the wait
-        // moved to where it is actually needed.
-        static const int delays[] = {0, 1, 2, 4}; // cumulative: 0s, 1s, 3s, 7s
+        static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s, 5s, 8s, 12s
         for (int attempt = 0; attempt < 4; attempt++) {
             sleep(delays[attempt]);
             int sbret = SBoardStartOverlay();
@@ -82,59 +56,17 @@ static void boot_start_sb_overlay(void) {
             RemoteCallInitFailure fail = remote_call_last_init_failure();
             const char *why = remote_call_init_failure_description(fail);
             NSString *whyStr = why ? [NSString stringWithUTF8String:why] : @"?";
-            // The measured detail, for the failures that have more than one way to
-            // happen. Without it this line said "bootstrap getpid failed (0x101 miss
-            // / 0x201?)", which is two guesses about a fork in the road and is all
-            // the console had to say about the failure that decides whether the
-            // overlay exists at all. The description cannot carry it, being a pure
-            // function of the enum, so it is fetched and appended here — in the one
-            // place a person can actually read it.
-            const char *detail = remote_call_last_init_failure_detail();
-            NSString *detailStr = (detail && detail[0])
-                                ? [NSString stringWithUTF8String:detail] : @"";
-            NSString *full = detailStr.length
-                           ? [NSString stringWithFormat:@"%@ — %@", whyStr, detailStr]
-                           : whyStr;
             NSLog(@"[BOOT] SpringBoard overlay attempt %d failed rc=%d fail=%@ code=%d",
                   attempt + 1, sbret, whyStr, (int)fail);
-            // L() is NSString formatting. %@ is for NSString* and %s is for a
-            // const char*, and each is right for its own type. Getting that backwards
-            // for KB_BUILD_ID crashed the app with a pointer authentication trap,
-            // because CFString takes a %@ argument to be an object and sends
-            // respondsToSelector: to whatever pointer it was handed.
-            //
-            // The build id is on this line rather than only at the top of the console
-            // because the top scrolls away. A screenshot of a failure line could not be
-            // attributed to a commit, and two rounds went on a log from a build that
-            // was three commits behind. Every line that reports a failure now says
-            // which binary reported it, so that cannot happen again.
-            L(@"[%s] WARN SB overlay attempt %d rc=%d (%@)",
-              KB_BUILD_ID, attempt + 1, sbret, full);
+            // L() is NSString formatting — must use %@ for NSString*, never %s.
+            L(@"WARN SB overlay attempt %d rc=%d (%@)",
+              attempt + 1, sbret, whyStr);
         }
-        L(@"[%s] ERR SpringBoard overlay failed after 4 attempts",
-          KB_BUILD_ID);
+        L(@"ERR SpringBoard overlay failed after 4 attempts — ESP will not draw over FF.");
     });
-
-    // The build id again, on the failure line, because that is the line a screenshot
-    // usually catches and the boot line scrolls away first.
-    // %s, not %@. KB_BUILD_ID is a C string literal, and %@ tells CFString to treat the
-    // argument as an object: it builds an NSDescription proxy around the raw pointer
-    // and calls respondsToSelector: on it, which is a pointer authentication trap and
-    // takes the process down.
-    //
-    //   EXC_BREAKPOINT / SIGTRAP, "(Breakpoint) pointer authentication trap DA"
-    //   __CFStringAppendFormatCore -> _NSDescriptionWithStringProxyFunc
-    //                              -> objc_opt_respondsToSelector
-    //
-    // The note in this file about never using %s is about NSString arguments, and does
-    // not apply here: this argument is a const char * and %s is the correct conversion
-    // for it. The two rules are about different types, and reading the first one as if
-    // it covered the second is what produced this.
-    L(@"build %s", KB_BUILD_ID);
 }
 
 void kernelBootStart(void) {
-    L(@"[%s] MINHDUC build", KB_BUILD_ID);
     if (g_booting) return;
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");

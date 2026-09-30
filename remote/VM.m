@@ -6,7 +6,6 @@
 //
 
 #import <Foundation/Foundation.h>
-#import <mach/mach_time.h>
 #import <pthread.h>
 #import <stddef.h>
 #import <string.h>
@@ -16,16 +15,6 @@
 #import "../../kexploit/offsets.h"
 #import "../../kexploit/kutils.h"
 #import "../../kexploit/kexploit_opa334.h"
-
-// Monotonic microseconds for the rate limiters on this file's two DIAG lines.
-// clock_gettime rather than mach_absolute_time, because the latter counts ticks
-// and a one-second window built on ticks is a window of arbitrary length.
-#include <time.h>
-static inline uint64_t vm_diag_now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
 
 #define VM_PAGE_PACKED_PTR_BITS                         31
 #define VM_PAGE_PACKED_PTR_SHIFT                        6
@@ -188,34 +177,13 @@ uint64_t VME_OFFSET(uint64_t vme_offset_raw)
     return vme_offset_raw << 12;
 }
 
-// The body of vm_get_object, with the entry lookup already done.
-//
-// vm_get_object spends its time in vm_map_find_entry, and vm_map_find_entry
-// walks the whole map on every call. That is correct and it is what the comment
-// on vm_map_find_entry demands, because a cached entry pointer goes stale when
-// the target's COW splits an entry. It is the wrong cost for a caller that is
-// ALREADY walking the map and holding the entry in its hand, and ds_attach is
-// exactly that caller: it walks every entry of Free Fire's vm_map looking for
-// the module base, and asked vm_map_remote_page for the page at that entry's
-// start, which walked the same map again from the beginning, once per
-// qualifying region. n entries in, n walks out, and each walk step is one
-// kreadbuf, which is one getsockopt syscall into the kernel. That is the hang
-// measured on the device, on the main thread, inside ds_attach:
-//
-//   ds_attach + 724 -> vm_map_remote_page -> vm_get_object
-//     -> vm_map_find_entry -> vm_map_iterate_entries -> kreadbuf
-//       -> early_kread64 -> getsockopt
-//
-// 1.10 s of a 1.10 s main thread hang, all of it inside the redundant walk.
-// The entry pointer is only trusted for the length of the caller's own
-// iteration, which is exactly the window in which vm_map_find_entry would have
-// returned that same pointer anyway.
-struct VMObject vm_get_object_for_entry(uint64_t entryAddr, uint64_t address)
+struct VMObject vm_get_object(uint64_t map, uint64_t address)
 {
     struct VMObject result = {0};
-
+ 
+    uint64_t entryAddr = vm_map_find_entry(map, address);
     if (!entryAddr) {
-        NSLog(@"[DS] DIAG vm_get_object_for_entry FAILED addr=0x%llx (no entry covers it)",
+        NSLog(@"[DS] DIAG vm_map_find_entry FAILED addr=0x%llx (no entry covers it)",
               (unsigned long long)address);
         return result;
     }
@@ -252,66 +220,11 @@ struct VMObject vm_get_object_for_entry(uint64_t entryAddr, uint64_t address)
  
     return result;
 }
-
-// The original entry point, unchanged for callers that hold no entry: it still
-// pays one full walk to find the entry, on purpose. See the comment on
-// vm_map_find_entry for why that walk is not cached.
-struct VMObject vm_get_object(uint64_t map, uint64_t address)
-{
-    return vm_get_object_for_entry(vm_map_find_entry(map, address), address);
-}
  
-
-// The remap writes into live kernel vm_map_entry and vm_named_entry objects, so
-// every one of them takes an XNU zone/kernel lock. The device log for
-// 2026-09-28 21:53:11-21:53:26 shows 310 vme_object_or_delta writes and 309
-// named_entry.offset writes in fifteen seconds with no "base walk: ... us=" line
-// ever printed, which is the DIAG flood below plus a remap loop that never
-// finishes. Two things follow, and both are measured rather than assumed:
-//
-//   A. The layout dumps were written to be read once, and they are re-read on
-//      every remap. A flag keeps the first few so a bad layout is still visible
-//      without the flood.
-//   C. The write count is reported once a second, so "is the loop bounded" is
-//      answered by a number instead of by a line count.
-static volatile int32_t g_vmShmemCalls = 0;
-static volatile int32_t g_vmKwriteCount = 0;
-static uint64_t g_vmLastRateUS = 0;
-static int32_t g_vmLastRateCount = 0;
-
-static void vm_note_kernel_write(void)
-{
-    __sync_fetch_and_add(&g_vmKwriteCount, 1);
-}
-
-// Reports once a second: total remaps, kernel writes this second, and writes
-// per remap. A loop that never ends shows a per-second write count that never
-// drops, and that is the difference between "slow" and "stuck".
-static void vm_log_write_rate(uint64_t nowUS)
-{
-    if (g_vmLastRateUS == 0) {
-        g_vmLastRateUS = nowUS;
-        g_vmLastRateCount = __sync_fetch_and_add(&g_vmKwriteCount, 0);
-        return;
-    }
-    if (nowUS - g_vmLastRateUS < 1000000ULL) return;
-
-    int32_t total = __sync_fetch_and_add(&g_vmKwriteCount, 0);
-    int32_t delta = total - g_vmLastRateCount;
-    g_vmLastRateCount = total;
-    g_vmLastRateUS = nowUS;
-
-    int32_t calls = __sync_fetch_and_add(&g_vmShmemCalls, 0);
-    NSLog(@"[PUSH][K] remaps=%d kwrites_1s=%d kwrites_total=%d per_remap=%.2f",
-          calls, delta, total,
-          calls > 0 ? (double)total / (double)calls : 0.0);
-}
 
 static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object)
 {
     struct VMShmem shmem = {0};
-    __sync_fetch_and_add(&g_vmShmemCalls, 1);
-    vm_log_write_rate(mach_absolute_time() * 1000ULL / 1000000ULL);
     if (!object || !is_kaddr_valid(object->address)) {
         printf("[DS][%s:%d] invalid VM object 0x%llx\n",
                __FUNCTION__, __LINE__,
@@ -463,11 +376,7 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     // DIAG via NSLog (3uTools realtime only captures NSLog, not printf):
     // dump the real 72 bytes so the kernel's actual layout is measured on the
     // device instead of inferred.
-    //
-    // The layout is a property of the kernel, not of the call, so three dumps
-    // measure it. Every remap used to dump, which is what produced 1579 log
-    // lines in fifteen seconds on 2026-09-28 with no other output in between.
-    if (__sync_fetch_and_add(&g_vmShmemCalls, 0) <= 3) {
+    {
         uint8_t raw[VME_ENTRY_ZONE_BYTES];
         kreadbuf(nextAddr, raw, sizeof(raw));
         // Plain C hex, not -appendFormat:- which is an NSMutableString category
@@ -563,35 +472,13 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         const uint32_t newOD = (uint32_t)packedPointer;
         memcpy(blk + (odOff - VME_BLOCK_HI), &newOD, sizeof(newOD));
 
-        vm_note_kernel_write();
         early_kwrite32bytes(nextAddr + VME_BLOCK_HI, blk);
 
-        // The readback is the proof the write landed, and it is this write that
-        // matters, not the layout dump above it. A mismatch has to stay visible
-        // on every call; a match does not. 310 of these in fifteen seconds is
-        // what flooded the 21:53 log.
         uint32_t check = 0;
         kreadbuf(nextAddr + odOff, &check, sizeof(check));
-        if (check != newOD || __sync_fetch_and_add(&g_vmShmemCalls, 0) <= 3) {
-            // A mismatch stays visible, but once a second rather than once per
-            // call. The 21:53 log had 310 of these in fifteen seconds, which is
-            // about twenty remaps a second, and an NSLog on the memory path is
-            // an os_log round trip on a path that runs while the page-cache lock
-            // is held. The count per second says the same thing as the raw
-            // flood did and costs one line.
-            static uint64_t s_odLast = 0;
-            static uint64_t s_odCount = 0;
-            const uint64_t now = vm_diag_now_us();
-            s_odCount++;
-            if (s_odLast == 0 || now - s_odLast >= 1000000ULL) {
-                s_odLast = now;
-                NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@ (x%llu this second)",
-                      (unsigned long)odOff, newOD, check,
-                      check == newOD ? @"MATCH" : @"MISMATCH",
-                      (unsigned long long)s_odCount);
-                s_odCount = 0;
-            }
-        }
+        NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
+              (unsigned long)odOff, newOD, check,
+              check == newOD ? @"MATCH" : @"MISMATCH");
     }
 
     // ---------------------------------------------------------------------
@@ -664,16 +551,10 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         }
         const uint32_t offAt = (sizeAt == NE_NONE) ? NE_NONE : (sizeAt - 8);
 
-        // The layout dump is a kernel property, so three calls are enough to
-        // measure it. The SKIP line is not a layout, it is a fault, and it
-        // stays on every call.
-        const int32_t vmCallNo = __sync_fetch_and_add(&g_vmShmemCalls, 0);
-        if (vmCallNo <= 3) {
-            NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
-                  (unsigned long long)shmemNamedEntry, neHex,
-                  (unsigned long long)copySize,
-                  (unsigned)sizeAt, (unsigned)offAt);
-        }
+        NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
+              (unsigned long long)shmemNamedEntry, neHex,
+              (unsigned long long)copySize,
+              (unsigned)sizeAt, (unsigned)offAt);
 
         if (offAt != NE_NONE && offAt + sizeof(uint64_t) <= VNE_BLOCK_BYTES) {
             uint8_t blk[EARLY_KRW_LENGTH];
@@ -682,30 +563,14 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             const uint64_t newOffset = pageObjectOffset;
             memcpy(blk + offAt, &newOffset, sizeof(newOffset));
 
-            vm_note_kernel_write();
             early_kwrite32bytes(shmemNamedEntry, blk);
 
             uint64_t check = 0;
             kreadbuf(shmemNamedEntry + offAt, &check, sizeof(check));
-            if (check != newOffset || vmCallNo <= 3) {
-                // Same 1 Hz limiter as the vme_object_or_delta readback above,
-                // and for the same reason: a mismatch on this path logged once
-                // per call, which is the other half of the 309 lines that
-                // flooded the 21:53 log.
-                static uint64_t s_neLast = 0;
-                static uint64_t s_neCount = 0;
-                const uint64_t now = vm_diag_now_us();
-                s_neCount++;
-                if (s_neLast == 0 || now - s_neLast >= 1000000ULL) {
-                    s_neLast = now;
-                    NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@ (x%llu this second)",
-                          (unsigned)offAt, (unsigned long long)newOffset,
-                          (unsigned long long)check,
-                          check == newOffset ? @"MATCH" : @"MISMATCH",
-                          (unsigned long long)s_neCount);
-                    s_neCount = 0;
-                }
-            }
+            NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
+                  (unsigned)offAt, (unsigned long long)newOffset,
+                  (unsigned long long)check,
+                  check == newOffset ? @"MATCH" : @"MISMATCH");
         } else {
             NSLog(@"[DS] DIAG SKIP named_entry.offset: located at 0x%x, not inside "
                   @"the writable 32-byte block [0x00,0x%x)", (unsigned)offAt,
@@ -770,25 +635,6 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
     {
         NSLog(@"[DS] DIAG vm_map_remote_page no object for 0x%llx",
               (unsigned long long)address);
-        return shmem;
-    }
-
-    return vm_create_shmem_with_object(&vmObject);
-}
-
-// Same page, for a caller that is walking this very map and already holds the
-// entry that covers address. Identical work minus the lookup, so the result is
-// identical: vm_map_find_entry(map, address) would return entryAddr, because
-// that is the entry the caller is standing on. See
-// vm_get_object_for_entry for the measurement that made this necessary.
-struct VMShmem vm_map_remote_page_for_entry(uint64_t vmMap, uint64_t entryAddr, uint64_t address)
-{
-    struct VMShmem shmem = {0};
-    struct VMObject vmObject = vm_get_object_for_entry(entryAddr, address);
-    if (!vmObject.address)
-    {
-        NSLog(@"[DS] DIAG vm_map_remote_page_for_entry no object for 0x%llx entry=0x%llx",
-              (unsigned long long)address, (unsigned long long)entryAddr);
         return shmem;
     }
 

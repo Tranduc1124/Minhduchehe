@@ -19,7 +19,6 @@
 #include <cmath>
 #include <float.h>
 #import <mach/mach.h>
-#include <pthread.h>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -1377,27 +1376,13 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     Vector3 head = liveHead;
     bool headOk = false;
     if (looksLikeWorldPos(liveHead)) {
-        // A plausible head is a plausible head. It used to also have to agree
-        // with the hip: the anchor was the hip, and the head had to be within
-        // 6 m of it and above it by no more than -0.6. The hip is a skinned
-        // bone and it lags hard strafes, which this file says so more than
-        // once. So a live head plus a lagging hip reads as a disagreement, the
-        // head is thrown away, and the aim falls to root+0.85 or hip+0.55,
-        // which is a torso, not a skull. That is the reported "always off by
-        // one position, never the head", and it happens identically whether the
-        // enemy is standing or knocked because the fault is the hip, not the
-        // pose.
-        //
-        // The guard exists to reject a head that is nowhere near the body. Root
-        // is the authority for that, not the lagging bone, and a head within
-        // 4 m above the root and roughly level with it is a head.
-        Vector3 anchor = looksLikeWorldPos(root) ? root : hip;
+        Vector3 anchor = looksLikeWorldPos(hip) ? hip : root;
         if (!looksLikeWorldPos(anchor)) {
             headOk = true;
         } else {
             float dx = liveHead.x - anchor.x, dy = liveHead.y - anchor.y, dz = liveHead.z - anchor.z;
-            float dXZ2 = dx*dx + dz*dz;
-            if (dXZ2 < 4.0f * 4.0f && liveHead.y >= anchor.y - 0.6f) headOk = true;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < 6.0f * 6.0f && liveHead.y >= anchor.y - 0.6f) headOk = true;
         }
     }
     if (!headOk) {
@@ -1517,10 +1502,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
             if (isnan(outQ.x) || isnan(outQ.y) || isnan(outQ.z) || isnan(outQ.w)) outQ = targetQ;
         }
     }
-    // Once. This was written twice in a row, which is not a harmless duplicate:
-    // the write is a kernel poke at the rotation fields, so every aim tick was
-    // paying for two and the second landed after the game may already have
-    // consumed the first.
+    write_aim_rotations(localPawn, outQ);
     write_aim_rotations(localPawn, outQ);
     AimSyncFireHit(localPawn, from, aimed);
 
@@ -2093,24 +2075,10 @@ static inline Vector3 PickStableHipRaw(uint64_t pawn, PosTrack &tr) {
 static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // No death-tombstone early return here, deliberately.
-    //
-    // The tombstone is keyed on the pawn POINTER, and a game recycles object
-    // addresses. A pawn that dies and respawns frequently comes back on the
-    // address the previous one used, so `tr.pawn == pawn` matches a fresh live
-    // pawn and this branch returned {0,0,0} for the rest of the hold window,
-    // which is 45 to 120 frames, so up to two seconds. For that whole time the
-    // pawn had no head position, every aim candidate through it failed
-    // looksLikeWorldPos, and the fallback aimed at whatever was left. That is
-    // the reported symptom exactly, and it is tied precisely to the events that
-    // produce address reuse: knocked, died, respawned.
-    //
-    // The tombstone's job is to stop a dead shell's smoothing state being
-    // revived, and markGhostDead already does that: it zeroes headSmoothed,
-    // lastHeadRaw, headVel, lastHeadT, the source holds, hasHead and bodyLenHold
-    // at the moment it writes the tombstone. With that state zeroed and hasHead
-    // false, the code below returns the raw bone when the bone reads live and
-    // {0,0,0} when it does not, which is the real test and it runs every frame.
+    // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
+    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
+        return Vector3{0, 0, 0};
+    }
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -2134,24 +2102,10 @@ static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
 static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // No death-tombstone early return here, deliberately.
-    //
-    // The tombstone is keyed on the pawn POINTER, and a game recycles object
-    // addresses. A pawn that dies and respawns frequently comes back on the
-    // address the previous one used, so `tr.pawn == pawn` matches a fresh live
-    // pawn and this branch returned {0,0,0} for the rest of the hold window,
-    // which is 45 to 120 frames, so up to two seconds. For that whole time the
-    // pawn had no head position, every aim candidate through it failed
-    // looksLikeWorldPos, and the fallback aimed at whatever was left. That is
-    // the reported symptom exactly, and it is tied precisely to the events that
-    // produce address reuse: knocked, died, respawned.
-    //
-    // The tombstone's job is to stop a dead shell's smoothing state being
-    // revived, and markGhostDead already does that: it zeroes headSmoothed,
-    // lastHeadRaw, headVel, lastHeadT, the source holds, hasHead and bodyLenHold
-    // at the moment it writes the tombstone. With that state zeroed and hasHead
-    // false, the code below returns the raw bone when the bone reads live and
-    // {0,0,0} when it does not, which is the real test and it runs every frame.
+    // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
+    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
+        return Vector3{0, 0, 0};
+    }
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -2178,11 +2132,10 @@ static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
 static inline Vector3 EspSmoothDisplayPos(uint64_t pawn, Vector3 raw, bool isHead) {
     if (!looksLikeWorldPos(raw) || !isVaildPtr(pawn)) return raw;
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
-    // Same reason as the three resolvers above: this tombstone is keyed on an
-    // address the game recycles, so on a respawn it silences a live pawn for up
-    // to the hold window and the box disappears along with the aim. `raw` has
-    // already been checked as a live world position on the line above, which is
-    // the real evidence that this pawn is on screen right now.
+    // Exact-pawn tombstone: if dead hold is active for THIS pawn, do not smooth or emit.
+    if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
+        return Vector3{0,0,0};
+    }
     if (tr.pawn != pawn) {
         tr = PosTrack{};
         tr.pawn = pawn;
@@ -2265,57 +2218,18 @@ extern "C" void ToggleSpeedX50(bool enable) {
 
 // Single clean write per call. Double-writes + multi-burst made the camera thrash
 // even when bullets (silent/fire-dir) were already accurate.
-// Which of the aim rotation fields to force. Default is all of them, which is
-// what the code has always done, so behaviour is unchanged unless you turn one
-// off. It is a mask rather than a set of ifdefs because the fastest way to find
-// which field the crosshair is actually rendered from is to turn one off and
-// look, and that needs a rebuild each time otherwise.
-//
-// The suspicion is 0x5C4. 0x5B4 and 0x5C4 are exactly 16 bytes apart, which is
-// one Quaternion, so they are two adjacent quaternion slots rather than two
-// independent fields, and a Unity shooter commonly keeps the camera rotation
-// next to the weapon rotation or next to its own interpolated crosshair rotation.
-// Forcing the same raw value into both makes the game interpolate against a
-// value that is already pinned, and the residual reads as a constant pitch
-// offset, which is what "aims at the sky" looks like. Clearing
-// SB_AIM_MASK_HARD_5C4 is the first thing to try.
-//
-// [SB-AIMOFF] prints the resolved offsets once per session so a device log says
-// what the offsets actually are on this build and version, rather than us
-// guessing which pair aliases.
-#define SB_AIM_MASK_PRIMARY     0x01
-#define SB_AIM_MASK_AUX         0x02
-#define SB_AIM_MASK_HARD_5B4    0x04
-#define SB_AIM_MASK_HARD_5C4    0x08
-#define SB_AIM_MASK_CURRENT     0x10
-#define SB_AIM_MASK_HARD_19A4   0x20
-#ifndef SB_AIM_WRITE_MASK
-#define SB_AIM_WRITE_MASK (SB_AIM_MASK_PRIMARY | SB_AIM_MASK_AUX | \
-                           SB_AIM_MASK_HARD_5B4 | SB_AIM_MASK_HARD_5C4 | \
-                           SB_AIM_MASK_CURRENT | SB_AIM_MASK_HARD_19A4)
-#endif
-
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
-    static int s_offsetLogged = 0;
-    if (!s_offsetLogged) {
-        s_offsetLogged = 1;
-        NSLog(@"[SB-AIMOFF] kAimRotation=0x%llx aux=0x%llx current=0x%llx hard5B4=0x5B4 hard5C4=0x5C4 hard19A4=0x19A4 mask=0x%x",
-              (unsigned long long)kAimRotation, (unsigned long long)kAimRotationAux,
-              (unsigned long long)kCurrentAimRotation, (unsigned)(SB_AIM_WRITE_MASK));
-    }
-    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_PRIMARY)
-        WriteAddr<Quaternion>(player + kAimRotation, out);
-    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_AUX)
-        WriteAddr<Quaternion>(player + kAimRotationAux, out);
-    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_5B4) && kAimRotation != 0x5B4)
+    WriteAddr<Quaternion>(player + kAimRotation, out);
+    WriteAddr<Quaternion>(player + kAimRotationAux, out);
+    if (kAimRotation != 0x5B4) {
         WriteAddr<Quaternion>(player + 0x5B4, out);
-    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_5C4) && kAimRotation != 0x5C4)
         WriteAddr<Quaternion>(player + 0x5C4, out);
-    if (SB_AIM_WRITE_MASK & SB_AIM_MASK_CURRENT)
-        WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
-    if ((SB_AIM_WRITE_MASK & SB_AIM_MASK_HARD_19A4) && kCurrentAimRotation != 0x19A4)
+    }
+    WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
+    if (kCurrentAimRotation != 0x19A4) {
         WriteAddr<Quaternion>(player + 0x19A4, out);
+    }
 }
 
 void set_aim(uint64_t player, Quaternion rotation, float speed, int mode, bool forceInstant) {
@@ -2482,7 +2396,6 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.snaplinePath = ESPCreateMutablePath();
     buffers.snaplineBotPath = ESPCreateMutablePath();
     buffers.snaplineKnockedPath = ESPCreateMutablePath();
-    buffers.cardPath = ESPCreateMutablePath();
     buffers.hpFillGreenPath = ESPCreateMutablePath();
     buffers.hpFillOrangePath = ESPCreateMutablePath();
     buffers.hpFillRedPath = ESPCreateMutablePath();
@@ -2514,7 +2427,6 @@ static inline void ESPGeometryBuffersRelease(ESPGeometryBuffers *buffers) {
     ESPReleasePath(buffers->bonePath); ESPReleasePath(buffers->boneBotPath); ESPReleasePath(buffers->boneKnockedPath);
     ESPReleasePath(buffers->snaplinePath); ESPReleasePath(buffers->snaplineBotPath);
     ESPReleasePath(buffers->snaplineKnockedPath); ESPReleasePath(buffers->hpFillGreenPath);
-    ESPReleasePath(buffers->cardPath);
     ESPReleasePath(buffers->hpFillOrangePath); ESPReleasePath(buffers->hpFillRedPath); 
     ESPReleasePath(buffers->bgFillBlackPath); ESPReleasePath(buffers->alertPath);
 }
@@ -2769,22 +2681,7 @@ void ESPSyncFromPrefs(void) {
 @property (nonatomic, strong) CAShapeLayer *alertNumOrangeLayer;
 @property (nonatomic, strong) CAShapeLayer *alertNumRedLayer;
 
-// The grey card layer. Filled, not stroked, and the only filled layer in the
-// overlay: a CGPath carries no per-shape paint, so anything that has to be a
-// fill rather than an outline needs a layer of its own.
-@property (nonatomic, strong) CAShapeLayer *cardLayer;
 @property (nonatomic, strong) NSMutableArray<CATextLayer *> *textLayerPool;
-// Role for each pooled text layer, index aligned with textLayerPool. Kept
-// beside the layers rather than on them because CATextLayer has nowhere to put
-// a custom value, and the overlay needs to know which label is a name and which
-// is a distance without guessing from frame width or string contents.
-@property (nonatomic, strong) NSMutableArray<NSNumber *> *textRolePool;
-// Identity of whatever each pooled text belongs to, index aligned with
-// textLayerPool. The overlay keys its labels on this, not on the string.
-@property (nonatomic, strong) NSMutableArray<NSNumber *> *textKeyPool;
-// Index the last dequeueTextLayer handed out, so addText: can record the role
-// against the layer it was given.
-@property (nonatomic, assign) NSUInteger lastTextLayerIndex;
 @property (nonatomic, assign) NSUInteger activeTextLayerCount;
 
 @property (nonatomic, strong) NSMutableArray<CALayer *> *imageLayerPool;
@@ -2796,7 +2693,7 @@ void ESPSyncFromPrefs(void) {
 - (void)configureRenderingLayers;
 - (void)resetReusableLayers;
 - (void)clearAllContent; 
-- (void)addText:(NSString *)text role:(int)role key:(uint64_t)key frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned;
+- (void)addText:(NSString *)text frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned;
 - (void)addImage:(UIImage *)image frame:(CGRect)frame;
 @end
 
@@ -2805,10 +2702,10 @@ void ESPSyncFromPrefs(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { return NO; }
 
-static void ESPViewAddTextCallback(void *context, NSString *string, int role, uint64_t key, CGRect frame, UIColor *color, CGFloat fontSize, BOOL leftAligned) {
+static void ESPViewAddTextCallback(void *context, NSString *string, CGRect frame, UIColor *color, CGFloat fontSize, BOOL leftAligned) {
     if (!context || !string) return;
     ESP_View *view = (__bridge ESP_View *)context;
-    [view addText:string role:role key:key frame:frame color:color fontSize:fontSize leftAligned:leftAligned];
+    [view addText:string frame:frame color:color fontSize:fontSize leftAligned:leftAligned];
 }
 
 static void ESPViewAddImageCallback(void *context, UIImage *image, CGRect frame) {
@@ -2910,7 +2807,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            the matrix is frozen, the drawing is innocent.
 // Bump this every commit that changes measurement, so a device log identifies
 // its own build. Absence of this token = the IPA on the device is older.
-#define ESP_DIAG_BUILD "MEMO1-PACSAFE"
+#define ESP_DIAG_BUILD "FLUSH1"
 
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
@@ -2980,8 +2877,6 @@ static void ESPDiagHeartbeat(void) {
         self.userInteractionEnabled = NO; 
         self.backgroundColor = [UIColor clearColor];
         self.textLayerPool = [NSMutableArray arrayWithCapacity:300];
-        self.textRolePool = [NSMutableArray arrayWithCapacity:300];
-        self.textKeyPool = [NSMutableArray arrayWithCapacity:300];
         self.imageLayerPool = [NSMutableArray arrayWithCapacity:80];
         
         // NOTE: no dispatch_once attach here! The game may not be running yet
@@ -3065,12 +2960,6 @@ static void ESPDiagHeartbeat(void) {
     self.fovLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ];
     self.aimAssistLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:1.5f zPos:baseZ + 6];
     
-    // The grey card. Stroke nil so it is only ever filled, and the same grey the
-    // overlay's fill layer uses, 0.16 at 0.72 alpha, so the two agree.
-    self.cardLayer = [self buildShapeLayerWithStroke:nil
-                       fill:[UIColor colorWithRed:0.16f green:0.16f blue:0.16f alpha:0.72f]
-                      lineWidth:0 zPos:baseZ + 5];
-
     self.hpFillGreenLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:0.0f green:1.0f blue:0.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5]; 
     self.hpFillOrangeLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor orangeColor] lineWidth:0 zPos:baseZ + 5];
     self.hpFillRedLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor redColor] lineWidth:0 zPos:baseZ + 5];
@@ -3082,7 +2971,7 @@ static void ESPDiagHeartbeat(void) {
     self.alertNumOrangeLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
     self.alertNumRedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
 
-    NSArray *layers = @[self.cardLayer, self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
+    NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
 
     for (CAShapeLayer *layer in layers) {
         [_secureCanvas.layer addSublayer:layer];
@@ -3119,7 +3008,6 @@ static void ESPDiagHeartbeat(void) {
     if (self.activeTextLayerCount < self.textLayerPool.count) {
         CATextLayer *layer = self.textLayerPool[self.activeTextLayerCount];
         if (layer.hidden) layer.hidden = NO;
-        self.lastTextLayerIndex = self.activeTextLayerCount;
         self.activeTextLayerCount++;
         return layer;
     } 
@@ -3133,7 +3021,6 @@ static void ESPDiagHeartbeat(void) {
         layer.actions = @{ @"position": NSNull.null, @"bounds": NSNull.null, @"string": NSNull.null, @"hidden": NSNull.null, @"foregroundColor": NSNull.null, @"fontSize": NSNull.null };
         [self.textLayerPool addObject:layer];
         [_secureCanvas.layer addSublayer:layer];
-        self.lastTextLayerIndex = self.textLayerPool.count - 1;
         self.activeTextLayerCount++;
         return layer;
     }
@@ -3162,48 +3049,15 @@ static void ESPDiagHeartbeat(void) {
     return self.imageLayerPool.lastObject;
 }
 
-- (void)addText:(NSString *)text role:(int)role key:(uint64_t)key frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned {
+- (void)addText:(NSString *)text frame:(CGRect)frame color:(UIColor *)color fontSize:(CGFloat)fontSize leftAligned:(BOOL)leftAligned {
     if (text.length == 0) return;
     CATextLayer *layer = [self dequeueTextLayer];
-    while (self.textRolePool.count <= self.lastTextLayerIndex) {
-        [self.textRolePool addObject:@(ESPTextRoleWeapon)];
-        [self.textKeyPool addObject:@(0)];
-    }
-    self.textRolePool[self.lastTextLayerIndex] = @(role);
-    self.textKeyPool[self.lastTextLayerIndex] = @(key);
     
     static NSString *fontNameStr = nil;
     if (!fontNameStr) {
         fontNameStr = LoadCountFont(10).fontName; 
     }
-
-    // Shrink the frame to the text for the two roles that carry a background or
-    // have to be read, keeping the centre where the caller put it.
-    //
-    // The name and the distance are given a fixed 200pt wide frame so a centred
-    // CATextLayer would centre its string in it. The overlay uses that frame as
-    // the label's own bounds, and a UILabel's background is its bounds, so the
-    // grey card came out as a 200pt grey bar with forty points of name in the
-    // middle of it. Measuring here costs nothing: the app has the string and
-    // UIKit, so the text is measured once per string and only when the string
-    // changed.
-    if (role == ESPTextRoleName || role == ESPTextRoleDistance) {
-        // Measured with the font the SpringBoard label actually uses, which is
-        // boldSystemFontOfSize. Measuring with the layer's own font name gives a
-        // different width for the same string, and the two disagreeing is what
-        // made the text spill out of its own card.
-        UIFont *f = [UIFont boldSystemFontOfSize:fontSize];
-        if (f) {
-            const CGSize sz = [text sizeWithAttributes:@{NSFontAttributeName: f}];
-            if (sz.width > 1.0) {
-                const CGFloat padW = (role == ESPTextRoleName) ? 10.0f : 4.0f;
-                const CGFloat w = ceil(sz.width) + padW;
-                const CGFloat cx = frame.origin.x + frame.size.width * 0.5f;
-                frame = CGRectMake(cx - w * 0.5f, frame.origin.y, w, frame.size.height);
-            }
-        }
-    }
-
+    
     layer.font = (__bridge CFTypeRef)fontNameStr;
     if (![layer.string isEqualToString:text]) layer.string = text;
     if (!CGRectEqualToRect(layer.frame, frame)) layer.frame = frame;
@@ -3238,11 +3092,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
     // game reads + the SpringBoard mirror; stopping when not on screen
     // would freeze the SB overlay. The timer itself is the lifecycle.
 
-    // Every value the memo in UnityMath.mm holds belongs to the frame it was
-    // read in, so the generation opens before the first bone read of this
-    // frame and closes by being replaced on the next one.
-    ESPFrameMemoBegin();
-
     @autoreleasepool {
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame
         static CFTimeInterval lastPrefSync = 0;
@@ -3254,21 +3103,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // Runs before every early return below, so the log always carries the
         // gate state even when the render path bails out immediately.
         ESPDiagHeartbeat();
-
-        // Which thread draws, 1 Hz. The 21:08:39 stackshot has the app's
-        // com.apple.main-thread busy in the kernel while SpringBoard's main
-        // thread is turnstile-blocked on this task, so the draw thread has to
-        // be named before the lock holder can be identified.
-        {
-            static CFTimeInterval s_lastTidLog = 0;
-            if (now - s_lastTidLog > 1.0) {
-                s_lastTidLog = now;
-                NSLog(@"[PUSH][TID] draw tid=%u attached=%d pid=%d base=0x%llx",
-                      (uint32_t)pthread_mach_thread_np(pthread_self()),
-                      ds_attached() ? 1 : 0, ds_pid(),
-                      (unsigned long long)Moudule_Base);
-            }
-        }
         
         // Color / thickness: use synced globals most frames. Re-read prefs only while
         // rainbow is on or ~8×/s so RGB picker still feels live without 16 prefs
@@ -3469,7 +3303,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
         MenuViewApplyPath(self.snaplineLayer, showVisuals ? buffers.snaplinePath : nil, buffers.snaplineDirty);
         MenuViewApplyPath(self.snaplineBotLayer, showVisuals ? buffers.snaplineBotPath : nil, buffers.snaplineBotDirty);
         MenuViewApplyPath(self.snaplineKnockedLayer, showVisuals ? buffers.snaplineKnockedPath : nil, buffers.snaplineKnockedDirty);
-        MenuViewApplyPath(self.cardLayer, showVisuals ? buffers.cardPath : nil, buffers.cardDirty);
         MenuViewApplyPath(self.hpFillGreenLayer, showVisuals ? buffers.hpFillGreenPath : nil, buffers.hpFillGreenDirty);
         MenuViewApplyPath(self.hpFillOrangeLayer, showVisuals ? buffers.hpFillOrangePath : nil, buffers.hpFillOrangeDirty);
         MenuViewApplyPath(self.hpFillRedLayer, showVisuals ? buffers.hpFillRedPath : nil, buffers.hpFillRedDirty);
@@ -3517,18 +3350,14 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 CGPathApply(self.aimAssistLayer.path, &am, espCountPathElements);
                 NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d bone=%d hp=%d show=%d | "
                       @"box=%u/%u bone=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
-                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d | "
-                      @"count=%d real=%d bot=%d sum=%d stHidden=%d stStr=%@",
+                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
                       (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isBone, (int)isHealth,
                       (int)showVisuals,
                       bx.n, bx.curves, bn.n, bn.curves, sn.n, sn.curves,
                       fv.n, fv.curves, am.n, am.curves,
                       (int)s_dirtyBox, (int)s_dirtyBone,
                       (int)s_dirtySnap, (int)s_dirtyHpG,
-                      (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil),
-                      (int)isCount, (int)stats.realCount, (int)stats.botCount,
-                      (int)(stats.realCount + stats.botCount),
-                      (int)self.statusLayer.hidden, self.statusLayer.string);
+                      (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil));
             }
         }
 
@@ -3538,21 +3367,26 @@ static inline uint64_t ESPPhaseNowUS(void) {
             CGFloat fontSize;
 
             if (stats.realCount == 0 && stats.botCount == 0) {
-                countText = @"0";
-                countColor = [UIColor redColor];
-                fontSize = isESP2 ? 25.0f : 21.0f;
+                if (isESP2) {
+                    countText = @"CLEAR";
+                    countColor = [UIColor cyanColor];
+                    fontSize = 20.0f;
+                } else {
+                    countText = @"CLEAR";
+                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
+                    fontSize = 21.0f;
+                }
             } else {
-                // A plain number, in red.
-                //
-                // Both of the things that were here before are gone. It read
-                // "PLAYER [n] | BOT [n]", which is eighteen characters and no
-                // longer fits the field the overlay sends over, and it was green:
-                // 69cab125 turned it green because a red count had been asked to
-                // be removed at the time. The current request is a count from 0
-                // to 1000 in red, so that is what it is.
-                countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
-                countColor = [UIColor redColor];
-                fontSize = isESP2 ? 25.0f : 21.0f;
+                // Đổi đỏ → xanh lá (user: bỏ vẽ đỏ thừa; đỏ chỉ dành cho knocked/HP thấp).
+                if (isESP2) {
+                    countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
+                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
+                    fontSize = 25.0f;
+                } else {
+                    countText = [NSString stringWithFormat:@"PLAYER [%d] | BOT [%d]", stats.realCount, stats.botCount];
+                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
+                    fontSize = 16.0f;
+                }
             }
 
             if (![self.lastStatusString isEqualToString:countText]) {
@@ -3565,7 +3399,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
             // Tight frame around text only (was 200x50) — visual only; CATextLayer
             // never receives touches, but keep bounds small and non-interactive flags set.
-            CGFloat countWidth = 80.0f;
+            CGFloat countWidth = isESP2 ? 80.0f : 220.0f;
             CGFloat countHeight = fontSize + 8.0f;
             CGFloat yPos = isESP2 ? 30.0f : 25.0f;
             CGFloat xPos = halfWidth - (countWidth * 0.5f);
@@ -3585,32 +3419,9 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         [CATransaction commit];
 
-        // Where the number the overlay is about to be told came from. Every
-        // condition that can zero it is in one line, so a zero is explained
-        // rather than guessed at: a bot-only scene with EspBot off is the
-        // expected way to get sum=0 while sixteen rectangles are on screen.
-        {
-            static uint64_t s_cntLogUS = 0;
-            const uint64_t nowC = ESPPhaseNowUS();
-            if (nowC > s_cntLogUS) {
-                s_cntLogUS = nowC + 1000000ULL;
-                NSLog(@"[SB-TXT] src espBot=%d disLimit=%.0f real=%d bot=%d sum=%d",
-                      (int)isEspBot, (double)espDistanceLimit,
-                      (int)stats.realCount, (int)stats.botCount,
-                      (int)(stats.realCount + stats.botCount));
-            }
-        }
-
         // Mirror this frame to the SpringBoard dedicated overlay (if active).
-        //
-        // The count goes across unconditionally. It used to be gated on isCount,
-        // and that made a requested feature depend on a menu toggle: with the
-        // toggle off the app never set statusLayer, the overlay was handed -1,
-        // and no text op was ever built, which is three rounds of txt=0 with a
-        // perfectly healthy label. isCount still governs the app's own layer,
-        // which is the one the menu setting is really about; the overlay
-        // counter is a separate always-on display that was asked for by name.
-        SBRemotePushESPFrame(self, stats.realCount + stats.botCount);
+        extern void SBRemotePushESPFrame(UIView *espView);
+        SBRemotePushESPFrame(self);
 
         {
             const uint64_t tPhase3 = ESPPhaseNowUS();
@@ -4081,24 +3892,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
         static int s_deadUntilFrame[96] = {};
         const int deadSlot = (int)(PawnObject % 96ull);
         if (s_deadPawn[deadSlot] == PawnObject && g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
-            // Only honour the tombstone while this pawn still reads as dead.
-            //
-            // The slot is PawnObject % 96, keyed on an address, and the game
-            // recycles addresses: a pawn that respawns onto the one its
-            // predecessor used lands here and `continue`d out of the whole
-            // entity loop. The entity then had no box, no name, and no aim
-            // candidate for the rest of the 45 to 120 frame hold, which is
-            // exactly "it breaks when they get knocked and come back".
-            //
-            // isKnocked is already read for this pawn earlier in the pass. A
-            // live, upright pawn on a recycled address is not the corpse the
-            // tombstone was written for, so the hold is cleared and the pass
-            // continues.
-            if (c.isKnocked) continue;
-            s_deadPawn[deadSlot] = 0;
-            s_deadUntilFrame[deadSlot] = 0;
-            PosTrack &trLive = g_posTrack[PosTrackSlot(PawnObject)];
-            trLive.deadUntilFrame = 0;
+            continue;
         }
         auto markGhostDead = [&](int holdFrames) {
             // Tombstone inside PosTrack by exact pawn (not just %96 bucket).
@@ -4332,49 +4126,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
             if (trDisp.bodyLenHold > 0) trDisp.bodyLenHold--;
 
             const bool haveStableBL = (trDisp.bodyLen >= 0.45f && trDisp.bodyLen <= 1.25f);
-
-            // A knocked or prone pawn is short, and that is correct, not broken.
-            //
-            // This block used to run unconditionally, so a downed enemy whose
-            // head-to-hip dy is under 0.15 tripped the guard and had a hip
-            // synthesised for it: the head, minus a learned 0.45-1.25 m body
-            // length, or minus a flat 0.85. A prone enemy is roughly that short,
-            // so the synthesised hip landed at or below ground level, and the
-            // learned bodyLen was then refreshed from a pair that was not a body.
-            // The box grew a phantom torso and the aim inherited the result,
-            // which is the report: the crosshair climbs well above a downed
-            // enemy and the box around one is wrong.
-            //
-            // Only rebuild the column when the pawn is actually upright. dy is
-            // measured against the smoothed head, and a mounted or vehicle pawn
-            // is upright by definition, so both are exempt. Collapsed-while-
-            // upright is what markGhostDead and the bodyCollapsed check above
-            // exist to catch, and a leaning or mid-animation pose passes through
-            // untouched.
-            const bool tooTall  = (dy > 1.35f) || (bodyLen > 2.6f);
-            const bool tooShort = (dy < 0.15f) || (bodyLen < 0.28f);
-
-            // A body that is too SHORT is a downed enemy, not broken data.
-            //
-            // Synthesising here is what put a standing-length torso on a prone
-            // player: head minus a flat 0.85 put the hip at ground level or
-            // under it, and the box then stood a metre of empty space above a
-            // head that is a hand's width off the floor. The device screenshot
-            // shows it exactly, a box roughly 0.85 m tall drawn around a
-            // knocked enemy, which is the hardcoded fallback verbatim.
-            //
-            // The earlier attempt at this keyed the exemption on isKnocked, and
-            // that was wrong: isKnocked is the game's flag and it lags, which
-            // the earliest version of this file already noted. A pawn that just
-            // went down has a short dy before the flag flips, so the synthesis
-            // still ran. Measuring the body is the only evidence that does not
-            // arrive late.
-            //
-            // So: rebuild the column only when the column is too tall to be a
-            // body. A short one is left alone and the box shrinks to fit, which
-            // is what a downed enemy should look like. A hip below the head by
-            // almost nothing still needs a floor, otherwise the box inverts.
-            if (tooTall) {
+            if (bodyLen < 0.28f || bodyLen > 2.6f || dy < 0.15f || dy > 1.35f) {
                 if (haveStableBL) {
                     espHipPos = headBonePos;
                     espHipPos.y -= trDisp.bodyLen;
@@ -4382,29 +4134,19 @@ static inline uint64_t ESPPhaseNowUS(void) {
                     espHipPos = headBonePos;
                     espHipPos.y -= treatAsVehicle ? 1.05f : 0.85f;
                 }
-            } else if (tooShort && haveStableBL) {
-                // Keep it short, but never let head and hip coincide: a zero
-                // height box reads as a line and the inverted one reads as a
-                // box above the player.
-                const float floorLen = fminf(trDisp.bodyLen, 0.42f);
-                if (dy < 0.18f) {
+            } else if (haveStableBL) {
+                float want = trDisp.bodyLen;
+                float cur  = bodyLen;
+                if (fabsf(cur - want) > 0.22f) {
                     espHipPos = headBonePos;
-                    espHipPos.y -= floorLen;
+                    espHipPos.y -= want;
                 }
-            } else if (tooShort && !haveStableBL && treatAsVehicle) {
-                // A vehicle has no short body to learn from, so give it the
-                // standing fallback it always had.
-                espHipPos = headBonePos;
-                espHipPos.y -= 1.05f;
             }
         }
 
         // Always use real local↔enemy distance when we have a local world anchor.
-        // Measured against the raw anchor, so the range cull cannot be moved by
-        // the display smoother either.
         float tempDisForAim = useLocalDistance
-            ? Vector3::Distance(myLocation, looksLikeWorldPos(liveHead) ? liveHead
-                                                                        : (looksLikeWorldPos(liveHip) ? liveHip : headBonePos))
+            ? Vector3::Distance(myLocation, headBonePos)
             : 0.0f;
         // On vehicle distance can be noisy; only skip clearly insane ranges.
         // Min-distance cull skipped for vehicle/collapsed (passenger next to you).
@@ -4414,22 +4156,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // Aimbot + Aim Assist + Silent all honor AimPos (Head/Neck/Chest-Body).
         // Prefer GetAimTargetPosMode / ResolveSilentAimWorldPos (live).
         // Ghost: never aim if HP shell is dead (already filtered) or bone not live.
-        //
-        // The aim position must never come from headBonePos. That value is the
-        // DISPLAY smoother: EspSmoothDisplayPos, a world-space EMA over
-        // PickStableHeadRaw, gated on a per-pawn tracker, with a source-flip
-        // bypass and a learned body length. It is tuned to make a box look calm.
-        // Pointing a crosshair at it couples the crosshair to every decision
-        // that was made to look at boxes, and the failure mode is exactly the
-        // one that was reported: the crosshair sits on an enemy while the point
-        // under it is somewhere no enemy is.
-        //
-        // liveHead and liveHip are the same bone, read raw at the top of this
-        // pawn's pass, before any smoothing and before any tracker state. They
-        // are the only positions here that cannot inherit a display decision.
-        Vector3 rawAnchor = looksLikeWorldPos(liveHead) ? liveHead
-                           : (looksLikeWorldPos(liveHip) ? liveHip : Vector3{0, 0, 0});
-        Vector3 aimPos = rawAnchor;
+        Vector3 aimPos = headBonePos;
         bool canAimThisPawn = false;
         if (isAimbot || useAssist || useSilent) {
             Vector3 bone = (useSilent && !isAimbot && !useAssist)
@@ -4438,14 +4165,12 @@ static inline uint64_t ESPPhaseNowUS(void) {
             if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
                 bone = ResolveSilentAimWorldPos(PawnObject, aimPosition);
             }
-            if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) bone = rawAnchor;
-            // Reject an aim bone far from our own raw head. Measured against
-            // rawAnchor, not headBonePos: a guard that compares a candidate
-            // against a smoothed value inherits every way that smoothed value can
-            // be wrong, and then it stops being a guard.
+            if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) bone = headBonePos;
+            // Reject aim bone far from our live head (track invent / wrong pawn).
+            // Body is lower on torso — allow a bit more distance than pure head.
             const float maxBoneDist = (treatAsVehicle ? 3.5f : 2.6f);
-            if (!IsZeroVec(bone) && looksLikeWorldPos(bone) && looksLikeWorldPos(rawAnchor) &&
-                Vector3::Distance(bone, rawAnchor) < maxBoneDist) {
+            if (!IsZeroVec(bone) && looksLikeWorldPos(bone) &&
+                Vector3::Distance(bone, headBonePos) < maxBoneDist) {
                 aimPos = bone;
                 if (aimPosition == 0) headBonePos = bone;
                 canAimThisPawn = true;
@@ -4455,68 +4180,32 @@ static inline uint64_t ESPPhaseNowUS(void) {
         }
 
         float dis = useLocalDistance
-            ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? rawAnchor : aimPos)
+            ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? headBonePos : aimPos)
             : tempDisForAim;
 
-        // Count enemies for the number, deduplicated by user id.
-        //
-        // This used to be decided here, from its own rules, before the draw
-        // gate below had been evaluated, and the two disagreed. The draw asks
-        // isEspBot, which line 2513 and line 2614 force to YES when aim-on-bot
-        // or aim-assist is on, while the count asked the raw EspBot preference,
-        // which defaults to NO. A bot-only scene therefore drew four boxes and
-        // counted zero, which is what the device log showed and what the
-        // counter then displayed.
-        //
-        // The comment the old block carried records an earlier attempt at this:
-        // it switched the count onto the raw preference to stop the count being
-        // inflated by the forced flag. That fixed the inflation by creating the
-        // opposite fault. Two rules cannot both be right.
-        //
-        // So the count no longer decides anything. It is applied below, where
-        // wantDraw is already true, which makes it count exactly the pawns the
-        // renderer is about to draw whatever combination of preferences and aim
-        // settings got them there. The number and the boxes are then the same
-        // set by construction, and the distance rule is espDrawLimit, the one the
-        // draw already uses.
-
-        // Check Visible: Camera bit OR vehicle passenger — always draw people in cars.
-        const bool mounted = treatAsVehicle;
-        // || isKnocked used to be here. A knocked pawn is on the ground, not
-        // exempt from being visible: the flag made every knocked pawn pass the
-        // check unconditionally, so a pawn whose bones had already stopped
-        // reading still produced a box and a snapline with nothing in it. Pose
-        // says nothing about whether the game is drawing the player. mounted is
-        // kept, because a vehicle is legitimately drawn through cover it blocks.
-        bool espVisible = !isEspCheckVisible || isFPP || isCamVis || mounted;
-
-        // Phase-1: store world-space snapshot only. W2S + draw happen AFTER a fresh
-        // view matrix sample so overlay tracks cam (no "stick then snap").
-        bool wantDraw = false;
-        if ((isESP || isESP2) && (espVisible || (isBot && isEspBot) || mounted)) {
-            if (!(isBot && !isEspBot && !mounted)) {
-                float espDrawLimit = mounted ? fmaxf(espDistanceLimit, 250.0f) : espDistanceLimit;
-                if (!useLocalDistance || dis <= espDrawLimit || (mounted && dis < 8.0f)) {
-                    wantDraw = true;
-                }
-            }
+        // Count enemies for ESP number only:
+        // - not self / not teammate (already skipped)
+        // - alive (CurHP > 0) — knocked still counts as a person
+        // - within ESP distance
+        // - dedup by pawn
+        // - bots only if EspBot PREF is on (not the forced isEspBot from AimOnBot)
+        // Count: real players only by default; bots only if EspBot switch is ON in prefs
+        // (not the temporary isEspBot forced by AimOnBot — that inflated count by +bots).
+        // EspBot pref once per frame (not every pawn — was re-reading defaults 100×).
+        static bool s_espBotPref = false;
+        static int s_espBotFrame = -1;
+        if (s_espBotFrame != g_cacheFrameCounter) {
+            s_espBotFrame = g_cacheFrameCounter;
+            s_espBotPref = ESPPrefsBool(@"EspBot", NO);
         }
-
-        // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
-        if (CurHP <= 0) continue;
-
-        // Count what is actually drawn, not what a second set of rules says
-        // should be drawn. wantDraw is the renderer's own verdict, already
-        // carrying the bot rule, the visibility rule, the mounted rule and the
-        // distance rule that the boxes on screen were produced by, so this needs
-        // no rule of its own and cannot drift from them.
-        //
-        // Deduplicated by user id because the same player can appear twice in
-        // the pawn list, and the array is per frame so it never has to be
-        // cleared, only rewound.
-        if (wantDraw && dis >= 1.5f) {
-            const uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
-            const uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
+        bool shouldCountEnemy = true;
+        if (isBot && !s_espBotPref) shouldCountEnemy = false;
+        if (CurHP <= 0) shouldCountEnemy = false; // CurHP<=0 is terminal; ignore lagged isKnocked for counting ghosts.
+        float countDis = dis;
+        float countLimit = fmaxf(espDistanceLimit, 1.0f);
+        if (shouldCountEnemy && countDis <= countLimit && countDis >= 1.5f) {
+            uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
+            uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
             static uint64_t s_countSeen[128];
             static int s_countFrame = -1;
             static int s_countN = 0;
@@ -4534,6 +4223,25 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 else stats.realCount++;
             }
         }
+
+        // Check Visible: Camera bit OR vehicle passenger — always draw people in cars.
+        const bool mounted = treatAsVehicle;
+        bool espVisible = !isEspCheckVisible || isFPP || isCamVis || isKnocked || mounted;
+
+        // Phase-1: store world-space snapshot only. W2S + draw happen AFTER a fresh
+        // view matrix sample so overlay tracks cam (no "stick then snap").
+        bool wantDraw = false;
+        if ((isESP || isESP2) && (espVisible || (isBot && isEspBot) || mounted)) {
+            if (!(isBot && !isEspBot && !mounted)) {
+                float espDrawLimit = mounted ? fmaxf(espDistanceLimit, 250.0f) : espDistanceLimit;
+                if (!useLocalDistance || dis <= espDrawLimit || (mounted && dis < 8.0f)) {
+                    wantDraw = true;
+                }
+            }
+        }
+
+        // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
+        if (CurHP <= 0) continue;
 
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
@@ -4745,7 +4453,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 NSString *distTextFormat = [[NSString alloc] initWithData:distTextBytes encoding:NSUTF8StringEncoding];
                 NSString *distText = [NSString stringWithFormat:distTextFormat, (int)s.dis];
                 CGRect textFrame = CGRectMake(edgeX - radius, edgeY - 4.5f, radius * 2.0f, 10.0f);
-                ESPViewAddTextCallback((__bridge void *)self, distText, ESPTextRoleDistance, 0, textFrame, [UIColor whiteColor], 8.0f, NO);
+                ESPViewAddTextCallback((__bridge void *)self, distText, textFrame, [UIColor whiteColor], 8.0f, NO);
             }
         }
 
@@ -4761,44 +4469,16 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 const float dy = HeadPos.y - HipPos.y;
                 const float dxz = sqrtf((HeadPos.x - HipPos.x) * (HeadPos.x - HipPos.x) +
                                        (HeadPos.z - HipPos.z) * (HeadPos.z - HipPos.z));
-                // A body that is too SHORT is a downed enemy, not broken data.
-                //
-                // The guard used to reject on both sides, and the remedy for both
-                // sides was a standing-length constant. So a knocked pawn, whose
-                // head-to-hip dy is about a tenth of a metre, failed the dy floor,
-                // had its hip replaced with head minus 0.88, and then had its feet
-                // put a further 0.92 below that. The box came out 1.80 m tall
-                // around a body lying on the ground.
-                //
-                // Only an over-tall column is rebuilt now. Root, the network
-                // authority, is the rejector for dxz rather than the lagging hip,
-                // and it is the same shape of test the Pro path uses.
-                const bool hipTooTall  = (dy > 1.25f) || (bodyLen > 1.35f);
-                const bool hipTooShort = (dy < 0.20f) || (bodyLen < 0.30f);
-                if (hipTooTall || (hipTooShort && dxz > 0.85f)) {
+                const bool hipOk = bodyLen >= 0.30f && bodyLen <= 1.35f &&
+                                   dy >= 0.20f && dy <= 1.25f && dxz <= 0.85f;
+                if (!hipOk) {
                     HipPos = HeadPos;
                     HipPos.y -= s.treatAsVehicle ? 1.00f : 0.88f;
-                } else if (hipTooShort) {
-                    // Prone: keep it short, but keep head and hip apart so the box
-                    // has a floor and cannot invert above the player.
-                    HipPos.y -= fminf(0.45f, fmaxf(0.22f, dy > 0.0f ? dy : 0.22f));
                 }
             }
             // Synthetic feet under hip (world) — stable height, not swinging ankles.
-            //
-            // Measured from the hip, so a prone body keeps a prone foot instead of
-            // inheriting a full 0.92 stand under a hip that is barely below the
-            // head. This is the second half of the same 1.80 m box.
             Vector3 FootPos = HipPos;
-            {
-                const float hipDrop = HeadPos.y - HipPos.y;
-                if (hipDrop < 0.55f && !s.treatAsVehicle) {
-                    // Prone: feet a little below the hip, never a full stride.
-                    FootPos.y -= fminf(0.40f, fmaxf(0.12f, hipDrop * 0.6f));
-                } else {
-                    FootPos.y -= s.treatAsVehicle ? 0.55f : 0.92f;
-                }
-            }
+            FootPos.y -= s.treatAsVehicle ? 0.55f : 0.92f;
             HeadPos.y += 0.08f; // helmet pad in world, not screen inflate
             Vector3 w2sHead = WorldToScreenLayer(HeadPos, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
             Vector3 w2sHip = WorldToScreenLayer(HipPos, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
@@ -5225,36 +4905,9 @@ static inline uint64_t ESPPhaseNowUS(void) {
             const bool lknock = get_IsKnockedDown(gAimLockTarget);
             Vector3 liveHeadTarget = getPositionExt(getHead(gAimLockTarget));
             const bool hasLiveHead = looksLikeWorldPos(liveHeadTarget);
-            // A live bone is not a live player.
-            //
-            // This used to invent health for the locked pawn:
-            //
-            //     if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
-            //
-            // A knocked or killed pawn keeps its bones in the entity dict and
-            // they keep reading a valid world position, which is the position it
-            // died at or the place it is lying. So a corpse with 0/0 read as a
-            // full-health live target, passed every check below including
-            // lhp > 0, and the crosshair parked on the body. On respawn the lock
-            // still held that position, so the crosshair stayed where the old
-            // body was while the player was somewhere else entirely.
-            //
-            // It also made lhpBad unreachable for exactly the case it existed to
-            // catch, since lhp had already been forced positive.
-            //
-            // And it contradicted this same file: the entity loop at 4100 treats
-            // MaxHP <= 0 as dead and tombstones the pawn for 120 frames. The two
-            // halves of the renderer disagreed about what 0/0 means, and only the
-            // aim half believed the corpse was alive.
-            //
-            // There is no way to tell a broken HP read from a genuine 0/0 from
-            // inside this expression, so the invention is gone and the liveness
-            // test below does the work. A pawn whose HP cannot be read was
-            // already being suppressed by the entity loop, so nothing that used
-            // to draw now stops drawing.
-            const bool lhpBad = (lmax <= 0) || (lmax > 2000) || (lhp < 0) ||
-                                ((lhp == 0 && lmax == 0) && !lknock);
-            if (!lhpBad && (lhp > 0 || lknock) && !(isAimIgnoreKnock && lknock) &&
+            if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
+            const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
+            if (!lhpBad && (lhp > 0) && !(isAimIgnoreKnock && lknock) &&
                 !(isAimIgnoreBot && get_IsBot(gAimLockTarget))) {
                 Vector3 lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
                 if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
@@ -5422,24 +5075,15 @@ static inline uint64_t ESPPhaseNowUS(void) {
         Vector3 liveHeadCheck = getPositionExt(getHead(pawn));
         const bool hasLiveHead = looksLikeWorldPos(liveHeadCheck);
 
-        // This block used to promote a corpse:
-        //
-        //     if (hasLiveHead && hp <= 0 && maxHp <= 0) { hp = 200; maxHp = 200; }
-        //     else if (hasLiveHead && maxHp <= 0) { maxHp = 200; if (hp <= 0) hp = 200; }
-        //
-        // The identical block was already removed from the sticky re-eval a few
-        // hundred lines above and that removal was not propagated here. A knocked
-        // or killed pawn keeps its bones in the dict reading a valid position, so
-        // hasLiveHead is true, the 0/0 read was rewritten as a healthy 200, and
-        // every liveness test below then passed. This lambda gates the camera
-        // write at three call sites, so a corpse passed the gate and the camera
-        // parked on where the body was. knocked is computed on the line above and
-        // was never consulted by either branch.
-        //
-        // A live bone is not a live player. The HP fields decide.
-        const bool hpBad = (maxHp <= 0) || (maxHp > 2000) || (hp < 0) ||
-                           ((hp == 0 && maxHp == 0) && !knocked);
-        if (hpBad) return false;
+        if (hasLiveHead && hp <= 0 && maxHp <= 0) {
+            hp = 200; maxHp = 200;
+        } else if (hasLiveHead && maxHp <= 0) {
+            maxHp = 200; if (hp <= 0) hp = 200;
+        }
+
+        // Dead / unreadable / garbage HP shell → drop lock (no ghost aim).
+        if (!hasLiveHead && (maxHp <= 0 || maxHp > 2000)) return false;
+        if (!hasLiveHead && (hp == 0 && maxHp == 0)) return false;
         if (!hasLiveHead && (hp <= 0)) return false;
         if (hp > 2000 || (maxHp > 0 && hp > maxHp + 50)) return false;
         if (isAimIgnoreKnock && knocked) return false;
@@ -5666,33 +5310,10 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 AimLockClear();
             } else {
                 // Camera mild lead; bullet path uses stronger lead in silent/fire-dir.
-                //
-                // Not tracked here. AimTrackAndLeadEx is a stateful tracker keyed
-                // on the pawn, and AimLookAtHeadLive calls it on the same pawn a
-                // few lines below, on the same frame. Running it twice in one
-                // frame advances g_aimMotion's history twice against one
-                // timestamp, so the second call measures an instantaneous
-                // velocity from a history it had already consumed and feeds that
-                // into the EMA. The fallback below is what this call was for, and
-                // the live path already overwrites aimPoint with its own result
-                // when that result is valid, so this call is only ever needed
-                // when AimLookAtHeadLive fails.
-                //
-                // It is still computed, just after the live attempt, so the
-                // tracker is advanced once per frame and the fallback does not
-                // steal the live path's history.
-                // aimPoint must hold the bone from here on. The FOV circle, the
-                // 180 test and the assist radius all project it, and they are
-                // evaluated BELOW, before AimLookAtHeadLive has written anything.
-                // It was initialised to {0,0,0} so the stateful tracker would only
-                // run on the fallback path, which left every one of those gates
-                // projecting the world origin instead of the enemy, and the origin
-                // is never inside the FOV circle. The gate is then force-enabled
-                // while firing or scoping, so it was inert exactly when the aim
-                // was live. lookBone is the bone the live path aims at, so the
-                // gates now test the same point the camera is about to get.
-                Vector3 aimPoint = lookBone;
-                bestHeadPos = lookBone;
+                Vector3 aimPoint = AimTrackAndLeadEx(bestTarget, lookBone, bestDistance, true, /*bulletLead=*/false);
+                if (IsZeroVec(aimPoint)) aimPoint = lookBone;
+
+                bestHeadPos = aimPoint;
                 s_lastAimPawn = bestTarget;
 
                 // Geometry re-check at apply time.
@@ -5741,19 +5362,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
                     if (!IsZeroVec(glued) && looksLikeWorldPos(glued)) {
                         aimPoint = glued;
                         bestHeadPos = glued;
-                    } else {
-                        // Only now is the fallback worth computing, and only the
-                        // tracker-free version: the live path already ran the
-                        // stateful tracker on this pawn this frame, and running it
-                        // again to produce a value that is usually discarded is
-                        // what corrupted its history.
-                        aimPoint = lookBone;
-                        if (IsZeroVec(aimPoint) || !looksLikeWorldPos(aimPoint)) {
-                            aimPoint = AimTrackAndLead(bestTarget, lookBone, bestDistance, true);
-                        }
-                        if (IsZeroVec(aimPoint) || !looksLikeWorldPos(aimPoint)) {
-                            aimPoint = lookBone;
-                        }
+                    } else if (!IsZeroVec(aimPoint) && looksLikeWorldPos(aimPoint)) {
                         bestHeadPos = aimPoint;
                     }
                     // No AimLock thread for Aimbot/Assist — it shook cam after release.
@@ -5786,27 +5395,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
                         }
                         AimSyncFireHit(myPawnObject, fromNow, hit);
                     }
-                    // No camera write here. There used to be one:
-                    //
-                    //     Quaternion tq = GetRotationToLocation(hit, 0.0f, from2);
-                    //     write_aim_rotations(myPawnObject, tq);
-                    //
-                    // AimLookAtHeadLive above already wrote the camera rotation
-                    // for this frame, aimed at the bone the camera path chose.
-                    // This line then wrote it again, later in the same frame,
-                    // aimed at `hit`, which is a ResolveSilentAimWorldPos
-                    // resolution: a different position from a different aim
-                    // mode. Last write wins, so while firing the crosshair
-                    // followed the silent-aim point and not the bone under it.
-                    // That is the reported "it does not go straight at the
-                    // bone", and it only showed up while shooting, because this
-                    // block is gated on fireWindow.
-                    //
-                    // The block's job is the fire-direction and HitObject
-                    // spoof, which AimSyncFireHit does. Moving the camera is
-                    // not part of that job, and when two subsystems write the
-                    // same rotation in one frame the crosshair belongs to
-                    // neither of them.
+                    Vector3 from2 = AimCameraOrigin(myPawnObject, myLocation);
+                    Quaternion tq = Quaternion::Normalized(GetRotationToLocation(hit, 0.0f, from2));
+                    if (!(isnan(tq.x) || isnan(tq.y) || isnan(tq.z) || isnan(tq.w))) {
+                        write_aim_rotations(myPawnObject, tq);
+                    }
                 }
             }
         }

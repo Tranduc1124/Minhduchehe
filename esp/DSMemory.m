@@ -107,25 +107,9 @@ static void init_physmap(void) {
 
 #pragma mark - attach
 
-// Microseconds, for the attach's own wall time. ds_now_ms below is defined
-// after ds_attach, so this cannot reuse it without a forward declaration of a
-// different unit.
-static uint64_t ds_now_us(void) {
-    static mach_timebase_info_data_t tb;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
-    return (mach_absolute_time() * tb.numer / tb.denom) / 1000ULL;
-}
-
 int ds_attach(void) {
     if (ds_attached()) return 0;
     if (!g_kexploit_ready) return -1;
-
-    // Enters and leaves are logged so a stuck attach is visible as a missing
-    // "exit" even when the walk itself never gets far enough to log.
-    const uint64_t tAttach0 = ds_now_us();
-    NSLog(@"[PUSH][DS] attach begin tid=%u",
-          (uint32_t)pthread_mach_thread_np(pthread_self()));
 
     init_physmap();
 
@@ -194,28 +178,13 @@ int ds_attach(void) {
 
     uint64_t bestStart = 0, bestSize = 0;
     int mappedCount = 0, failCount = 0;
-    // How many entries this walk has to look at, and how many of them ask for
-    // a page. The attach used to be a full map walk per qual, so the cost was
-    // nentries x qual; these two numbers are what make that visible.
-    int qualCount = 0;
-    // Which thread walks the map. The 21:08:39 stackshot shows the app's
-    // com.apple.main-thread inside the kernel (TH_RUN) while SpringBoard's main
-    // thread is turnstile-blocked on this task, so the walk has to be
-    // attributable to a thread id before anything else is blamed.
-    const uint32_t walkTid = (uint32_t)pthread_mach_thread_np(pthread_self());
-    NSLog(@"[PUSH][DS] attach enter tid=%u nentries=%u", walkTid, nentries);
-    const uint64_t tWalk0 = ds_now_us();
     for (uint32_t i = 0; i < nentries && K(e); i++) {
         uint64_t start = kread64(e + E_START);
         uint64_t end   = kread64(e + E_END);
         uint64_t size  = (end > start) ? (end - start) : 0;
 
         if (start >= 0x100000000 && size > 0x400000 && start < 0x800000000) {
-            // e is the entry that covers start, so vm_map_remote_page's walk
-            // back to it would return e. Passing it in removes one full
-            // vm_map walk per qualifying region, which is the whole attach cost.
-            qualCount++;
-            struct VMShmem page = vm_map_remote_page_for_entry(map, e, start);
+            struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
             if (page.localAddress) {
                 mappedCount++;
                 uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
@@ -244,13 +213,8 @@ int ds_attach(void) {
         }
         e = kread_ptr(e + off_vm_map_entry_links_next);
     }
-    // Wall time of the walk. On 2026-09-28 20:39:56 this loop blocked the main
-    // thread for 1.10s and the device wrote a runloop hang report, with the
-    // whole sample stack inside vm_map_find_entry's redundant walk. One number
-    // per attach is enough to tell whether that is gone.
-    NSLog(@"[DS] base walk: mapped=%d qual=%d fail=%d best=0x%llx size=0x%llx us=%llu tid=%u",
-          mappedCount, qualCount, failCount, bestStart, bestSize,
-          (unsigned long long)(ds_now_us() - tWalk0), walkTid);
+    NSLog(@"[DS] base walk: mapped=%d fail=%d best=0x%llx size=0x%llx",
+          mappedCount, failCount, bestStart, bestSize);
     if (bestStart) {
         g_ff_base = bestStart;
     }
@@ -266,15 +230,11 @@ int ds_attach(void) {
                 dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
             }
         }
-        NSLog(@"[PUSH][DS] attach exit ok=0 tid=%u total_us=%llu",
-              (uint32_t)pthread_mach_thread_np(pthread_self()),
-              (unsigned long long)(ds_now_us() - tAttach0));
         return -1;
     }
 
-    NSLog(@"[PUSH][DS] attach exit ok=1 tid=%u pid=%d total_us=%llu",
-          (uint32_t)pthread_mach_thread_np(pthread_self()), g_ff_pid,
-          (unsigned long long)(ds_now_us() - tAttach0));
+    NSLog(@"[DS] attached: pid=%d proc=0x%llx task=0x%llx base=0x%llx",
+          g_ff_pid, g_ff_proc, g_ff_task, g_ff_base);
     return 0;
 }
 
@@ -650,9 +610,7 @@ bool ds_read(uint64_t va, void *buf, size_t len) {
 }
 
 bool ds_write(uint64_t va, const void *buf, size_t len) {
-    // ds_rw_remap takes a void* because it also serves ds_read's own buffer, but
-    // a write never modifies the caller's bytes, so dropping const here is safe.
-    return ds_rw_remap(va, (void *)(uintptr_t)buf, len, true);
+    return ds_rw_remap(va, buf, len, true);
 }
 
 uint8_t  ds_read8(uint64_t va)  { uint8_t v=0;  ds_read(va,&v,1); return v; }

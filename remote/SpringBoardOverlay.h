@@ -16,14 +16,7 @@ int SBoardStartOverlay(void);
 void SBoardStopOverlay(void);
 // Mirror the local ESP_View into the SB-hosted view (called every frame
 // from updateFrame; no-op when the overlay isn't up).
-//
-// enemyCount is the total to draw as the red counter, or -1 for none. It is
-// passed rather than read back off a CATextLayer because the counter lives in
-// statusLayer, not in textLayerPool, and reading it back also meant depending
-// on that layer's hidden flag and its string being up to date. Two rounds of
-// building this from the layer produced txt=0 on every publish while the
-// counter was being drawn perfectly well in the app.
-void SBRemotePushESPFrame(UIView *espView, int enemyCount);
+void SBRemotePushESPFrame(UIView *espView);
 
 #ifdef __cplusplus
 }
