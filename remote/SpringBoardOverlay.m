@@ -2189,20 +2189,46 @@ int SBoardStartOverlay(void) {
     uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
-    // Built with four separate CGFloats, which is the call the diagnostic proved
-    // carries its arguments: numberWithDouble: on the same path came back
-    // describing itself as 1.5, and setLineWidth: read straight back out of the
-    // CALayer as 1.50. So four doubles in one call is not the open question it
-    // was three rounds ago.
-    double greenRGBA[4] = { 0.0, 1.0, 0.0, 1.0 };
-    uint64_t greenColor = r_is_objc_ptr(clsCol)
-                        ? r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
-                                          &greenRGBA[0], 8, &greenRGBA[1], 8,
-                                          &greenRGBA[2], 8, &greenRGBA[3], 8)
-                        : 0;
-    uint64_t greenCGColor = r_is_objc_ptr(greenColor)
-                          ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
-    if (!r_is_objc_ptr(greenCGColor)) greenCGColor = whiteCGColor;
+    // The green outline went here, and it was the only thing standing between the
+    // overlay and its own first frame.
+    //
+    // greenCGColor was built and then never read. Every stroke in this overlay is
+    // one CAShapeLayer, g_sbShape, whose colour is set below with
+    // setStrokeColor: whiteCGColor. The boxes, the bones, the FOV ring and the
+    // health bar are all paths on that one layer, so they have all been white
+    // this whole time. greenCGColor, and the colorWithRed:green:blue:alpha: call
+    // that fed it, were a leftover nothing consumed.
+    //
+    // What it cost. colorWithRed:green:blue:alpha: is where the session died, on
+    // 2026-09-30, three runs, every attempt, same address:
+    //
+    //   22:03:00  [PUSH][SB-LAST] ... sel=colorWithRed:green:blue:alpha: wait=1
+    //             stable/objc_msgSend FAULT in the callee pc=0x18c73f020
+    //             [BOOT] SpringBoard overlay attempt 1 failed rc=-1
+    //   22:03:05  same, attempt 2
+    //   22:03:17  same, attempt 4
+    //
+    // pc=0x18c73f020 is objc_msgSend+0x20, and the 18:20:18 device log puts the
+    // faulting address at 0x1, which is an objc_msgSend that read a bogus isa and
+    // branched to it. The class is right here, a class method on UIColor sent to
+    // UIColor, so what is wrong is the register it was handed.
+    //
+    // The 18:20 run recorded what that register held, and it is the same shape as
+    // the stale pointer this file already documents further down, the layer getter
+    // that reads 0x1f82546c8 out of a malloc'd buffer in the target no matter what
+    // was written to it:
+    //
+    //   18:20:18  wait2 exc PC=0x195edf020 LR=0x401 x0=0x303266d40
+    //   22:03:17  wait2 exc PC=0x401 x0=0x194a07520
+    //
+    // So the return value of a call into the target is not coming back. That is
+    // the real defect and it is not fixed here. What is fixed here is that nothing
+    // needed this particular return value.
+    //
+    // The grey card behind a pawn's name does the same round trip and is still
+    // below, and is now the only live colorWithRed in the file. It is a different
+    // call at a different point in the sequence, past UIWindow alloc, so it is
+    // left alone until something says it is the next thing to die.
 
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
