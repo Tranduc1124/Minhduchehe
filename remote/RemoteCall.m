@@ -1653,6 +1653,60 @@ int remote_call_set_stable_timeout_floor_ms(int timeoutMS)
     return previous;
 }
 
+// Which thread of THIS process issued a remote call, and whether doing so means
+// the call is being made on SpringBoard's main thread.
+//
+// IPS 2026-09-30 17:00 (WATCHDOG, com.apple.main-thread) settled one thing and
+// refuted another: SpringBoard's main thread was NOT parked at 0x101/0x201/0x301/
+// 0x401. It was in a plain mach_msg receive with fifteen frames of real
+// SpringBoard code, which means it resumed and ran on its own. So the getpid
+// "never returns to 0x201" line breaks the overlay; it is not what killed the
+// board. What the report cannot say is who was holding the main thread.
+//
+// This records the caller, once per distinct (tid, name), because a publish
+// loop makes thousands of calls and a per-call logd line would drown the
+// console. The first sighting of a caller is the one that matters; after that
+// the count is the signal.
+static uint64_t g_rcCallerSeen[64] = {0};   // packed tid<<32 | name hash
+static int      g_rcCallerHits[64] = {0};
+static uint32_t g_rcCallerSlot = 0;
+static pthread_mutex_t g_rcCallerLock = PTHREAD_MUTEX_INITIALIZER;
+
+static void rc_log_caller(const char *what, const char *name, int viaStable)
+{
+    uint64_t tid = (uint64_t)pthread_mach_thread_np(pthread_self());
+    uint32_t h = 2166136261u;
+    for (const char *s = name ? name : ""; s && *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    uint64_t key = (tid << 32) | (h & 0xffffffffu);
+
+    pthread_mutex_lock(&g_rcCallerLock);
+    int slot = -1;
+    for (int i = 0; i < 64; i++) {
+        if (g_rcCallerSeen[i] == key) { slot = i; break; }
+    }
+    int nth = 0;
+    if (slot < 0) {
+        slot = (int)(g_rcCallerSlot++ % 64u);
+        g_rcCallerSeen[slot] = key;
+        g_rcCallerHits[slot] = 0;
+    }
+    nth = ++g_rcCallerHits[slot];
+    pthread_mutex_unlock(&g_rcCallerLock);
+
+    // First sighting and the 1000th are both worth a line; the rest are not.
+    if (nth != 1 && nth != 1000 && nth != 10000)
+        return;
+
+    RC_DIAG("caller %s tid=0x%llx name=%s#%d onTargetMain=%d extra=%d success=%d",
+            what,
+            (unsigned long long)tid,
+            name ?: "?",
+            nth,
+            remote_call_runs_on_target_main_thread() ? 1 : 0,
+            g_RC_creatingExtraThread ? 1 : 0,
+            g_RC_success ? 1 : 0);
+}
+
 uint64_t do_remote_call_temp(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
@@ -1673,6 +1727,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     // re-park all came after it and are gone again: that build drove SpringBoard
     // with this exact sequence, and a8a15ead shows getpid still not returning
     // to 0x201 with any of the additions in place.
+    rc_log_caller("temp", name, 0);
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
@@ -1845,6 +1900,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return rc_vphone_bridge_call(3, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
     }
 
+    rc_log_caller("stable", name, 1);
     if (!g_RC_creatingExtraThread)
         return 0;
 
