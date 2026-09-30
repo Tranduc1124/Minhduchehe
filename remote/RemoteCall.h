@@ -145,6 +145,12 @@ extern __thread int g_RC_pacWaitTimeouts;
 // parked thread can be driven, and a pid is not that; see the note at the call site.
 extern __thread uint64_t g_RC_bootstrapPid;
 
+// Which branch of the synthetic call thread construction gave up, so that
+// "synthetic call thread kobject invalid" stops being one sentence for nine different
+// failures. Read by remote_call_last_init_failure_detail; the values are listed at
+// its definition.
+extern __thread int g_RC_callThreadStep;
+
 #ifdef __OBJC__
 @class RemotePointer;
 

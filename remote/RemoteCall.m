@@ -130,6 +130,25 @@ static __thread int g_RC_bootstrapAttempts = 0;
 // apart. Read by remote_call_last_init_failure_detail.
 __thread int g_RC_pacWaitTimeouts = 0;
 __thread uint64_t g_RC_bootstrapPid = 0;
+// Which branch of the synthetic call thread construction gave up.
+//
+//   1  pthread_create_suspended_np itself failed, or the call to it did
+//   2  the create succeeded and no thread appeared in the thread list diff
+//   3  a thread appeared but its address is not a kernel address
+//   4  the thread is there and valid, and SpringBoard's own ipc_space holds no
+//      port name for it, which the file already records as normal
+//   5  the out pointer came back empty or as the canary, and no thread appeared
+//   6  pthread_mach_thread_np failed
+//   7  that gave a port, and resolving it to a kobject gave something that is not
+//      a kernel address
+//   8  no port at all, and there is no inject thread[1] to fall back to
+//   9  no port at all, and thread[1] is invalid or is the signing thread itself
+//
+// Without this, "synthetic call thread kobject invalid" is one sentence for nine
+// different failures, four of which are documented in this file as expected on some
+// paths, and the console has no way to tell them apart. Read by
+// remote_call_last_init_failure_detail.
+__thread int g_RC_callThreadStep = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -273,35 +292,55 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
 // it, because a caller that cannot print it has nowhere to put it.
 const char *remote_call_last_init_failure_detail(void)
 {
-    static __thread char detail[96];
-    if (g_RC_lastInitFailure != RemoteCallInitFailureBootstrapGetpid) return "";
-
-    const char *step;
-    switch (g_RC_lastTempStep) {
-        // The thread was parked at a faulting PC by the creator reply and the trap
-        // never arrived, or never arrived in time.
-        case 1:  step = "wait1 no trap (thread never reached 0x101)"; break;
-        // It ran, and the fault from returning into the fake link register never came
-        // back, so the return value was never delivered.
-        case 2:  step = "wait2 no return (RET to 0x201 never trapped)"; break;
-        // Both waits completed, so the trap and the return both arrived, and the
-        // state was refused because it was not live enough to reply onto.
-        case 3:  step = "state rejected (not live enough to reply onto)"; break;
-        // Both waits completed and the state was fine, and signing the pointer the
-        // thread is about to run at did not produce a signature. This is the pacia
-        // signer's own wait, inside remote_pac, and it is counted.
-        case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
-        // Both waits completed and the step was never set, which is the only way to
-        // land here now: the call went out, ran, trapped on the way back, and the
-        // engine has nothing left to complain about. Reaching the failure branch at
-        // all in that state is a bug in whatever tested the return, not in the
-        // engine, so the sentence says so rather than inventing a cause.
-        default: step = "both waits completed (no step recorded)"; break;
+    static __thread char detail[160];
+    if (g_RC_lastInitFailure == RemoteCallInitFailureBootstrapGetpid) {
+        const char *step;
+        switch (g_RC_lastTempStep) {
+            // The thread was parked at a faulting PC by the creator reply and the trap
+            // never arrived, or never arrived in time.
+            case 1:  step = "wait1 no trap (thread never reached 0x101)"; break;
+            // It ran, and the fault from returning into the fake link register never came
+            // back, so the return value was never delivered.
+            case 2:  step = "wait2 no return (RET to 0x201 never trapped)"; break;
+            // Both waits completed, so the trap and the return both arrived, and the
+            // state was refused because it was not live enough to reply onto.
+            case 3:  step = "state rejected (not live enough to reply onto)"; break;
+            // Both waits completed and the state was fine, and signing the pointer the
+            // thread is about to run at did not produce a signature. This is the pacia
+            // signer's own wait, inside remote_pac, and it is counted.
+            case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
+            // Both waits completed and the step was never set, which is the only way to
+            // land here now: the call went out, ran, trapped on the way back, and the
+            // engine has nothing left to complain about. Reaching the failure branch at
+            // all in that state is a bug in whatever tested the return, not in the
+            // engine, so the sentence says so rather than inventing a cause.
+            default: step = "both waits completed (no step recorded)"; break;
+        }
+        snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d pid=%llu",
+                 g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts,
+                 (unsigned long long)g_RC_bootstrapPid);
+        return detail;
     }
-    snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d pid=%llu",
-             g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts,
-             (unsigned long long)g_RC_bootstrapPid);
-    return detail;
+
+    if (g_RC_lastInitFailure == RemoteCallInitFailureCallThread) {
+        const char *step;
+        switch (g_RC_callThreadStep) {
+            case 1:  step = "pthread_create_suspended_np failed"; break;
+            case 2:  step = "create ok, no new thread in list diff"; break;
+            case 3:  step = "new thread addr not a kernel address"; break;
+            case 4:  step = "no port name for the new thread in SB ipc_space"; break;
+            case 5:  step = "out pointer empty or canary, and no new thread"; break;
+            case 6:  step = "pthread_mach_thread_np failed"; break;
+            case 7:  step = "port resolved to a non-kernel kobject"; break;
+            case 8:  step = "no port and no inject thread[1] to reuse"; break;
+            case 9:  step = "thread[1] invalid or is the signing thread"; break;
+            default: step = "unclassified"; break;
+        }
+        snprintf(detail, sizeof(detail), "callThread=%s", step);
+        return detail;
+    }
+
+    return "";
 }
 
 static bool remote_call_verbose_logging(void)
@@ -2771,6 +2810,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     break;
                 }
             }
+            // Recorded before the branch below can overwrite it, because "the create
+            // worked and the thread list did not change" and "the out pointer came
+            // back empty" are different faults and both of them used to report as the
+            // same one.
+            g_RC_callThreadStep = newThreadAddr ? 0 : 2;
             if (newThreadAddr && is_kaddr_valid(newThreadAddr)) {
                 RC_DIAG("found synthetic thread kaddr=0x%llx (before=%lu after=%lu)",
                         (unsigned long long)newThreadAddr,
@@ -2778,6 +2822,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                         (unsigned long)threadsAfter.count);
             }
         } else {
+            g_RC_callThreadStep = 1;
             RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
         }
@@ -2789,6 +2834,12 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             if (callThreadPort) {
                 g_RC_callThreadAddr = newThreadAddr;
                 createdSuspended = true;
+            } else {
+                // Expected on some paths, per the note at the fallback below: SpringBoard
+                // holds no mach port name for a thread it never made a port for.
+                // Recorded so the console can say exactly that, instead of leaving the
+                // reader to infer it from a failure that has nothing to do with it.
+                g_RC_callThreadStep = 4;
             }
         } else if (pthreadAddr && pthreadAddr != kCanary) {
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
@@ -2798,15 +2849,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 if (is_kaddr_valid(g_RC_callThreadAddr)) {
                     createdSuspended = true;
                 } else {
+                    g_RC_callThreadStep = 7;
                     RC_DIAG("synthetic kobject invalid — thread[1]");
                     callThreadPort = 0;
                 }
             } else {
+                g_RC_callThreadStep = 6;
                 callThreadPort = 0;
             }
         } else {
-            RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] reuse",
-                    (unsigned long long)pthreadAddr);
+            g_RC_callThreadStep = newThreadAddr ? 3 : 5;
+            RC_DIAG("create miss (bounce=0x%llx newThread=0x%llx) — falling through to thread[1] reuse",
+                    (unsigned long long)pthreadAddr, (unsigned long long)newThreadAddr);
         }
     } else {
         RC_DIAG("iOS26+ pthread stubs — skipping create; trying thread[1] reuse");
@@ -2821,15 +2875,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool parkedViaGuard = false;
     if (!callThreadPort) {
         if (g_RC_threadList.count < 2) {
+            g_RC_callThreadStep = 8;
             RC_DIAG("no inject thread[1] — cannot build extra call thread");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
         uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
         if (!is_kaddr_valid(thread2Addr) || thread2Addr == g_RC_trojanThreadAddr) {
-            RC_DIAG("thread[1] invalid/same-as-signer addr=0x%llx trojan=0x%llx",
+            g_RC_callThreadStep = 9;
+            RC_DIAG("thread[1] invalid/same-as-signer addr=0x%llx trojan=0x%llx (list=%lu)",
                     (unsigned long long)thread2Addr,
-                    (unsigned long long)g_RC_trojanThreadAddr);
+                    (unsigned long long)g_RC_trojanThreadAddr,
+                    (unsigned long)g_RC_threadList.count);
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
