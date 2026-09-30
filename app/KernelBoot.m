@@ -18,6 +18,22 @@
 #import "../remote/RemoteCall.h"
 #import "KeepAlive.h"
 
+// The build this binary is. Bumped by hand, and it is here because the absence of it
+// cost a whole round: a screenshot of the console could not be attributed to a commit,
+// so a fix that was already in the tree looked like one that had not been taken.
+//
+// At the top of the file, above every use. It was at the bottom, then just above
+// kernelBootStart, and both were wrong: a macro is not a declaration, so there is no
+// forward reference, and the first use is in boot_start_sb_overlay which comes before
+// kernelBootStart. The build caught it twice in two days, and the check that caught it
+// is the one that covers app/ — which the first version of this file's own commit did
+// not run.
+//
+// Keep it short and unique. Nine characters, on the first line of the console, so it
+// is the first thing a screenshot shows and the only thing needed to say which binary
+// produced it.
+#define KB_BUILD_ID "r129-f0292c8"
+
 kernel_boot_log_fn kernelBootLog = NULL;
 
 static BOOL  g_booting   = NO;
@@ -90,21 +106,11 @@ static void boot_start_sb_overlay(void) {
 
     // The build id again, on the failure line, because that is the line a screenshot
     // usually catches and the boot line scrolls away first.
-    L(@"build %@", @KB_BUILD_ID);
+    L(@"build %@", KB_BUILD_ID);
 }
 
-// The build this binary is. Bumped by hand, and it is here because the absence of it
-// cost a whole round: a screenshot of the console could not be attributed to a commit,
-// so a fix that was already in the tree looked like one that had not been taken. The
-// line is printed before anything else the boot does.
-//
-// Keep it short and keep it unique. Nine characters, and it goes in the first line of
-// the console, so it is the first thing a screenshot shows and the only thing needed
-// to say which binary produced it.
-#define KB_BUILD_ID "r128-80134d"
-
 void kernelBootStart(void) {
-    L(@"[%@] MINHDUC build", @KB_BUILD_ID);
+    L(@"[%@] MINHDUC build", KB_BUILD_ID);
     if (g_booting) return;
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
