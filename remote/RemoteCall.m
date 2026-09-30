@@ -129,6 +129,7 @@ static __thread int g_RC_bootstrapAttempts = 0;
 // timed out on every attempt" are different bugs and only the count tells them
 // apart. Read by remote_call_last_init_failure_detail.
 __thread int g_RC_pacWaitTimeouts = 0;
+__thread uint64_t g_RC_bootstrapPid = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -290,10 +291,16 @@ const char *remote_call_last_init_failure_detail(void)
         // thread is about to run at did not produce a signature. This is the pacia
         // signer's own wait, inside remote_pac, and it is counted.
         case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
-        default: step = "unclassified"; break;
+        // Both waits completed and the step was never set, which is the only way to
+        // land here now: the call went out, ran, trapped on the way back, and the
+        // engine has nothing left to complain about. Reaching the failure branch at
+        // all in that state is a bug in whatever tested the return, not in the
+        // engine, so the sentence says so rather than inventing a cause.
+        default: step = "both waits completed (no step recorded)"; break;
     }
-    snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d",
-             g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts);
+    snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d pid=%llu",
+             g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts,
+             (unsigned long long)g_RC_bootstrapPid);
     return detail;
 }
 
@@ -1468,9 +1475,30 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
-    if(strcmp(name, "getpid") == 0 && retValue == 0) {
-        printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
-        g_RC_success = false;
+
+    // The "if getpid returned 0, fail" rule that used to be here is gone, and
+    // only the g_RC_success assignment is gone: the printf stays, because a zero
+    // from getpid is worth seeing.
+    //
+    // A value cannot tell a call that did not happen from a call that happened and
+    // returned zero, and this function can already tell the difference, precisely
+    // and without a guess. Reaching this line at all means both waits completed.
+    // The first one means the thread was parked at a faulting PC and took the trap.
+    // The second means it ran the function and took the trap on the way out. A
+    // caller that wants to know whether the mechanism worked reads the step, and a
+    // caller that wants to know whether it happened reads whether it got here.
+    //
+    // What the rule cost is not a failed init, it is a destroyed one. Together with
+    // the bootstrap's own "bootstrapPid != 0", it made the entire overlay depend on
+    // a number that the bootstrap then throws away and re-reads properly further
+    // down, and a session that measured attempts=3, last=unclassified,
+    // pacTimeouts=0 was exactly that: no wait gave up, the pacia signer was never
+    // late, the call went out and came back with zero, and every part of the engine
+    // was working. Both waits completing is the proof of life. A non-zero pid is
+    // not, and it is not even a fact about the engine.
+    if (strcmp(name, "getpid") == 0 && retValue == 0) {
+        printf("[%s:%d] getpid returned 0 (both waits completed, so the call ran)\n",
+               __FUNCTION__, __LINE__);
     }
     return retValue;
 }
@@ -2618,18 +2646,54 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     // used to say nothing beyond the two hypotheses in the failure string.
     uint64_t bootstrapPid = 0;
     g_RC_bootstrapAttempts = 0;
+    g_RC_bootstrapPid = 0;
     for (int attempt = 1; attempt <= 3; attempt++) {
         g_RC_success = true;   // do_remote_call_temp clears it; a retry starts clean
         g_RC_bootstrapAttempts = attempt;
         bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
-        RC_DIAG("bootstrap getpid attempt %d done pid=%llu success=%d waitmiss=%d",
+        g_RC_bootstrapPid = bootstrapPid;
+        RC_DIAG("bootstrap getpid attempt %d done pid=%llu success=%d step=%d",
                 attempt, (unsigned long long)bootstrapPid,
                 (int)g_RC_success, g_RC_lastTempStep);
-        if (g_RC_success && bootstrapPid != 0) break;
+
+        // Success is the mechanism. Not the pid.
+        //
+        // g_RC_lastTempStep is 0 when neither of the transport's two waits gave up,
+        // and the transport only returns normally once both of them have completed.
+        // The first one completing means the thread was parked at 0x101 and took the
+        // fault. The second means it ran the function and took the fault on the way
+        // back out, returning into 0x201. That is the whole of what this call is
+        // for, and it is the only part of it that the two waits actually measure.
+        //
+        // The pid is not that, and asking for it was wrong twice over.
+        //
+        // It is discarded here. Further down, once the synthetic thread exists,
+        // g_RC_pid is read properly with do_remote_call_stable and that is the value
+        // the rest of the engine uses. Nothing between here and there looks at
+        // bootstrapPid.
+        //
+        // And it is not free to demand. The engine carries a second copy of the same
+        // rule inside the transport, a bare "if getpid returned 0, fail", which
+        // clears g_RC_success on the way past and leaves the step unset. So the two
+        // rules together made the entire overlay depend on a number this call was
+        // never chartered to establish, and the sign that they had done it is
+        // unambiguous once the step is measured: a failing session read
+        // attempts=3, last=unclassified, pacTimeouts=0, which says no wait gave up,
+        // the pacia signer was never late, and the call went out and came back with
+        // zero. Every part of the engine was working, and the session was destroyed
+        // over a return value that is thrown away.
+        if (g_RC_lastTempStep == 0) {
+            // Restored because the transport clears it for the reason above, and
+            // every step after this one is guarded on it: the pthread create reads
+            // "g_RC_success && createResult == 0", so leaving it false here would skip
+            // the synthetic call thread and the session would limp on without one.
+            g_RC_success = true;
+            break;
+        }
     }
-    RC_DIAG("bootstrap getpid done pid=%llu success=%d",
-            (unsigned long long)bootstrapPid, (int)g_RC_success);
-    if (!g_RC_success || bootstrapPid == 0) {
+    RC_DIAG("bootstrap getpid done pid=%llu success=%d step=%d",
+            (unsigned long long)bootstrapPid, (int)g_RC_success, g_RC_lastTempStep);
+    if (g_RC_lastTempStep != 0) {
         RC_DIAG("bootstrap getpid FAILED");
         fail_after_creator_park(RemoteCallInitFailureBootstrapGetpid, targetPid);
         return -1;
@@ -2884,9 +2948,25 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     // session is unusable — bail instead of falling through to the unconditional
     // `g_RC_success = true` at the end, which used to hand callers a live-looking
     // but broken session (every later objc_msgSend then went nowhere).
-    if (!g_RC_success || !g_RC_pid) {
-        RC_DIAG("first stable getpid failed (success=%d) — tearing down session",
-                (int)g_RC_success);
+    //
+    // g_RC_success is the whole of that test, and the pid is not part of it. The
+    // proof is that the call completed, and g_RC_success is what the transport sets
+    // when it does not: a wait that gave up, a state it refused to reply onto, a
+    // signature it could not produce. Adding "and the pid is non-zero" asked a
+    // second question of a call whose return value cannot answer it, and it is the
+    // same mistake as the bootstrap's, one call later and for the same reason.
+    //
+    // A zero pid is harmless here, which is worth saying out loud because it looks
+    // load-bearing. Nothing addresses the target through it. g_RC_taskAddr, from
+    // task_for_pid at the top of init, is what every call in the engine goes
+    // through. g_RC_pid is read in exactly three places outside this file, and all
+    // three are diagnostics: remote_call_current_pid tags the PUSH-REARM log line,
+    // and r_sel and r_class use it as the key for the selector and class caches.
+    // A cache key of zero is a perfectly good cache key, and it is scoped to the
+    // session either way, because the caches are dropped in teardown.
+    if (!g_RC_success) {
+        RC_DIAG("first stable getpid failed (success=%d pid=%d) — tearing down session",
+                (int)g_RC_success, (int)g_RC_pid);
         fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
         return -1;
     }

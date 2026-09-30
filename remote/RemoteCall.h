@@ -139,6 +139,12 @@ const char *remote_call_last_init_failure_detail(void);
 // only the count says which.
 extern __thread int g_RC_pacWaitTimeouts;
 
+// What the bootstrap getpid came back with, kept only so a failure can report it.
+//
+// Deliberately not used to decide success. The bootstrap getpid is a proof that the
+// parked thread can be driven, and a pid is not that; see the note at the call site.
+extern __thread uint64_t g_RC_bootstrapPid;
+
 #ifdef __OBJC__
 @class RemotePointer;
 
