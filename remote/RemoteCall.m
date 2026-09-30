@@ -1069,6 +1069,9 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
+    // x8 is set here, on the way in, and cleared on every way out. See the long
+    // version at do_remote_call_stable_addr_internal; this is the same rule.
+    exc.threadState.__x[8] = 0;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &exc.threadState);
 
@@ -1089,6 +1092,10 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)exc2.threadState.__x[0]);
     uint64_t retValue = exc2.threadState.__x[0];
+    // Re-park. x8 cleared, same reason and same rule as the stable path: a
+    // parked thread has nothing outstanding, and whatever the callee left in x8
+    // is not a value this file chose.
+    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
@@ -1210,6 +1217,9 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
+    // x8 is set here, on the way in, and cleared on every way out. See the long
+    // version at do_remote_call_stable_addr_internal; this is the same rule.
+    exc.threadState.__x[8] = 0;
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
@@ -1239,6 +1249,37 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
+    //
+    // x8 is cleared here rather than left as the callee returned it, and it is
+    // set to zero on the way in for the same reason. x8 is the arm64 INDIRECT
+    // RESULT register, the address a function returning a struct wider than 16
+    // bytes writes into, and its contents mean nothing once that function has
+    // returned. This file sets x0 through x7 and never touched x8, so every
+    // register it published for the next call was chosen by it except that one,
+    // and the value in it belonged to whatever the previous callee left behind.
+    //
+    // The SpringBoard crash on 2026-09-30 23:21:23 is what that costs. The dead
+    // thread was inside an NSInvocation, which is the path every cached
+    // invocation in the overlay takes, and its registers were:
+    //
+    //   pc  = 0x401                     FAKE_LR_TROJAN, the park address
+    //   x8  = 0x401                     the same value, in the selector slot
+    //   x10 = OBJC_CLASS_$_NSInvocation
+    //   x14 = OBJC_CLASS_$_NSMethodSignature
+    //   x16 = objc_autorelease
+    //   x17 = -[NSMethodSignature frameLength]
+    //
+    // A parked thread was holding the fake park address in x8 and the next call
+    // read it. 0x401 is not a pointer anything can read, so the branch landed on
+    // it and the process took SIGBUS at an address that is not in any region.
+    //
+    // Zero is the correct value for a thread that is parked rather than running:
+    // the callee has returned, so there is no indirect result outstanding. And
+    // nothing here needs a non-zero one: the only struct return in the overlay
+    // is r_msg2_main_struct_ret, which builds an NSInvocation and reads the
+    // result back through -[NSInvocation getReturnValue:], so the callee writes
+    // into the invocation's own buffer and never needs x8 at all.
+    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
@@ -2008,6 +2049,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 drainHits,
                 (unsigned long long)native_strip(exc2.threadState.__pc),
                 (unsigned long long)native_strip(exc2.threadState.__lr));
+        // Republishing a faulted thread verbatim also republishes its x8. Same
+        // rule as the re-parks above: nothing outstanding, so zero.
+        exc2.threadState.__x[8] = 0;
         reply_with_state(&exc2, &exc2.threadState);
     }
     RC_DIAG("pre-creator drain done hits=%d", drainHits);
@@ -2016,6 +2060,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         g_RC_trojanThreadAddr = firstThread;
 
     arm_thread_state64_internal newState = exc.threadState;
+    // The very first park of the session. Same rule as every other one.
+    newState.__x[8] = 0;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     RC_DIAG("creator-park signer=0x%llx signedPC=0x%llx signedLR=0x%llx flags=0x%x",
             (unsigned long long)g_RC_trojanThreadAddr,
