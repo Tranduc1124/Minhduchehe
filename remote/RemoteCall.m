@@ -1745,6 +1745,29 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)exc2.threadState.__x[0],
             (unsigned)exc2.threadState.__flags);
+
+    // Recorded HERE, on the temp path, which is where the create reads it.
+    //
+    // The assignment existed, but it had ended up in do_remote_call_stable_addr_internal
+    // instead — the stable path — while the check that reads it guards the create, and
+    // the create goes through do_remote_call_temp. So for every temp call the variable
+    // was 0, the check saw 0 rather than the fake link register, and abandoned the
+    // create. Every single time, deterministically, with a log that said so:
+    //
+    //   DIAG create did not return: retPC=0x0 expected=0x201
+    //
+    // retPC=0x0 is not a program counter. It is a variable nothing on this path ever
+    // wrote. The call had already returned — the create's own result was 0, which is
+    // pthread's success — and the check threw it away on a stale read.
+    //
+    // It sits directly under the line that already prints the same program counter, so
+    // the record and the report cannot come apart again.
+    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
+    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
+    g_RC_lastTempExcType = exc2.exception;
+    g_RC_lastTempExcCode = exc2.codeFirst;
+    g_RC_lastTempX0 = exc2.threadState.__x[0];
+
     uint64_t retValue = exc2.threadState.__x[0];
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
