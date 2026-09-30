@@ -511,8 +511,17 @@ int SBoardStartOverlay(void) {
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
     if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    // Fill is cleared, so everything on this layer is an outline and this width is
+    // the stroke weight of the entire ESP: box, snapline and FOV ring alike.
+    //
+    // 1.5 was a slab. On a 390 point wide screen a 1.5 point outline is four
+    // pixels, which on a box around a distant pawn swallows the box and on the
+    // snapline reads as a wide wedge rather than a line. 0.8 is the thinnest
+    // CAShapeLayer stroke that still rasterises to a full pixel row on this
+    // display at 2x, and it is a real reduction rather than a rounding of the
+    // same number.
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
-    double lw = 1.5;
+    double lw = 0.8;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;

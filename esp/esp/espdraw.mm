@@ -238,47 +238,6 @@ static void ESPRenderPawnCore(
     float centerX = x + boxWidth * 0.5f;
 
     // ---------------------------------------------------------
-    // BONE
-    // ---------------------------------------------------------
-    if (isBone) {
-        Vector3 wHead   = WorldToScreenLayer(HeadPos,   matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLE     = WorldToScreenLayer(L_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRE     = WorldToScreenLayer(R_ForeArm,  matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLH     = WorldToScreenLayer(L_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRH     = WorldToScreenLayer(R_Hand,      matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLA     = WorldToScreenLayer(L_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wRA     = WorldToScreenLayer(R_Ankle,     matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-        Vector3 wLT     = w2sLeftToe;
-        Vector3 wRT     = w2sToe;
-
-        CGPoint pHead = CGPointMake(wHead.x, wHead.y);
-        CGPoint pHip  = CGPointMake(w2sHip.x,  w2sHip.y);
-        CGPoint pNeck = CGPointMake(pHead.x + (pHip.x - pHead.x) * 0.15f, pHead.y + (pHip.y - pHead.y) * 0.15f);
-        CGPoint pLE = CGPointMake(wLE.x, wLE.y);
-        CGPoint pRE = CGPointMake(wRE.x, wRE.y);
-        CGPoint pLS = CGPointMake(pNeck.x + (pLE.x - pNeck.x) * 0.3f, pNeck.y + (pLE.y - pNeck.y) * 0.3f);
-        CGPoint pRS = CGPointMake(pNeck.x + (pRE.x - pNeck.x) * 0.3f, pNeck.y + (pRE.y - pNeck.y) * 0.3f);
-        CGPoint pLH = CGPointMake(wLH.x, wLH.y);
-        CGPoint pRH = CGPointMake(wRH.x, wRH.y);
-        CGPoint pLK = CGPointMake(pHip.x + (wLA.x - pHip.x) * 0.45f, pHip.y + (wLA.y - pHip.y) * 0.45f);
-        CGPoint pRK = CGPointMake(pHip.x + (wRA.x - pHip.x) * 0.45f, pHip.y + (wRA.y - pHip.y) * 0.45f);
-        CGPoint pLA = CGPointMake(wLA.x, wLA.y);
-        CGPoint pRA = CGPointMake(wRA.x, wRA.y);
-        CGPoint pLT = CGPointMake(wLT.x, wLT.y);
-        CGPoint pRT = CGPointMake(wRT.x, wRT.y);
-
-        CGFloat headToHip = fabs(pHead.y - pHip.y);
-        CGFloat headRadius = fmaxf(headToHip / 4.5f, 1.0f);
-        ESPAddCircle(buffers->bonePath, CGPointMake(pHead.x, pHead.y - headRadius * 0.5f), headRadius);
-        ESPAddLine(buffers->bonePath, pNeck, pHip);
-        ESPAddLine(buffers->bonePath, pNeck, pLS); ESPAddLine(buffers->bonePath, pLS, pLE); ESPAddLine(buffers->bonePath, pLE, pLH);
-        ESPAddLine(buffers->bonePath, pNeck, pRS); ESPAddLine(buffers->bonePath, pRS, pRE); ESPAddLine(buffers->bonePath, pRE, pRH);
-        ESPAddLine(buffers->bonePath, pHip, pLK); ESPAddLine(buffers->bonePath, pLK, pLA); ESPAddLine(buffers->bonePath, pLA, pLT);
-        ESPAddLine(buffers->bonePath, pHip, pRK); ESPAddLine(buffers->bonePath, pRK, pRA); ESPAddLine(buffers->bonePath, pRA, pRT);
-        buffers->boneDirty = true;
-    }
-
-    // ---------------------------------------------------------
     // WEAPON
     // ---------------------------------------------------------
     if (isWeapon) {
