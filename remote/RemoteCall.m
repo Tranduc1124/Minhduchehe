@@ -1392,26 +1392,44 @@ static bool tro_swap_thread_op(uint64_t targetThread,
 // park_remote_thread_via_tro_swap installs a state into a target thread through a
 // borrowed TRO, suspending, setting and resuming it in one balanced sequence.
 //
-// It takes the whole state rather than a program counter and a link register, and
-// that is the fix. It used to take the two and build the rest here, out of
-// g_RC_originalState, which is the state of the HIJACKED thread, not of the thread
-// being parked. So the reused thread was parked on the hijacked thread's stack
-// pointer and frame pointer, which is the same defect SB IPS 2026-09-26 06:21:04
-// recorded as a thread_set_state returning kr=0 while the resumed thread ran getpid
-// with sp=0.
+// IT CANNOT DO THAT, and it is no longer asked to pretend it can.
 //
-// And the caller signed the two program counters with the hijacked thread's PAC keys,
-// because sign_state was handed g_RC_trojanThreadAddr. On arm64e a signature is per
-// thread, so a program counter signed for one thread and resumed on another does not
-// authenticate. That is the class of fault that produces an EXC_BAD_ACCESS on execute
-// or an EXC_BAD_INSTRUCTION at the moment the thread is released, and the reuse path
-// was the one place still doing it: the fresh-thread park was corrected two commits
-// ago to read the target's own state and sign for the target, and this one was missed
-// because it goes through a different helper.
+// tro_swap_thread_op works like this, and reading it is the whole of the finding: it
+// creates a LOCAL helper thread running fn, resumes it, then finds the helper's kernel
+// stack, locates the helper's thread_resume_operation, verifies the target thread
+// belongs to the target task, and kwrites the TARGET thread's TRO over the helper's.
+// So when the kernel resumes that slot, the thread that actually runs is the target
+// thread, continuing in the middle of fn.
 //
-// So the caller does the reading and the signing, on the thread that is going to be
-// parked, and this function only performs the sequence.
+// fn here is thread_set_state, and the thread that runs it is a SpringBoard thread.
+// Its arguments are x0, x1, x2, x3, and x2 is the state buffer. The buffer is malloc'd
+// in THIS process, so the address is a user address of this app. That address is not
+// mapped in SpringBoard. The target thread therefore dereferences an unmapped address
+// while inside thread_set_state, writes nothing, and the state is never installed —
+// and the function reports success, because all it checks is that the TRO swap
+// happened.
+//
+// That is not a new observation. It is what this file already recorded and did not
+// connect: "thread_set_state returned kr=0 while the resumed thread still ran getpid
+// with sp=0" is a set_state that did not set anything.
+//
+// So the reuse path has been reporting a park that never happened for its whole life,
+// and every failure after it has been read as a fault in whatever came next. Making
+// the state buffer live in the target needs a target-side write for 42 bytes, and
+// this engine has no primitive for that: remote_write is the aliasing path the file
+// distrusts, and a remote memcpy needs a target source. Until there is one, the honest
+// thing is for this to say no in one line instead of succeeding and costing a round.
 static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
+                                            const arm_thread_state64_internal *stateToInstall,
+                                            bool useMigFilterBypass)
+{
+    (void)targetThread; (void)stateToInstall; (void)useMigFilterBypass;
+    RC_DIAG("TRO park: refused — thread_set_state runs in the target but the state "
+            "buffer is allocated here, so it installs nothing while reporting success");
+    return false;
+}
+
+static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
                                             const arm_thread_state64_internal *stateToInstall,
                                             bool useMigFilterBypass)
 {
