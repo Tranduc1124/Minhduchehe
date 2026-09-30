@@ -32,7 +32,7 @@
 // Keep it short and unique. Nine characters, on the first line of the console, so it
 // is the first thing a screenshot shows and the only thing needed to say which binary
 // produced it.
-#define KB_BUILD_ID "r129-f0292c8"
+#define KB_BUILD_ID "r131-216c959"
 
 kernel_boot_log_fn kernelBootLog = NULL;
 
@@ -97,11 +97,22 @@ static void boot_start_sb_overlay(void) {
                            : whyStr;
             NSLog(@"[BOOT] SpringBoard overlay attempt %d failed rc=%d fail=%@ code=%d",
                   attempt + 1, sbret, whyStr, (int)fail);
-            // L() is NSString formatting — must use %@ for NSString*, never %s.
-            L(@"WARN SB overlay attempt %d rc=%d (%@)",
-              attempt + 1, sbret, full);
+            // L() is NSString formatting. %@ is for NSString* and %s is for a
+            // const char*, and each is right for its own type. Getting that backwards
+            // for KB_BUILD_ID crashed the app with a pointer authentication trap,
+            // because CFString takes a %@ argument to be an object and sends
+            // respondsToSelector: to whatever pointer it was handed.
+            //
+            // The build id is on this line rather than only at the top of the console
+            // because the top scrolls away. A screenshot of a failure line could not be
+            // attributed to a commit, and two rounds went on a log from a build that
+            // was three commits behind. Every line that reports a failure now says
+            // which binary reported it, so that cannot happen again.
+            L(@"[%s] WARN SB overlay attempt %d rc=%d (%@)",
+              KB_BUILD_ID, attempt + 1, sbret, full);
         }
-        L(@"ERR SpringBoard overlay failed after 4 attempts — ESP will not draw over FF.");
+        L(@"[%s] ERR SpringBoard overlay failed after 4 attempts",
+          KB_BUILD_ID);
     });
 
     // The build id again, on the failure line, because that is the line a screenshot
