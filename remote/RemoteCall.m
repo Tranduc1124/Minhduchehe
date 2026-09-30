@@ -171,6 +171,22 @@ static bool g_RC_createDead = false;
 // Which path produced the call thread, for the failure report. "create", "reuse1" or
 // empty, and empty means neither happened.
 static const char *g_RC_callThreadPath = "";
+
+// The definition of g_RC_callThreadStep, which the header declares extern because
+// PAC.m increments it.
+//
+// It was lost, and the loss was invisible to every check in this repo. The line was
+// replaced wholesale when the create-side flag went in above, so what remained was an
+// extern declaration, a use, and no definition. That compiles perfectly under
+// -fsyntax-only, which is all synall.sh and synapp.sh do, and only the linker sees it:
+//
+//   Undefined symbols for architecture arm64:
+//     "_g_RC_callThreadStep", referenced from:
+//       _remote_call_last_init_failure_detail in RemoteCall.m.435c9f27.o
+//
+// So a declaration and its definition are now checked against each other, which is
+// the class of mistake no compile-only check can catch. See synapp.sh.
+__thread int g_RC_callThreadStep = 0;
 // The PC of whatever arrived on the port second, i.e. where the thread was when the
 // call's "return" was delivered. A return is always the fake link register. Anything
 // else is a fault raised inside the function, and its x0 is a register the function
