@@ -106,10 +106,29 @@ static __thread uint32_t g_RC_lastInitFailurePid = 0;
 // in prose, "0x101 miss / 0x201?", which is a hypothesis dressed as a diagnosis
 // and is the only thing the app's own console had to say about a failure that
 // decides whether the entire overlay exists. This is the measurement behind it.
-static __thread int g_RC_lastTempWaitMiss = 0;
+// Which step of a temp call gave up on its last call.
+//
+//   1  the first wait, for the thread to be parked at a faulting PC
+//   2  the second wait, for it to come back from the function
+//   3  both waits completed, and the state that arrived was rejected as not live
+//      enough to reply onto
+//   4  both waits completed, and sign_state failed, which is remote_pac returning
+//      0, which is the pacia signer not producing a result in time
+//
+// Values 3 and 4 were one bucket until the app console was asked to tell them
+// apart and answered "state rejected or sign_state failed", which is the answer you
+// get when the question had two halves and only one was asked. It had two halves
+// because the PAC signer's internal wait and the target's exception wait are
+// governed by completely different numbers, and the signer was the wrong one.
+static __thread int g_RC_lastTempStep = 0;
 // How many times the bootstrap getpid was tried before the init gave up. Zero for
 // any other failure. Only exists so the failure can say how hard it tried.
 static __thread int g_RC_bootstrapAttempts = 0;
+// How many times the pacia signer produced nothing in time on this thread. Counted
+// rather than merely recorded, because "the signer timed out once" and "the signer
+// timed out on every attempt" are different bugs and only the count tells them
+// apart. Read by remote_call_last_init_failure_detail.
+__thread int g_RC_pacWaitTimeouts = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -257,19 +276,24 @@ const char *remote_call_last_init_failure_detail(void)
     if (g_RC_lastInitFailure != RemoteCallInitFailureBootstrapGetpid) return "";
 
     const char *step;
-    switch (g_RC_lastTempWaitMiss) {
+    switch (g_RC_lastTempStep) {
         // The thread was parked at a faulting PC by the creator reply and the trap
         // never arrived, or never arrived in time.
         case 1:  step = "wait1 no trap (thread never reached 0x101)"; break;
         // It ran, and the fault from returning into the fake link register never came
         // back, so the return value was never delivered.
         case 2:  step = "wait2 no return (RET to 0x201 never trapped)"; break;
-        // Both waits completed, so the call went out and something else rejected it:
-        // a state that was not live enough to reply onto, or a signature that failed.
-        default: step = "state rejected or sign_state failed"; break;
+        // Both waits completed, so the trap and the return both arrived, and the
+        // state was refused because it was not live enough to reply onto.
+        case 3:  step = "state rejected (not live enough to reply onto)"; break;
+        // Both waits completed and the state was fine, and signing the pointer the
+        // thread is about to run at did not produce a signature. This is the pacia
+        // signer's own wait, inside remote_pac, and it is counted.
+        case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
+        default: step = "unclassified"; break;
     }
-    snprintf(detail, sizeof(detail), "attempts=%d last=%s",
-             g_RC_bootstrapAttempts, step);
+    snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d",
+             g_RC_bootstrapAttempts, step, g_RC_pacWaitTimeouts);
     return detail;
 }
 
@@ -1377,13 +1401,13 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
 
-    g_RC_lastTempWaitMiss = 0;
+    g_RC_lastTempStep = 0;
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("temp/%s wait1 MISS timeout=%d (missed creator 0x101 → likely SIGBUS 0x201)",
                 name ?: "?", newTimeout);
-        g_RC_lastTempWaitMiss = 1;
+        g_RC_lastTempStep = 1;
         g_RC_success = false;
         return 0;
     }
@@ -1402,6 +1426,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
                 (unsigned long long)native_strip(exc.threadState.__pc),
                 (unsigned long long)native_strip(exc.threadState.__sp),
                 (unsigned)exc.flavor);
+        g_RC_lastTempStep = 3;
         g_RC_success = false;
         return 0;
     }
@@ -1416,6 +1441,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[7] = x7;
     if (!sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR)) {
         RC_DIAG("sign_state failed in temp_internal, no reply sent (name=%s)", name ? name : "?");
+        g_RC_lastTempStep = 4;
         g_RC_success = false;
         return 0;
     }
@@ -1429,7 +1455,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("temp/%s wait2 MISS (RET to FAKE_LR 0x201 uncaught?)", name ?: "?");
-        g_RC_lastTempWaitMiss = 2;
+        g_RC_lastTempStep = 2;
         g_RC_success = false;
         return 0;
     }
@@ -1569,6 +1595,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
                 (unsigned long long)native_strip(exc.threadState.__pc),
                 (unsigned long long)native_strip(exc.threadState.__sp),
                 (unsigned)exc.flavor);
+        g_RC_lastTempStep = 3;
         g_RC_success = false;
         return 0;
     }
@@ -2597,7 +2624,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
         RC_DIAG("bootstrap getpid attempt %d done pid=%llu success=%d waitmiss=%d",
                 attempt, (unsigned long long)bootstrapPid,
-                (int)g_RC_success, g_RC_lastTempWaitMiss);
+                (int)g_RC_success, g_RC_lastTempStep);
         if (g_RC_success && bootstrapPid != 0) break;
     }
     RC_DIAG("bootstrap getpid done pid=%llu success=%d",

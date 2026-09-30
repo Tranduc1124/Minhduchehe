@@ -130,6 +130,15 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure);
 // its own cannot distinguish a fork in the road. See the note at its definition.
 const char *remote_call_last_init_failure_detail(void);
 
+// How many times the pacia signer produced no result in time on this thread.
+//
+// Not static, and not in RemoteCall.m, because remote_pac lives in PAC.m and this is
+// where the failure it causes is reported from. The count rather than a flag because
+// the difference between a signer that timed out once on a busy device and a signer
+// that timed out on every attempt is the difference between a budget and a bug, and
+// only the count says which.
+extern __thread int g_RC_pacWaitTimeouts;
+
 #ifdef __OBJC__
 @class RemotePointer;
 

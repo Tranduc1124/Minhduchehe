@@ -212,8 +212,39 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     ExceptionMessage exc;
     memset(&exc, 0, sizeof(exc));
 
-    if (!wait_exception(exceptionPort, &exc, 100, false)) {
-        printf("[%s:%d] wait_exception failed\n", __FUNCTION__, __LINE__);
+    // 100 ms was the budget for all of the above, and it was the only un-floored
+    // wait in the engine. Every other one is raised to the stable floor first, in
+    // do_remote_call_temp_internal, so this was the single place where a slow
+    // machine could turn into a wrong answer rather than a slow one.
+    //
+    // What the 100 ms has to cover: create a thread, allocate and zero sixteen
+    // kilobytes, create an exception port, install it, resolve the kobject, set
+    // the thread state, set the PAC keys, resume, run a pacia gadget, take the
+    // fault it raises on purpose, and receive it. That is a thread's whole startup
+    // plus a fault, on a device that is running a game, and it was given a tenth of
+    // a second.
+    //
+    // This is the hot path of every remote call in the file, not a startup path.
+    // sign_state calls remote_pac once for the PC and once for the LR, so a call
+    // that goes through r_msg_main_raw signs two pointers, and the counter's
+    // creation alone signs a dozen.
+    //
+    // A miss here returns 0, and 0 from remote_pac is what makes sign_state return
+    // false, and sign_state returning false is what stops the call before it is
+    // sent. So the entire session, every layer, every box and the counter, rests on
+    // a hundred milliseconds being enough to sign a pointer, and when it is not
+    // enough the symptom is not a slow overlay. It is init_remote_call failing at
+    // the bootstrap getpid, with both of its waits reported as having completed,
+    // because the failure is not a wait at all.
+    //
+    // 1500 ms. Fifteen times the old budget and still an order of magnitude under
+    // the ten second floor the rest of the engine waits with, and the wait returns
+    // the moment the message arrives, so a signer that is working costs exactly
+    // what it always cost.
+    if (!wait_exception(exceptionPort, &exc, 1500, false)) {
+        g_RC_pacWaitTimeouts++;
+        printf("[%s:%d] pacia signer produced no result in 1500ms (hit %d)\n",
+               __FUNCTION__, __LINE__, g_RC_pacWaitTimeouts);
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
