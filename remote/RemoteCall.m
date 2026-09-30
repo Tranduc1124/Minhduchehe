@@ -1980,7 +1980,14 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         RC_DIAG("sign_state failed, abandoning without a reply (name=%s)", name ? name : "?");
         g_RC_lastTempStep = 19;
         g_RC_success = false;
-        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        // No unlock here. do_remote_call_stable and do_remote_call_stable_addr
+        // both took g_universal_ipc_mutex before calling in, and both unlock it
+        // on the way out. Unlocking in here as well is a second unlock of a
+        // recursive mutex: the count goes negative, the mutex is released while
+        // the wrapper still believes it holds it, and a second thread walks into
+        // the transport. That is the 51-second gap in the 2026-09-30 17:23 log —
+        // one call timed out, the next thread got in immediately and read a port
+        // nobody was driving, so every wait from there on was a 10s timeout.
         return 0;
     }
     reply_with_state(&exc, &exc.threadState);
