@@ -1730,11 +1730,21 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("temp/%s wait2 PC=0x%llx LR=0x%llx ret=0x%llx",
+    // exc/code/codeFirst/codeSecond are the discriminant this whole bug turns on.
+    // A bad-access from executing an unauthenticated PC and a PAC failure are
+    // different codes, and every log so far has printed only PC — so "the body
+    // ran" and "the ret auth failed" were both readings of the same line, and
+    // they cannot both be right. Log the type and the code before touching the
+    // state. Nothing about the behaviour changes.
+    RC_DIAG("temp/%s wait2 exc=0x%x code=0x%llx/0x%llx PC=0x%llx LR=0x%llx x0=0x%llx flags=0x%x",
             name ?: "?",
+            (unsigned)exc2.exception,
+            (unsigned long long)exc2.codeFirst,
+            (unsigned long long)exc2.codeSecond,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
-            (unsigned long long)exc2.threadState.__x[0]);
+            (unsigned long long)exc2.threadState.__x[0],
+            (unsigned)exc2.threadState.__flags);
     uint64_t retValue = exc2.threadState.__x[0];
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
