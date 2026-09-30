@@ -97,6 +97,20 @@ void abandon_remote_call_internal(void);
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
 
+// Which of the two waits in do_remote_call_temp_internal gave up on its last call:
+// 1 is the first, waiting for the thread to be parked at a faulting PC, 2 is the
+// second, waiting for it to come back from the function. 0 is neither, so the call
+// failed somewhere else, in sign_state or in a rejected state.
+//
+// The init failure string for the bootstrap getpid used to guess between the two
+// in prose, "0x101 miss / 0x201?", which is a hypothesis dressed as a diagnosis
+// and is the only thing the app's own console had to say about a failure that
+// decides whether the entire overlay exists. This is the measurement behind it.
+static __thread int g_RC_lastTempWaitMiss = 0;
+// How many times the bootstrap getpid was tried before the init gave up. Zero for
+// any other failure. Only exists so the failure can say how hard it tried.
+static __thread int g_RC_bootstrapAttempts = 0;
+
 typedef struct RemoteCallState {
     uint64_t taskAddr;
     bool creatingExtraThread;
@@ -213,7 +227,11 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
         case RemoteCallInitFailureLocalThread: return "local bootstrap thread setup failed";
         case RemoteCallInitFailureNoTargetThreads: return "no injectable target threads";
         case RemoteCallInitFailureFirstExceptionTimeout: return "target did not deliver bootstrap exception";
-        case RemoteCallInitFailureBootstrapGetpid: return "bootstrap getpid failed (0x101 miss / 0x201?)";
+        // The two guesses that used to live here, "0x101 miss / 0x201?", were a
+        // hypothesis with no measurement behind it, and they were the only thing the
+        // app's console could say about a failure that decides whether the entire
+        // overlay exists. The measurement is remote_call_last_init_failure_detail.
+        case RemoteCallInitFailureBootstrapGetpid: return "bootstrap getpid failed";
         case RemoteCallInitFailurePthreadCreate: return "pthread_create_suspended_np / mach_thread failed";
         case RemoteCallInitFailureCallThread: return "synthetic call thread kobject invalid";
         case RemoteCallInitFailureThreadResume: return "thread_resume synthetic failed";
@@ -221,6 +239,38 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
         case RemoteCallInitFailureOther: return "other RemoteCall init failure";
     }
     return "unknown RemoteCall init failure";
+}
+
+// What actually happened, for the failures that have more than one way to happen.
+//
+// The app's console is the only place a person can read any of this, and it prints
+// remote_call_init_failure_description and nothing else. That string is a pure
+// function of the enum, so for a failure with a fork in it the fork was invisible
+// and the string carried a guess instead.
+//
+// Built on demand into a thread-local buffer, from thread-local state, so there is
+// nothing to keep in step at the point of failure. Callers print it; nothing logs
+// it, because a caller that cannot print it has nowhere to put it.
+const char *remote_call_last_init_failure_detail(void)
+{
+    static __thread char detail[96];
+    if (g_RC_lastInitFailure != RemoteCallInitFailureBootstrapGetpid) return "";
+
+    const char *step;
+    switch (g_RC_lastTempWaitMiss) {
+        // The thread was parked at a faulting PC by the creator reply and the trap
+        // never arrived, or never arrived in time.
+        case 1:  step = "wait1 no trap (thread never reached 0x101)"; break;
+        // It ran, and the fault from returning into the fake link register never came
+        // back, so the return value was never delivered.
+        case 2:  step = "wait2 no return (RET to 0x201 never trapped)"; break;
+        // Both waits completed, so the call went out and something else rejected it:
+        // a state that was not live enough to reply onto, or a signature that failed.
+        default: step = "state rejected or sign_state failed"; break;
+    }
+    snprintf(detail, sizeof(detail), "attempts=%d last=%s",
+             g_RC_bootstrapAttempts, step);
+    return detail;
 }
 
 static bool remote_call_verbose_logging(void)
@@ -1327,10 +1377,13 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
 
+    g_RC_lastTempWaitMiss = 0;
+
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("temp/%s wait1 MISS timeout=%d (missed creator 0x101 → likely SIGBUS 0x201)",
                 name ?: "?", newTimeout);
+        g_RC_lastTempWaitMiss = 1;
         g_RC_success = false;
         return 0;
     }
@@ -1376,6 +1429,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("temp/%s wait2 MISS (RET to FAKE_LR 0x201 uncaught?)", name ?: "?");
+        g_RC_lastTempWaitMiss = 2;
         g_RC_success = false;
         return 0;
     }
@@ -2506,7 +2560,46 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     RC_DIAG("remote_pac(0x301,0)=0x%llx", (unsigned long long)remoteCrashSigned);
 
     RC_DIAG("bootstrap getpid begin");
-    uint64_t bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
+
+    // The bootstrap getpid, retried. This is the one call that decides whether the
+    // whole overlay exists: every call after it runs on the thread this one proves
+    // can be driven at all, so a single miss here takes down the entire feature.
+    //
+    // It was also the only one-shot left in the bootstrap, and a one-shot on a mach
+    // exception port is a bet that the fault is already queued at the instant we go
+    // looking for it.
+    //
+    // The 100 is not 100 ms. do_remote_call_temp_internal raises every temp call to
+    // the stable floor first, so this already waits 10 s, and a miss here is a full
+    // ten second wait that came back empty rather than a call that was too slow.
+    //
+    // Retrying is the correct response to a miss rather than a patch over one,
+    // because the port is a queue and a miss means the fault is late far more often
+    // than it means the fault is absent. Nothing is replied on a miss, so whatever
+    // was in flight is still queued and the next attempt consumes it. If it is the
+    // second wait that missed, then the return fault is what is now sitting in the
+    // queue, and driving the thread with getpid again from that state runs getpid
+    // once more and traps in the same place, so the pair converges instead of
+    // oscillating. Every attempt is self-contained: same port, same parked thread,
+    // one more step along.
+    //
+    // Three attempts, not thirty. SpringBoard's main thread is parked at 0x101 for
+    // the duration, so each attempt is more time the device runs without a main
+    // thread, and a failure here is a failure of the whole feature rather than
+    // something to grind on. The step that missed is printed unconditionally, once,
+    // because the app's console is the only surface available when this fails and it
+    // used to say nothing beyond the two hypotheses in the failure string.
+    uint64_t bootstrapPid = 0;
+    g_RC_bootstrapAttempts = 0;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        g_RC_success = true;   // do_remote_call_temp clears it; a retry starts clean
+        g_RC_bootstrapAttempts = attempt;
+        bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
+        RC_DIAG("bootstrap getpid attempt %d done pid=%llu success=%d waitmiss=%d",
+                attempt, (unsigned long long)bootstrapPid,
+                (int)g_RC_success, g_RC_lastTempWaitMiss);
+        if (g_RC_success && bootstrapPid != 0) break;
+    }
     RC_DIAG("bootstrap getpid done pid=%llu success=%d",
             (unsigned long long)bootstrapPid, (int)g_RC_success);
     if (!g_RC_success || bootstrapPid == 0) {

@@ -125,6 +125,10 @@ int remote_call_set_stable_timeout_floor_ms(int timeoutMS);
 RemoteCallInitFailure remote_call_last_init_failure(void);
 uint32_t remote_call_last_init_failure_pid(void);
 const char *remote_call_init_failure_description(RemoteCallInitFailure failure);
+// A measured detail for the failures that have more than one way to happen, and an
+// empty string for the ones that do not. Print it next to the description, which on
+// its own cannot distinguish a fork in the road. See the note at its definition.
+const char *remote_call_last_init_failure_detail(void);
 
 #ifdef __OBJC__
 @class RemotePointer;

@@ -547,9 +547,6 @@ static unsigned g_sbLabelFrame = 0;
 #define SB_CARD_B      0.16
 #define SB_CARD_A      0.72
 static uint64_t g_sbCountLabel   = 0;
-// kCAAlignmentCenter, built once. Lives and dies with the session, like the
-// label it is only ever passed to.
-static uint64_t g_sbCountAlignStr = 0;
 // When the label was built, and when text first reached it. The label is made
 // entirely of main-thread setters, so it exists here well before the target has
 // drawn any of it; the gap between these two is the whole of the delay before
@@ -565,6 +562,17 @@ static uint64_t g_sbCountFirstTextUS = 0;
 static int      g_sbCountStringProbed = 0;
 static uint64_t g_sbCountPosInv  = 0;
 static uint64_t g_sbCountPosBuf  = 0;
+// setBounds: and setTransform: for the counter, cached the same way.
+//
+// The counter used to set all three of these through r_msg_main_raw, which builds
+// a fresh NSInvocation per call and presents it with waitUntilDone:YES. The pooled
+// labels set the identical three through cached invocations, which is two remote
+// calls each and never blocks. Both were in this file at the same time, doing the
+// same job on two labels, and only the counter's version ever failed. There is no
+// longer a raw-path setter anywhere in the counter's construction or per frame
+// path; if one comes back, sb_cached_invocation is what it should have used.
+static uint64_t g_sbCountBoundsInv = 0, g_sbCountBoundsBuf = 0;
+static uint64_t g_sbCountTransInv  = 0, g_sbCountTransBuf  = 0;
 static double   g_sbCountLastPos[2] = { -1.0, -1.0 };
 static char     g_sbCountLastText[SB_TEXT_MAX + 1] = { 0 };
 static int      g_sbCountShown   = 0;
@@ -765,32 +773,65 @@ static BOOL sb_write_inv_arg(uint64_t buf, const void *data, size_t size) {
     return r_remote_write_verified(buf, data, size) ? YES : NO;
 }
 
+// The one surface a person can read.
+//
+// Everything in this file logs with NSLog, which goes to the OS log, and the OS log
+// is not somewhere the counter's owner can look. What they can look at is the boot
+// console in the app, which is a function pointer the app installs and which is the
+// only place the lines in this overlay have ever been read from.
+//
+// The counter's own measurements are the reason this exists. Every one of them is
+// written to answer a question that only a person looking at the screen can finish,
+// "did the setter land, and if not which one", and a measurement nobody can look at
+// is not a measurement. They go to both places now, console and OS log, and the
+// console line is the same text, so the two cannot disagree.
+//
+// Looked up by name and not linked, because this file is compiled into more than one
+// target and not all of them have a console. A missing log line is a smaller failure
+// than a build that does not link.
+typedef void (*sb_console_fn)(NSString *line);
+static void sb_console(NSString *line) {
+    if (!line) return;
+    static sb_console_fn sink = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sink = (sb_console_fn)dlsym(RTLD_DEFAULT, "kernelBootLog");
+    });
+    if (sink) sink(line);
+}
+
 // Returns the number of remote calls made, so the publish log counts them.
 static uint64_t sb_count_label_place(double px, double py) {
     if (!r_is_objc_ptr(g_sbCountLabel)) return 0;
     if (px == g_sbCountLastPos[0] && py == g_sbCountLastPos[1]) return 0;
 
-    // Straight through, like every setter on this layer that has ever read back
-    // correct: setFrame:, setFontSize:, setContentsScale: and setCornerRadius: all
-    // go through r_msg_main_raw with the real bytes of the struct, and all four
-    // read back the value that was set.
+    // The cached invocation, which is what the pooled labels have always used for
+    // this exact setter and what the counter's own invocation has been sitting
+    // unused for.
     //
-    // The cached invocation is gone from the counter. It was three separate
-    // pieces of machinery, each with its own malloc'd argument buffer in the
-    // target and each a chance to write into a stale alias and quietly do
-    // nothing, and its fire-and-forget present meant the position was only ever
-    // eventually true. This blocks instead, so by the time the publish returns
-    // the layer is where it was put.
+    // It was removed here with a note arguing that the fire-and-forget present
+    // only made the position eventually true and that blocking was better. Both
+    // halves of that were true and neither was a reason. Eventually true is what
+    // every label in this file is, the pooled ones included, and they are on screen.
+    // The blocking form is r_msg_main_raw, which stages a CGPoint in a malloc'd
+    // buffer in the target, hands the invocation that pointer, presents with
+    // waitUntilDone:YES, and is the path whose argument handling this file has
+    // already measured going wrong: a setLineWidth: of 1.5 was never set, and the
+    // probe left in r_msg_main_raw concluded that the frame holds the values while
+    // invoke does not read them from there.
     //
-    // The pooled labels keep theirs. They are six of them, built once, and their
-    // arguments are rewritten every frame on a buffer that is reused, so the
-    // exposure is different and they are not on the display path today.
+    // The counter's position was also already being set once at creation, below, so
+    // this function normally has nothing to do at all: the label does not move.
+    // That is the shape the whole fix is aiming at, a per frame path that does
+    // nothing, not a per frame path that has to be right.
+    if (!sb_cached_pos_invocation()) return 0;
     double p[2] = { px, py };
-    r_msg_main_raw(g_sbCountLabel, r_sel("setPosition:"),
-                   p, sizeof(p), NULL, 0, NULL, 0, NULL, 0);
+    if (!sb_write_inv_arg(g_sbCountPosBuf, p, sizeof(p))) return 0;
+    r_msg2(g_sbCountPosInv, "setArgument:atIndex:", g_sbCountPosBuf, 2, 0, 0);
+    r_msg(g_sbCountPosInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     g_sbCountLastPos[0] = px;
     g_sbCountLastPos[1] = py;
-    return 1;
+    return 4;
 }
 
 static uint64_t sb_count_label_text(const char *utf8) {
@@ -842,32 +883,9 @@ static uint64_t sb_count_label_text(const char *utf8) {
     if (!r_is_objc_ptr(ns)) return 0;
 
     uint64_t calls = 4;   // malloc, memcpy, alloc, initWithUTF8String
-    // setString:, not setText:. A CATextLayer is a CALayer, not a view, so the
-    // view setters do not exist on it.
-    //
-    // Through a cached invocation, which is r_msg2 rather than r_msg_main_raw.
-    //
-    // This is not a guess between two transports, it is what the setters on this
-    // very layer already proved. The three that are read back correct,
-    // setFrame:, setFontSize: and setContentsScale:, all take a struct or a
-    // scalar and all go through r_msg_main_raw. setBackgroundColor: also goes
-    // through r_msg_main_raw and drew. setString: takes an object, and through
-    // r_msg_main_raw it has never once landed.
-    //
-    // The comparison that settles it is one line away in the same file. setPath:
-    // takes an object too, and it is the one that draws every box on screen, and
-    // it goes through sb_cached_invocation, which is a plain r_msg2 to
-    // setArgument:atIndex: and invoke. r_msg_main_raw is the transport whose
-    // argument handling this file has already documented as unreliable, with an
-    // argument probe left in it comparing getArgument: against invoke and
-    // concluding that the invocation holds the values while invoke does not read
-    // them from there.
-    //
-    // The cached invocation was tried here before and failed, but it failed while
-    // the NSString was still the 0xbeb0fdba garbage, so the setter was being
-    // asked to store a pointer that was never a pointer. That is no longer the
-    // case. sb_make_nsstring now returns a real object, and this is the first
-    // run of the cached path with a real one to store.
+    // setText:, through a cached invocation, and that is now the same call the
+    // pooled labels make for the same job. The counter was a CATextLayer and this
+    // was setString:; it is a UILabel now, like every other label here.
     //
     // The string is held afterwards, the way setPath: is held in g_sbPathRing,
     // because the invocation is fired with waitUntilDone:NO and the object has
@@ -882,7 +900,7 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // the one thing that had not happened. The other transport is tried instead,
     // and whichever one ran is named.
     const char *path = "none";
-    if (sb_cached_invocation(g_sbCountLabel, "setString:",
+    if (sb_cached_invocation(g_sbCountLabel, "setText:",
                              &g_sbCountTextInv, &g_sbCountTextBuf, 8)) {
         // Verified write, not remote_write64. The invocation reads this buffer
         // when it is invoked, and a bare write can land in a stale alias and
@@ -901,36 +919,21 @@ static uint64_t sb_count_label_text(const char *utf8) {
         }
     }
     if (strcmp(path, "cached-invocation") != 0) {
-        // r_msg2_main rather than the raw form, because it is the same call the
-        // working setters on this layer make and it takes an object argument
-        // directly. Its return path is no longer the broken one.
-        r_msg2_main(g_sbCountLabel, "setString:", ns, 0, 0, 0);
+        r_msg2_main(g_sbCountLabel, "setText:", ns, 0, 0, 0);
         calls++;
         path = "r_msg2_main";
     }
 
-    // The readback, on the transport that can be trusted.
+    // No setNeedsDisplay.
     //
-    // This is the measurement I should have taken from the start and did not,
-    // because every earlier attempt used r_msg2_main. That path goes through
-    // r_msg_main_raw, which stages the return value in a malloc'd buffer in the
-    // target and reads it back through the vm_map_entry hijack, and it returned
-    // the same 0x1f82546c8 on consecutive runs in which the string sent was a
-    // different object every time. A read that returns the same value no matter
-    // what was written is not a read.
+    // It was here because a CATextLayer is not a view: it rasterises into a
+    // backing store from its own dirty flag, so setting the string without asking
+    // for the redraw was thought to leave the old glyphs up. Asking for it on
+    // every publish is also what made the plate blink, and the text setter only
+    // runs on a change now anyway, so the two never coexisted well.
     //
-    // r_msg2 is the other transport: a plain objc_msgSend with the result coming
-    // back in a register, no buffer, nothing to alias. It is the one that has
-    // returned correct objects all along, which is how the label itself, the
-    // container layer and every NSString in this file were made. So the string is
-    // read back through it, once, and compared against what was sent.
-    //
-    // setNeedsDisplay rides along here rather than on its own every frame: a
-    // CATextLayer is not a view, it rasterises into a backing store inside
-    // drawInContext: from its own dirty flag, and asking for that draw on every
-    // publish is what made the plate blink.
-    r_msg2_main(g_sbCountLabel, "setNeedsDisplay", 0, 0, 0, 0);
-    calls++;
+    // A UILabel lays out and redraws itself when its text changes. There is
+    // nothing to ask for.
 
     // One string is held, not a ring of them. A new count replaces the old count,
     // so releasing the previous one here covers every fire-and-forget setter
@@ -961,10 +964,13 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // returns in a register, so there is nothing in another process's memory that
     // can be stale.
     if (g_sbCountTextSets <= 3) {
-        const uint64_t back = r_msg2(g_sbCountLabel, "string", 0, 0, 0, 0);
-        NSLog(@"[SB-CNT] string=0x%llx sent=0x%llx match=%d via=%s text=%s",
-              (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
-              path, utf8);
+        const uint64_t back = r_msg2(g_sbCountLabel, "text", 0, 0, 0, 0);
+        NSString *line = [NSString stringWithFormat:
+            @"[SB-CNT] text=0x%llx sent=0x%llx match=%d via=%s value=%s",
+            (unsigned long long)back, (unsigned long long)ns, (int)(back == ns),
+            path, utf8];
+        NSLog(@"%@", line);
+        sb_console(line);
     }
 
     strncpy(g_sbCountLastText, utf8, sizeof(g_sbCountLastText) - 1);
@@ -1288,270 +1294,207 @@ static void sb_make_count_label(uint64_t container) {
     if (g_sbCountLabel || !r_is_objc_ptr(container)) return;
     g_sbCountBornUS = now_us();
 
-    // CATextLayer, not UILabel.
+    // A UILabel, built and driven exactly like sb_make_pooled_label.
     //
-    // A CATextLayer is a CALayer, so it is added to the layer tree rather than as
-    // a subview, and it carries its own backgroundColor and cornerRadius. That is
-    // the reason for the swap: a UILabel's background is the label's bounds, and a
-    // CATextLayer's background is the layer's, so a pill behind the number is one
-    // object instead of a shape in one path and a view in another. Two objects
-    // updated by two paths is exactly what let the name text drift off its card
-    // before, and it cannot drift when there is only one thing to move.
+    // It was a CATextLayer, chosen on the argument that a pill behind the number
+    // should be one object instead of a shape in one path and a view in another.
+    // That argument was about where the plate came from and it was answered with a
+    // class that costs six things a UILabel does not need, and every one of the
+    // six is a place the value can stop on the way to the screen:
     //
-    // The text is also CoreText's rather than UIKit's, which is the point of the
-    // reference implementation having a buildAttrStringForText: in its binary.
-    uint64_t CATL = r_class("CATextLayer");
-    if (!r_is_objc_ptr(CATL)) {
-        NSLog(@"[SB-LABEL] CATextLayer not available, counter text stays empty");
+    //   setAlignmentMode:  takes an NSString. The integer this label used to send
+    //                     the UILabel it replaced killed SpringBoard's main thread
+    //                     on a CFEqual against 0x9.
+    //   setContentsScale:  a CGFloat, which cannot go through r_msg2_main because
+    //                     that sends the integer part. 3.0 went across as 3 and
+    //                     the target read eight bytes as a double, 4.2e-45, and a
+    //                     layer with a contents scale of zero rasterises nothing.
+    //   setFont:           takes a font NAME as a CFTypeRef, resolved against a
+    //                     separately set fontSize, so the type was two setters and
+    //                     a string instead of one object.
+    //   setFrame:          a CGRect, so r_msg_main_raw and a blocking wait, for a
+    //                     size the pooled labels set with setBounds: and two calls.
+    //   setTransform:      a CATransform3D, sixteen doubles, where a view's is a
+    //                     CGAffineTransform of six.
+    //   addSublayer:       onto the container's layer, which needs a layer getter,
+    //                     and that getter's return value is read out of a malloc'd
+    //                     buffer in the target which this file has already caught
+    //                     returning the same 0x1f82546c8 no matter what was
+    //                     written to it. r_is_objc_ptr only asks whether the value
+    //                     clears 0x100000000, so that constant passed, and the
+    //                     layer was built in full and correctly and then never
+    //                     attached to anything.
+    //
+    // No number appeared in any of them, and the plate did not either, and both
+    // facts have the same explanation: this was the only label in the file with its
+    // own recipe, and everything visible in SpringBoard from here is made by the
+    // other one.
+    //
+    // So the counter stops being the odd one out. The text is UIKit's, the font is
+    // a UIFont, the background is a UIColor, the size is bounds, the transform is
+    // six doubles, and the container takes addSubview: directly with no getter in
+    // between. Those are the calls the pooled labels make on the same container,
+    // and the names they draw are on the screen.
+    //
+    // The black plate is the label's own backgroundColor, which is a UIColor and
+    // not a CGColor, so there is no -CGColor round trip to get a stale pointer out
+    // of, and no zPosition to get wrong against the stroke layer at 100 and the
+    // fill layer at 99: a subview is above its superview's layer children whatever
+    // their zPosition is.
+    uint64_t UILabel = r_class("UILabel");
+    if (!r_is_objc_ptr(UILabel)) {
+        NSLog(@"[SB-LABEL] UILabel not available, counter not built");
         return;
     }
-    uint64_t alloc = r_msg2_main(CATL, "alloc", 0, 0, 0, 0);
+    uint64_t alloc = r_msg2_main(UILabel, "alloc", 0, 0, 0, 0);
     uint64_t label = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(label)) return;
+    g_sbCountLabel = label;
 
-    r_msg2_main(label, "setWrapped:", 0, 0, 0, 0);        // one line, no wrap
-    r_msg2_main(label, "setTruncationMode:", 0, 0, 0, 0); // none, and an enum
-    // Alignment is an NSString on CATextLayer, not an integer. The UILabel this
-    // replaced took an integer through setTextAlignment:, and the migration
-    // carried the 1 across to a selector of the same name on a different class.
-    // QuartzCore's setter CFEquals the argument, so 1 was dereferenced as a
-    // CFStringRef and SpringBoard's main thread died:
+    r_msg2_main(label, "setUserInteractionEnabled:", 0, 0, 0, 0);
+    // Centre, and an integer. This is the value that killed the main thread when
+    // it was carried across to setAlignmentMode:, where the parameter is an
+    // NSString. On a UILabel it is NSTextAlignmentCenter and an integer is all it
+    // ever wanted.
+    r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);
+    r_msg2_main(label, "setNumberOfLines:", 1, 0, 0, 0);
+    r_msg2_main(label, "setAdjustsFontSizeToFitWidth:", 0, 0, 0, 0);
+
+    // The font: a UIFont, made once for the session, the same way g_sbNameFont is
+    // made and for the same reason.
     //
-    //   EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE at 0x9
-    //   CFEqual <- CA::Layer::setter <- -[CATextLayer setAlignmentMode:]
-    //           <- __invoking___ <- -[NSInvocation invoke]
-    //           <- __NSThreadPerformPerform <- com.apple.main-thread
-    //
-    // That is the same PC, 0x1908e9f68, that every wait2 timeout kept
-    // reporting as an EXC_BAD_ACCESS on a thread that was not the call thread.
-    // It was SpringBoard's main thread, running this line, queued through
-    // performSelectorOnMainThread. Not corruption and not a borrowed thread
-    // faulting: our own setter, killing the main thread, which is why every
-    // remote call after it blocked until the ten second floor.
-    //
-    // kCAAlignmentCenter is the string "center". Made once and kept, like the
-    // label it belongs to.
-    if (!r_is_objc_ptr(g_sbCountAlignStr)) {
-        g_sbCountAlignStr = sb_make_nsstring("center");
-    }
-    if (r_is_objc_ptr(g_sbCountAlignStr))
-        r_msg2_main(label, "setAlignmentMode:", g_sbCountAlignStr, 0, 0, 0);
-    // Without this the text is rasterised at scale 1 and is visibly soft on a
-    // retina display, which is the most obvious way for it to look worse than
-    // the UILabel it replaced. Read once from the screen, set once here.
-    //
-    // Through r_msg_main_raw, not r_msg2_main, and that is the whole line.
-    // r_msg2_main takes its arguments as uint64_t, so handing it a CGFloat
-    // sends the integer part: a scale of 3.0 went across as the integer 3, and
-    // the target read those eight bytes as a double, which is 4.2e-45. A layer
-    // with a contents scale of zero rasterises nothing at all, so the pill drew
-    // because a background is filled rather than rasterised, and the number never
-    // appeared because text is drawn from a rasterised contents. Every other
-    // check on this layer had already come back correct: bounds, fontSize,
-    // attached, position, hidden, and a genuine NSString address, which is
-    // exactly the shape of a layer that is fine and cannot draw.
+    // boldSystemFontOfSize: takes a CGFloat, and this is the one place in the
+    // counter's construction where a double has to go through r_msg_main_raw,
+    // because r_msg2_main takes uint64_t and sends the integer part. It is one
+    // call for the whole session rather than one per label, and the label keeps a
+    // reference for as long as it draws.
     {
-        double scale = [UIScreen mainScreen].scale;
-        if (scale > 0.5) {
-            r_msg_main_raw(label, r_sel("setContentsScale:"), &scale, sizeof(scale),
-                           NULL, 0, NULL, 0, NULL, 0);
-        }
-    }
-
-    uint64_t UIColor = r_class("UIColor");
-    if (r_is_objc_ptr(UIColor)) {
-        // The text colour, built through registers, and white.
-        //
-        // It was red, fetched through r_msg2_main, and that is two mistakes.
-        // r_msg2_main stages the result in a malloc'd buffer inside the target and
-        // reads it back through the vm_map_entry hijack, which has already been
-        // caught returning the same constant no matter what was written. So the
-        // CGColor could be garbage, and r_is_objc_ptr only asks whether the value
-        // clears 0x100000000, so garbage passes the check and gets handed to
-        // setForegroundColor:. A CATextLayer whose foreground colour is not a
-        // colour falls back to black.
-        //
-        // The plate is black. Black glyphs on a black plate is a layer that draws
-        // perfectly and shows nothing, which is exactly what the device shows and
-        // exactly what I spent several commits blaming on the font.
-        //
-        // r_msg2 returns through a register, so nothing can be stale. And white on
-        // black is the largest contrast available, so if this is still not visible
-        // the colour is not the reason.
-        uint64_t white = r_msg2(UIColor, "whiteColor", 0, 0, 0, 0);
-        uint64_t whiteCG = r_is_objc_ptr(white) ? r_msg2(white, "CGColor", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(whiteCG)) r_msg2_main(label, "setForegroundColor:", whiteCG, 0, 0, 0);
-
-        // Above its siblings, which it was not.
-    //
-    // The container layer holds three things: the stroke CAShapeLayer at
-    // zPosition 100, the fill CAShapeLayer at 99, and this text layer, whose
-    // zPosition was never set and so is 0. It was being drawn underneath both.
-    // Nothing sets an anchorPoint either, so this is only about ordering.
-    //
-    // 200 puts it clear of both, and it is set before addSublayer: so the layer
-    // is never presented even once underneath.
-    {
-        double z = 200.0;
-        r_msg_main_raw(label, r_sel("setZPosition:"), &z, sizeof(z),
-                       NULL, 0, NULL, 0, NULL, 0);
-    }
-
-    // A black plate behind the number.
-        //
-        // This is here on purpose and not as decoration. A layer whose text is
-        // not rasterising draws nothing at all, so a number that never appears
-        // and a number that is off screen look identical from the outside. The
-        // plate separates them: if a black rectangle shows up in the right place
-        // and no number is on it, the layer is positioned correctly and the
-        // failure is in drawing the glyphs. If nothing shows at all, it is still
-        // off screen or detached.
-        //
-        // Near opaque rather than solid, so it does not read as a hole punched in
-        // the game.
-        //
-        // Four CGFloats in registers, not through r_msg2_main_raw. The raw form
-        // would send their integer parts, which is how the contents scale once
-        // arrived as 4.2e-45; sb_fbits sends the real eight bytes of each double
-        // and never allocates anything in the target, so there is no buffer to go
-        // stale. One remote call instead of thirteen.
-        {
-            const uint64_t plateColor = r_msg2(r_class("UIColor"),
-                                              "colorWithRed:green:blue:alpha:",
-                                              sb_fbits(0.0), sb_fbits(0.0),
-                                              sb_fbits(0.0), sb_fbits(0.9));
-            const uint64_t plateCG = r_is_objc_ptr(plateColor)
-                                   ? r_msg2(plateColor, "CGColor", 0, 0, 0, 0) : 0;
-            if (r_is_objc_ptr(plateCG)) r_msg2_main(label, "setBackgroundColor:", plateCG, 0, 0, 0);
-
-            double plateRadius = SB_COUNT_H * 0.5;
-            r_msg_main_raw(label, r_sel("setCornerRadius:"), &plateRadius, sizeof(plateRadius),
-                           NULL, 0, NULL, 0, NULL, 0);
-        }
-
-        // Font size, and then a font, below. Two things were wrong here for most
-        // of this layer's life and the first was mine. I wrote that fontSize alone
-        // was enough, and justified it with a crash log showing the layer reaching
-        // -[CATextLayer drawInContext:]. That is not evidence of glyphs:
-        // drawInContext: is entered for an empty string and for a nil-font string,
-        // and _createStringDict runs before anything is rasterised. The device
-        // screenshot disproves the claim outright: the plate fills, which means the
-        // layer is in the tree, above its siblings, the right size, in the right
-        // place, and it has drawn. It has drawn without glyphs, which is what a
-        // layer looks like when it has a background but no font.
-        // backgroundColor is filled by CoreAnimation regardless of text state.
-        // Glyphs are not.
-        //
-        // The type matters as much as the presence. CALayer's font is a CFTypeRef
-        // and this repo has two CATextLayers that already draw, both setting it the
-        // same way:
-        //
-        //   esp/esp/esp.mm:3209  layer.font = (__bridge CFTypeRef)fontNameStr;
-        //   esp/esp/esp.mm:3563  statusLayer.font = (__bridge CFTypeRef)...fontName;
-        //
-        // A font NAME string, which QuartzCore resolves against fontSize. Not a
-        // CTFontRef and not a UIFont. The pooled labels hand a UIFont to setFont:
-        // and that only looks like the right shape because those are UILabels.
-        //
-        // And explicitly not CTFontCreateWithName, which is what killed
-        // SpringBoard: its size argument is a double by value and it was being
-        // handed the address of a double in this process's own stack, so CoreText
-        // read eight bytes of our frame as a font size and built something
-        // malformed, and the main thread died on a pointer authentication trap in
-        // -[CATextLayer _createStringDict]. A name string carries no bare double,
-        // so that whole class of mistake cannot happen.
-        const double fsz = SB_COUNT_FONT_SIZE;
-        r_msg_main_raw(label, r_sel("setFontSize:"), &fsz, sizeof(fsz),
-                       NULL, 0, NULL, 0, NULL, 0);
-        if (!r_is_objc_ptr(g_sbCountFont)) {
-            g_sbCountFont = sb_make_nsstring(SB_COUNT_FONT_NAME);
+        uint64_t UIFont = r_class("UIFont");
+        if (r_is_objc_ptr(UIFont) && !r_is_objc_ptr(g_sbCountFont)) {
+            double fsz = SB_COUNT_FONT_SIZE;
+            g_sbCountFont = r_msg_main_raw(UIFont, r_sel("boldSystemFontOfSize:"),
+                                           &fsz, sizeof(fsz),
+                                           NULL, 0, NULL, 0, NULL, 0);
         }
         if (r_is_objc_ptr(g_sbCountFont)) {
             r_msg2_main(label, "setFont:", g_sbCountFont, 0, 0, 0);
         }
     }
 
-    // Size first, while the transform is still identity, so setFrame: means what
-    // it says.
+    // White on black.
     //
-    // This is the whole reason nothing appeared. A CALayer draws nothing at all
-    // with zero bounds, and setPosition: alone never gives it any: position is
-    // where the layer is, bounds is how big it is, and only bounds was ever set
-    // on this label. The frame log confirmed the mechanism was running, txt=1 on
-    // every publish and calls unchanged at 2 and 10, so the text was being set
-    // into a label with no area to draw it in.
-    double frame[4] = { 0.0, 0.0, SB_COUNT_W, SB_COUNT_H };
-    r_msg_main_raw(label, r_sel("setFrame:"), frame, sizeof(frame),
-                   NULL, 0, NULL, 0, NULL, 0);
+    // Both are UIColors sent straight to the label's own setters. A UILabel's
+    // setTextColor: and setBackgroundColor: take a UIColor; a CALayer's took a
+    // CGColor, which meant a -CGColor round trip whose result this file has already
+    // measured as a constant that does not depend on what was asked for. That
+    // constant passed r_is_objc_ptr, went into setForegroundColor:, and a
+    // CATextLayer handed something that is not a colour falls back to black: black
+    // glyphs on a black plate, which is a layer that draws perfectly and shows
+    // nothing at all.
+    uint64_t UIColor = r_class("UIColor");
+    if (r_is_objc_ptr(UIColor)) {
+        uint64_t white = r_msg2_main(UIColor, "whiteColor", 0, 0, 0, 0);
+        uint64_t black = r_msg2_main(UIColor, "blackColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0, 0, 0);
+        if (r_is_objc_ptr(black)) r_msg2_main(label, "setBackgroundColor:", black, 0, 0, 0);
+    }
 
-    // The position is set here, at creation, not on the first frame that carries
-    // a count.
+    // Bounds and transform, through cached invocations, the way the pooled labels
+    // do both.
     //
-    // This is why the plate shows up in the corner first and then slides across to
-    // the right place. setFrame: 0,0 puts the layer at the container's origin,
-    // which is the top left of the screen, and setPosition: was only ever reached
-    // from the op 5 decode. Every publish before the first count record therefore
-    // draws it in the corner and the user watches it travel.
+    // A persistent buffer in the target, a verified write into it,
+    // setArgument:atIndex: and a present. Four remote calls each, none of them
+    // blocking, against the thirteen a fresh NSInvocation through r_msg_main_raw
+    // costs, and the measured cost of ignoring that difference here was calls=186
+    // and ms=6046 on a single frame, a six second stall.
     //
-    // The place does not depend on the text. It comes from the screen size, which
-    // is fixed for the device, so there is nothing to wait for and nothing to
-    // learn from a frame that has not arrived yet.
+    // The size is a CGRect on setFrame: and a CGRect on setBounds:, so nothing is
+    // given up by not using the former, and the pooled labels have always set
+    // theirs this way. The transform is the same six numbers the pooled labels
+    // send, which is what orients the text along the long axis.
+    if (sb_cached_invocation(label, "setBounds:",
+                             &g_sbCountBoundsInv, &g_sbCountBoundsBuf, 32)) {
+        double b[4] = { 0.0, 0.0, SB_COUNT_W, SB_COUNT_H };
+        if (sb_write_inv_arg(g_sbCountBoundsBuf, b, sizeof(b))) {
+            r_msg2(g_sbCountBoundsInv, "setArgument:atIndex:", g_sbCountBoundsBuf, 2, 0, 0);
+            r_msg(g_sbCountBoundsInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        }
+    }
+    if (sb_cached_invocation(label, "setTransform:",
+                             &g_sbCountTransInv, &g_sbCountTransBuf, 48)) {
+        double tr[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+        if (sb_write_inv_arg(g_sbCountTransBuf, tr, sizeof(tr))) {
+            r_msg2(g_sbCountTransInv, "setArgument:atIndex:", g_sbCountTransBuf, 2, 0, 0);
+            r_msg(g_sbCountTransInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        }
+    }
+
+    // The place, set here at creation and not from the op 5 decode.
+    //
+    // That is why it used to appear in the corner first and slide across: setFrame:
+    // with an origin of 0,0 put the layer at the container's origin, the top left
+    // of the screen, and setPosition: was only ever reached by the first publish
+    // that carried a count. The place does not depend on the text, it comes from
+    // the screen size, so there is nothing to wait for.
     //
     // Container space is 390 wide by 844 tall. Landscape top centre of an 844x390
     // screen is (422, 42), and sbEmit's map, (sx, sy) -> (landH - sy, sx), turns
     // that into (390 - 42, 422).
-    {
+    //
+    // sb_cached_pos_invocation builds this one, and it refuses to build anything
+    // for a target it cannot see, which is why g_sbCountLabel is set above and not
+    // at the end of this function.
+    if (sb_cached_pos_invocation()) {
         double centre[2] = { (390.0 - SB_COUNT_TOP) - SB_COUNT_H * 0.5, 422.0 };
-        r_msg_main_raw(label, r_sel("setPosition:"), centre, sizeof(centre),
-                       NULL, 0, NULL, 0, NULL, 0);
-        g_sbCountLastPos[0] = centre[0];
-        g_sbCountLastPos[1] = centre[1];
+        if (sb_write_inv_arg(g_sbCountPosBuf, centre, sizeof(centre))) {
+            r_msg2(g_sbCountPosInv, "setArgument:atIndex:", g_sbCountPosBuf, 2, 0, 0);
+            r_msg(g_sbCountPosInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+            g_sbCountLastPos[0] = centre[0];
+            g_sbCountLastPos[1] = centre[1];
+        }
     }
 
-    // Sixteen doubles, not six. A view's setTransform: takes a CGAffineTransform,
-    // six, and that is the array this used to carry because the counter was a
-    // UILabel. CATextLayer is a CALayer, whose setTransform: takes a
-    // CATransform3D: sixteen, a 4x4 matrix. Passing six left m34 through m44 as
-    // whatever the argument buffer happened to hold, and m44 is the scale.
-    static const double tr[16] = {
-        0.0,  1.0,  0.0, 0.0,     // m11 m12 m13 m14
-       -1.0,  0.0,  0.0, 0.0,     // m21 m22 m23 m24
-        0.0,  0.0,  1.0, 0.0,     // m31 m32 m33 m34
-        0.0,  0.0,  0.0, 1.0,     // m41 m42 m43 m44
-    };
-    r_msg_main_raw(label, r_sel("setTransform:"), tr, sizeof(tr),
-                   NULL, 0, NULL, 0, NULL, 0);
+    // A subview. No layer getter, so there is no way for the label to be built in
+    // full and then fail to be attached, which is what the layer getter's buffer
+    // read allowed.
+    r_msg2_main(container, "addSubview:", label, 0, 0, 0);
 
-    // addSublayer:, not addSubview:. It is a layer, and the view method would
-    // fail quietly and leave it detached from anything.
-    uint64_t containerLayer = r_msg2_main(container, "layer", 0, 0, 0, 0);
-    if (r_is_objc_ptr(containerLayer)) {
-        r_msg2_main(containerLayer, "addSublayer:", label, 0, 0, 0);
-    } else {
-        NSLog(@"[SB-LABEL] container has no layer, counter text not attached");
-        return;
-    }
+    // Born hidden, as the pooled labels are.
+    //
+    // They can afford it because they have no text and no size at this point and so
+    // draw nothing at the origin. This one has both now, so without this it would
+    // be visible in the right place for the frames between here and the first
+    // publish that carries a count. g_sbCountShown starts at 0 and
+    // sb_count_label_hide(0) presents setHidden:0 on that first count.
+    r_msg2_main(label, "setHidden:", 1, 0, 0, 0);
 
-    // Read the size straight back out of SpringBoard's own CALayer, the same way
-    // lineWidth was verified, so "the label has an area" is a measured fact and
-    // not an assumption. The sentinel is minus one, so a real zero is
+    // Read the state back out of SpringBoard's own view, on the transport that can
+    // be trusted: r_msg2 returns in a register, so there is nothing in another
+    // process's memory that can be stale. bounds is a struct, so it goes through
+    // r_msg2_main_struct_ret; the sentinel is minus one, so a real zero is
     // distinguishable from a read that did not happen.
+    //
+    // The three numbers that decide whether this label will ever draw are: it has a
+    // non-zero size, it is attached to something, and the three cached invocations
+    // the per frame path depends on all exist. A zero in any of them names the step
+    // that failed instead of leaving it to be guessed at.
     double bBack[4] = { -1.0, -1.0, -1.0, -1.0 };
     const bool bOK = r_msg2_main_struct_ret(label, "bounds", bBack, sizeof(bBack),
                                             NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-    // fontSize is read back for the same reason. Every property above is a
-    // setter whose success is assumed, and a CATextLayer with a colour and a
-    // background but no font is exactly the shape of a label that draws a pill
-    // with nothing in it. Reading it turns that from a suspicion into a fact.
-    double fszBack = -1.0;
-    const bool fOK = r_msg2_main_struct_ret(label, "fontSize", &fszBack, sizeof(fszBack),
-                                            NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-    NSLog(@"[SB-LABEL] counter label=0x%llx created bounds=%.1f,%.1f %.1fx%.1f ok=%d "
-          @"fontSize=%.1f ok=%d attached=%d",
-          label, bBack[0], bBack[1], bBack[2], bBack[3], (int)bOK,
-          fszBack, (int)fOK, (int)r_is_objc_ptr(containerLayer));
-
-    g_sbCountLabel = label;
+    const uint64_t sup = r_msg2(label, "superview", 0, 0, 0, 0);
+    const uint64_t hid = r_msg2(label, "isHidden", 0, 0, 0, 0);
+    NSString *line = [NSString stringWithFormat:
+        @"[SB-LABEL] counter=0x%llx bounds=%.1f,%.1f %.1fx%.1f ok=%d super=0x%llx "
+        @"want=0x%llx match=%d hidden=%llu inv=b%d,p%d,t%d font=%llu",
+        (unsigned long long)label,
+        bBack[0], bBack[1], bBack[2], bBack[3], (int)bOK,
+        (unsigned long long)sup, (unsigned long long)container, (int)(sup == container),
+        (unsigned long long)hid,
+        (int)r_is_objc_ptr(g_sbCountBoundsInv), (int)r_is_objc_ptr(g_sbCountPosInv),
+        (int)r_is_objc_ptr(g_sbCountTransInv),
+        (unsigned long long)g_sbCountFont];
+    NSLog(@"%@", line);
+    sb_console(line);
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d, int enemyCount) {
@@ -1828,12 +1771,15 @@ static void sb_forget_local_paint_state(void) {
     // exists and reading them would be a use after free.
     g_sbCountPosInv = 0;
     g_sbCountPosBuf = 0;
+    g_sbCountBoundsInv = 0;
+    g_sbCountBoundsBuf = 0;
+    g_sbCountTransInv = 0;
+    g_sbCountTransBuf = 0;
     g_sbCountTextInv = 0;
     g_sbCountTextBuf = 0;
     g_sbCountHideInv = 0;
     g_sbCountHideBuf = 0;
     g_sbCountLabel = 0;
-    g_sbCountAlignStr = 0;
     g_sbCountBornUS = 0;
     g_sbCountFont = 0;
     g_sbCountTextSets = 0;

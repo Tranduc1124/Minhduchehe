@@ -66,11 +66,24 @@ static void boot_start_sb_overlay(void) {
             RemoteCallInitFailure fail = remote_call_last_init_failure();
             const char *why = remote_call_init_failure_description(fail);
             NSString *whyStr = why ? [NSString stringWithUTF8String:why] : @"?";
+            // The measured detail, for the failures that have more than one way to
+            // happen. Without it this line said "bootstrap getpid failed (0x101 miss
+            // / 0x201?)", which is two guesses about a fork in the road and is all
+            // the console had to say about the failure that decides whether the
+            // overlay exists at all. The description cannot carry it, being a pure
+            // function of the enum, so it is fetched and appended here — in the one
+            // place a person can actually read it.
+            const char *detail = remote_call_last_init_failure_detail();
+            NSString *detailStr = (detail && detail[0])
+                                ? [NSString stringWithUTF8String:detail] : @"";
+            NSString *full = detailStr.length
+                           ? [NSString stringWithFormat:@"%@ — %@", whyStr, detailStr]
+                           : whyStr;
             NSLog(@"[BOOT] SpringBoard overlay attempt %d failed rc=%d fail=%@ code=%d",
                   attempt + 1, sbret, whyStr, (int)fail);
             // L() is NSString formatting — must use %@ for NSString*, never %s.
             L(@"WARN SB overlay attempt %d rc=%d (%@)",
-              attempt + 1, sbret, whyStr);
+              attempt + 1, sbret, full);
         }
         L(@"ERR SpringBoard overlay failed after 4 attempts — ESP will not draw over FF.");
     });
