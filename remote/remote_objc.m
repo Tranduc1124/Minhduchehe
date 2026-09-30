@@ -151,11 +151,11 @@ static void r_settle_note(uint64_t sleptUS)
     s_windowUS += sleptUS;
     if ((now - s_lastUS) < 1000000ull) return;
 
-    // PUSH tagged, like every other line this file prints. See MO_DAU.txt at
-    // r_main_wait_note: a printf without the tag is dropped by the PUSH log
-    // filter, and then the number is never seen again.
-    printf("[PUSH][SB-SETTLE] n=%llu us=%llu\n",
-           (unsigned long long)s_windowN, (unsigned long long)s_windowUS);
+    // NSLog, not printf. See the note at r_call_mark: stdout is invisible on a
+    // non-jailbroken sideload, so every PUSH line here used printf and none of
+    // them ever reached the log.
+    NSLog(@"[PUSH][SB-SETTLE] n=%llu us=%llu",
+          (unsigned long long)s_windowN, (unsigned long long)s_windowUS);
     s_lastUS = now;
     s_windowN = 0;
     s_windowUS = 0;
@@ -195,7 +195,8 @@ static uint64_t r_call_stable(int timeout, const char *fnName,
     // last line printed before SpringBoard stops checking in is the call that
     // wedged it.
     //
-    // PUSH tagged, or the filter drops it. Same shape as r_main_perf_mark: a
+    // PUSH tagged so the log filter keeps it, and printed with NSLog below, not
+    // printf, because printf is invisible here. Same shape as r_main_perf_mark: a
     // callee is printed the first time it is seen and then once every 250 ms.
     r_call_mark(fnName, a1);
     pthread_mutex_lock(&gRemoteCallLock);
@@ -535,7 +536,7 @@ static void r_main_perf_mark(const char *site, uint64_t sel, int wait)
     if (fresh && s_seenN < (int)(sizeof(s_seen) / sizeof(s_seen[0]))) {
         s_seen[s_seenN++] = sel;
     }
-    printf("[PUSH][SB-LAST] %s sel=%s wait=%d\n", site, r_sel_name(sel), wait);
+    NSLog(@"[PUSH][SB-LAST] %s sel=%s wait=%d", site, r_sel_name(sel), wait);
 }
 
 // The call in flight on the hijacked target thread.
@@ -570,7 +571,7 @@ static void r_call_mark(const char *fnName, uint64_t a1)
     // being named may be the one that has the target wedged.
     const char *selTxt = "n/a";
     if (fnName && strcmp(fnName, "objc_msgSend") == 0) selTxt = r_sel_name(a1);
-    printf("[PUSH][SB-CALL] %s sel=%s\n", fnName ? fnName : "(null)", selTxt);
+    NSLog(@"[PUSH][SB-CALL] %s sel=%s", fnName ? fnName : "(null)", selTxt);
 }
 
 static void r_main_wait_note(const char *what, uint64_t sel, uint64_t waitedUS)
@@ -582,19 +583,19 @@ static void r_main_wait_note(const char *what, uint64_t sel, uint64_t waitedUS)
     s_totalUS += waitedUS;
     if (waitedUS > s_maxUS) {
         s_maxUS = waitedUS;
-        printf("[PUSH][SB-WAIT] new worst %s %s %lluus n=%llu total=%lluus\n",
-               what, r_sel_name(sel), (unsigned long long)waitedUS,
-               (unsigned long long)s_count, (unsigned long long)s_totalUS);
+        NSLog(@"[PUSH][SB-WAIT] new worst %s %s %lluus n=%llu total=%lluus",
+              what, r_sel_name(sel), (unsigned long long)waitedUS,
+              (unsigned long long)s_count, (unsigned long long)s_totalUS);
     }
     if (waitedUS >= R_MAIN_WAIT_SLOW_US) {
-        printf("[PUSH][SB-WAIT] slow %s %s %lluus n=%llu worst=%lluus\n",
-               what, r_sel_name(sel), (unsigned long long)waitedUS,
-               (unsigned long long)s_count, (unsigned long long)s_maxUS);
+        NSLog(@"[PUSH][SB-WAIT] slow %s %s %lluus n=%llu worst=%lluus",
+              what, r_sel_name(sel), (unsigned long long)waitedUS,
+              (unsigned long long)s_count, (unsigned long long)s_maxUS);
     }
     if ((s_count % 200) == 0) {
-        printf("[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus last=%s %s\n",
-               (unsigned long long)s_count, (unsigned long long)s_maxUS,
-               (unsigned long long)s_totalUS, what, r_sel_name(sel));
+        NSLog(@"[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus last=%s %s",
+              (unsigned long long)s_count, (unsigned long long)s_maxUS,
+              (unsigned long long)s_totalUS, what, r_sel_name(sel));
     }
 }
 
