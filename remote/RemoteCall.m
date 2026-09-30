@@ -3307,58 +3307,24 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         mig_bypass_pause();
 
     if (callThreadPort && createdSuspended) {
-        // The park, written from the outside, reading the thread's own state first.
+        // Working build 734a5e248: creation-time PC is already signed 0x301
+        // (startRoutine = remote_pac(0x301)). Releasing the suspended thread
+        // IS the park — first instruction faults into secondExceptionPort.
         //
-        // It used to be "releasing the thread IS the park", with the fake address
-        // left in the creation-time program counter. That is a fake code address
-        // being asked to work as a program counter, which is the same mistake this
-        // file has made in four places, and it is the one that faulted.
-        //
-        // The earlier attempt at an explicit park was rejected for a reason that was
-        // real but was misread as a reason to have no park at all. It built the state
-        // from g_RC_originalState, which is the HACKED thread's stack pointer, and set
-        // it on the new one, so the resumed thread ran the start routine with the
-        // wrong stack. SB IPS 2026-09-26 06:21:04 recorded exactly that: a thread_set
-        // _state returning kr=0 while the resumed thread ran getpid with sp=0. The
-        // set_state was not the problem. The stack pointer was.
-        //
-        // So the state is read from the thread that is going to be parked, and only
-        // the two program counters are changed. A freshly created thread already has
-        // a real stack pointer, a real frame pointer and real flags, and keeping all
-        // three is the whole of the difference between parking it and breaking it.
-        //
-        // The port is already installed by the set_exception_port_on_thread above, so
-        // the fault that follows the resume has somewhere to go.
-        bool parked = false;
-        arm_thread_state64_internal own = {0};
-        if (thread_get_state_wrapper(callThreadPort, &own)) {
-            if (sign_state(g_RC_callThreadAddr, &own, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
-                parked = thread_set_state_wrapper(callThreadPort, g_RC_callThreadAddr, &own);
-            }
-        }
-        if (!parked) {
-            g_RC_callThreadStep = 14;
-            g_RC_createDead = true;
-            callThreadPort = 0;
-            createdSuspended = false;
-            RC_DIAG("could not park the fresh call thread (get_state/set_state) — "
-                    "abandoning the create, thread[1] reuse next");
-            g_RC_callThreadPath = "create";
-            RC_DIAG("parked fresh call thread at PC=0x%llx LR=0x%llx on its own state",
-                    (unsigned long long)native_strip(own.__pc),
-                    (unsigned long long)native_strip(own.__lr));
-            uint64_t ret = do_remote_call_temp(100, "thread_resume",
-                                               callThreadPort, 0, 0, 0, 0, 0, 0, 0);
-            if (ret != 0) {
-                // Fatal, and deliberately so. Everything the create could fail at is
-                // survivable because the reuse path is still ahead, but a thread that
-                // has been given an exception port and cannot be released is neither
-                // usable nor safe to abandon, and there is no third path to try.
-                RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
-                        (unsigned long long)ret);
-                fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
-                return -1;
-            }
+        // Later commits replaced this with local thread_get_state/set_state on
+        // callThreadPort. That port name lives in SpringBoard's ipc_space, not
+        // ours, so those wrappers operated on the wrong task. 734a5e measured
+        // that remote set_state also failed to stick (IPS 2026-09-26). Do not
+        // bring either back.
+        RC_DIAG("resuming synthetic call thread (creation-time PC=0x301)");
+        g_RC_callThreadPath = "create";
+        uint64_t ret = do_remote_call_temp(100, "thread_resume",
+                                           callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+        if (ret != 0) {
+            RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
+                    (unsigned long long)ret);
+            fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
+            return -1;
         }
     } else {
         // Either no SB port at all, or the port came from reusing thread[1] (iOS
