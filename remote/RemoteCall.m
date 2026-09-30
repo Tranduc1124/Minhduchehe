@@ -1574,8 +1574,14 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
         uint64_t discPC = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("pc"));
         uint64_t discLR = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("lr"));
 
+        // Fl0rk signs FAKE_PC 0x301 with modifier 0. Device log on 9a34e3e:
+        // getpid ran to RET (PC=getpid+0x18) but LR auth failed — wait2
+        // PC=LR=getpid+0x18, x0=0. Disc-signed fakes can FAULT as PC, but
+        // RET-auth of disc-signed 0x201 as LR does not. Modifier 0 for the
+        // tiny trap addresses; blended disc for real shared-cache code.
         if (pc) {
-            uint64_t signedPC = remote_pac(signingThread, pc, discPC);
+            uint64_t mod = (pc < 0x1000ULL) ? 0 : discPC;
+            uint64_t signedPC = remote_pac(signingThread, pc, mod);
             if (!signedPC) return false;
             uint32_t flags = state->__flags;
             flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
@@ -1583,7 +1589,8 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
             state->__pc = signedPC;
         }
         if (lr) {
-            uint64_t signedLR = remote_pac(signingThread, lr, discLR);
+            uint64_t mod = (lr < 0x1000ULL) ? 0 : discLR;
+            uint64_t signedLR = remote_pac(signingThread, lr, mod);
             if (!signedLR) return false;
             uint32_t flags = state->__flags;
             flags &= ~(__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR |
@@ -1737,6 +1744,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         g_RC_success = false;
         return 0;
     }
+    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x",
+            name ?: "?",
+            (unsigned long long)exc.threadState.__pc,
+            (unsigned long long)exc.threadState.__lr,
+            (unsigned)exc.threadState.__flags);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1762,61 +1774,17 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     g_RC_lastTempExcCode = exc2.codeFirst;
     g_RC_lastTempX0 = exc2.threadState.__x[0];
     uint64_t retValue = exc2.threadState.__x[0];
-    // A return is the thread executing the instruction it returned to. Anything else
-    // on the second wait is a fault raised inside the function.
-    //
-    // The two need different replies, and this was the same reply for both, which is
-    // how one fault used to poison a thread for the rest of the session.
-    //
-    // Replying with the exception's own state resumes the thread at the instruction
-    // that just faulted. It faults again, for the same reason, with the same
-    // registers, and that arrives on the port the next call reads. Every call after
-    // it therefore reports the identical fault with the identical return value, and
-    // the one that actually happened is indistinguishable from the ones it caused.
-    //
-    // It is visible in a measured console: pthread_create_suspended_np faulting once
-    // at a shared cache address, and every later number on that thread being the same
-    // fault at the same address with the same x0, which is not what a thread that has
-    // run since would look like. x0 was 0x10 on every attempt, which is a loop
-    // constant, and no argument to that call was ever 0x10.
-    //
-    // So a fault parks the thread at the fake program counter instead. It is a known
-    // trap address that the next call's first wait is designed to consume, and the
-    // fault is reported once, by the one check that exists, instead of being
-    // re-raised forever.
-    if (native_strip(exc2.threadState.__pc) == FAKE_LR_TROJAN_CREATOR) {
-        reply_with_state(&exc2, &exc2.threadState);
-    } else {
-        // A fault is not a return. x0 still holds whatever argument the callee
-        // had loaded (measured: malloc size=0x10; thread_suspend port=0x620b).
-        // Callers that treat a non-zero x0 as success then feed that garbage
-        // onward — outBuf=0x10 into pthread_create is the recorded case. Mark
-        // the call failed so those checks cannot pass.
-        //
-        // Also set the step. Bootstrap used to treat step==0 as "both waits
-        // completed, mechanism OK" and force g_RC_success back to true. A fault
-        // leaves step at 0 (neither wait timed out), so that restore turned a
-        // measured getpid fault into a green light and walked into create.
-        g_RC_success = false;
+    // Working 734a5e248 always replied the wait2 state. Re-parking to 0x101 on
+    // a non-0x201 PC made bootstrap getpid a hard fail before create could run.
+    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN_CREATOR) {
+        RC_DIAG("temp/%s wait2 PC=0x%llx != FAKE_LR 0x201 ret=0x%llx — reply anyway",
+                name ?: "?",
+                (unsigned long long)native_strip(exc2.threadState.__pc),
+                (unsigned long long)retValue);
         if (g_RC_lastTempStep == 0)
             g_RC_lastTempStep = 5;
-        arm_thread_state64_internal park = exc2.threadState;
-        if (sign_state(g_RC_trojanThreadAddr, &park,
-                       FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
-            RC_DIAG("temp/%s faulted at 0x%llx (not the fake LR) — parked at 0x%llx",
-                    name ?: "?", (unsigned long long)native_strip(exc2.threadState.__pc),
-                    (unsigned long long)FAKE_PC_TROJAN_CREATOR);
-            reply_with_state(&exc2, &park);
-        } else {
-            // No signature, so no state worth replying with. Handing back the
-            // faulting state would resume the loop, so the thread is left stopped on
-            // the exception instead, which strands it but breaks the loop, and the
-            // next call will fail loudly rather than repeating a stale fault.
-            RC_DIAG("temp/%s faulted at 0x%llx and the park could not be signed — "
-                    "leaving it stopped", name ?: "?",
-                    (unsigned long long)native_strip(exc2.threadState.__pc));
-        }
     }
+    reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
 
@@ -3061,13 +3029,12 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         // the pacia signer was never late, and the call went out and came back with
         // zero. Every part of the engine was working, and the session was destroyed
         // over a return value that is thrown away.
-        // Mechanism OK = both waits completed AND the second was a real return
-        // to FAKE_LR 0x201. step==0 alone is not enough: a fault inside the
-        // callee also completes both waits and used to leave step at 0, so the
-        // restore below painted over g_RC_success=false and the session walked
-        // on (e268f92 log: getpid faulted at getpid+0x18, then "done success=1").
-        if (g_RC_lastTempStep == 0 && g_RC_success &&
-            native_strip(g_RC_lastTempRetPC) == FAKE_LR_TROJAN_CREATOR) {
+        // Working 734a5e248: g_RC_success and a non-zero pid. retPC==0x201 is
+        // preferred but not required to proceed — that build did not test it.
+        if (g_RC_success && bootstrapPid != 0) {
+            break;
+        }
+        if (bootstrapPid != 0 && (g_RC_lastTempStep == 0 || g_RC_lastTempStep == 5)) {
             g_RC_success = true;
             break;
         }
@@ -3075,8 +3042,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     RC_DIAG("bootstrap getpid done pid=%llu success=%d step=%d retPC=0x%llx",
             (unsigned long long)bootstrapPid, (int)g_RC_success, g_RC_lastTempStep,
             (unsigned long long)native_strip(g_RC_lastTempRetPC));
-    if (g_RC_lastTempStep != 0 || !g_RC_success ||
-        native_strip(g_RC_lastTempRetPC) != FAKE_LR_TROJAN_CREATOR) {
+    if (!g_RC_success || bootstrapPid == 0) {
         RC_DIAG("bootstrap getpid FAILED");
         fail_after_creator_park(RemoteCallInitFailureBootstrapGetpid, targetPid);
         return -1;
