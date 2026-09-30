@@ -477,6 +477,9 @@ const char *remote_call_last_init_failure_detail(void)
             case 19: step = "stable sign_state failed, no reply sent"; break;
             case 20: step = "stable wait1 gave up (no park trap)"; break;
             case 21: step = "stable wait2 gave up (never came back)"; break;
+            case 22: step = "stable wait1 got a fault, not the call thread's park"; break;
+            case 23: step = "stable callee faulted; x0 is a register, not a result"; break;
+            case 24: step = "temp callee faulted; x0 is a register, not a result"; break;
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
@@ -1743,6 +1746,38 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     return res;
 }
 
+// A thread this engine is driving sits at one of these two addresses and stays
+// there until it is replied to. Nothing else is a park.
+static bool rc_pc_is_park(uint64_t pc)
+{
+    return pc == FAKE_PC_TROJAN || pc == FAKE_LR_TROJAN;
+}
+
+// Put a faulted thread back on its park, and say whether it happened.
+//
+// The message has to be replied to either way. A thread still sitting in an
+// exception message whose reply right is gone never runs again, so every later
+// wait on that port is waiting for a thread that has already stopped.
+//
+// Only the stack comes across from the state that faulted. The registers in it
+// are whatever the callee had half-loaded, and republishing them is how a wild
+// pointer becomes the next call's arguments.
+static bool rc_repark_at(ExceptionMessage *exc, uint64_t parkLR)
+{
+    if (!exc)
+        return false;
+    arm_thread_state64_internal park = exc->threadState;
+    for (int i = 0; i <= 8; i++)
+        park.__x[i] = 0;
+    if (!sign_state(g_RC_trojanThreadAddr, &park, parkLR, parkLR)) {
+        RC_DIAG("re-park sign_state failed at 0x%llx — the thread stays in the exception",
+                (unsigned long long)parkLR);
+        return false;
+    }
+    reply_with_state(exc, &park);
+    return true;
+}
+
 uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
@@ -1851,6 +1886,24 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     g_RC_lastTempX0 = exc2.threadState.__x[0];
 
     uint64_t retValue = exc2.threadState.__x[0];
+
+    // A call that came home left the thread executing the fake link register,
+    // because that is the address this engine returns to. Any other program
+    // counter means the callee never came home: it raised, and x0 in this state
+    // is whatever it had loaded, not an answer. Handing that register back as a
+    // return value is the defect; see the note at the stable path, which is
+    // where the springboardd abort came from. Same check, same reason.
+    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN_CREATOR) {
+        RC_DIAG("temp/%s FAULT in the callee pc=0x%llx (a return lands on 0x%llx) — "
+                "0, not a register", name ?: "?",
+                (unsigned long long)native_strip(exc2.threadState.__pc),
+                (unsigned long long)FAKE_LR_TROJAN_CREATOR);
+        g_RC_lastTempStep = 24;
+        g_RC_success = false;
+        rc_repark_at(&exc2, FAKE_LR_TROJAN_CREATOR);
+        return 0;
+    }
+
     // x8 cleared, same reason as the stable path: it is the INDIRECT_RESULT
     // address, it means nothing after the callee returns, and whatever is in it
     // now is a buffer the caller has already freed. Republishing it parks the
@@ -1996,6 +2049,24 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return 0;
     }
 
+    // wait1 is written to read the thread's park. This one carried a program
+    // counter inside real code instead, which is a fault that got in ahead of
+    // the park — the previous call's callee raised and left its message sitting
+    // in the port. Replying with this call's own PC onto that state would
+    // resume the thread in the middle of whatever raised, so park it instead and
+    // report the call as not issued. The device log at 2026-09-30 18:24:07 is
+    // this line firing:
+    //   stable/objc_msgSend wait1 caught ... PC=0x195edf020 LR=0x401 (expect 0x301)
+    if (!rc_pc_is_park(native_strip(exc.threadState.__pc))) {
+        RC_DIAG("stable/%s wait1 got a fault, not a park (pc=0x%llx) — reparking, "
+                "call not issued", name ?: "(addr-call)",
+                (unsigned long long)native_strip(exc.threadState.__pc));
+        g_RC_lastTempStep = 22;
+        g_RC_success = false;
+        rc_repark_at(&exc, FAKE_LR_TROJAN);
+        return 0;
+    }
+
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
     exc.threadState.__x[2] = x2;
@@ -2107,6 +2178,43 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     g_RC_lastTempExcType = exc2.exception;
     g_RC_lastTempExcCode = exc2.codeFirst;
     g_RC_lastTempX0 = exc2.threadState.__x[0];
+    // A call that came home left the thread executing FAKE_LR_TROJAN, because
+    // that is the address this engine returns to. Any other program counter here
+    // means the callee never came home: it raised, and the x0 printed above is
+    // whatever it had loaded, not an answer.
+    //
+    // Returning that register is what killed SpringBoard. 2026-09-30 18:41:19
+    // IPS, pid 518, uptime 16 minutes, SIGABRT:
+    //
+    //   -[BKSHIDEventDeferringToken setTarget:]: unrecognized selector
+    //       sent to instance 0x3019a7ae0
+    //   doesNotRecognizeSelector: / ___forwarding___ / _CF_forwarding_prep_0,
+    //   then four frames at libsystem_pthread + 0x401 and thread_start
+    //
+    // 0x401 is FAKE_LR_TROJAN, so the thread that threw was the synthetic call
+    // thread. 0x3019a7ae0 sits in the 0x30_xxxx_xxxx range, which is the range
+    // the device log has a faulting objc_msgSend reporting in x0 on two separate
+    // runs: 0x303266d40 at 18:20:18 and 0x302845ba0 at 18:24:07. The selector is
+    // ours — setTarget: is only ever sent to an NSInvocation, on the invocation
+    // r_msg2_struct built a few lines above — so the pointer that came back in x0
+    // was handed on as that invocation, and the block behind it had already been
+    // released and given to BackBoard for a HID deferring token.
+    //
+    // Replying with the faulting state unchanged, which is what this used to do,
+    // is the other half of it. The thread then resumes in the middle of the
+    // callee, raises again, and that second message is what the NEXT call reads
+    // as its park. That is the 10-second cadence in the 18:24 log: one call per
+    // message, every message out of phase by one.
+    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN) {
+        RC_DIAG("stable/%s FAULT in the callee pc=0x%llx (a return lands on 0x%llx) — "
+                "0, not a register; reparked", name ?: "(addr-call)",
+                (unsigned long long)native_strip(exc2.threadState.__pc),
+                (unsigned long long)FAKE_LR_TROJAN);
+        g_RC_lastTempStep = 23;
+        g_RC_success = false;
+        rc_repark_at(&exc2, FAKE_LR_TROJAN);
+        return 0;
+    }
     // Re-park: reply keeps thread blocked in exception until next hijack.
     //
     // x8 is cleared here and not left as the callee returned it. x8 is the arm64
