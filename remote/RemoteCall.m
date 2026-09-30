@@ -88,6 +88,10 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 bool remote_read_internal(uint64_t src, void *dst, uint64_t size);
 bool remote_write_internal(uint64_t dst, const void *src, uint64_t size);
 int destroy_remote_call_internal(void);
+// Hands a mach port to a thread that discards everything on it forever. Defined
+// next to destroy_remote_call(), called from both teardown paths, one of which
+// is earlier in this file.
+static void g_RC_keep_port_alive_forever(mach_port_t port);
 void abandon_remote_call_internal(void);
 
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
@@ -1346,8 +1350,16 @@ void abandon_remote_call_internal(void) {
     // Skip every SB-side IPC. Caller has decided that the remote task is dead
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
+    //
+    // The call thread's exception port is not one of them. Skipping the IPC above
+    // means the thread is left exactly where it was, mid-call if it was mid-call,
+    // and a thread that is left mid-call still returns to 0x401. Handing the port
+    // to a drain thread is the only thing between that and a SIGBUS in a process
+    // we were not asked to kill. See destroy_remote_call_internal for the whole
+    // argument.
+    g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
+
     destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1374,6 +1386,62 @@ void abandon_remote_call_internal(void) {
     g_RC_vphoneBridge = false;
     g_RC_trojanMem = 0;
     g_RC_threadList = [NSMutableArray new];
+}
+
+// Hands a mach port to a thread that reads it and discards every message, and
+// never comes back. See the comment at the call site for why the call thread's
+// exception port is not destroyed.
+static void *rc_port_drain_forever(void *arg) {
+    mach_port_t port = (mach_port_t)(uintptr_t)arg;
+    // Detached and never cancelled on purpose: the thing it protects is a thread
+    // in another process that has already been asked to stop, and there is no
+    // safe moment at which to stop watching it.
+    pthread_setname_np("rc-port-drain");
+    for (;;) {
+        ExceptionMessage msg;
+        // 0x160 is EXCEPTION_MSG_SIZE from Exception.m, and the receive is
+        // written the way wait_exception writes it, with MACH_RCV_TIMEOUT and a
+        // zero timeout, which is MACH_MSG_TIMEOUT_NONE and blocks forever. The
+        // size is the one the sender writes, so the message is consumed whole.
+        kern_return_t kr = mach_msg(&msg.Head, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                     0, 0x160, port,
+                                     MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) {
+            // MACH_RCV_TIMED_OUT cannot happen with an infinite timeout, and
+            // MACH_RCV_INVALID_NAME means the port is gone, which means there is
+            // nothing left to protect. Anything else, including a bad message
+            // size, is worth another turn rather than a thread that exits and
+            // leaves the port unread.
+            if (kr == MACH_RCV_INVALID_NAME) break;
+            continue;
+        }
+        // Discard. The thread that faulted is on its way out and its state is no
+        // longer anything this process can act on, so replying would only resume
+        // a thread whose stack is about to be reclaimed.
+    }
+    return NULL;
+}
+
+static void g_RC_keep_port_alive_forever(mach_port_t port) {
+    if (!MACH_PORT_VALID(port)) return;
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    // A small stack is right: this thread never returns and never recurses.
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    int rc = pthread_create(&th, &attr, rc_port_drain_forever,
+                            (void *)(uintptr_t)port);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        // No drain thread, so the queue could fill. Destroying the port instead is
+        // the old behaviour and the old SIGBUS; leaving it unread is a slower
+        // version of the same thing. Neither is good and neither is reachable in
+        // practice, so say so rather than choosing silently.
+        printf("[%s:%d] rc_port_drain_forever pthread_create failed rc=%d — "
+               "secondExceptionPort left installed and unread\n",
+               __FUNCTION__, __LINE__, rc);
+    }
 }
 
 int destroy_remote_call(void) {
@@ -1412,8 +1480,39 @@ int destroy_remote_call_internal(void) {
         restore_trojan_thread(&g_RC_originalState);
     }
 
+    // The call thread's exception port outlives this function.
+    //
+    // Every remote call signs the synthetic call thread with __pc = the callee and
+    // __lr = FAKE_LR_TROJAN, 0x401. When the callee returns, the thread RETs to
+    // 0x401 and faults, and that fault is the *designed* end of every call: the
+    // wait that follows it is how the return value in x0 is read. A thread that
+    // is still inside that sequence when the session is torn down therefore has
+    // a fault in flight, or is about to take one, and it will take it whether or
+    // not anyone is listening.
+    //
+    // The pthread_exit above is asked for with timeout -1, which replies and
+    // returns without waiting, so the thread has not reached pthread_exit yet at
+    // the moment the ports below would have been destroyed. Destroying them in
+    // that window is what killed SpringBoard:
+    //
+    //   23:03:09  pc=0x401  lr=0xd96d390000000401  far=0x401  esr="PC alignment"
+    //   23:21:23  pc=0x401  lr=0xbd761f0000000401  far=0x401  esr="PC alignment"
+    //   23:32:47  pc=0x401  lr=0x49021a0000000401  far=0x401  esr="PC alignment"
+    //
+    // all three with thread_start as the only frame above the fault, which is the
+    // call thread, and 0x401 is not in any region.
+    //
+    // So the port is not destroyed. It is handed to a thread that reads it and
+    // throws the messages away, forever. Draining matters as much as keeping it:
+    // a mach port whose queue fills raises an exception of its own, so leaving it
+    // installed and unread would only move the kill.
+    //
+    // The cost is one thread per torn down session, blocked in mach_msg on a port
+    // that in the steady state never fires. The port belongs to this process, so
+    // the leak is ours and not SpringBoard's.
+    g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
+
     destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
