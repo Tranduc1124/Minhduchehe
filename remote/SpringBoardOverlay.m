@@ -493,6 +493,17 @@ static void serFunc(void *info, const CGPathElement *e) {
 // The counter's font, as a name. CALayer's font property is a CFTypeRef and
 // QuartzCore resolves a name against fontSize; see sb_make_count_label.
 #define SB_COUNT_FONT_NAME "Helvetica-Bold"
+// How long after the label is built the same number keeps being written, in
+// microseconds. See the guard in sb_count_label_text: the first write can land
+// before the layer is live, so it is repeated for this long and then only made
+// when the number actually changes.
+//
+// It was a count of publishes, which is not a clock. A publish is rare: the
+// identical-frame gate in front of the draw path drops a frame whose bytes match
+// the one already on screen, and a measured session did upd=1, att=783 in
+// eighteen seconds. Sixty publishes is sixty, at one per changed frame, which in
+// a quiet scene is never.
+#define SB_COUNT_TEXT_RETRY_US 1500000ULL
 
 // One counter plus two labels per pawn, name and distance. Created lazily, so a
 // quiet frame costs nothing and a busy one tops out here rather than growing
@@ -803,7 +814,26 @@ static uint64_t sb_count_label_text(const char *utf8) {
     // first publish arriving before the layer is really live, and after that the
     // change check keeps the frame cost at nothing.
     const bool sameText = (strcmp(g_sbCountLastText, utf8) == 0);
-    if (sameText && g_sbCountTextSets > 60) return 0;
+    if (sameText) {
+        // The retry window is wall time, not a count of publishes.
+        //
+        // It was "the first sixty publishes", and a publish is something that
+        // almost never happens: the frame hash gate in front of this function
+        // drops a frame whose bytes are identical to the one already on screen,
+        // and a device log of a real session shows what that costs. Over eighteen
+        // seconds the counters were upd=1, att=783, skip=1133, ident=782, with
+        // S=G=M=B=0 on every line. Every one of those 782 frames was dropped by
+        // the hash and nothing else, and exactly one publish in the whole run
+        // ever reached this line. So a budget of sixty publishes is a budget of
+        // sixty, spent one at a time, potentially never.
+        //
+        // What the window is for is unchanged and still correct: the first text
+        // write races the layer becoming live, so it is repeated for a short
+        // while and then left alone. Measuring that while in seconds rather than
+        // in frames is what the intent was all along, and it cannot starve.
+        const uint64_t now = now_us();
+        if (now - g_sbCountBornUS > SB_COUNT_TEXT_RETRY_US) return 0;
+    }
     g_sbCountTextSets++;
 
     // Built without trusting initWithUTF8String:, which returns garbage here.
@@ -2729,8 +2759,39 @@ void SBRemotePushESPFrame(UIView *espView, int enemyCount) {
                       (int)remote_call_has_local_state(),
                       (int)remote_call_current_success(),
                       why ? why : "?", remote_call_current_pid());
+
+                // Two things had to be undone here or the rearm could not do any
+                // work at all, and both of them made the line above a lie.
+                //
+                // g_sbOverlayOn. SBoardStartOverlay opens with
+                //     if (g_sbOverlayOn) { unlock; return 0; }
+                // and the flag is still set, because nothing between the stall
+                // and here ever cleared it. So it returned 0 having made no
+                // remote call, the caller read 0 as success, and the log said
+                // "session re-initialised, overlay live" about a rebuild that
+                // never happened. That is why a measured session sat at
+                // on=1 ever=1 fail=0 ls=1 ok=0 with the skip counter climbing
+                // and the call counter frozen, forever, and reported itself
+                // healthy the whole time.
+                //
+                // The dead session. remote_call_current_success() returns a flag
+                // that is set true only inside init_remote_call, never by a
+                // successful call, so the one ten second wait2 timeout in a
+                // session latched ok=0 permanently. Clearing the overlay flag is
+                // not enough on its own: SBoardStartOverlay does not open the
+                // session, it is reached only after sb_open_session has, and
+                // sb_open_session is below the early return. So a session that
+                // is actually dead has to be torn down here, and the flag has to
+                // be cleared, or the rebuild is skipped on the very first line.
+                const int hadState = (int)remote_call_has_local_state();
+                const int wasOk    = (int)remote_call_current_success();
+                g_sbOverlayOn = 0;
+                if (hadState && !wasOk) {
+                    destroy_remote_call();
+                }
                 if (SBoardStartOverlay() == 0) {
-                    NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
+                    NSLog(@"[PUSH-REARM] session re-initialised, overlay live "
+                          @"(reinit=%d)", hadState && !wasOk);
                 } else {
                     NSLog(@"[PUSH-REARM] re-init failed, will retry in 5s");
                 }

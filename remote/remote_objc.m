@@ -558,7 +558,74 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
         return 0;
     }
 
-    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+    // retainArguments is NOT called here, and that is the fix, not an omission.
+    //
+    // It used to be, one line below where it stands now, which is after every
+    // setArgument:atIndex: above. The order is the whole bug.
+    //
+    // The argument frame of an NSInvocation is rebuilt by retainArguments, so an
+    // invocation whose arguments were set and then retained invokes against a
+    // frame that no longer holds them. The probe further down this function
+    // measured exactly that shape and reached exactly that conclusion: the frame
+    // holds the values, getArgument:atIndex: reads them back correctly, and
+    // invoke does not use them, which can only mean invoke is reading the frame
+    // retainArguments left behind rather than the one setArgument:atIndex: wrote.
+    // Its own note names the consequence and the one-line experiment that was
+    // never run: "If skipping it produces the right colour, then calling it is
+    // what moves the arguments somewhere invoke cannot see, and the fix is to
+    // stop calling it for scalar arguments."
+    //
+    // That experiment is no longer needed, because the transport that does work
+    // is in the same repo and differs in exactly one respect: the cached
+    // invocation behind setPath:, setString: and setHidden: calls retainArguments
+    // once, when the invocation is built and its frame is still empty, and never
+    // again. Every present then rewrites the argument and re-sets it with
+    // setArgument:atIndex: with no retainArguments after it. Those selectors run
+    // and their values land. This one called it after the arguments were in place
+    // and nothing it carried ever arrived.
+    //
+    // It is not a problem for a scalar either, which is what the note above
+    // suspected, because a scalar argument is not affected by retention: this
+    // function's own comment further down says "retainArguments only retains
+    // arguments that are objects, so a CGFloat argument is read straight out of
+    // this buffer when invoke runs", which is true and is exactly why the
+    // buffer has to outlive the call. Retention governs lifetime, not the bytes
+    // the frame is read from, so a CGFloat that arrives as zero is not an
+    // argument that was not retained. It is a frame that was rebuilt.
+    //
+    // Dropping it costs nothing for the object arguments either. It only ever
+    // kept an argument object alive across a fire-and-forget present, and every
+    // caller here already owns its objects: the argument buffers are freed at the
+    // very end of this function, after the return value has been read, and the
+    // objects in them are held by whoever made them.
+    //
+    // What this was costing, measured on the counter layer. Every one of its
+    // setters came through here, and every one of them was a silent no-op:
+    //
+    //   setFrame:        the CGRect arrived as zero, so the layer had no bounds,
+    //                    and a CALayer with zero bounds draws nothing at all
+    //   setFontSize:     arrived as 0.0, so no glyphs were ever rasterised
+    //   setContentsScale: arrived as 0.0, so nothing rasterised at any size
+    //   setZPosition:    arrived as 0, under the two shape layers at 99 and 100
+    //   setPosition:     arrived as (0,0)
+    //   setBackgroundColor:, setForegroundColor:, setFont:,
+    //   setAlignmentMode:, addSublayer:
+    //                    arrived as nil, so the layer was never given a plate, a
+    //                    colour, a font, an alignment, or a parent
+    //
+    // A layer in that state is indistinguishable, from outside, from a layer that
+    // was never created: nothing appears, not the text and not the plate, with no
+    // error anywhere. The setters that were believed to be working were not.
+    // setLineWidth: had already been caught doing this and being mistaken for
+    // working, because a line width of zero falls back to the CALayer default of
+    // one, which is close enough to the 1.5 that was asked for that nothing ever
+    // looked wrong. It was never actually being set.
+    //
+    // So the fix is one deleted call in each of the three NSInvocation paths in
+    // this file. The setters stay on the target's main thread, which is where they
+    // have to be: every CALayer setter opens a transaction and CoreAnimation
+    // aborts on that off the main thread. Nothing here moves a setter onto the
+    // call thread.
 
     if (r_arg_probe_enabled) {
         r_arg_probe_n = maxUserArgs;
@@ -845,7 +912,10 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
         return;
     }
 
-    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+    // Same omission as r_msg_main_raw, and for the same reason: retainArguments
+    // after setArgument:atIndex: rebuilds the frame the invocation is read from.
+    // See the long note at that call site. The argument buffers are freed below,
+    // after the present has returned, so the bytes are alive either way.
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
@@ -976,7 +1046,9 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
         return false;
     }
 
-    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+    // Dropped, like the other two NSInvocation paths in this file. Calling
+    // retainArguments after the arguments are in the frame rebuilds that frame,
+    // and invoke then reads a frame the setters never wrote. See r_msg_main_raw.
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
