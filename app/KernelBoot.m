@@ -106,11 +106,24 @@ static void boot_start_sb_overlay(void) {
 
     // The build id again, on the failure line, because that is the line a screenshot
     // usually catches and the boot line scrolls away first.
-    L(@"build %@", KB_BUILD_ID);
+    // %s, not %@. KB_BUILD_ID is a C string literal, and %@ tells CFString to treat the
+    // argument as an object: it builds an NSDescription proxy around the raw pointer
+    // and calls respondsToSelector: on it, which is a pointer authentication trap and
+    // takes the process down.
+    //
+    //   EXC_BREAKPOINT / SIGTRAP, "(Breakpoint) pointer authentication trap DA"
+    //   __CFStringAppendFormatCore -> _NSDescriptionWithStringProxyFunc
+    //                              -> objc_opt_respondsToSelector
+    //
+    // The note in this file about never using %s is about NSString arguments, and does
+    // not apply here: this argument is a const char * and %s is the correct conversion
+    // for it. The two rules are about different types, and reading the first one as if
+    // it covered the second is what produced this.
+    L(@"build %s", KB_BUILD_ID);
 }
 
 void kernelBootStart(void) {
-    L(@"[%@] MINHDUC build", KB_BUILD_ID);
+    L(@"[%s] MINHDUC build", KB_BUILD_ID);
     if (g_booting) return;
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
