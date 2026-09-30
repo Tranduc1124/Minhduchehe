@@ -1064,16 +1064,16 @@ static uint64_t sb_make_pooled_label(uint64_t container, int role, int slot) {
         }
     }
 
-    // Rounded card. CALayer has no cornerRadius of its own worth touching here;
-    // a UIView's own layer does, and masksToBounds is what clips the fill to it.
-    uint64_t layer = r_msg2_main(label, "layer", 0, 0, 0, 0);
-    if (r_is_objc_ptr(layer)) {
-        // The corner radius is not set. setCornerRadius: takes a CGFloat, and
-        // every route to a scalar argument here is r_msg_main_raw, which is
-        // thirteen blocking remote calls. A square card is what a card needs to
-        // be; rounded corners were never asked for and are not worth a
-        // thousandfold of the per frame budget at nine labels.
-    }
+    // The rounded card is gone. It was never drawn: CALayer has no cornerRadius
+    // worth reaching for here, and a UIView's own layer does, but -[UIView layer]
+    // is the getter that does not come back intact on this transport, and
+    // masksToBounds is what would clip the fill to the radius it set. What the
+    // block actually did was call that getter nine times a session and use the
+    // result for nothing: the if body is empty and the comment above it is the
+    // only place the corner radius was ever mentioned. A dead call that kills the
+    // session is worse than a square card, so it is deleted rather than moved to
+    // r_ivar_value, which would spend thirteen blocking calls per label to keep
+    // drawing the same square it was already drawing.
 
     // No size here on purpose. setFrame: takes a CGRect, so it can only go
     // through r_msg_main_raw, which is around thirteen blocking remote calls per
@@ -2298,7 +2298,35 @@ int SBoardStartOverlay(void) {
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
     sb_disable_layer_actions(shape);
 
-    uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
+    // The container's backing CALayer, read out of the object rather than asked
+    // for. This is the call that stopped the overlay from ever drawing, and the
+    // device log says exactly where:
+    //
+    //   22:38:32  [PUSH][SB-LAST] sel=layer wait=1
+    //             FAULT pc=0x18c73f020        <- objc_msgSend+0x20
+    //
+    // pc+0x20 is an objc_msgSend that loaded a bogus isa and branched on it. The
+    // target it branched to was 0x1, so what was wrong is the pointer the getter
+    // handed back, and the values recorded for that call across runs are all out
+    // of the shared cache rather than out of SpringBoard's heap:
+    //
+    //   18:20:18  wait2 exc PC=0x195edf020 LR=0x401 x0=0x303266d40
+    //   22:03:17  wait2 exc PC=0x401 x0=0x194a07520
+    //   0x1f82546c8   the value this getter produced, read back from the target
+    //
+    // A -[UIView layer] getter is a synthesised ivar read. The answer is sitting
+    // in the object, at a known offset, and reading it there cannot return a
+    // stale pointer because nothing is asked of the target for one. So it is read
+    // there now, and the getter is not called at all: calling it and preferring
+    // the ivar when both succeed would put the fault straight back, because the
+    // getter is the thing that faults.
+    //
+    // If this returns 0 the shape is simply not attached and the session lives.
+    // That is the failure this wants. The previous shape of this line killed
+    // SpringBoard.
+    uint64_t cLayer = r_ivar_value(container, "layer");
+    NSLog(@"[SB-LAYER] container=0x%llx cLayer=0x%llx ok=%d",
+          container, cLayer, (int)r_is_objc_ptr(cLayer));
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);

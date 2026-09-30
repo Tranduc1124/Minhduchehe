@@ -1380,19 +1380,64 @@ bool r_responds_main(uint64_t obj, const char *selName)
     return (r & 0xff) != 0;
 }
 
+// Reads an instance variable straight out of the object's own memory and asks
+// nothing of the target for the value, which is the whole point of it.
+//
+// The reason this exists is that the return value of an objc message sent into
+// the target is not always readable on this side. A class method comes back
+// intact, +[CAShapeLayer layer] returned 0x30087bb40 on 2026-09-30 and the shape
+// that value built went on to draw. An instance getter on the same transport, on
+// the same session, moments later, did not: the container's -[UIView layer]
+// handed back a pointer out of the shared cache, and the -[CALayer
+// addSublayer:] sent to that pointer died at objc_msgSend+0x20 reading a bogus
+// isa and branching to 0x1.
+//
+// A property whose getter is a synthesised ivar read has its answer in the
+// object. Reading it costs three calls into libobjc, all of which return
+// integers or pointers libobjc owns, and then a plain read of our own. None of
+// that can hand back a stale pointer, because none of it asks for one.
+//
+// The property name is not always the ivar name. A synthesised @property
+// produces _foo for the ivar, and class_getInstanceVariable matches exactly, so
+// "layer" finds nothing on UIView and "_layer" finds it. Try the name as given
+// first and the underscored one second, so callers can pass either and callers
+// that already pass the real ivar name keep working unchanged.
 uint64_t r_ivar_value(uint64_t obj, const char *ivarName)
 {
     if (!r_is_objc_ptr(obj)) return 0;
     uint64_t cls = r_call_stable(R_TIMEOUT, "object_getClass", obj, 0, 0, 0, 0, 0, 0, 0);
     if (!cls) return 0;
-    uint64_t nameBuf = r_alloc_str(ivarName);
-    if (!nameBuf) return 0;
-    uint64_t ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
-                                  cls, nameBuf, 0, 0, 0, 0, 0, 0);
-    r_free(nameBuf);
+
+    size_t len = strlen(ivarName);
+    char *underscored = (char *)malloc(len + 2);
+    uint64_t ivar = 0;
+    if (underscored) {
+        underscored[0] = '_';
+        memcpy(underscored + 1, ivarName, len + 1);
+        uint64_t nameBuf = r_alloc_str(underscored);
+        free(underscored);
+        if (nameBuf) {
+            ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
+                                 cls, nameBuf, 0, 0, 0, 0, 0, 0);
+            r_free(nameBuf);
+        }
+    }
+    if (!ivar) {
+        uint64_t nameBuf = r_alloc_str(ivarName);
+        if (!nameBuf) return 0;
+        ivar = r_call_stable(R_TIMEOUT, "class_getInstanceVariable",
+                             cls, nameBuf, 0, 0, 0, 0, 0, 0);
+        r_free(nameBuf);
+    }
     if (!ivar) return 0;
+
+    // ivar_getOffset answers a ptrdiff_t, which comes back as a small integer.
+    // A huge one means libobjc handed back something that is not an Ivar, and
+    // adding it to obj would read a random address in the target.
     uint64_t offset = r_call_stable(R_TIMEOUT, "ivar_getOffset",
                                     ivar, 0, 0, 0, 0, 0, 0, 0);
+    if (offset > 0x10000) return 0;
+
     return remote_read64(obj + offset);
 }
 
