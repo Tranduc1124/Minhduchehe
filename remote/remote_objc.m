@@ -84,6 +84,46 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
     pthread_mutex_unlock(&gObjCCacheLock);
 }
 
+// The name behind a selector pointer, for the ones this file made.
+//
+// r_sel caches name -> value and nothing cached the other direction, so every
+// main thread perform in this file logged as "objc_msgSend" and a wedged main
+// thread could not be attributed to a selector. The watchdog report names the
+// queue and the thread:
+//
+//     unresponsive dispatch queue(s): com.apple.main-thread
+//     60 seconds since last successful checkin
+//     thread 1561: turnstile blocked on task pid 494, hops: 2
+//
+// 1561 is the main thread and the report does not say what it was running, so
+// it cannot say which call has to move off the main thread. The cache already
+// holds a name for every selector the overlay resolves, so walking it backwards
+// is enough. An unknown selector prints as 0x<value>: asking the target to name
+// it is a remote call, and a remote call is the thing that is already in
+// trouble at the moment this is needed.
+#define R_SELNAME_MAX 128
+static const char *r_sel_name(uint64_t sel)
+{
+    static __thread char s_name[R_SELNAME_MAX];
+    if (!sel) return "(null)";
+    s_name[0] = '\0';
+    int pid = remote_call_current_pid();
+    pthread_mutex_lock(&gObjCCacheLock);
+    for (int i = 0; i < R_OBJC_CACHE_CAP; i++) {
+        if (gSelCache[i].value == sel && gSelCache[i].name[0] &&
+            (pid <= 0 || gSelCache[i].pid == pid)) {
+            strncpy(s_name, gSelCache[i].name, sizeof(s_name) - 1);
+            s_name[sizeof(s_name) - 1] = '\0';
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gObjCCacheLock);
+    if (!s_name[0]) {
+        snprintf(s_name, sizeof(s_name), "0x%llx", (unsigned long long)sel);
+    }
+    return s_name;
+}
+
 // Defined below, next to the other timers in this file.
 static uint64_t r_now_us(void);
 
@@ -438,7 +478,37 @@ static uint64_t r_now_us(void)
 // PUSH tagged. MO_DAU.txt: a printf without the tag is dropped by the PUSH log
 // filter, and then the number is never seen again.
 #define R_MAIN_WAIT_SLOW_US 50000ull
-static void r_main_wait_note(const char *what, uint64_t waitedUS)
+
+// The last thing handed to SpringBoard's main thread.
+//
+// The watchdog report names the queue, the thread and the turnstile, and not
+// the selector, so on its own it cannot say which call is the one that wedges
+// the main thread. Two rules keep this from becoming a per frame flood on a 15
+// fps overlay: a selector is printed the first time it is seen, and after that
+// only once every 250 ms. The overlay resolves a bounded set of selectors, so
+// the first rule alone covers every call the session makes, and the second
+// covers the run up to a hang.
+static void r_main_perf_mark(const char *site, uint64_t sel, int wait)
+{
+    static uint64_t s_seen[24];
+    static int s_seenN;
+    static uint64_t s_lastPrintUS;
+
+    uint64_t now = r_now_us();
+    bool fresh = true;
+    for (int i = 0; i < s_seenN; i++) {
+        if (s_seen[i] == sel) { fresh = false; break; }
+    }
+    bool due = (!s_lastPrintUS) || (now - s_lastPrintUS) >= 250000ull;
+    if (!fresh && !due) return;
+    s_lastPrintUS = now;
+    if (fresh && s_seenN < (int)(sizeof(s_seen) / sizeof(s_seen[0]))) {
+        s_seen[s_seenN++] = sel;
+    }
+    printf("[PUSH][SB-LAST] %s sel=%s wait=%d\n", site, r_sel_name(sel), wait);
+}
+
+static void r_main_wait_note(const char *what, uint64_t sel, uint64_t waitedUS)
 {
     static uint64_t s_count;
     static uint64_t s_maxUS;
@@ -447,19 +517,19 @@ static void r_main_wait_note(const char *what, uint64_t waitedUS)
     s_totalUS += waitedUS;
     if (waitedUS > s_maxUS) {
         s_maxUS = waitedUS;
-        printf("[PUSH][SB-WAIT] new worst %s %lluus n=%llu total=%lluus\n",
-               what, (unsigned long long)waitedUS, (unsigned long long)s_count,
-               (unsigned long long)s_totalUS);
+        printf("[PUSH][SB-WAIT] new worst %s %s %lluus n=%llu total=%lluus\n",
+               what, r_sel_name(sel), (unsigned long long)waitedUS,
+               (unsigned long long)s_count, (unsigned long long)s_totalUS);
     }
     if (waitedUS >= R_MAIN_WAIT_SLOW_US) {
-        printf("[PUSH][SB-WAIT] slow %s %lluus n=%llu worst=%lluus\n",
-               what, (unsigned long long)waitedUS, (unsigned long long)s_count,
-               (unsigned long long)s_maxUS);
+        printf("[PUSH][SB-WAIT] slow %s %s %lluus n=%llu worst=%lluus\n",
+               what, r_sel_name(sel), (unsigned long long)waitedUS,
+               (unsigned long long)s_count, (unsigned long long)s_maxUS);
     }
     if ((s_count % 200) == 0) {
-        printf("[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus\n",
+        printf("[PUSH][SB-WAIT] n=%llu worst=%lluus total=%lluus last=%s %s\n",
                (unsigned long long)s_count, (unsigned long long)s_maxUS,
-               (unsigned long long)s_totalUS);
+               (unsigned long long)s_totalUS, what, r_sel_name(sel));
     }
 }
 
@@ -702,10 +772,11 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     // waitUntilDone:YES, timed. This parks the EXTRA thread until SpringBoard's
     // main thread runs the block, so this call's duration is the main thread's
     // latency as seen by the overlay. r_main_wait_note says what to do with it.
+    r_main_perf_mark("r_msg_main_raw", sel, 1);
     {
         uint64_t t0 = r_now_us();
         r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg_main_raw", r_now_us() - t0);
+        r_main_wait_note("r_msg_main_raw", sel, r_now_us() - t0);
     }
 
     // Only now is it safe to free. setArgument:atIndex: stores the pointer and
@@ -925,9 +996,10 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
         // queued invocation finished, so it must be told to wait. The previous 0
         // meant the buffers below were freed while the main thread had not yet
         // read them.
+        r_main_perf_mark("r_msg2_main_async", sel, 1);
         uint64_t t0 = r_now_us();
         r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg2_main_async", r_now_us() - t0);
+        r_main_wait_note("r_msg2_main_async", sel, r_now_us() - t0);
     }
     // Safe now that invoke has returned. See the comment at the free in
     // r_msg_main_raw.
@@ -1060,10 +1132,11 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
         return false;
     }
     // waitUntilDone:YES, timed. See r_main_wait_note.
+    r_main_perf_mark("r_msg2_main_struct_ret", sel, 1);
     {
         uint64_t t0 = r_now_us();
         r_msg(inv, performSel, invokeSel, 0, 1, 0);
-        r_main_wait_note("r_msg2_main_struct_ret", r_now_us() - t0);
+        r_main_wait_note("r_msg2_main_struct_ret", sel, r_now_us() - t0);
     }
 
     // The argument buffers are released after the return has been read, for the
@@ -1135,12 +1208,14 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     if (!performSel) return 0;
     if (!wait) {
+        r_main_perf_mark("r_perform_main", sel, 0);
         return r_msg(obj, performSel, sel, object, 0, 0);
     }
     // waitUntilDone:YES, timed. See r_main_wait_note.
+    r_main_perf_mark("r_perform_main", sel, 1);
     uint64_t t0 = r_now_us();
     uint64_t r = r_msg(obj, performSel, sel, object, 1, 0);
-    r_main_wait_note("r_perform_main", r_now_us() - t0);
+    r_main_wait_note("r_perform_main", sel, r_now_us() - t0);
     return r;
 }
 
