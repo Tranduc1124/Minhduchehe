@@ -137,13 +137,15 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
 
     address = native_strip(address);
     
-    if (remoteThreadAddr != s_keyOwner || !s_keyA || !s_keyB) {
-        s_keyA = thread_get_rop_pid(remoteThreadAddr);
-        s_keyB = thread_get_jop_pid(remoteThreadAddr);
-        s_keyOwner = remoteThreadAddr;
-    }
-    const uint64_t keyA = s_keyA;
-    const uint64_t keyB = s_keyB;
+    // Working 734a5e248 re-read keys every call. The cache was added later and
+    // is a suspect for LR RET PAC fails after creator already signed with the
+    // same thread address (5d0b6a log: getpid body ran, RET auth of 0x201 failed).
+    // Keep s_keyOwner updated so pac_release_key_cache still clears on teardown.
+    const uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
+    const uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
+    s_keyA = keyA;
+    s_keyB = keyB;
+    s_keyOwner = remoteThreadAddr;
     
     mach_port_t pacThread = MACH_PORT_NULL;
     kern_return_t kr = thread_create(mach_task_self_, &pacThread);

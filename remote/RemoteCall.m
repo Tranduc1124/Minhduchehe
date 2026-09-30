@@ -1574,14 +1574,13 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
         uint64_t discPC = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("pc"));
         uint64_t discLR = ptrauth_blend_discriminator_wrapper(diver, ptrauth_string_discriminator_special("lr"));
 
-        // Fl0rk signs FAKE_PC 0x301 with modifier 0. Device log on 9a34e3e:
-        // getpid ran to RET (PC=getpid+0x18) but LR auth failed — wait2
-        // PC=LR=getpid+0x18, x0=0. Disc-signed fakes can FAULT as PC, but
-        // RET-auth of disc-signed 0x201 as LR does not. Modifier 0 for the
-        // tiny trap addresses; blended disc for real shared-cache code.
+        // Fl0rk IPA dig (0x1006bc094): creator calls sign_state(state, 0x101, 0x201)
+        // via the blended-discriminator path. Only pthread start uses
+        // remote_pac(0x301, modifier=0) at 0x1006ba340. 5d0b6a000 wrongly used
+        // modifier 0 for LR 0x201 — getpid ran to RET then PAC-failed
+        // (wait2 PC=LR=getpid+0x18). Match working 734a5e248: always discPC/discLR.
         if (pc) {
-            uint64_t mod = (pc < 0x1000ULL) ? 0 : discPC;
-            uint64_t signedPC = remote_pac(signingThread, pc, mod);
+            uint64_t signedPC = remote_pac(signingThread, pc, discPC);
             if (!signedPC) return false;
             uint32_t flags = state->__flags;
             flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
@@ -1589,8 +1588,7 @@ bool sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
             state->__pc = signedPC;
         }
         if (lr) {
-            uint64_t mod = (lr < 0x1000ULL) ? 0 : discLR;
-            uint64_t signedLR = remote_pac(signingThread, lr, mod);
+            uint64_t signedLR = remote_pac(signingThread, lr, discLR);
             if (!signedLR) return false;
             uint32_t flags = state->__flags;
             flags &= ~(__DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR |
@@ -1744,11 +1742,12 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x",
+    RC_DIAG("temp/%s signed PC=0x%llx LR=0x%llx flags=0x%x diver=0x%llx",
             name ?: "?",
             (unsigned long long)exc.threadState.__pc,
             (unsigned long long)exc.threadState.__lr,
-            (unsigned)exc.threadState.__flags);
+            (unsigned)exc.threadState.__flags,
+            (unsigned long long)(exc.threadState.__flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK));
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
