@@ -3226,18 +3226,22 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             createdSuspended = false;
             RC_DIAG("could not park the fresh call thread (get_state/set_state) — "
                     "abandoning the create, thread[1] reuse next");
-        } else {
             g_RC_callThreadPath = "create";
-        RC_DIAG("parked fresh call thread at PC=0x%llx LR=0x%llx on its own state",
-                (unsigned long long)native_strip(own.__pc),
-                (unsigned long long)native_strip(own.__lr));
-        uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
-        if (ret != 0) {
-            RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
-                    (unsigned long long)ret);
-            fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
-            return -1;
-        }
+            RC_DIAG("parked fresh call thread at PC=0x%llx LR=0x%llx on its own state",
+                    (unsigned long long)native_strip(own.__pc),
+                    (unsigned long long)native_strip(own.__lr));
+            uint64_t ret = do_remote_call_temp(100, "thread_resume",
+                                               callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+            if (ret != 0) {
+                // Fatal, and deliberately so. Everything the create could fail at is
+                // survivable because the reuse path is still ahead, but a thread that
+                // has been given an exception port and cannot be released is neither
+                // usable nor safe to abandon, and there is no third path to try.
+                RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
+                        (unsigned long long)ret);
+                fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
+                return -1;
+            }
         }
     } else {
         // Either no SB port at all, or the port came from reusing thread[1] (iOS
