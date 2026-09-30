@@ -414,6 +414,7 @@ const char *remote_call_last_init_failure_detail(void)
             case 11: step = "create faulted instead of returning"; break;
             case 12: step = "start routine signature (remote_pac 0x301) failed"; break;
             case 13: step = "callee symbol did not resolve, call refused"; break;
+            case 14: step = "could not park the fresh call thread"; break;
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
@@ -1623,7 +1624,48 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     g_RC_lastTempExcCode = exc2.codeFirst;
     g_RC_lastTempX0 = exc2.threadState.__x[0];
     uint64_t retValue = exc2.threadState.__x[0];
-    reply_with_state(&exc2, &exc2.threadState);
+    // A return is the thread executing the instruction it returned to. Anything else
+    // on the second wait is a fault raised inside the function.
+    //
+    // The two need different replies, and this was the same reply for both, which is
+    // how one fault used to poison a thread for the rest of the session.
+    //
+    // Replying with the exception's own state resumes the thread at the instruction
+    // that just faulted. It faults again, for the same reason, with the same
+    // registers, and that arrives on the port the next call reads. Every call after
+    // it therefore reports the identical fault with the identical return value, and
+    // the one that actually happened is indistinguishable from the ones it caused.
+    //
+    // It is visible in a measured console: pthread_create_suspended_np faulting once
+    // at a shared cache address, and every later number on that thread being the same
+    // fault at the same address with the same x0, which is not what a thread that has
+    // run since would look like. x0 was 0x10 on every attempt, which is a loop
+    // constant, and no argument to that call was ever 0x10.
+    //
+    // So a fault parks the thread at the fake program counter instead. It is a known
+    // trap address that the next call's first wait is designed to consume, and the
+    // fault is reported once, by the one check that exists, instead of being
+    // re-raised forever.
+    if (native_strip(exc2.threadState.__pc) == FAKE_LR_TROJAN_CREATOR) {
+        reply_with_state(&exc2, &exc2.threadState);
+    } else {
+        arm_thread_state64_internal park = exc2.threadState;
+        if (sign_state(g_RC_trojanThreadAddr, &park,
+                       FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR)) {
+            RC_DIAG("temp/%s faulted at 0x%llx (not the fake LR) — parked at 0x%llx",
+                    name ?: "?", (unsigned long long)native_strip(exc2.threadState.__pc),
+                    (unsigned long long)FAKE_PC_TROJAN_CREATOR);
+            reply_with_state(&exc2, &park);
+        } else {
+            // No signature, so no state worth replying with. Handing back the
+            // faulting state would resume the loop, so the thread is left stopped on
+            // the exception instead, which strands it but breaks the loop, and the
+            // next call will fail loudly rather than repeating a stale fault.
+            RC_DIAG("temp/%s faulted at 0x%llx and the park could not be signed — "
+                    "leaving it stopped", name ?: "?",
+                    (unsigned long long)native_strip(exc2.threadState.__pc));
+        }
+    }
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
 
@@ -2901,26 +2943,30 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool createdSuspended = false;
 
     if (!ios26StubPthread) {
-        // Park the synthetic thread by making FAKE_PC the *start routine*, the
-        // way Cyanide and Fl0rk do it. The thread is created suspended, so the
-        // kernel itself records PC=0x301 as creation-time state; the first thing
-        // the thread does after thread_resume is fault at 0x301, which lands in
-        // secondExceptionPort. Nothing written afterwards can perturb that.
+        // The start routine is a real function, not a fake address.
         //
-        // The fork instead used startRoutine = signed local getpid and then
-        // overwrote the state with thread_set_state(). That park never took:
-        // SB IPS 2026-09-26 06:21:04 shows thread_set_state returning kr=0 while
-        // the resumed thread still ran getpid with sp=0 — neither the 0x301 PC
-        // nor the borrowed SP landed, and the call thread then answered with an
-        // all-zero state that we used to reply onto (SIGKILL, CODESIGNING
-        // "Invalid Page"). Parking in creation-time state removes every
-        // unproven step: the remote_write into SB heap, the malloc/free of the
-        // state buffer, and the ARM_THREAD_STATE64 count semantics.
-        uint64_t startRoutine = remoteCrashSigned;
-        const char *startKind = "pac_0x301";
+        // It was a signature over 0x301, on the theory that the kernel records the
+        // start program counter as creation-time state and that the thread faults
+        // there the moment it is released, which is the whole of the park. The
+        // thread is never released until its state has been written from the outside
+        // anyway, see the park below, so nothing runs the start routine, so making it
+        // a fake address buys nothing and costs the one input the create cannot
+        // cope with being wrong.
+        //
+        // The cost is measured. A create that faulted reported it as a return, and
+        // x0 at the fault was 0x10, which is not a pointer and not an argument this
+        // call was given: the thread was already looping on a fault by then, which
+        // is what the transport did with a faulted state, now fixed separately.
+        //
+        // A real, stripped, shared cache function is what this file records as
+        // working on a pre-26 target: "On pre-26, suspended_np + stripped
+        // shared-cache getpid works (756f683)". That is the one line of this call
+        // that has a measurement behind it, so it is the one that goes back to it.
+        uint64_t startRoutine = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
+        const char *startKind = "stripped_getpid";
         if (!startRoutine || startRoutine == (uint64_t)-1) {
             g_RC_callThreadStep = 12;
-            RC_DIAG("remote_pac(FAKE_PC_TROJAN) failed — cannot create call thread");
+            RC_DIAG("no start routine address — cannot create call thread");
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
         }
@@ -3119,14 +3165,45 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         mig_bypass_pause();
 
     if (callThreadPort && createdSuspended) {
-        // Fresh suspended pthread whose creation-time PC is signed 0x301.
-        // There is deliberately no thread_set_state park here: releasing the
-        // thread IS the park. The removed block set state via remote_write into
-        // SB heap + a remote thread_set_state, and that never took --
-        // thread_set_state returned kr=0 while the resumed thread still ran the
-        // start routine with sp=0 (SB IPS 2026-09-26 06:21:04).
-        RC_DIAG("resuming synthetic call thread (creation-time PC=0x%llx)",
-                (unsigned long long)remoteCrashSigned);
+        // The park, written from the outside, reading the thread's own state first.
+        //
+        // It used to be "releasing the thread IS the park", with the fake address
+        // left in the creation-time program counter. That is a fake code address
+        // being asked to work as a program counter, which is the same mistake this
+        // file has made in four places, and it is the one that faulted.
+        //
+        // The earlier attempt at an explicit park was rejected for a reason that was
+        // real but was misread as a reason to have no park at all. It built the state
+        // from g_RC_originalState, which is the HACKED thread's stack pointer, and set
+        // it on the new one, so the resumed thread ran the start routine with the
+        // wrong stack. SB IPS 2026-09-26 06:21:04 recorded exactly that: a thread_set
+        // _state returning kr=0 while the resumed thread ran getpid with sp=0. The
+        // set_state was not the problem. The stack pointer was.
+        //
+        // So the state is read from the thread that is going to be parked, and only
+        // the two program counters are changed. A freshly created thread already has
+        // a real stack pointer, a real frame pointer and real flags, and keeping all
+        // three is the whole of the difference between parking it and breaking it.
+        //
+        // The port is already installed by the set_exception_port_on_thread above, so
+        // the fault that follows the resume has somewhere to go.
+        bool parked = false;
+        arm_thread_state64_internal own = {0};
+        if (thread_get_state_wrapper(callThreadPort, &own)) {
+            if (sign_state(g_RC_callThreadAddr, &own, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
+                parked = thread_set_state_wrapper(callThreadPort, g_RC_callThreadAddr, &own);
+            }
+        }
+        if (!parked) {
+            g_RC_callThreadStep = 14;
+            RC_DIAG("could not park the fresh call thread (get_state/set_state) — "
+                    "resuming it would run its start routine, so not resuming");
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+        RC_DIAG("parked fresh call thread at PC=0x%llx LR=0x%llx on its own state",
+                (unsigned long long)native_strip(own.__pc),
+                (unsigned long long)native_strip(own.__lr));
         uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         if (ret != 0) {
             RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
