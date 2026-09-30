@@ -339,6 +339,7 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
         case RemoteCallInitFailurePthreadCreate: return "pthread_create_suspended_np / mach_thread failed";
         case RemoteCallInitFailureCallThread: return "synthetic call thread kobject invalid";
         case RemoteCallInitFailureThreadResume: return "thread_resume synthetic failed";
+        case RemoteCallInitFailureFirstStableCall: return "first call on the call thread failed";
         case RemoteCallInitFailureRestoreOriginal: return "restore original after pthread failed";
         case RemoteCallInitFailureOther: return "other RemoteCall init failure";
     }
@@ -454,6 +455,9 @@ const char *remote_call_last_init_failure_detail(void)
             case 14: step = "could not park the fresh call thread"; break;
             case 15: step = "could not sign the reused thread's park"; break;
             case 16: step = "TRO-swap park of the reused thread failed"; break;
+            case 19: step = "stable sign_state failed, no reply sent"; break;
+            case 20: step = "stable wait1 gave up (no park trap)"; break;
+            case 21: step = "stable wait2 gave up (never came back)"; break;
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
@@ -1848,6 +1852,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_rcWait1TO++;
         RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
+        g_RC_lastTempStep = 20;
         g_RC_success = false;
         return 0;
     }
@@ -1896,6 +1901,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         // session is finished so it re-initialises instead of pushing another
         // call through a wedged thread.
         RC_DIAG("sign_state failed, abandoning without a reply (name=%s)", name ? name : "?");
+        g_RC_lastTempStep = 19;
         g_RC_success = false;
         pthread_mutex_unlock(&g_universal_ipc_mutex);
         return 0;
@@ -1934,6 +1940,12 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         // failed re-send loses the message and strands the thread. borrowed
         // says how many threads init gave back, so a nonzero count here means
         // the release did not take.
+        g_RC_lastTempStep = 21;
+        g_RC_lastTempRetPC_raw = 0;
+        g_RC_lastTempRetPC = 0;
+        g_RC_lastTempExcType = 0;
+        g_RC_lastTempExcCode = 0;
+        g_RC_lastTempX0 = 0;
         g_rcW2Stray = g_rcBorrowedReleased ? 1 : 2;
         NSLog(@"[RC-W2TO] %s: no return, call pc=0x%llx w1snd=0x%x w1pc=0x%llx "
               @"borrowed=%llu released=%llu kept=%llu",
@@ -1953,6 +1965,16 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
             (unsigned long long)native_strip(exc2.threadState.__pc),
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)retValue);
+    // Recorded here as well, and for the reason the temp path records it. The
+    // report prints a program counter, an exception type and x0, and on this path
+    // all three were carried over from whichever temp call ran last. So a failure
+    // of the very first stable call was being described in terms of a fault that
+    // had already been dealt with, and a reader had no way to know that.
+    g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
+    g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
+    g_RC_lastTempExcType = exc2.exception;
+    g_RC_lastTempExcCode = exc2.codeFirst;
+    g_RC_lastTempX0 = exc2.threadState.__x[0];
     // Re-park: reply keeps thread blocked in exception until next hijack.
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
@@ -3324,6 +3346,24 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             RC_DIAG("TRO-swap park: no own state (port=0x%llx), falling back to the "
                     "hijacked thread's stack", (unsigned long long)callThreadPort);
         }
+        // This signs for the REUSED thread, and the reply path in
+        // do_remote_call_stable_addr_internal deliberately does the opposite, with a
+        // note that it was measured:
+        //
+        //   "Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
+        //    even though the exception arrives on the synthetic call thread.
+        //    Signing with callThreadAddr produced uncatchable RET->0x401 SIGBUS."
+        //
+        // That is a real experiment against this choice and it is not being dismissed.
+        // The two are different mechanisms and that is the only reason both can stand:
+        // a reply delivers a state to a thread that is already stopped, and a
+        // thread_set_state installs one, and the key that authenticates a program
+        // counter when the thread runs it is the thread's own either way. If this
+        // park faults the reused thread at the moment it is released, with
+        // EXC_BAD_ACCESS.execute or EXC_BAD_INSTRUCTION and a program counter at
+        // 0x301, then the note above is about this path too and the sign has to go
+        // back to g_RC_trojanThreadAddr. That is a one-line change and it is recorded
+        // here rather than left for the next reader to discover from a crash.
         if (!sign_state(g_RC_callThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
             // thread_set_state is what actually parks the target thread on this path,
             // so a failed sign here means the park never happens and the thread is
@@ -3392,7 +3432,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!g_RC_success) {
         RC_DIAG("first stable getpid failed (success=%d pid=%d) — tearing down session",
                 (int)g_RC_success, (int)g_RC_pid);
-        fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+        fail_after_creator_park(RemoteCallInitFailureFirstStableCall, targetPid);
         return -1;
     }
 

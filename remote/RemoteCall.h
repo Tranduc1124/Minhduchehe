@@ -49,6 +49,11 @@ typedef enum {
     RemoteCallInitFailurePthreadCreate,
     RemoteCallInitFailureCallThread,
     RemoteCallInitFailureThreadResume,
+    // The first call on the call thread after the hijacked thread has been restored.
+    // It was reported as RemoteCallInitFailureCallThread, which is a different stage
+    // entirely and is how a session that had parked both threads correctly still read
+    // "synthetic call thread kobject invalid".
+    RemoteCallInitFailureFirstStableCall,
     RemoteCallInitFailureRestoreOriginal,
     RemoteCallInitFailureOther,
 } RemoteCallInitFailure;
