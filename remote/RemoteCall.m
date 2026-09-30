@@ -163,6 +163,21 @@ __thread int g_RC_callThreadStep = 0;
 // outside is not much of a measurement. Read by remote_call_last_init_failure_detail.
 __thread uint64_t g_RC_lastTempRetPC = 0;
 __thread uint64_t g_RC_lastTempRetPC_raw = 0;
+// The type and code of whatever arrived on the port second, and x0 as it stood at
+// the fault. A PC on its own says the thread was somewhere; these say what happened
+// to it there, which is the difference between four bugs behind one line:
+//
+//   EXC_BAD_ACCESS read     the call was handed an address it cannot read
+//   EXC_BAD_ACCESS write    the call was handed an address it cannot write
+//   EXC_BAD_ACCESS execute  the thread jumped where it may not execute, which is
+//                           what a signature that does not authenticate looks like
+//   EXC_BAD_INSTRUCTION     an illegal instruction, which with authenticated
+//                           pointers is a PAC failure and essentially nothing else
+//   EXC_GUARD               not a fault at all: a thread guard tripping, so the
+//                           port caught something that is not the call
+__thread uint32_t g_RC_lastTempExcType = 0;
+__thread uint64_t g_RC_lastTempExcCode = 0;
+__thread uint64_t g_RC_lastTempX0 = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -304,9 +319,40 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
 // Built on demand into a thread-local buffer, from thread-local state, so there is
 // nothing to keep in step at the point of failure. Callers print it; nothing logs
 // it, because a caller that cannot print it has nowhere to put it.
+// A fault in words, from the type and code the exception message already carries.
+//
+// The ARM_THREAD_STATE64 flavor has no fault address in it, so the address is not
+// available and is not invented here. The type and the code are, and between them
+// they name the fault: a bad access says whether the thread was reading, writing or
+// executing, an illegal instruction means a signature did not authenticate, and a
+// thread guard means the port caught something that is not a fault at all.
+static const char *rc_exc_kind(char *buf, size_t n)
+{
+    if (g_RC_lastTempExcType == 0x241 || g_RC_lastTempExcType == 0x242) {
+        snprintf(buf, n, "EXC_GUARD");
+    } else if (g_RC_lastTempExcType == 2) {           // EXC_BAD_ACCESS
+        const unsigned kind = (unsigned)(g_RC_lastTempExcCode & 0xff);
+        const char *what = (kind == 1) ? "read" : (kind == 2) ? "write"
+                        : (kind == 3) ? "execute" : "unknown";
+        snprintf(buf, n, "EXC_BAD_ACCESS.%s code=0x%llx", what,
+                 (unsigned long long)g_RC_lastTempExcCode);
+    } else if (g_RC_lastTempExcType == 6) {           // EXC_BAD_INSTRUCTION
+        snprintf(buf, n, "EXC_BAD_INSTRUCTION(pac) code=0x%llx",
+                 (unsigned long long)g_RC_lastTempExcCode);
+    } else if (g_RC_lastTempExcType == 1) {           // EXC_SOFTWARE
+        snprintf(buf, n, "EXC_SOFTWARE code=0x%llx",
+                 (unsigned long long)g_RC_lastTempExcCode);
+    } else {
+        snprintf(buf, n, "exc=%u code=0x%llx", g_RC_lastTempExcType,
+                 (unsigned long long)g_RC_lastTempExcCode);
+    }
+    return buf;
+}
+
 const char *remote_call_last_init_failure_detail(void)
 {
-    static __thread char detail[160];
+    static __thread char detail[224];
+    static __thread char kind[64];
     if (g_RC_lastInitFailure == RemoteCallInitFailureBootstrapGetpid) {
         const char *step;
         switch (g_RC_lastTempStep) {
@@ -353,10 +399,11 @@ const char *remote_call_last_init_failure_detail(void)
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
-                 "callThread=%s retPC=0x%llx raw=0x%llx want=0x%llx",
+                 "callThread=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
                  step, (unsigned long long)g_RC_lastTempRetPC,
-                 (unsigned long long)g_RC_lastTempRetPC_raw,
-                 (unsigned long long)FAKE_LR_TROJAN_CREATOR);
+                 (unsigned long long)FAKE_LR_TROJAN_CREATOR,
+                 rc_exc_kind(kind, sizeof(kind)),
+                 (unsigned long long)g_RC_lastTempX0);
         return detail;
     }
 
@@ -370,10 +417,11 @@ const char *remote_call_last_init_failure_detail(void)
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
-                 "callThread=%s retPC=0x%llx raw=0x%llx want=0x%llx",
+                 "callThread=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
                  step, (unsigned long long)g_RC_lastTempRetPC,
-                 (unsigned long long)g_RC_lastTempRetPC_raw,
-                 (unsigned long long)FAKE_LR_TROJAN_CREATOR);
+                 (unsigned long long)FAKE_LR_TROJAN_CREATOR,
+                 rc_exc_kind(kind, sizeof(kind)),
+                 (unsigned long long)g_RC_lastTempX0);
         return detail;
     }
 
@@ -1571,6 +1619,9 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)exc2.threadState.__x[0]);
     g_RC_lastTempRetPC_raw = exc2.threadState.__pc;
     g_RC_lastTempRetPC = native_strip(exc2.threadState.__pc);
+    g_RC_lastTempExcType = exc2.exception;
+    g_RC_lastTempExcCode = exc2.codeFirst;
+    g_RC_lastTempX0 = exc2.threadState.__x[0];
     uint64_t retValue = exc2.threadState.__x[0];
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
