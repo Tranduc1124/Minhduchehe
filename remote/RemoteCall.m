@@ -152,7 +152,25 @@ __thread uint64_t g_RC_bootstrapPid = 0;
 // different failures, four of which are documented in this file as expected on some
 // paths, and the console has no way to tell them apart. Read by
 // remote_call_last_init_failure_detail.
-__thread int g_RC_callThreadStep = 0;
+// Set when the fresh-create path cannot be completed, so the thread[1] reuse below
+// gets its turn instead of the session being destroyed.
+//
+// A create is an optimisation. It yields a brand new thread, which is the safest
+// thing to hijack, so it stays first. But it is a call into another process's
+// libsystem_pthreads with a caller-supplied out pointer, it has faulted
+// deterministically, and every one of the ways it can fail used to end the whole
+// session. SpringBoard has threads of its own a few entries down the list from the
+// one being hijacked, this file already has a path that parks one of those at the
+// same fake program counter behind the same exception port, and a working fallback
+// is worth more than a create that dies.
+//
+// A flag rather than a goto, because the create block declares things that are still
+// in scope after it and a jump into their initialisation is the kind of thing that
+// compiles and then does something else.
+static bool g_RC_createDead = false;
+// Which path produced the call thread, for the failure report. "create", "reuse1" or
+// empty, and empty means neither happened.
+static const char *g_RC_callThreadPath = "";
 // The PC of whatever arrived on the port second, i.e. where the thread was when the
 // call's "return" was delivered. A return is always the fake link register. Anything
 // else is a fault raised inside the function, and its x0 is a register the function
@@ -399,8 +417,9 @@ const char *remote_call_last_init_failure_detail(void)
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
-                 "callThread=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
-                 step, (unsigned long long)g_RC_lastTempRetPC,
+                 "callThread=%s path=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
+                 step, g_RC_callThreadPath[0] ? g_RC_callThreadPath : "-",
+                 (unsigned long long)g_RC_lastTempRetPC,
                  (unsigned long long)FAKE_LR_TROJAN_CREATOR,
                  rc_exc_kind(kind, sizeof(kind)),
                  (unsigned long long)g_RC_lastTempX0);
@@ -418,8 +437,9 @@ const char *remote_call_last_init_failure_detail(void)
             default: step = "unclassified"; break;
         }
         snprintf(detail, sizeof(detail),
-                 "callThread=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
-                 step, (unsigned long long)g_RC_lastTempRetPC,
+                 "callThread=%s path=%s retPC=0x%llx want=0x%llx %s x0=0x%llx",
+                 step, g_RC_callThreadPath[0] ? g_RC_callThreadPath : "-",
+                 (unsigned long long)g_RC_lastTempRetPC,
                  (unsigned long long)FAKE_LR_TROJAN_CREATOR,
                  rc_exc_kind(kind, sizeof(kind)),
                  (unsigned long long)g_RC_lastTempX0);
@@ -2941,6 +2961,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     const bool ios26StubPthread = SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"26.0");
     uint64_t callThreadPort = 0;
     bool createdSuspended = false;
+    g_RC_createDead = false;
+    g_RC_callThreadPath = "";
 
     if (!ios26StubPthread) {
         // The start routine is a real function, not a fake address.
@@ -2973,9 +2995,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
         if (!outBuf) {
             g_RC_callThreadStep = 10;
-            RC_DIAG("no target out buffer for pthread_create_suspended_np");
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
+            g_RC_createDead = true;
+            RC_DIAG("no target out buffer for pthread_create_suspended_np — "
+                    "abandoning the create, thread[1] reuse next");
         }
 
         NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
@@ -3010,16 +3032,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         if (g_RC_success &&
             native_strip(g_RC_lastTempRetPC) != FAKE_LR_TROJAN_CREATOR) {
             g_RC_callThreadStep = 11;
-            g_RC_lastTempRetPC_raw = g_RC_lastTempRetPC;
-            RC_DIAG("create did not return: retPC=0x%llx expected=0x%llx (fault, not a return)",
+            RC_DIAG("create did not return: retPC=0x%llx expected=0x%llx (fault, not a "
+                    "return) — abandoning the create, thread[1] reuse next",
                     (unsigned long long)native_strip(g_RC_lastTempRetPC),
                     (unsigned long long)FAKE_LR_TROJAN_CREATOR);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
+            g_RC_createDead = true;
         }
         uint64_t pthreadAddr = 0;
         uint64_t newThreadAddr = 0;
-        if (g_RC_success && createResult == 0) {
+        if (g_RC_createDead) {
+            createdSuspended = false;
+        }
+        if (g_RC_success && !g_RC_createDead && createResult == 0) {
             uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
             if (g_RC_success && heapBounce) {
                 // Zero via SB memset — no KRW write to bounce (avoids shmem poison).
@@ -3111,6 +3135,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!callThreadPort) {
         if (g_RC_threadList.count < 2) {
             g_RC_callThreadStep = 8;
+            g_RC_callThreadPath = g_RC_createDead ? "create-failed-no-reuse" : "no-port";
             RC_DIAG("no inject thread[1] — cannot build extra call thread");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
@@ -3196,11 +3221,13 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         }
         if (!parked) {
             g_RC_callThreadStep = 14;
+            g_RC_createDead = true;
+            callThreadPort = 0;
+            createdSuspended = false;
             RC_DIAG("could not park the fresh call thread (get_state/set_state) — "
-                    "resuming it would run its start routine, so not resuming");
-            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-            return -1;
-        }
+                    "abandoning the create, thread[1] reuse next");
+        } else {
+            g_RC_callThreadPath = "create";
         RC_DIAG("parked fresh call thread at PC=0x%llx LR=0x%llx on its own state",
                 (unsigned long long)native_strip(own.__pc),
                 (unsigned long long)native_strip(own.__lr));
@@ -3210,6 +3237,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     (unsigned long long)ret);
             fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
             return -1;
+        }
         }
     } else {
         // Either no SB port at all, or the port came from reusing thread[1] (iOS
@@ -3242,6 +3270,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 (unsigned long long)park.__pc,
                 (unsigned long long)park.__lr);
         RC_DIAG("TRO-swap park begin (no join; fail restores main)");
+        g_RC_callThreadPath = "reuse1";
         if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, park.__pc, park.__lr,
                                              useMigFilterBypass)) {
             RC_DIAG("TRO-swap park failed — restoring main @0x201");
