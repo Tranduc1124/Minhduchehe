@@ -1178,6 +1178,64 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     if (!g_RC_creatingExtraThread)
         return 0;
 
+    // The session gate.
+    //
+    // The transport is one hijacked thread in one target process, driven through
+    // two exception ports. Its phase with that thread is global, and every failure
+    // path below destroys it in a way nothing here can repair: a callee fault is
+    // republished at 0x401, which is the same address a return lands on, so wait1
+    // can no longer tell a park from the previous call's return; a wait2 that gives
+    // up leaves the call unreplied and the thread running code nobody is counting.
+    // Each of those sets g_RC_success = false, and each says in its comment that
+    // the caller must abandon or re-initialise. Nothing implemented that, so the
+    // next call went straight out on the broken transport.
+    //
+    // What makes this the most valuable single line in the file right now is the
+    // shape of the workload rather than the log. One publish frame is hundreds of
+    // remote calls. A fault on the first of them, with no gate, becomes hundreds
+    // of blind calls on a transport that has already lost its phase, and each one
+    // is another chance to leave the thread somewhere nobody is counting. With the
+    // gate it becomes one fault, one refused frame, and nothing further sent.
+    //
+    // 2026-09-30 21:50:33 device log, this gate absent. The callee faulted:
+    //   stable/objc_msgSend FAULT in the callee pc=0x18c73f020 ... reparked
+    //   caller stable tid=0x2103 name=object_getClass#1 ... success=0
+    // and the next call was issued in the same second:
+    //   stable/objc_msgSend wait1 begin timeout=10000        (alloc)
+    //   [PUSH][SB-LAST] r_msg_main_raw sel=initWithWindowScene: wait=1
+    //   [PUSH][SB-LAST] r_msg_main_raw sel=setWindowLevel: wait=1
+    //   ... 21:50:35 [PUSH][SB-LAST] r_msg_main_raw sel=addSublayer: wait=1
+    //   21:50:45 stable/objc_msgSend wait2 TIMEOUT
+    //   21:50:45 [RC-SLOW] call=objc_msgSend held=10038ms tid=8451
+    // and one second after that the next call was issued too and never came back.
+    //
+    // SpringBoard-2026-09-30-215137.ips is the result, 46 seconds later:
+    //   pid 34 thread 1551 com.apple.main-thread
+    //     "turnstile blocked on task pid 326, hops: 2, priority: 47"
+    //     60 seconds since last successful checkin -> WATCHDOG
+    // and in the same report, pid 326:
+    //   thread 5639 com.apple.root.utility-qos
+    //     turnstileInfo "turnstile has unknown inheritor"
+    //     waitInfo "mach_msg receive on port 0xff37fe3d7354cbcf name 0x4c2b"
+    // A caller of ours sat in the exception port with SpringBoard's main thread
+    // queued behind it, and nothing ever drained.
+    //
+    // The teardown already applies this exact rule to the one call it makes, at the
+    // pthread_exit: a session that has already failed is the common case there, and
+    // issuing a remote call on it is issuing a call whose reply nobody can trust.
+    // It belongs on every call, not only the last one.
+    //
+    // This block existed once, as commit 490187cf9, and was deleted as collateral
+    // by the bulk revert a90b913d6. Its own diagnostic was visible in that era's
+    // logs on the line "stable/object_getClass refused, session already failed
+    // (step=23) — port untouched", which is how we know the refused path was
+    // being taken and that the transport survived it.
+    if (!g_RC_success) {
+        RC_DIAG("stable/%s refused, session already failed — port untouched",
+                name ?: "(addr-call)");
+        return 0;
+    }
+
     if (!pcAddr) {
         printf("[%s:%d] NULL function pointer: %s\n", __FUNCTION__, __LINE__, name ?: "(addr-call)");
         g_RC_success = false;
