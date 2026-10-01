@@ -162,8 +162,6 @@ static char      g_sbTextGlyphFor[40];
 static double    g_sbTextGlyphSize = 0;
 // Set when the glyphs were rebuilt, so the publish knows the target's path is
 // stale and has to be replaced. Read and cleared by the publish thread.
-static int       g_sbTextPathDirty = 0;
-#define SB_TEXT_GLYPH_MAX 40
 // The index kShapeKeys does not have. The sixteen CAShapeLayers are the
 // geometry's; this one is ours, and it is written into the same op stream after
 // them so the decoder's existing marker carries it with no new framing.
@@ -800,7 +798,6 @@ static CGPathRef sb_text_glyph_path_for_frame(UIView *espView) {
     // The target's path now holds the previous string's geometry and there is no
     // way to clear it, so it has to be replaced. Set on the thread that hands the
     // geometry over and cleared by the publish that consumes it.
-    g_sbTextPathDirty = 1;
     // The bounding box is the measurement this whole thing is missing.
     //
     // Turning the counter on makes the FOV ring come out as a solid red disc and
@@ -1475,6 +1472,24 @@ int SBoardStartOverlay(void) {
         r_msg2_main(tShape, "setOpaque:", 0, 0,0,0);
         double tz = 101.0;
         r_msg2_main_raw(tShape, "setZPosition:", &tz, 8, NULL,0,NULL,0,NULL,0);
+        // Clipped to where the counter can ever be, whatever the layer's path
+        // turns out to contain.
+        //
+        // This is the belt to the backstop's braces, and it is here because the
+        // FOV ring is still arriving on this layer by a route the decoder's layer
+        // switch was supposed to cover and demonstrably does not, and because a
+        // mistake in a remote draw call shows up as the whole screen turning the
+        // counter's colour. A clip turns that failure into the counter being cut
+        // off, which is a bug in one number instead of the whole overlay.
+        //
+        // In the layer's own space, which is the portrait one the geometry uses:
+        // the counter's frame of (377, 25, 90, 33) in landscape maps to
+        // x = landH - y - h = 332, y = x = 377, and the rotation has swapped the
+        // axes, so the rect is 33 wide and 90 tall. Generously rounded, because
+        // the counter's frame is read from the app each time and a clip that was
+        // one point tight would clip a digit rather than show a problem.
+        double clip[4] = { 300.0, 350.0, 90.0, 160.0 };
+        r_msg2_main_raw(tShape, "setClip:", clip, 32, NULL,0,NULL,0,NULL,0);
         sb_disable_layer_actions(tShape);
         g_sbTextShape = tShape;
         uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
@@ -2008,23 +2023,32 @@ void SBRemotePushESPFrame(UIView *espView) {
             // shape of code that has broken here before.
             uint64_t dstPath = rp;
             int dstLayer = -1;
-            // The counter's path is replaced rather than emptied: CGPathClear and
-            // CGPathReset are both absent from CoreGraphics.tbd on this OS, so
-            // there is no way to clear a CGMutablePathRef in place.
+            // The counter's path is replaced, and the replacement happens here,
+            // on the thread that is about to draw into it.
             //
-            // The previous version of this allocated a fresh one on every publish
-            // and let the old one go. At the 50 publishes a second the overlay
-            // reaches, that is 50 CGMutablePaths a second accumulating in
-            // SpringBoard, which is a leak measured in objects per second in
-            // somebody else's process and is not a thing to leave running.
+            // The previous version asked the render thread whether the glyphs had
+            // changed, with a flag the render thread set and this thread cleared.
+            // The two do not synchronise, so a rebuild that landed between this
+            // thread's read and its clear was lost: the old path survived, the new
+            // digits were added to it, and the counter showed one number drawn
+            // over another. Both digits were correct and both were on screen,
+            // which is why it looked like a number over a number rather than a
+            // stale one.
             //
-            // It is replaced only when there is something to put in it. The
-            // publish still ends up handing the same path over unchanged when the
-            // counter has not moved, and handing the same path to setPath: again
-            // is one call that changes nothing, which is cheaper than allocating.
-            if (r_is_objc_ptr(rpT) && g_sbTextPathDirty) {
+            // So there is no flag. The path is replaced at the first layer 16 run
+            // of this publish, which is exactly the moment the content is known to
+            // differ from whatever the target is holding, and it happens on one
+            // thread so nothing can be lost. The old path is released, which is
+            // what the flag was there to avoid leaking.
+            if (r_is_objc_ptr(rpT)) {
+                if (r_is_objc_ptr(g_sbTextPath)) {
+                    dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
+                }
                 g_sbTextPath = 0;
                 rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                if (!r_is_objc_ptr(rpT)) {
+                    g_sbTextPath = 0;
+                }
             }
             uint32_t dstCount = 0;                 // runs sent to the text path
             uint32_t tCount = 0;                   // and their shapes
@@ -2292,7 +2316,6 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
-                g_sbTextPathDirty = 0;   // consumed; the next change sets it again
                 // What actually went on the text layer. The FOV ring came out as a
                 // solid red disc, which is what a filled closed circle looks like,
                 // so either a geometry run reached this path or the glyphs did. The
