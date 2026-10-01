@@ -2023,33 +2023,34 @@ void SBRemotePushESPFrame(UIView *espView) {
             // shape of code that has broken here before.
             uint64_t dstPath = rp;
             int dstLayer = -1;
-            // The counter's path is replaced, and the replacement happens here,
-            // on the thread that is about to draw into it.
+            // The layer the points currently in run[] actually belong to.
             //
-            // The previous version asked the render thread whether the glyphs had
-            // changed, with a flag the render thread set and this thread cleared.
-            // The two do not synchronise, so a rebuild that landed between this
-            // thread's read and its clear was lost: the old path survived, the new
-            // digits were added to it, and the counter showed one number drawn
-            // over another. Both digits were correct and both were on screen,
-            // which is why it looked like a number over a number rather than a
-            // stale one.
+            // curLayer is not good enough for that. A marker used to overwrite
+            // curLayer before the run it had interrupted was drawn, so a check
+            // reading curLayer at the drawing site saw 16 for the FOV's points and
+            // passed them through. runLayer is set when a subpath starts and is
+            // never touched by a marker, so it is the honest answer and it makes
+            // the backstop below reachable instead of decorative.
+            int runLayer = -1;
+            // The counter's path is replaced, and the replacement happens at the
+            // first layer 16 marker of this publish, which is the moment the
+            // content is known to differ from whatever the target is holding.
             //
-            // So there is no flag. The path is replaced at the first layer 16 run
-            // of this publish, which is exactly the moment the content is known to
-            // differ from whatever the target is holding, and it happens on one
-            // thread so nothing can be lost. The old path is released, which is
-            // what the flag was there to avoid leaking.
-            if (r_is_objc_ptr(rpT)) {
-                if (r_is_objc_ptr(g_sbTextPath)) {
-                    dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
-                }
-                g_sbTextPath = 0;
-                rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-                if (!r_is_objc_ptr(rpT)) {
-                    g_sbTextPath = 0;
-                }
-            }
+            // It used to happen here instead, unconditionally, before the decode
+            // loop. That is where a large part of the lag came from and it is worth
+            // being exact about why. sb_text_path() caches, but this block set
+            // g_sbTextPath to zero every time, so the cache could never hit and the
+            // cache's own create ran as well: one path allocated and immediately
+            // released, on every publish, whether or not the counter was on. Two
+            // crossings wasted 60 times a second for a feature that was switched
+            // off.
+            //
+            // It was also the reason the comment above this block claimed a thread
+            // safety property it did not have. Replacing the path on the thread
+            // that draws into it is the part that matters and it is preserved: no
+            // flag crosses between threads, so a rebuild cannot be lost and digits
+            // cannot be drawn over digits.
+            int textPathReady = 0;
             uint32_t dstCount = 0;                 // runs sent to the text path
             uint32_t tCount = 0;                   // and their shapes
             uint8_t  tPts[64];
@@ -2067,9 +2068,69 @@ void SBRemotePushESPFrame(UIView *espView) {
                 while (i < len) {
                     uint8_t op = b[i++];
                     if (op == 4) {                 // layer marker, no coordinates
+                        // A marker arriving while run[] still holds the previous
+                        // layer's points must not be acted on yet.
+                        //
+                        // This is why the FOV ring turned into a solid disc of the
+                        // counter's colour. The handler used to switch dstPath and
+                        // then continue, leaving the pending run in run[] while its
+                        // destination had already been repointed. The run is drawn
+                        // further down with whatever dstPath holds at that moment, so
+                        // the last subpath of every layer was drawn into the NEXT
+                        // layer's path. Layers 0 to 15 all share rp, so the mistake
+                        // was invisible right up until the transition into layer 16,
+                        // which is the counter's: the FOV is layer 14, the aim assist
+                        // layer 15 is empty and emits no marker at all, so the ring's
+                        // 73 points were the ones that landed in rpT and got filled.
+                        //
+                        // The backstop below could not catch it, and it is worth being
+                        // clear about why rather than pretending it was close. It
+                        // tested curLayer, and curLayer had already been overwritten
+                        // to 16 by the line above. The corruption happened at the
+                        // marker, so a check placed at the run cannot see it.
+                        //
+                        // The log said L16/87 on every line and agreed with itself,
+                        // because the tally opens a bucket per distinct layer and the
+                        // FOV's 73 were counted under the overwritten curLayer: 73
+                        // plus 14 is 87. It was measuring the corruption, not
+                        // contradicting it. The blue fill is what settled it.
+                        //
+                        // So: push the marker back and let the next outer pass consume
+                        // it with rn == 0, exactly as the op == 1 branch below does
+                        // for a moveTo. Only the one op byte has been consumed here.
+                        if (rn > 0) { i -= 1; break; }
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
                         if (curLayer != dstLayer) {
+                            // Replace the counter's path here, at the first layer
+                            // 16 marker, rather than unconditionally at the top of
+                            // the publish.
+                            //
+                            // That unconditional version was most of the lag. It ran
+                            // two remote calls on every publish whether or not the
+                            // counter was on, and worse it defeated sb_text_path's
+                            // own cache by zeroing g_sbTextPath first, so the cache
+                            // allocated a path that was then immediately released.
+                            // Sixty times a second, for a feature that was off.
+                            //
+                            // This is still the right thread: it is the one about to
+                            // draw into the path, so no flag crosses between threads
+                            // and digits cannot be drawn over digits.
+                            if (curLayer == SB_TEXT_LAYER_INDEX && !textPathReady) {
+                                textPathReady = 1;
+                                if (r_is_objc_ptr(rpT)) {
+                                    if (r_is_objc_ptr(g_sbTextPath)) {
+                                        dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
+                                        calls += 1;
+                                    }
+                                    g_sbTextPath = 0;
+                                    rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                                    calls += 1;
+                                    if (!r_is_objc_ptr(rpT)) {
+                                        g_sbTextPath = 0;
+                                    }
+                                }
+                            }
                             // The pending rectangle batch is flushed before the
                             // switch, or a batch begun on one layer would finish
                             // into the next one's path.
@@ -2108,6 +2169,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // with rn==0 in order to start the new subpath.
                         if (rn > 0) { i -= 17; break; }
                         run[rn++] = x; run[rn++] = y;
+                        runLayer = curLayer;        // a subpath begins here
                         continue;
                     }
                     if (rn >= 2046) { nTrunc++; i = len; break; }
@@ -2120,29 +2182,20 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
-                // The text path may only ever receive layer 16. Enforced here,
-                // at the point of drawing, rather than only at the marker.
-                //
-                // It is enforced twice because the marker alone was not enough.
-                // Turning the counter on turned the FOV ring into a solid disc of
-                // the counter's fill, which means the FOV's geometry reached the
-                // text layer; and the marker counter said runs=1 [L16/87] on every
-                // single line, because it only tallied runs that arrived on the
-                // text path at a layer change. A run that got there another way was
-                // never counted, so the diagnostic agreed with itself and was
-                // wrong. The colour was what settled it, not the tally.
-                //
-                // So this is a backstop rather than a diagnosis: whatever route
-                // the FOV is taking, it is stopped here, and the tallies are
-                // corrected to count every run that is drawn into the text path so
-                // the log agrees with the screen next time.
-                if (dstPath == rpT && curLayer != SB_TEXT_LAYER_INDEX) {
+                // The text path may only ever receive layer 16. This is now a
+                // backstop rather than the fix, because the fix is at the marker
+                // above, but it is kept and it is keyed on runLayer rather than
+                // curLayer so that it can actually fire. The previous version
+                // tested curLayer, which a marker had already overwritten to 16,
+                // so the condition could never be true and the FOV walked through
+                // it on every frame while the log insisted the routing was correct.
+                if (dstPath == rpT && runLayer != SB_TEXT_LAYER_INDEX) {
                     dstPath = rp;
-                    dstLayer = curLayer;
+                    dstLayer = runLayer;
                 }
                 if (dstPath == rpT) {
-                    if (tCount == 0 || tPts[tCount - 1] != curLayer) {
-                        if (tCount < 64) { tPts[tCount] = (uint8_t)curLayer; tPtsN[tCount] = 0; tCount++; }
+                    if (tCount == 0 || tPts[tCount - 1] != (uint8_t)runLayer) {
+                        if (tCount < 64) { tPts[tCount] = (uint8_t)runLayer; tPtsN[tCount] = 0; tCount++; }
                     }
                     tPtsN[tCount - 1] += (uint32_t)np;
                 }
@@ -2312,7 +2365,23 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
             // thread fills a path instead of laying out a string, which is the
             // whole reason for the change: ms=391 to 822 for a two digit number
             // before, against 6 to 12 for an ordinary frame.
-            if (r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
+            //
+            // Gated on textPathReady, which is only set when a layer 16 marker
+            // actually arrived. This call is not one remote call, it is thirteen:
+            // r_msg_main_raw builds an NSInvocation through methodSignatureFor-
+            // Selector, invocationWithMethodSignature:, setTarget:, setSelector:,
+            // malloc, setArgument:atIndex:, retainArguments, then performs it with
+            // waitUntilDone set to YES, then frees and releases. Eight of those
+            // inner calls are r_msg2, and every r_msg2 calls r_settle, which is
+            // usleep(3000) as set in sb_open_session. So one line here costs
+            // thirteen crossings and about 24 milliseconds of sleeping per
+            // publish, and because the perform waits, the sleep is serial rather
+            // than overlapped with anything.
+            //
+            // Without the gate it ran on every publish even with the counter off,
+            // handing a fresh empty path to a filled layer sixty times a second,
+            // which is a wasted main thread wakeup and a wasted redraw.
+            if (textPathReady && r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
                 r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
