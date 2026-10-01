@@ -51,6 +51,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *lineSwitch;
 @property (nonatomic, strong) UILabel *hpLabel;
 @property (nonatomic, strong) UISwitch *hpSwitch;
+@property (nonatomic, strong) UILabel *sbTextLabel;
+@property (nonatomic, strong) UISwitch *sbTextSwitch;
 
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
@@ -498,6 +500,23 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_hpSwitch addTarget:self action:@selector(hpSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [_togglesCard addSubview:_hpSwitch];
 
+    // Draws the enemy counter as text in SpringBoard, so it is visible while the
+    // game is in front. Off by default and that is not caution for its own sake:
+    // the label has to be turned a quarter turn by hand to match the overlay's
+    // portrait window, and that placement cannot be checked without a device.
+    // With the switch off the overlay makes no call at all for it.
+    _sbTextLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _sbTextLabel.text = @"Counter lên SpringBoard";
+    _sbTextLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _sbTextLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_sbTextLabel];
+
+    _sbTextSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _sbTextSwitch.onTintColor = [self accentGreen];
+    _sbTextSwitch.on = ESPPrefsBool(@"SbCountText", NO);
+    [_sbTextSwitch addTarget:self action:@selector(sbTextSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_sbTextSwitch];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -683,9 +702,10 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
-    // Quick toggles card (Aimbot / ESP / CamPC / FOV + slider, then Box / Line / HP)
-    // 176 + 3 rows of 40 for the FOV block and 4 rows of 40 for the three shapes.
-    CGFloat togglesH = 376.0f;
+    // Quick toggles card (Aimbot / ESP / CamPC / FOV + slider, Box / Line / HP, counter)
+    // 176 + 3 rows of 40 for the FOV block, 4 rows of 40 for the three shapes,
+    // and one more row of 40 for the counter.
+    CGFloat togglesH = 416.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
     _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
@@ -705,6 +725,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _lineSwitch.frame = CGRectMake(cardW - 68, 278, 51, 31);
     _hpLabel.frame = CGRectMake(16, 322, 200, 24);
     _hpSwitch.frame = CGRectMake(cardW - 68, 318, 51, 31);
+    _sbTextLabel.frame = CGRectMake(16, 362, 220, 24);
+    _sbTextSwitch.frame = CGRectMake(cardW - 68, 358, 51, 31);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -888,6 +910,16 @@ static const CGFloat kMenuButtonSize = 56.0f;
 
 - (void)hpSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"Health", sender.on);
+    ESPSyncFromPrefs();
+}
+
+// The counter label in SpringBoard. Turning this on makes the overlay build a
+// CATextLayer over there and keep its string in step with the app's own counter;
+// turning it off makes the overlay stop sending, and the layer it built goes
+// away with the session. It is read once per publish, so the switch takes effect
+// on the next frame rather than needing a restart.
+- (void)sbTextSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"SbCountText", sender.on);
     ESPSyncFromPrefs();
 }
 
