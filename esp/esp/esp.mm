@@ -3390,13 +3390,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
             // sky, which is what most of these matches look like.
             UIColor *redText = [UIColor colorWithRed:1.0f green:0.0f blue:0.0f alpha:1.0f];
 
-            if (stats.realCount == 0 && stats.botCount == 0) {
-                // Two dashes and not a word. The counter answers one question,
-                // which is how many, and "CLEAR" and then "Ful" were both
-                // answering a different one in letters the same reader has to
-                // decode. "--" is the same width whatever the number would have
-                // been, and unlike a single dash it cannot be mistaken for a
-                // stray mark on the screen.
+            if (stats.realCount == 0 && stats.botCount == 0 && !stats.inMatch) {
+                // "--" only when there is no match to count, which is a different
+                // statement from "in a match with nobody in it". The two shared one
+                // branch and printed the same thing, so an empty lobby was
+                // indistinguishable from a game that had not loaded. Inside a match
+                // this falls through to the number below and prints 0, which is
+                // what a count of nobody looks like.
                 countText = @"--";
                 countColor = redText;
                 fontSize = 25.0f;
@@ -3746,6 +3746,11 @@ static int      s_espCountN = 0;
         }
     }
 
+    // Reached only when both the camera and the match pointer are valid, which
+    // is what the early return above checks. It used to be a literal true, which
+    // made the field useless: the counter needed to tell "no match loaded" apart
+    // from "in a match with nobody in it", and a field that is always true cannot
+    // tell them apart.
     stats.inMatch = true;
 
     // Camera / local origin for ESP distance + min/max cull.
