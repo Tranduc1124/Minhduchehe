@@ -115,13 +115,61 @@ static SbTextSlot g_sbText[SB_TEXT_SLOTS];
 // kCAAlignCenter, built once in the target and shared by every slot.
 static uint64_t g_sbAlignStr = 0;
 // How often the app's text is read. The counter's string changes about once a
-// second, so four times a second is four times more often than it needs, and the
-// point of the gate is that the frame path does no work at all between ticks:
-// the publish interval above is 8ms and the ESP render loop calls in far more
-// often than that, so reading on every call was a KVC lookup and a UTF8String
-// conversion at frame rate for a string that changes once a second.
-#define SB_TEXT_MIN_INTERVAL_US 250000ULL
+// second, so twice a second is a hard ceiling rather than a target.
+//
+// The ceiling matters more than the rate. Every change costs about eleven
+// process crossings and they run inside the publish that is drawing the boxes,
+// because the transport is not safe to drive from two threads at once. So the
+// number of text changes per second is the number of times the ESP can be held
+// up, and this puts a bound on it no matter what the count does. The count has
+// hysteresis of its own, which should keep it near one change a second; this is
+// what stops a bad frame from turning into forty.
+#define SB_TEXT_MIN_INTERVAL_US 500000ULL
 static uint64_t g_sbNextTextUS = 0;
+
+// Ownership of the transport.
+//
+// One session, one queue, one set of argument buffers, so two threads must
+// never be inside it at once. The geometry publish takes this lock and holds it
+// for the whole publish. The text thread takes it with trylock only and gives up
+// if a publish is running.
+//
+// That asymmetry is the whole point. The ESP never waits for the counter, and
+// the counter waits for the ESP. Sharing one thread could only ever have been
+// the other way round, and that is what made the boxes stutter at the counter's
+// rhythm: the counter's eleven process crossings sat inside the publish that was
+// drawing them.
+static pthread_mutex_t g_sbIoLock = PTHREAD_MUTEX_INITIALIZER;
+
+// The hand-off from the app's thread, which is the only thread allowed to read
+// the app's CATextLayer, to the text thread.
+//
+// A two slot sequence with a mutex rather than atomics because the payload is an
+// NSString, and a block captured under ARC does not retain an object pointer
+// inside it, so a bare pointer hand-off would be reading a possibly stale
+// reference. The lock is held for a handful of assignments and is not the
+// transport lock; it never waits on anything.
+typedef struct {
+    NSString *text;
+    double    col[4];
+    CGRect    frame;
+    CGFloat   fontSize;
+    int       on;
+    int       changed;
+} SbTextReq;
+
+static SbTextReq       g_sbTextReq[2];
+static int             g_sbTextSeq = 0;
+static pthread_mutex_t g_sbTextHandoff = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t       g_sbTextThread = 0;
+// The app view's bounds, so the text thread can do the landscape to portrait
+// conversion without touching the view. Written by the app's thread while it
+// stages a request, read by the text thread, and it only ever changes when the
+// device rotates, so a stale read costs one frame of a wrong landH.
+static CGRect g_sbTextStageBounds = CGRectZero;
+// Defined next to SBRemotePushESPFrame, which is where the text belongs, and
+// called from SBoardStartOverlay, which is above it.
+static void sb_text_thread_start(void);
 
 static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
@@ -415,6 +463,33 @@ static void sb_text_forget(void) {
 // reading it mid write is a torn read waiting to happen. The existing code draws
 // the same line by copying the serialised bytes on the calling thread and only
 // decoding them on the publish thread, and the text is read the same way.
+// Turns CoreAnimation's implicit animation off for one update.
+//
+// The geometry layer gets a clean repaint because sb_disable_layer_actions
+// nulls "path" in its actions dictionary. A CATextLayer also animates bounds
+// and position by default, and this label's frame moves every time the string or
+// the font size changes, so without this the glyphs ease from the old frame to
+// the new one instead of jumping. That is the flicker that was reported, and it
+// was not the string changing: the number was changing and each change was being
+// animated.
+//
+// A transaction is three calls and it covers string and hidden as well, where an
+// actions dictionary needs three keys at about seven calls each to set up. It
+// also replaces the trick of setting the string before addSublayer:, because the
+// fade on a newly added sublayer is itself a transaction and this turns those
+// off too.
+static void sb_text_txn_begin(void) {
+    uint64_t tx = r_class("CATransaction");
+    if (!r_is_objc_ptr(tx)) return;
+    r_msg2_main(tx, "begin", 0,0,0,0);
+    r_msg2_main(tx, "setDisableActions:", 1, 0,0,0);
+}
+
+static void sb_text_txn_end(void) {
+    uint64_t tx = r_class("CATransaction");
+    if (r_is_objc_ptr(tx)) r_msg2_main(tx, "commit", 0,0,0,0);
+}
+
 static void sb_text_send(int slot, NSString *text,
                          double cr, double cg, double cb, double ca,
                          CGRect frame, CGFloat fontSize, double landH) {
@@ -423,7 +498,9 @@ static void sb_text_send(int slot, NSString *text,
 
     if (!text || text.length == 0) {
         if (r_is_objc_ptr(sl->layer) && !sl->hidden) {
+            sb_text_txn_begin();
             r_msg2_main(sl->layer, "setHidden:", 1, 0,0,0);
+            sb_text_txn_end();
             sl->hidden = 1;
         }
         return;
@@ -474,10 +551,11 @@ static void sb_text_send(int slot, NSString *text,
     }
 
     double fs = (double)fontSize;
+    sb_text_txn_begin();
     r_msg2_main_raw(sl->layer, "setFontSize:", &fs, 8, NULL,0,NULL,0,NULL,0);
     sb_text_ensure_color(sl, sl->layer, cr, cg, cb, ca);
     sb_text_place(sl->layer, &frame, landH);
-    if (!sb_text_push_string(sl->layer, c)) return;
+    if (!sb_text_push_string(sl->layer, c)) { sb_text_txn_end(); return; }
     snprintf(sl->last, sizeof(sl->last), "%s", c);
     if (sl->hidden) {
         r_msg2_main(sl->layer, "setHidden:", 0, 0,0,0);
@@ -485,13 +563,15 @@ static void sb_text_send(int slot, NSString *text,
         uint64_t cl = r_msg2_main(g_sbCanvas, "layer", 0,0,0,0);
         // The string is in before the layer joins the hierarchy, so the implicit
         // fade CoreAnimation puts on a newly added sublayer has nothing to fade
-        // from. Suppressing it properly means assembling the actions dictionary
-        // inside the target, about twenty calls, which is not worth one fade.
+        // from. The transaction above covers it as well, and this ordering is
+        // kept because it costs nothing.
         if (r_is_objc_ptr(cl)) r_msg2_main(cl, "addSublayer:", sl->layer, 0,0,0);
+        sb_text_txn_end();
         NSLog(@"[SB-TEXT] slot %d live \"%s\" size=%.0f canvas=%d", slot, sl->last, fs,
               (int)r_is_objc_ptr(cl));
         return;
     }
+    sb_text_txn_end();
     NSLog(@"[SB-TEXT] slot %d set \"%s\" size=%.0f", slot, sl->last, fs);
 }
 
@@ -1125,9 +1205,77 @@ int SBoardStartOverlay(void) {
     sb_cost_probe();
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
+    // The text thread outlives any single session: it wakes, finds no session or
+    // a busy transport, and does nothing. Restarting it per session would mean a
+    // thread per rearm, and a rearm loop is exactly what must not accumulate.
+    sb_text_thread_start();
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
           win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
     return 0;
+}
+
+// The text thread.
+//
+// Its whole job is to be somewhere else. Every version that ran the counter
+// inside the publish made the boxes stutter at the counter's rhythm, because the
+// two shared a thread and the shared thread was the one drawing the boxes.
+//
+// It wakes four times a second, takes the transport only if it is free, applies
+// whatever the app's thread last staged, and gives the lock straight back. It
+// never blocks on a publish and a publish never blocks on it, so neither can
+// change the other's pace. If a publish is running the tick is dropped, and the
+// next one picks up the same staged request, because staging is a snapshot and
+// not a queue of events.
+//
+// Dropped ticks are not lost work: sb_text_send compares the string against what
+// the target already shows and returns without a single call, so a tick that has
+// nothing new to say is free.
+static void sb_text_drain(void) {
+    SbTextReq r;
+    pthread_mutex_lock(&g_sbTextHandoff);
+    r = g_sbTextReq[(g_sbTextSeq - 1) & 1];      // struct copy retains the string
+    pthread_mutex_unlock(&g_sbTextHandoff);
+
+    if (!r.on && !r.changed) return;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+
+    const CGRect vb = g_sbTextStageBounds;
+    if (CGRectIsEmpty(vb)) return;
+    const double landH = (vb.size.width > vb.size.height) ? vb.size.height : vb.size.width;
+
+    if (r.on && r.text) {
+        sb_text_send(SB_TEXT_SLOT_COUNT, r.text, r.col[0], r.col[1], r.col[2], r.col[3],
+                     r.frame, r.fontSize, landH);
+    } else if (!r.on && r.changed) {
+        // The switch was turned off. Stopping the updates is not taking the text
+        // away: the label is already a layer over there and stays for the life of
+        // the session, which is what was reported. One setHidden: and then
+        // nothing, because the slot remembers it is hidden.
+        sb_text_send(SB_TEXT_SLOT_COUNT, nil, 0, 0, 0, 0, CGRectZero, 0, landH);
+    }
+}
+
+static void *sb_text_thread_main(void *arg) {
+    (void)arg;
+    // The bounds are needed to turn the app's landscape frame into the portrait
+    // one, and they are the app view's, so the first staged request carries them.
+    while (1) {
+        usleep(250000);                            // 4 Hz
+        if (pthread_mutex_trylock(&g_sbIoLock) != 0) continue;   // a publish owns it
+        sb_text_drain();
+        pthread_mutex_unlock(&g_sbIoLock);
+    }
+    return NULL;
+}
+
+static void sb_text_thread_start(void) {
+    if (g_sbTextThread) return;
+    if (pthread_create(&g_sbTextThread, NULL, sb_text_thread_main, NULL) == 0) {
+        NSLog(@"[SB-TEXT] thread up, transport shared with the publish by try-lock");
+    } else {
+        g_sbTextThread = 0;
+        NSLog(@"[SB-TEXT] thread failed to start, text stays inside the publish");
+    }
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
@@ -1252,64 +1400,74 @@ void SBRemotePushESPFrame(UIView *espView) {
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
 
-    // Text is read here, on the thread that writes it, and sent from the publish
-    // queue after the geometry. Three things forced that split.
+    // Text is sampled here, on the thread that writes it, and sent by the text
+    // thread. Three things forced that split.
     //
     // The race. The app assigns statusLayer.string on its own thread, so reading
-    // it from the publish queue can catch it mid write. The geometry already
-    // draws this line, copying the serialised bytes here and only decoding them
-    // on the publish thread, and the text is read the same way.
+    // it from the text thread can catch it mid write. The geometry already draws
+    // this line, copying the serialised bytes on the calling thread and only
+    // decoding them on the publish thread, and the text is sampled the same way.
+    //
+    // The rhythm. This used to be sent from inside the publish, which is the one
+    // place that must not be delayed: eleven crossings inside a publish that is
+    // drawing the boxes is what made the ESP stutter in time with the counter.
+    // Now the publish does not touch text at all, and the text thread skips its
+    // turn whenever a publish holds the transport. The two run at their own
+    // rates and the geometry is never the one waiting.
     //
     // The cost. This is the frame path. The interval gate above lets frames
     // through every 8ms and the ESP render loop calls in far more often than
     // that, so an unconditional read is a KVC lookup and a UTF8String conversion
-    // per frame for a string that changes about once a second.
-    //
-    // The blocking. The first version made its remote calls synchronously right
-    // here, on the render thread, in front of the geometry. Eleven crossing calls
-    // block the frame that is building the boxes, which is what the lag was: the
-    // ESP moved in visible steps rather than smoothly. Text is now sent from the
-    // publish thread, after the frame is already on screen, so it cannot delay
-    // it and a failure in it cannot drop one.
+    // per frame for a value that rarely differs.
     static int s_textPrev = -1;
     const int textOn = ESPPrefsBool(@"SbCountText", NO) ? 1 : 0;
     const int textChanged = (s_textPrev != textOn);
     s_textPrev = textOn;
-
-    NSString *textSend = nil;
-    // Four scalars and not a double[4]: a block cannot capture a C array, and a
-    // struct would work but four doubles say the same thing without inventing a
-    // type for it.
-    double colR = 1.0, colG = 0.0, colB = 0.0, colA = 1.0;
-    CGRect frameSend = CGRectZero;
-    CGFloat sizeSend = 0.0;
-    if (textOn) {
+    g_sbTextStageBounds = espView.bounds;
+    {
         const uint64_t tTxt = now_us();
         if (textChanged || tTxt >= g_sbNextTextUS) {
             g_sbNextTextUS = tTxt + SB_TEXT_MIN_INTERVAL_US;
-            id obj = [espView valueForKey:@"statusLayer"];
-            if ([obj isKindOfClass:[CATextLayer class]]) {
-                CATextLayer *src = (CATextLayer *)obj;
-                // CATextLayer declares string as id in this SDK.
-                NSString *s = (NSString *)src.string;
-                if (s.length > 0 && !src.hidden) {
-                    textSend = s;
-                    frameSend = src.frame;
-                    sizeSend = src.fontSize;
-                    CGColorRef c = src.foregroundColor;
-                    const size_t nc = c ? CGColorGetNumberOfComponents(c) : 0;
-                    const CGFloat *cc = c ? CGColorGetComponents(c) : NULL;
-                    if (nc >= 3 && cc) {
-                        colR = cc[0]; colG = cc[1]; colB = cc[2];
-                        colA = (nc >= 4) ? cc[nc - 1] : 1.0;
+            SbTextReq r;
+            memset(&r, 0, sizeof(r));
+            r.on = textOn;
+            r.changed = textChanged;
+            if (textOn) {
+                id obj = [espView valueForKey:@"statusLayer"];
+                if ([obj isKindOfClass:[CATextLayer class]]) {
+                    CATextLayer *src = (CATextLayer *)obj;
+                    // CATextLayer declares string as id in this SDK.
+                    NSString *s = (NSString *)src.string;
+                    if (s.length > 0 && !src.hidden) {
+                        r.text = s;
+                        r.frame = src.frame;
+                        r.fontSize = src.fontSize;
+                        CGColorRef c = src.foregroundColor;
+                        const size_t nc = c ? CGColorGetNumberOfComponents(c) : 0;
+                        const CGFloat *cc = c ? CGColorGetComponents(c) : NULL;
+                        r.col[0] = 1.0; r.col[1] = 0.0; r.col[2] = 0.0; r.col[3] = 1.0;
+                        if (nc >= 3 && cc) {
+                            r.col[0] = cc[0]; r.col[1] = cc[1]; r.col[2] = cc[2];
+                            r.col[3] = (nc >= 4) ? cc[nc - 1] : 1.0;
+                        }
                     }
                 }
             }
+            pthread_mutex_lock(&g_sbTextHandoff);
+            g_sbTextReq[g_sbTextSeq & 1] = r;    // retains the string
+            __sync_synchronize();
+            g_sbTextSeq++;
+            pthread_mutex_unlock(&g_sbTextHandoff);
         }
     }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
+        // The transport for the whole publish, and for the text thread when it
+        // gets a turn. @finally rather than a pair of unlocks on the error paths,
+        // because this body has several returns and a lock left held on any of
+        // them would freeze the text thread permanently.
+        pthread_mutex_lock(&g_sbIoLock);
         @try {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
             if (!r_is_objc_ptr(g_sbShape)) return;
@@ -1675,32 +1833,6 @@ void SBRemotePushESPFrame(UIView *espView) {
             if (drawn > 0) {
                 sb_invoke_cached_main_raw();
 
-                // Text goes out after the geometry, never before it, so its
-                // latency lands on a frame that is already on screen and a
-                // failure in it cannot cost one. It runs here rather than in the
-                // caller because these are the remote calls, and this is the
-                // thread that is allowed to make them.
-                //
-                // The off branch is the fix for the switch doing nothing. Stopping
-                // the updates is not the same as taking the text away: the label
-                // was already in SpringBoard and stayed there for the life of the
-                // session, which is what was reported. sb_text_send with no text
-                // hides the slot, and it costs one call the first time and none
-                // after that.
-                {
-                    const CGRect vb = espView.bounds;
-                    const double landH = (vb.size.width > vb.size.height)
-                                       ? vb.size.height : vb.size.width;
-                    if (textOn) {
-                        sb_text_send(SB_TEXT_SLOT_COUNT, textSend,
-                                     colR, colG, colB, colA,
-                                     frameSend, sizeSend, landH);
-                    } else if (textChanged) {
-                        sb_text_send(SB_TEXT_SLOT_COUNT, nil,
-                                     0, 0, 0, 0, CGRectZero, 0, landH);
-                    }
-                }
-
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
                 g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
@@ -1770,6 +1902,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                 }
             }
         } @finally {
+            // The transport goes back before the busy flag, so the text thread
+            // can take it the instant this publish is done with it. The order
+            // matters: releasing the other way round would let a text tick start
+            // while this publish was still unwinding, and the two would
+            // interleave inside the transport.
+            pthread_mutex_unlock(&g_sbIoLock);
             // hold = how long the busy flag was held, which is the delay a
             // frame arriving right now would have to wait.
             g_sbHoldUS += now_us() - tAcquire;

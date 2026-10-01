@@ -3479,6 +3479,19 @@ static inline uint64_t ESPPhaseNowUS(void) {
     }
 }
 
+// Hysteresis table behind the enemy count. See the tally at the end of the pawn
+// loop: a pawn counts if it was drawn recently, not only if it is drawn now.
+//
+// The keys are user ids where the pawn has one, because the player dictionary
+// can name the same pawn twice and two entries for one player is a number that
+// disagrees with the boxes beside it. Entries are never removed; they age out,
+// and a match restart ages everything out within the hold window on its own.
+#define ESP_COUNT_HOLD_FRAMES 3
+static uint64_t s_espCountKey[192]  = {0};
+static int64_t  s_espCountFrame[192] = {0};
+static uint8_t  s_espCountBot[192]   = {0};
+static int      s_espCountN = 0;
+
 - (ESPFrameStats)renderESPWithBuffers:(ESPGeometryBuffers *)buffers
                             viewWidth:(CGFloat)viewWidth
                            viewHeight:(CGFloat)viewHeight
@@ -4248,23 +4261,20 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // number, so there is one decision now and it is wantDraw. Dedup stays
         // because the player dictionary can name the same pawn twice.
         if (wantDraw) {
+            // Recorded, not counted. The tally happens after the loop.
             const uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
-            const uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
-            static uint64_t s_countSeen[128];
-            static int s_countFrame = -1;
-            static int s_countN = 0;
-            if (s_countFrame != g_cacheFrameCounter) {
-                s_countFrame = g_cacheFrameCounter;
-                s_countN = 0;
+            const uint64_t key = (uid != 0) ? uid : PawnObject;
+            int slot = -1;
+            for (int ci = 0; ci < s_espCountN; ci++) {
+                if (s_espCountKey[ci] == key) { slot = ci; break; }
             }
-            bool dup = false;
-            for (int ci = 0; ci < s_countN; ci++) {
-                if (s_countSeen[ci] == dedupKey) { dup = true; break; }
+            if (slot < 0 && s_espCountN < (int)(sizeof(s_espCountKey) / sizeof(s_espCountKey[0]))) {
+                slot = s_espCountN++;
+                s_espCountKey[slot] = key;
             }
-            if (!dup && s_countN < 128) {
-                s_countSeen[s_countN++] = dedupKey;
-                if (isBot) stats.botCount++;
-                else stats.realCount++;
+            if (slot >= 0) {
+                s_espCountFrame[slot] = g_cacheFrameCounter;
+                s_espCountBot[slot] = isBot ? 1 : 0;
             }
         }
 
@@ -4283,6 +4293,34 @@ static inline uint64_t ESPPhaseNowUS(void) {
             s.canAim = canAimThisPawn;
             s.wantDraw = wantDraw;
         }
+    }
+
+    // The count, with hysteresis.
+    //
+    // A pawn counts if it was drawn within the last ESP_COUNT_HOLD_FRAMES
+    // frames, not only if it is drawn on this one. wantDraw is genuinely
+    // jittery at the edges: a player standing on the distance limit, or one
+    // whose occlusion bit flips between reads, is drawn on some frames and not
+    // on others. Counting that directly made the number change several times a
+    // second.
+    //
+    // That was not cosmetic. Every change is a new string, and a new string is
+    // a new NSString built in the other process, a setString: and a setFrame:
+    // across the process boundary, and all of it inside the publish that is
+    // drawing the boxes, so the boxes were dragged along at the counter's
+    // rhythm. The reported symptom was the counter flickering and the ESP
+    // stuttering in time with it, and both came from here.
+    //
+    // Three frames is about 85ms at 35fps. Far shorter than looking away from a
+    // player and back, far longer than the jitter.
+    {
+        int rc = 0, bc = 0;
+        for (int ci = 0; ci < s_espCountN; ci++) {
+            if (g_cacheFrameCounter - s_espCountFrame[ci] > ESP_COUNT_HOLD_FRAMES) continue;
+            if (s_espCountBot[ci]) bc++; else rc++;
+        }
+        stats.realCount = rc;
+        stats.botCount = bc;
     }
 
     static int s_countDiagLog = 0;
