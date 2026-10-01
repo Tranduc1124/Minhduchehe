@@ -10,6 +10,11 @@ typedef struct {
     CGMutablePathRef boxBotPath;
     CGMutablePathRef boxKnockedPath;
     
+    // Đã phân tách 3 đường xương chuẩn
+    CGMutablePathRef bonePath;
+    CGMutablePathRef boneBotPath;
+    CGMutablePathRef boneKnockedPath;
+    
     CGMutablePathRef snaplinePath;
     CGMutablePathRef snaplineBotPath;
     CGMutablePathRef snaplineKnockedPath;
@@ -23,6 +28,10 @@ typedef struct {
     bool boxDirty;
     bool boxBotDirty;
     bool boxKnockedDirty;
+    
+    bool boneDirty;
+    bool boneBotDirty;
+    bool boneKnockedDirty;
     
     bool snaplineDirty;
     bool snaplineBotDirty;
@@ -62,6 +71,7 @@ extern uint64_t Moudule_Base;
 extern bool isESP;
 extern bool isESP2;
 extern bool isBox;
+extern bool isBone;
 extern bool isHealth;
 extern bool isName;
 extern bool isDis;
@@ -95,6 +105,7 @@ extern bool isAimAssist;
 
 
 extern UIColor *colorBox;
+extern UIColor *colorBone;
 extern UIColor *colorLine;
 extern UIColor *colorName;
 extern UIColor *colorDis;

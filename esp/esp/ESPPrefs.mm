@@ -155,7 +155,7 @@ static void ESPPrefsLoadIfNeeded(void) {
             @"AimBehindWall",
             @"AimMaster", @"AimTypeMode",
             @"AimRage", @"AimLegit", @"Aimbot", @"AimAssist", @"AimSilent", @"Aim360", @"AimSphereMode",
-            @"AimMode", @"TriggerMode", @"AimPos", @"AimTargetMode", @"Fov", @"AimSpeed", @"ShowFovCircle", @"FovSize",
+            @"AimMode", @"TriggerMode", @"AimPos", @"AimTargetMode", @"Fov", @"AimSpeed", @"ShowFovCircle",
             @"EspDistanceLimit", @"Norecoil", @"BrutalSpeed", @"FloatingPanelX", @"FloatingPanelY", @"MenuLastTab",
             @"CustomName", @"SetName",
             @"CustomToggleBtnX", @"CustomToggleBtnY", @"CustomToggleBtnState",
