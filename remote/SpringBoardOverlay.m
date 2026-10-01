@@ -1697,11 +1697,33 @@ void SBRemotePushESPFrame(UIView *espView) {
         if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
             g_sbRearmAfterUS = now_us() + 3000000ULL;   // 3s between attempts
             g_sbConsecFail = 0;
-            if (SBoardStartOverlay() == 0) {
-                NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
-            } else {
-                NSLog(@"[PUSH-REARM] rebuild failed, retrying");
-            }
+            // Off this thread, which is the game's main queue.
+            //
+            // SBRemotePushESPFrame is called from the game's frame timer, which is
+            // a dispatch source on the main queue, so everything above and below
+            // this runs on the game's main thread while the game is trying to draw.
+            // SBoardStartOverlay makes about thirty r_msg2_main calls to build the
+            // window, the layers and the cached invocation, and every one of those
+            // settles, and settle is usleep(3000). That is a ninety to a hundred
+            // and fifty millisecond stall of the game, and it repeats every three
+            // seconds for as long as the overlay stays dead.
+            //
+            // It looks like periodic hitching that has nothing to do with drawing,
+            // which is why it was never traced to this line. The recovery branch
+            // further down already does exactly this and dispatches to a background
+            // queue; this one did not.
+            //
+            // The three second cooldown set above is taken before the dispatch, so
+            // at most one rebuild is ever in flight and they cannot stack. Nothing
+            // between here and the return touches remote state, so there is
+            // nothing to serialise against.
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (SBoardStartOverlay() == 0) {
+                    NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
+                } else {
+                    NSLog(@"[PUSH-REARM] rebuild failed, retrying");
+                }
+            });
         }
         return;
     }

@@ -163,7 +163,20 @@ static void ESPRenderPawnCore(
 
     const bool isKnocked = (isKnockedFlag != 0);
     const bool isBot = (isBotFlag != 0);
-    NSString *Name = GetNickName(PawnObject);
+    // Only read the nickname if something is going to show it.
+    //
+    // GetNickName is not cheap. It reads a pointer, reads 32 bytes of the name out
+    // of the game, allocates an NSString, then strips the icon characters by
+    // enumerating composed character sequences over the whole string and trimming
+    // it. Three allocations and a Unicode walk, per player, per frame, for a
+    // string that the isName gate below discards.
+    //
+    // The gate is at the NAME section, well below this line, so the read and the
+    // strip were both being paid for with the name display off. Both conditions
+    // are checked here: isName covers the real name and isEspBot covers the BOT
+    // label, which is the only other place Name reaches an output.
+    NSString *Name = nil;
+    if (isName || isEspBot) Name = GetNickName(PawnObject);
     if (!Name || Name.length == 0) Name = isBot ? @"BOT" : @"Player";
 
     Vector3 HeadPos; HeadPos.x = headX; HeadPos.y = headY; HeadPos.z = headZ;
@@ -315,42 +328,38 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // THANH MÁU — ngang, nằm trên đỉnh đầu, một màu.
+    // THANH MÁU — ngang, trên đỉnh đầu, MỘT thanh mảnh.
     //
-    // Trước đây là một thanh dọc 2pt bám bên trái box, chia ba đoạn màu
-    // theo lượng máu. Cả ba điều đó sai với yêu cầu: nó dọc chứ không
-    // ngang, nó không nằm trên đầu, và ba màu là ba layer riêng trong khi
-    // SpringBoard chỉ có một CAShapeLayer nên tất cả đều bị gộp về một màu
-    // viền duy nhất. Ba layer cho ba màu là ba lần present để rồi không
-    // thấy màu nào cả.
+    // Một hình chữ nhật duy nhất, cao đúng bằng nét vẽ. Cần hiểu vì sao cao
+    // đúng bằng nét: SpringBoard chỉ có nét, không có tô, nên nét 0.75 tô đều
+    // lên cả bốn cạnh của hình chữ nhật. Một hình chữ nhật cao h chắn cạnh
+    // trên che từ -0.375 tới +0.375 và cạnh dưới che từ h-0.375 tới h+0.375,
+    // nên giữa lại hở h-1.5pt. h = 0.75 là giá trị duy nhất hai cạnh chồng
+    // khít và ra một dải đặc, dày 1.5pt. Mọi h lớn hơn đều ra khung rỗng, và
+    // đó là lỗi đo được bằng cách chụp màn hình chứ không phải cảm giác.
     //
-    // Nên còn một đường, một màu. Thanh là hình chữ nhật nên decoder ở
-    // SpringBoard nhận ra bốn góc và gom vào CGPathAddRects, tức nó tốn
-    // đúng một call bất kể có bao nhiêu người trên màn hình.
+    // Trước đây ở đây là ba hình chữ nhật 0.75 chồng nhau để dải đặc dày 3pt,
+    // vì lúc đó 1.5pt được cho là quá mảnh để đọc trên một box cao 60px. Người
+    // dùng nói nó to quá và chỉ muốn một thanh ngang. Ba rect đó còn tốn ba
+    // cạnh vẽ cho một dải, tức là nó đậm lên rồi lại nhòe ở giữa, đúng cái
+    // mà câu "to quá" là thanh quay lại đúng một thanh.
     //
-    // Cao 2.5pt thì nó ra một khung rỗng, và đó là lỗi đo được chứ không phải
-    // cảm giác. SpringBoard chỉ có nét vẽ, không có tô: nét 0.75 tô đều lên
-    // cả bốn cạnh, nên một hình chữ nhật cao 2.5 có cạnh trên che từ -0.375
-    // tới +0.375 và cạnh dưới che từ +2.125 tới +2.875, giữa lại hở 1.75pt.
-    // Máy chụp màn hình cho thấy đúng cái khung rỗng đó.
+    // Hình chữ nhật nên decoder ở SpringBoard nhận ra bốn góc và gom vào
+    // CGPathAddRects chung, tức vẫn đúng một lệnh cho toàn bộ thanh máu
+    // trên màn hình, không tăng theo số người.
     //
-    // Muốn nó đặc thì chiều cao phải nhỏ hơn hoặc bằng nét vẽ, để hai cạnh
-    // chồng lên nhau. Một hình chữ nhật cao đúng 0.75 cho dải đặc 1.5pt, quá
-    // mảnh để đọc trên một box cao 60px. Nên khoẻ theo chiều dọc: ba hình
-    // chữ nhật cao 0.75 chồng lên nhau, dải đặc 3pt, vẫn gom trong cùng một
-    // lệnh CGPathAddRects, không tốn thêm call nào.
+    // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung; nền xám
+    // của tên bám theo đúng con số này, xem phần NAME.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barH = 0.75f;      // bằng nét vẽ, để hai cạnh dính nhau
+        const CGFloat barH = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
         const CGFloat barGap = 1.5f;
         const CGFloat barW = boxWidth * healthRatio;
-        const CGFloat barTop = y - barGap - 3.0f * barH;
+        const CGFloat barTop = y - barGap - barH;
 
-        for (int seg = 0; seg < 3; seg++) {
-            CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                          CGRectMake(x, barTop + seg * barH, barW, barH));
-        }
+        CGPathAddRect(buffers->hpFillGreenPath, NULL,
+                      CGRectMake(x, barTop, barW, barH));
         buffers->hpFillGreenDirty = true;
     }
 }
