@@ -53,6 +53,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *hpSwitch;
 @property (nonatomic, strong) UILabel *sbTextLabel;
 @property (nonatomic, strong) UISwitch *sbTextSwitch;
+@property (nonatomic, strong) UILabel *sbNameLabel;
+@property (nonatomic, strong) UISwitch *sbNameSwitch;
 
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
@@ -521,6 +523,23 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_sbTextSwitch addTarget:self action:@selector(sbTextSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [_togglesCard addSubview:_sbTextSwitch];
 
+    // Name and distance over SpringBoard, from the manifest the renderer writes
+    // every frame. Off by default for the same reason the counter is: it is the
+    // first thing that spends crossings in proportion to how many players are on
+    // screen rather than to how much changed, so it needs measuring before it
+    // needs believing.
+    _sbNameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _sbNameLabel.text = @"Tên + cự ly lên SpringBoard";
+    _sbNameLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _sbNameLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_sbNameLabel];
+
+    _sbNameSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _sbNameSwitch.onTintColor = [self accentGreen];
+    _sbNameSwitch.on = ESPPrefsBool(@"SbNameText", NO);
+    [_sbNameSwitch addTarget:self action:@selector(sbNameSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_sbNameSwitch];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -709,7 +728,7 @@ static const CGFloat kMenuButtonSize = 56.0f;
     // Quick toggles card (Aimbot / ESP / CamPC / FOV + slider, Box / Line / HP, counter)
     // 176 + 3 rows of 40 for the FOV block, 4 rows of 40 for the three shapes,
     // and one more row of 40 for the counter.
-    CGFloat togglesH = 416.0f;
+    CGFloat togglesH = 456.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
     _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
@@ -731,6 +750,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _hpSwitch.frame = CGRectMake(cardW - 68, 318, 51, 31);
     _sbTextLabel.frame = CGRectMake(16, 362, 220, 24);
     _sbTextSwitch.frame = CGRectMake(cardW - 68, 358, 51, 31);
+    _sbNameLabel.frame = CGRectMake(16, 402, 230, 24);
+    _sbNameSwitch.frame = CGRectMake(cardW - 68, 398, 51, 31);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -924,6 +945,14 @@ static const CGFloat kMenuButtonSize = 56.0f;
 // on the next frame rather than needing a restart.
 - (void)sbTextSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"SbCountText", sender.on);
+    ESPSyncFromPrefs();
+}
+
+// The per player labels. Off by default, and the switch only writes the pref: the
+// overlay reads the manifest and reconciles it against its own slots on its own
+// thread, so there is no path here that can stall a frame.
+- (void)sbNameSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"SbNameText", sender.on);
     ESPSyncFromPrefs();
 }
 

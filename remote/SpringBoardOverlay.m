@@ -20,6 +20,7 @@
 #import "PAC.h"
 #import "remote_objc.h"
 #import "ESPPrefs.h"
+#import "esp.h"
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -112,21 +113,54 @@ static uint64_t g_sbInvokeSel = 0;
 // thing to want and the mechanism should not have to be rebuilt for it. Slots
 // are handed out by index, a layer is built the first time its slot is used, and
 // a slot whose string has not changed costs nothing. See sb_text_sync.
-#define SB_TEXT_SLOTS 24
+// 256, the maximum, and not a target. 128 pawns is the snapshot cap the renderer
+// already enforces and each contributes a name and a distance.
+//
+// Raising this costs nothing until it is used: a slot's CATextLayer is built the
+// first time that slot is spoken for and never before, so an empty lobby still
+// builds exactly one. What it does cost is a slot that has to be hidden again when
+// its pawn leaves, which is what the pawn key and the eviction are for.
+#define SB_TEXT_SLOTS 256
+// A pawn that has not been in the manifest for this many reconciles loses its
+// slot. Long enough that a player stepping behind something for a moment does not
+// cost a hide and a rebuild, short enough that leaving the match does not leave
+// their name on the screen.
+#define SB_TEXT_EVICT_FRAMES 12
 
-// The count, at the top of the screen. The only slot wired up so far: it is the
-// one string that changes slowly enough to be affordable.
+// The count, at the top of the screen. It is not a manifest entry and it is not
+// a pawn, so it gets a slot of its own above the keyed range rather than
+// pretending to be one. The keyed slots start at SB_TEXT_SLOT_KEYED.
 #define SB_TEXT_SLOT_COUNT 0
+// Manifest slots start here. A slot's key is its index, which is what makes
+// lookup a scan and not a hash, and at 256 entries a scan is a few hundred
+// comparisons of two integers, which is nothing next to a process crossing.
+#define SB_TEXT_SLOT_KEYED 1
 
 typedef struct {
     uint64_t layer;        // CATextLayer in the target, 0 until the slot is used
     uint64_t color;        // CGColor in the target, 0 until one is needed
     float    r, g, b, a;   // components of that colour, -1 until then
-    char     last[40];     // what the target is already showing
+    uint64_t pawn;         // manifest key this slot belongs to, 0 when free
+    uint32_t kind;         // ESP_TEXT_KIND_*, so name and distance never share
+    uint32_t seenFrame;    // last manifest frame this slot appeared in
+    float    x, y, w, h;   // what the target is showing, so only real moves cost
+    float    size;
+    uint16_t len;                        // strlen of last, so a compare is not a strcmp
+    char     last[ESP_TEXT_NAME_MAX];   // what the target is already showing
     int      hidden;
 } SbTextSlot;
 
 static SbTextSlot g_sbText[SB_TEXT_SLOTS];
+// Remote calls spent on text, so the reconcile can report what a change actually
+// costs rather than what it assumes. Incremented at the top of sb_text_send, which
+// is the only place that crosses the boundary for text.
+static uint32_t g_sbTextCalls = 0;
+static uint64_t g_sbTextSends = 0;
+static int64_t  g_sbTextReconUS = 0;
+static uint64_t g_sbTextNextLogUS = 0;
+// Whether any keyed slot is currently spoken for, so switching the names off
+// knows there is something to take down.
+static int g_sbTextEverNamed = 0;
 // kCAAlignCenter, built once in the target and shared by every slot.
 static uint64_t g_sbAlignStr = 0;
 // How often the app's text is read. The counter's string changes about once a
@@ -475,6 +509,12 @@ static void sb_text_forget(void) {
         g_sbText[i].layer = 0;
         g_sbText[i].color = 0;
         g_sbText[i].r = g_sbText[i].g = g_sbText[i].b = g_sbText[i].a = -1;
+        g_sbText[i].pawn = 0;
+        g_sbText[i].kind = 0;
+        g_sbText[i].seenFrame = 0;
+        g_sbText[i].x = g_sbText[i].y = g_sbText[i].w = g_sbText[i].h = 0;
+        g_sbText[i].size = 0;
+        g_sbText[i].len = 0;
         g_sbText[i].last[0] = 0;
         g_sbText[i].hidden = 1;
     }
@@ -540,6 +580,7 @@ static void sb_text_send(int slot, NSString *text,
     }
     const char *c = text.UTF8String;
     if (!c) return;
+    g_sbTextCalls++;
     // The common case. Nothing to say and nothing to do.
     if (r_is_objc_ptr(sl->layer) && !sl->hidden && strcmp(c, sl->last) == 0) return;
 
@@ -590,6 +631,8 @@ static void sb_text_send(int slot, NSString *text,
     sb_text_place(sl->layer, &frame, landH);
     if (!sb_text_push_string(sl->layer, c)) { sb_text_txn_end(); return; }
     snprintf(sl->last, sizeof(sl->last), "%s", c);
+    sl->len = (uint16_t)strlen(c);
+    g_sbTextSends++;
     if (sl->hidden) {
         r_msg2_main(sl->layer, "setHidden:", 0, 0,0,0);
         sl->hidden = 0;
@@ -1272,6 +1315,101 @@ int SBoardStartOverlay(void) {
 // Dropped ticks are not lost work: sb_text_send compares the string against what
 // the target already shows and returns without a single call, so a tick that has
 // nothing new to say is free.
+// Finds the slot a pawn's label lives in, or claims a free one.
+//
+// Claiming prefers a slot that was freed by eviction over an unused one, so a
+// match that repeatedly fills and empties does not walk to the end of a 256 entry
+// array every time. Returns -1 when the pool is genuinely full, which is the only
+// case where a label is dropped, and the caller counts it.
+static int sb_text_claim(uint64_t pawn, uint32_t kind) {
+    int freeUnused = -1;
+    for (int i = SB_TEXT_SLOT_KEYED; i < SB_TEXT_SLOTS; i++) {
+        SbTextSlot *sl = &g_sbText[i];
+        if (sl->pawn == pawn && sl->kind == kind) return i;
+        if (sl->pawn == 0 && freeUnused < 0) freeUnused = i;
+        if (sl->layer == 0 && freeUnused < 0) freeUnused = i;
+    }
+    return freeUnused;
+}
+
+// Walks the manifest once and sends only what moved.
+//
+// This is the reconcile, and it is the whole design for the per player text. The
+// app's manifest is a flat array of everything drawn this frame, keyed by pawn, so
+// one walk covers every name, every distance and every deletion at the same time:
+// a slot whose pawn is not in the manifest has gone, and a slot whose frame or
+// string differs from what the target is showing has moved.
+//
+// The cost is per changed entry, not per entry, and that is the number worth
+// watching. A name whose player is standing still and whose camera is still costs
+// nothing. Twenty labels at sixty frames a second would be twelve hundred
+// crossings; twenty labels where only the ones on screen move, at ten frames a
+// second, is a couple of hundred, which is the same order as the geometry itself.
+//
+// The counts are printed once a second. entries is how many labels exist, moved is
+// how many of them changed, calls is what that cost, and the ratio of moved to
+// entries is the number that decides whether the per player text is affordable at
+// all.
+static void sb_text_reconcile(double landH, int *outMoved, int *outCalls) {
+    const EspTextManifest *man = ESPTextManifestGet();
+    int moved = 0, calls = 0;
+    if (!man) { *outMoved = 0; *outCalls = 0; return; }
+    const uint32_t frame = man->frame;
+
+    int32_t n = man->count;
+    if (n > ESP_TEXT_MANIFEST_MAX) n = ESP_TEXT_MANIFEST_MAX;
+
+    for (int32_t i = 0; i < n; i++) {
+        const EspTextEntry *e = &man->e[i];
+        if (!e->len) continue;
+        int slot = sb_text_claim(e->pawn, e->kind);
+        if (slot < 0) continue;                 // pool full; counted below
+        g_sbTextEverNamed = 1;
+        SbTextSlot *sl = &g_sbText[slot];
+        sl->pawn = e->pawn;
+        sl->kind = e->kind;
+        sl->seenFrame = frame;
+
+        const BOOL textSame = (sl->len == e->len) && (memcmp(sl->last, e->text, e->len) == 0);
+        const BOOL geoSame  = (sl->x == e->x) && (sl->y == e->y) &&
+                              (sl->w == e->w) && (sl->h == e->h);
+        const BOOL wasHidden = sl->hidden;
+        if (r_is_objc_ptr(sl->layer) && !wasHidden && textSame && geoSame) continue;
+
+        NSString *want = [NSString stringWithUTF8String:e->text];
+        if (!want) continue;
+        const uint32_t before = g_sbTextCalls;
+        sb_text_send(slot, want, e->r, e->g, e->b, e->a,
+                     CGRectMake(e->x, e->y, e->w, e->h), (CGFloat)e->size, landH);
+        calls += (int)(g_sbTextCalls - before);
+        if (g_sbTextCalls == before) continue;   // send declined, do not record
+        moved++;
+        sl->x = e->x; sl->y = e->y; sl->w = e->w; sl->h = e->h;
+        sl->size = e->size;
+        snprintf(sl->last, sizeof(sl->last), "%s", e->text);
+    }
+
+    // Anything that was not spoken for this frame has gone. Hidden rather than
+    // freed, because the layer object is in the target and this thread does not
+    // free things there; the slot goes back to the pool on the next frame's claim.
+    for (int i = SB_TEXT_SLOT_KEYED; i < SB_TEXT_SLOTS; i++) {
+        SbTextSlot *sl = &g_sbText[i];
+        if (sl->pawn == 0) continue;
+        if (frame != 0 && (int)(frame - sl->seenFrame) <= SB_TEXT_EVICT_FRAMES) continue;
+        if (r_is_objc_ptr(sl->layer) && !sl->hidden) {
+            sb_text_send(i, nil, 0, 0, 0, 0, CGRectMake(0,0,0,0), 0, landH);
+            calls++;
+        }
+        sl->pawn = 0;
+        sl->kind = 0;
+        sl->last[0] = 0;
+        sl->hidden = 1;
+    }
+
+    *outMoved = moved;
+    *outCalls = calls;
+}
+
 static void sb_text_drain(void) {
     SbTextReq r;
     pthread_mutex_lock(&g_sbTextHandoff);
@@ -1284,6 +1422,41 @@ static void sb_text_drain(void) {
     const CGRect vb = g_sbTextStageBounds;
     if (CGRectIsEmpty(vb)) return;
     const double landH = (vb.size.width > vb.size.height) ? vb.size.height : vb.size.width;
+
+    const int wantNames = ESPPrefsBool(@"SbNameText", NO) ? 1 : 0;
+    const uint64_t tRec = now_us();
+    const uint32_t callsBefore = g_sbTextCalls;
+    if (wantNames) {
+        int moved = 0, calls = 0;
+        sb_text_reconcile(landH, &moved, &calls);
+        const uint64_t tNow = now_us();
+        g_sbTextReconUS += (int64_t)(tNow - tRec);
+        // entries, moved, calls per second, and the cost of one reconcile. moved
+        // against entries is the ratio that decides whether this is affordable:
+        // if most labels move every time then the per player text is bounded by
+        // the crossing rate and not by anything else, and the only lever left is
+        // the update interval.
+        if (tNow >= g_sbTextNextLogUS) {
+            g_sbTextNextLogUS = tNow + 1000000ULL;
+            const EspTextManifest *man = ESPTextManifestGet();
+            NSLog(@"[SB-TEXT] entries=%d overflow=%d moved=%d calls=%u sends=%llu "
+                  @"reconUS=%lld landH=%.0f",
+                  man ? man->count : -1, man ? man->overflow : -1, moved,
+                  g_sbTextCalls - callsBefore, (unsigned long long)g_sbTextSends,
+                  (long long)g_sbTextReconUS, landH);
+        }
+    } else if (g_sbTextEverNamed) {
+        // Turning the names off has to take them off the screen, same as the
+        // counter. Hiding every keyed slot is the only way, because the manifest
+        // is no longer being read and nothing else would notice they are stale.
+        for (int i = SB_TEXT_SLOT_KEYED; i < SB_TEXT_SLOTS; i++) {
+            SbTextSlot *sl = &g_sbText[i];
+            if (sl->pawn == 0) continue;
+            sb_text_send(i, nil, 0, 0, 0, 0, CGRectMake(0,0,0,0), 0, landH);
+            sl->pawn = 0; sl->kind = 0; sl->last[0] = 0; sl->len = 0; sl->hidden = 1;
+        }
+        g_sbTextEverNamed = 0;
+    }
 
     if (r.on && r.text) {
         sb_text_send(SB_TEXT_SLOT_COUNT, r.text, r.col[0], r.col[1], r.col[2], r.col[3],

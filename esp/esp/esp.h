@@ -172,3 +172,57 @@ Vector3 ResolveHeadWorldPosForESP(uint64_t pawn);
 @interface ESPOverlayView : UIView
 - (instancetype)initWithFrame:(CGRect)frame;
 @end
+// The text manifest: what the renderer drew as text this frame, in a form the
+// overlay can read without touching a CATextLayer.
+//
+// It exists because mirroring the app's own text layers cannot work. Those come
+// out of a pool by position, textLayerPool[activeTextLayerCount++], so the index
+// is the order addText: happened to be called in, which is the order the pawns
+// were walked. Next frame index zero is a different player. Reading them by index
+// would shuffle the names around every frame.
+//
+// So the renderer records them here instead, beside the call that already has the
+// pawn in hand, keyed by something stable. Writing it costs nothing: a struct
+// assignment in this process, no remote call, and the strings are copied as bytes
+// rather than retained, so the reader on another thread never touches ARC.
+//
+// The manifest is rewritten from empty each frame, so a label that is no longer
+// drawn is simply absent. Absence is the delete, which is what lets the overlay
+// reconcile by walking one array.
+//
+// The size is a maximum, not a target. 128 pawns is the snapshot cap the renderer
+// already enforces, two labels each, and the headroom past that means a full lobby
+// drops nothing: entries past the cap raise the overflow count instead of
+// disappearing quietly.
+#define ESP_TEXT_MANIFEST_MAX 256
+#define ESP_TEXT_NAME_MAX 48
+
+typedef enum {
+    ESP_TEXT_KIND_NAME     = 1,
+    ESP_TEXT_KIND_DISTANCE = 2
+} EspTextKind;
+
+typedef struct {
+    uint64_t pawn;                        // stable key
+    uint32_t kind;
+    float    x, y, w, h;                  // the app's own frame, landscape space
+    float    size;
+    float    r, g, b, a;
+    uint16_t len;
+    char     text[ESP_TEXT_NAME_MAX];
+} EspTextEntry;
+
+typedef struct {
+    int32_t  count;                       // entries actually written
+    int32_t  overflow;                    // dropped because the cap was hit
+    uint32_t frame;                       // 0 before the first frame
+    uint32_t reserved;
+    EspTextEntry e[ESP_TEXT_MANIFEST_MAX];
+} EspTextManifest;
+
+// Called once per frame before anything is drawn.
+void ESPTextManifestReset(void);
+// Returns 1 if the entry was recorded, 0 if the text was empty or the cap was hit.
+int32_t  ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
+                            CGRect frame, CGFloat size, const CGFloat *rgba);
+const EspTextManifest *ESPTextManifestGet(void);
