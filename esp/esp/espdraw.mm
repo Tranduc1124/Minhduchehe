@@ -348,13 +348,18 @@ static void ESPRenderPawnCore(
     // CGPathAddRects chung, tức vẫn đúng một lệnh cho toàn bộ thanh máu
     // trên màn hình, không tăng theo số người.
     //
+    // barGap là khoảng hở giữa đáy thanh và đỉnh box. Nó là 3 chứ không phải
+    // 1.5: ở 1.5 thì dải đặc dính sát mép trên của box và đọc ra như một
+    // đường viền dày thêm chứ không phải một thanh. Đây là khoảng cách trông
+    // đẹp nhất trong ba giá trị thử; không phải thanh to thêm, chỉ dời lên.
+    //
     // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung; nền xám
     // của tên bám theo đúng con số này, xem phần NAME.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
         const CGFloat barH = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
-        const CGFloat barGap = 1.5f;
+        const CGFloat barGap = 3.0f;     // đáy thanh lên khỏi đỉnh box
         const CGFloat barW = boxWidth * healthRatio;
         const CGFloat barTop = y - barGap - barH;
 
