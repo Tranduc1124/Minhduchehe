@@ -3383,27 +3383,32 @@ static inline uint64_t ESPPhaseNowUS(void) {
             UIColor *countColor;
             CGFloat fontSize;
 
+            // Red, and only red, for the count. It used to be green for the
+            // number and cyan or green for the word CLEAR, so the one thing on
+            // screen whose job is to be read at a glance was the only thing
+            // carrying three colours. Red is also the one that survives a bright
+            // sky, which is what most of these matches look like.
+            UIColor *redText = [UIColor colorWithRed:1.0f green:0.0f blue:0.0f alpha:1.0f];
+
             if (stats.realCount == 0 && stats.botCount == 0) {
-                if (isESP2) {
-                    countText = @"CLEAR";
-                    countColor = [UIColor cyanColor];
-                    fontSize = 20.0f;
-                } else {
-                    countText = @"CLEAR";
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 21.0f;
-                }
+                // "Ful" and not "CLEAR". The counter answers one question, which
+                // is how many, and "CLEAR" was answering a different one in
+                // words the same reader has to decode. Three letters, and the
+                // same width whatever the number would have been.
+                countText = @"Ful";
+                countColor = redText;
+                fontSize = 25.0f;
             } else {
-                // Đổi đỏ → xanh lá (user: bỏ vẽ đỏ thừa; đỏ chỉ dành cho knocked/HP thấp).
-                if (isESP2) {
-                    countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 25.0f;
-                } else {
-                    countText = [NSString stringWithFormat:@"PLAYER [%d] | BOT [%d]", stats.realCount, stats.botCount];
-                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
-                    fontSize = 16.0f;
-                }
+                // Just the number. This used to be "PLAYER [x] | BOT [y]" on the
+                // main path and plain "%d" on the Lite path, so the two ESP
+                // modes reported the same fact in two different shapes, and the
+                // longer one was 220 points wide for six glyphs' worth of
+                // information. A count is one number: real and bot are already
+                // distinguished on the box, which is what those two figures were
+                // for.
+                countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
+                countColor = redText;
+                fontSize = 25.0f;
             }
 
             if (![self.lastStatusString isEqualToString:countText]) {
@@ -3416,7 +3421,14 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
             // Tight frame around text only (was 200x50) — visual only; CATextLayer
             // never receives touches, but keep bounds small and non-interactive flags set.
-            CGFloat countWidth = isESP2 ? 80.0f : 220.0f;
+            // 90, down from 220. The frame is sized for the string it holds and
+            // the string is one or three glyphs now, and CATextLayer centres
+            // within it, so the number lands in the same place either way. What
+            // changes is the band the overlay derives from it: the quarter turn
+            // turns the frame's width into the portrait rect's height, so 220
+            // was a 220 point tall band on a 390 point screen for a 25 point
+            // number.
+            CGFloat countWidth = 90.0f;
             CGFloat countHeight = fontSize + 8.0f;
             CGFloat yPos = isESP2 ? 30.0f : 25.0f;
             CGFloat xPos = halfWidth - (countWidth * 0.5f);

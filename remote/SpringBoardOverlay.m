@@ -86,14 +86,34 @@ static uint64_t g_sbSetPathArgBuf = 0;
 static uint64_t g_sbPerformMainSel = 0;
 static uint64_t g_sbInvokeSel = 0;
 
-// The enemy counter, as a CATextLayer in SpringBoard. One label, opt in.
-// See sb_push_count_text for why this is affordable and why it is a switch.
-static uint64_t g_sbTextLayer = 0;
-static uint64_t g_sbAlignStr  = 0;
-static uint64_t g_sbTextColor = 0;
-static float    g_sbTextR = -1, g_sbTextG = -1, g_sbTextB = -1, g_sbTextA = -1;
-static char     g_sbTextLast[40];
-static int      g_sbTextHidden = 1;
+// Text in SpringBoard, as a fixed pool of CATextLayers.
+//
+// CATextLayer and not UILabel: the overlay already builds CAShapeLayer this way
+// and adds it to a container's layer, a label is a view and would need a
+// window of its own, and CATextLayer is what the app side already uses for every
+// string it draws, so one mirror routine serves all of them.
+//
+// A pool rather than one label because the per player text is the obvious next
+// thing to want and the mechanism should not have to be rebuilt for it. Slots
+// are handed out by index, a layer is built the first time its slot is used, and
+// a slot whose string has not changed costs nothing. See sb_text_sync.
+#define SB_TEXT_SLOTS 24
+
+// The count, at the top of the screen. The only slot wired up so far: it is the
+// one string that changes slowly enough to be affordable.
+#define SB_TEXT_SLOT_COUNT 0
+
+typedef struct {
+    uint64_t layer;        // CATextLayer in the target, 0 until the slot is used
+    uint64_t color;        // CGColor in the target, 0 until one is needed
+    float    r, g, b, a;   // components of that colour, -1 until then
+    char     last[40];     // what the target is already showing
+    int      hidden;
+} SbTextSlot;
+
+static SbTextSlot g_sbText[SB_TEXT_SLOTS];
+// kCAAlignCenter, built once in the target and shared by every slot.
+static uint64_t g_sbAlignStr = 0;
 
 static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
@@ -278,30 +298,29 @@ static uint64_t sb_text_make_nsstring(const char *cstr) {
     return s;
 }
 
-static int sb_text_push_string(uint64_t tl, NSString *want) {
-    const char *c = want.UTF8String;
-    if (!c) return 0;
-    uint64_t s = sb_text_make_nsstring(c);
+static int sb_text_push_string(uint64_t tl, const char *cstr) {
+    if (!cstr) return 0;
+    uint64_t s = sb_text_make_nsstring(cstr);
     if (!r_is_objc_ptr(s)) return 0;
     r_msg2_main(tl, "setString:", s, 0,0,0);
     return 1;
 }
 
-// Creates the label's colour in SpringBoard, but only when it has actually
-// changed. The counter is one of a small number of flat colours, so after the
-// first few frames this costs nothing at all.
-static void sb_text_ensure_color(uint64_t tl, CGColorRef c) {
+// Creates a colour in SpringBoard, but only when it has actually changed. The
+// counter is one of a small number of flat colours, so after the first few
+// changes this costs nothing at all.
+static void sb_text_ensure_color(SbTextSlot *sl, uint64_t tl, CGColorRef c) {
     if (!c) return;
     const size_t n = CGColorGetNumberOfComponents(c);
     const CGFloat *comp = CGColorGetComponents(c);
     if (n < 3 || !comp) return;
     // Slots 0 to 2 are the colour channels for every RGB and every grey model,
-    // and alpha is last. The counter is a flat UIColor, so grey never reaches
-    // here with a different meaning.
+    // and alpha is last. These are flat UIColors, so grey never arrives here
+    // with a different meaning.
     const float r = (float)comp[0], g = (float)comp[1], b = (float)comp[2];
     const float a = (n >= 4) ? (float)comp[n - 1] : 1.0f;
-    if (fabsf(r - g_sbTextR) < 0.004f && fabsf(g - g_sbTextG) < 0.004f &&
-        fabsf(b - g_sbTextB) < 0.004f && fabsf(a - g_sbTextA) < 0.004f) return;
+    if (sl->color && fabsf(r - sl->r) < 0.004f && fabsf(g - sl->g) < 0.004f &&
+        fabsf(b - sl->b) < 0.004f && fabsf(a - sl->a) < 0.004f) return;
     uint64_t cls = r_class("UIColor");
     if (!r_is_objc_ptr(cls)) return;
     double v[4] = { r, g, b, a };
@@ -309,147 +328,183 @@ static void sb_text_ensure_color(uint64_t tl, CGColorRef c) {
                                    &v[0], 8, &v[1], 8, &v[2], 8, &v[3], 8);
     uint64_t cg = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
     if (!r_is_objc_ptr(cg)) return;
-    g_sbTextColor = cg; g_sbTextR = r; g_sbTextG = g; g_sbTextB = b; g_sbTextA = a;
+    sl->color = cg; sl->r = r; sl->g = g; sl->b = b; sl->a = a;
     r_msg2_main(tl, "setForegroundColor:", cg, 0,0,0);
-    NSLog(@"[SB-TEXT] colour %.2f,%.2f,%.2f,%.2f cg=%d", r, g, b, a, (int)r_is_objc_ptr(cg));
 }
 
 // Places the label so that, after the quarter turn, its glyphs occupy exactly
-// the portrait rectangle the app's counter frame maps to.
+// the portrait rectangle the app's frame maps to.
 //
-// sbEmit sends a landscape point to px = landH - sy, py = sx, so an app frame
-// of (x, y, w, h) becomes the portrait rect (landH - y, x, w, h). A quarter
-// turn of the layer maps its local (u, v) to portrait (-v, u) about the anchor,
-// so bounds (0, 0, w, h) at position (px + h, py) covers x from px to px + h
-// and y from py to py + w, which is that rectangle and not a neighbour of it.
+// The arithmetic is written out because getting it wrong is invisible from the
+// screen, and the first version of it was wrong.
+//
+// sbEmit sends landscape (sx, sy) to portrait (landH - sy, sx), so a frame of
+// (x, y, w, h) has its corners at
+//
+//   (x,     y    ) -> (landH - y,     x    )
+//   (x + w, y + h) -> (landH - y - h, x + w)
+//
+// which is the portrait rect x in [landH - y - h, landH - y], y in [x, x + w].
+// The two ends of the x range differ by h because the rotation swaps the axes:
+// the frame's height is what the portrait rect measures across.
+//
+// A quarter turn maps the layer's local (u, v) to portrait (-v, u) about the
+// anchor, so with the anchor at the top left and bounds (0, 0, w, h) the drawn
+// extent at position P is
+//
+//   x in [P.x - h, P.x]      y in [P.y, P.y + w]
+//
+// Matching the two ranges gives P.x = landH - y and P.y = x. That is the whole
+// formula. The first version added h to P.x, which asked for one frame height
+// too much: with the real numbers (x=312, y=25, h=29, landH=390) it wanted
+// P.x = 394 instead of 365, so the band covered portrait x in [365, 394] on a
+// screen 390 wide. Nine points hung off the edge and the rest of it sat under
+// the game's own top HUD, which is why the count was in the wrong place and not
+// visible at the same time.
 //
 // Both rotations have determinant +1, so the glyphs are not mirrored. The
 // baseline runs the way the player's does, because landscape +x is portrait +y,
-// and the text's up is portrait +x, which is landscape up. The anchor is the
-// top left rather than the default centre so that position and bounds mean what
-// they say; with a centre anchor a transform turns about the middle and the
-// frame has to be solved backwards.
+// and the text's up is portrait +x, which is landscape up.
 static void sb_text_place(uint64_t tl, const CGRect *appFrame, double landH) {
     const double w = appFrame->size.width, h = appFrame->size.height;
     double bnd[4] = { 0.0, 0.0, w, h };
     r_msg2_main_raw(tl, "setBounds:", bnd, 32, NULL,0,NULL,0,NULL,0);
-    double pos[2] = { landH - appFrame->origin.y + h, appFrame->origin.x };
+    double pos[2] = { landH - appFrame->origin.y, appFrame->origin.x };
     r_msg2_main_raw(tl, "setPosition:", pos, 16, NULL,0,NULL,0,NULL,0);
     double t[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };   // +90 degrees
     r_msg2_main_raw(tl, "setAffineTransform:", t, 48, NULL,0,NULL,0,NULL,0);
-    NSLog(@"[SB-TEXT] place app=%.0f,%.0f,%.0f,%.0f pos=%.0f,%.0f",
-          appFrame->origin.x, appFrame->origin.y, w, h, pos[0], pos[1]);
+    NSLog(@"[SB-TEXT] place app=%.0f,%.0f,%.0f,%.0f pos=%.0f,%.0f -> portrait x %.0f..%.0f y %.0f..%.0f (landH=%.0f)",
+          appFrame->origin.x, appFrame->origin.y, w, h, pos[0], pos[1],
+          pos[0] - h, pos[0], pos[1], pos[1] + w, landH);
 }
 
-// The enemy counter, drawn as text in SpringBoard.
-//
-// Every other shape here is a path, and a path cannot carry letters. mergePaths
-// reads kShapeKeys, which is sixteen CAShapeLayers, and the decoder turns each
-// into CGPathAddRects and CGPathAddLines. Text is a CATextLayer rather than a
-// path, so it never crossed over, and the counter existed only while the app was
-// in the foreground.
-//
-// One label is affordable where twenty are not, and the reason is the update
-// rate rather than the label count. The counter's string changes about once a
-// second. Building a string in the target costs three operations for the buffer
-// and two for the object, so a change is about eleven calls once a second,
-// against a baseline of sixty to six hundred calls a second. The same
-// arithmetic for ten players' distance labels, which change every frame, is
-// thousands of calls a second. That is the whole reason this is one label and
-// why the other text has not been attempted.
-//
-// The rotation is the part that cannot be checked without a device, so it sits
-// behind a pref that is off by default and the pref is the entire safety story:
-// with it off not one call is made and the screen looks exactly as it did.
-static void sb_push_count_text(UIView *espView) {
-    if (!espView) return;
-    // Read through the same cached suite the app writes, in this process, so
-    // there is no cross process preference read to get wrong.
-    if (!ESPPrefsBool(@"SbCountText", NO)) return;
+// Drops every text slot. The layers, the colours and the alignment string are
+// all objects inside the target, and the strings the slots remember describe a
+// session that is going away. They are dropped, not released: the target's
+// allocator and its autorelease pool are not ours to drive from a teardown.
+static void sb_text_forget(void) {
+    for (int i = 0; i < SB_TEXT_SLOTS; i++) {
+        g_sbText[i].layer = 0;
+        g_sbText[i].color = 0;
+        g_sbText[i].r = g_sbText[i].g = g_sbText[i].b = g_sbText[i].a = -1;
+        g_sbText[i].last[0] = 0;
+        g_sbText[i].hidden = 1;
+    }
+    g_sbAlignStr = 0;
+}
 
-    id sl = [espView valueForKey:@"statusLayer"];
-    if (![sl isKindOfClass:[CATextLayer class]]) return;
-    CATextLayer *src = (CATextLayer *)sl;
+// Mirrors one CATextLayer from the app into a CATextLayer in SpringBoard.
+//
+// Slots are fixed and a layer is built the first time its slot is used, so the
+// cost of a label that has not changed is zero: the string is compared and the
+// function returns. That comparison is the entire design. A name label that
+// changes every frame would cost about seven calls every frame, and twenty of
+// them would be thousands of calls a second, which is why the pool alone is not
+// enough for the per player text and the update rate has to come down too.
+static void sb_text_sync(int slot, UIView *espView, NSString *key, double landH) {
+    if (slot < 0 || slot >= SB_TEXT_SLOTS || !espView) return;
+    SbTextSlot *sl = &g_sbText[slot];
+
+    id obj = [espView valueForKey:key];
+    if (![obj isKindOfClass:[CATextLayer class]]) return;
+    CATextLayer *src = (CATextLayer *)obj;
     // CATextLayer declares string as id in this SDK, so the type is pinned here
-    // once rather than at every use.
+    // once instead of at every use.
     NSString *want = (NSString *)src.string;
     if (!want) return;
+    const char *c = want.UTF8String;
+    const BOOL hidden = src.hidden || want.length == 0 || !c;
 
-    // Nothing on screen and nothing in the app means nothing to draw, and one
-    // setHidden: is cheaper than a string.
-    if (src.hidden || want.length == 0) {
-        if (r_is_objc_ptr(g_sbTextLayer) && !g_sbTextHidden) {
-            r_msg2_main(g_sbTextLayer, "setHidden:", 1, 0,0,0);
-            g_sbTextHidden = 1;
+    if (hidden) {
+        if (r_is_objc_ptr(sl->layer) && !sl->hidden) {
+            r_msg2_main(sl->layer, "setHidden:", 1, 0,0,0);
+            sl->hidden = 1;
         }
         return;
     }
+    // The common case, and the one that runs every frame. Nothing to say and
+    // nothing to do.
+    if (r_is_objc_ptr(sl->layer) && !sl->hidden && strcmp(c, sl->last) == 0) return;
+
+    if (!r_is_objc_ptr(sl->layer)) {
+        uint64_t tl = r_msg2_main(r_class("CATextLayer"), "layer", 0,0,0,0);
+        if (!r_is_objc_ptr(tl)) { NSLog(@"[SB-TEXT] +[CATextLayer layer] nil"); return; }
+        sl->layer = tl;
+        // Anchor at the top left so position and bounds mean what they say. With
+        // the default centre anchor a transform turns about the middle and the
+        // frame has to be solved backwards, which is where the first attempt at
+        // this went wrong.
+        double zero[2] = { 0.0, 0.0 };
+        r_msg2_main_raw(tl, "setAnchorPoint:", zero, 16, NULL,0,NULL,0,NULL,0);
+        // kCAAlignCenter, built once and shared by every slot. r_nsstr_retained
+        // is about six operations and the value never changes.
+        if (!r_is_objc_ptr(g_sbAlignStr)) g_sbAlignStr = r_nsstr_retained("kCAAlignCenter");
+        if (r_is_objc_ptr(g_sbAlignStr)) r_msg2_main(tl, "setAlignmentMode:", g_sbAlignStr, 0,0,0);
+        // Without this the glyphs rasterise at scale 1 and are scaled up, which
+        // on a 3x panel is the difference between readable and a grey smear.
+        double cs = (double)[UIScreen mainScreen].scale;
+        r_msg2_main_raw(tl, "setContentsScale:", &cs, 8, NULL,0,NULL,0,NULL,0);
+        // Above the geometry layer at 100, so text is not drawn through a box.
+        double z = 200.0;
+        r_msg2_main_raw(tl, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
+        // No font is set. CATextLayer falls back to Helvetica and a real
+        // CFTypeRef would need CGFontCreateWithFontName inside the target. The
+        // app draws its text in a loaded font, so the two will not match, and
+        // matching is worth less than the calls.
+        sl->last[0] = 0;
+        sl->color = 0; sl->r = sl->g = sl->b = sl->a = -1;
+    }
+
+    double fs = (double)src.fontSize;
+    r_msg2_main_raw(sl->layer, "setFontSize:", &fs, 8, NULL,0,NULL,0,NULL,0);
+    sb_text_ensure_color(sl, sl->layer, src.foregroundColor);
+    const CGRect f = src.frame;
+    sb_text_place(sl->layer, &f, landH);
+    if (!sb_text_push_string(sl->layer, c)) return;
+    snprintf(sl->last, sizeof(sl->last), "%s", c);
+    if (sl->hidden) {
+        r_msg2_main(sl->layer, "setHidden:", 0, 0,0,0);
+        sl->hidden = 0;
+        uint64_t cl = r_msg2_main(g_sbCanvas, "layer", 0,0,0,0);
+        // The string is in before the layer joins the hierarchy, so the implicit
+        // fade CoreAnimation puts on a newly added sublayer has nothing to fade
+        // from. Suppressing it properly means assembling the actions dictionary
+        // inside the target, about twenty calls, which is not worth one fade.
+        if (r_is_objc_ptr(cl)) r_msg2_main(cl, "addSublayer:", sl->layer, 0,0,0);
+        NSLog(@"[SB-TEXT] slot %d live \"%s\" size=%.0f canvas=%d", slot, sl->last, fs,
+              (int)r_is_objc_ptr(cl));
+        return;
+    }
+    NSLog(@"[SB-TEXT] slot %d set \"%s\" size=%.0f", slot, sl->last, fs);
+}
+
+// The text that goes over to SpringBoard.
+//
+// Every other shape here is a path, and a path cannot carry letters. mergePaths
+// reads kShapeKeys, which is sixteen CAShapeLayers, and the decoder turns each
+// one into CGPathAddRects and CGPathAddLines. Text is a CATextLayer rather than
+// a path, so it never crossed over, and existed only while the app was in the
+// foreground. RenderTotalEnemyCount at espdraw.mm:85 turned out to be dead code
+// that nothing calls; the live counter is statusLayer, built at esp.mm:3381.
+//
+// The counter is the only source wired up, and deliberately. Its string changes
+// about once a second, so a change costs about eleven calls against a baseline
+// of sixty to six hundred a second. The name and distance labels change every
+// frame, and twenty of those at that rate is thousands of calls a second, so
+// they need their update rate cut before they can be added, not just a slot in
+// the pool. The pool exists so that adding them is a table entry and an update
+// interval rather than a new mechanism.
+//
+// The pref is off by default and that is the whole safety story: with it off not
+// one remote call is made for text and the screen looks exactly as it did.
+static void sb_push_overlay_text(UIView *espView) {
+    if (!espView) return;
+    if (!ESPPrefsBool(@"SbCountText", NO)) return;
 
     const CGRect vb = espView.bounds;
     const double landH = (vb.size.width > vb.size.height) ? vb.size.height : vb.size.width;
 
-    if (!r_is_objc_ptr(g_sbTextLayer)) {
-        uint64_t tl = r_msg2_main(r_class("CATextLayer"), "layer", 0,0,0,0);
-        if (!r_is_objc_ptr(tl)) { NSLog(@"[SB-TEXT] +[CATextLayer layer] nil"); return; }
-        g_sbTextLayer = tl;
-
-        double zero[2] = { 0.0, 0.0 };
-        r_msg2_main_raw(tl, "setAnchorPoint:", zero, 16, NULL,0,NULL,0,NULL,0);
-        // kCAAlignCenter, built once and kept: r_nsstr_retained is about six
-        // operations and the value never changes.
-        if (!r_is_objc_ptr(g_sbAlignStr)) g_sbAlignStr = r_nsstr_retained("kCAAlignCenter");
-        if (r_is_objc_ptr(g_sbAlignStr)) r_msg2_main(tl, "setAlignmentMode:", g_sbAlignStr, 0,0,0);
-        // Without this the glyphs are rasterised at scale 1 and scaled up, which
-        // on a 3x panel is the difference between readable and a grey smear.
-        double cs = (double)[UIScreen mainScreen].scale;
-        r_msg2_main_raw(tl, "setContentsScale:", &cs, 8, NULL,0,NULL,0,NULL,0);
-        // Above the geometry layer at 100, so the count is not drawn through a
-        // box outline.
-        double z = 200.0;
-        r_msg2_main_raw(tl, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
-        // No font is set. CATextLayer falls back to Helvetica, and a real
-        // CFTypeRef would need CGFontCreateWithFontName inside the target. The
-        // app draws this in a loaded font, so the two will not match, and
-        // matching is worth less than the calls.
-        double fs = (double)src.fontSize;
-        r_msg2_main_raw(tl, "setFontSize:", &fs, 8, NULL,0,NULL,0,NULL,0);
-        sb_text_ensure_color(tl, src.foregroundColor);
-        const CGRect f = src.frame;
-        sb_text_place(tl, &f, landH);
-        // The string goes in before the layer joins the hierarchy, so the
-        // implicit fade CoreAnimation puts on a newly added sublayer has
-        // nothing to fade from. Suppressing it properly means assembling the
-        // actions dictionary inside the target, about twenty calls, which is not
-        // worth one fade at session start.
-        if (!sb_text_push_string(tl, want)) { g_sbTextLayer = 0; return; }
-        const char *c0 = want.UTF8String;
-        snprintf(g_sbTextLast, sizeof(g_sbTextLast), "%s", c0 ? c0 : "");
-        uint64_t cl = r_msg2_main(g_sbCanvas, "layer", 0,0,0,0);
-        if (r_is_objc_ptr(cl)) r_msg2_main(cl, "addSublayer:", tl, 0,0,0);
-        g_sbTextHidden = 0;
-        NSLog(@"[SB-TEXT] live str=\"%s\" align=%d canvas=%d", g_sbTextLast,
-              (int)r_is_objc_ptr(g_sbAlignStr), (int)r_is_objc_ptr(cl));
-        return;
-    }
-
-    // The common case: the app's string is what SpringBoard already shows. Zero
-    // calls, and that is the case that runs sixty times a second.
-    const char *c = want.UTF8String;
-    if (!c) return;
-    if (!g_sbTextHidden && strcmp(c, g_sbTextLast) == 0) return;
-
-    double fs = (double)src.fontSize;
-    r_msg2_main_raw(g_sbTextLayer, "setFontSize:", &fs, 8, NULL,0,NULL,0,NULL,0);
-    sb_text_ensure_color(g_sbTextLayer, src.foregroundColor);
-    const CGRect f = src.frame;
-    sb_text_place(g_sbTextLayer, &f, landH);
-    if (!sb_text_push_string(g_sbTextLayer, want)) return;
-    snprintf(g_sbTextLast, sizeof(g_sbTextLast), "%s", c);
-    if (g_sbTextHidden) {
-        r_msg2_main(g_sbTextLayer, "setHidden:", 0, 0,0,0);
-        g_sbTextHidden = 0;
-    }
-    NSLog(@"[SB-TEXT] set \"%s\" size=%.0f", g_sbTextLast, src.fontSize);
+    sb_text_sync(SB_TEXT_SLOT_COUNT, espView, @"statusLayer", landH);
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
@@ -530,16 +585,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbLastSubpaths = 0;
     g_sbLastCalls = 0;
     g_sbNextPublishUS = 0;
-    // The counter's label, its colour and its alignment string are all objects
-    // in the target, and the string it last showed describes a session that is
-    // going away. Dropped, not released: the target's allocator and its
-    // autorelease pool are not ours to drive from a teardown.
-    g_sbTextLayer = 0;
-    g_sbTextColor = 0;
-    g_sbAlignStr = 0;
-    g_sbTextR = g_sbTextG = g_sbTextB = g_sbTextA = -1;
-    g_sbTextLast[0] = 0;
-    g_sbTextHidden = 1;
+    sb_text_forget();
     // The hold ring outlives the session pointer, so it is emptied here rather
     // than left for the next SBoardStartOverlay to overwrite.
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
@@ -1069,15 +1115,10 @@ int SBoardStartOverlay(void) {
     g_sbWin = win;
     g_sbShape = shape;
     g_sbCanvas = container;
-    // A new session means the old label, colour and alignment string are
-    // dangling. Dropped here as well as in the teardown, because a rearm builds
-    // a fresh window while the old pointers are still sitting in these globals.
-    g_sbTextLayer = 0;
-    g_sbTextColor = 0;
-    g_sbAlignStr = 0;
-    g_sbTextR = g_sbTextG = g_sbTextB = g_sbTextA = -1;
-    g_sbTextLast[0] = 0;
-    g_sbTextHidden = 1;
+    // A new session means every text slot and the alignment string are dangling.
+    // Dropped here as well as in the teardown, because a rearm builds a fresh
+    // window while the old pointers are still live in these globals.
+    sb_text_forget();
     g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
@@ -1190,12 +1231,11 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
     g_sbSessionDead = 0;
 
-    // Before the geometry, and outside every gate below it, because the counter
-    // is not a shape: it is one label whose string changes about once a second,
-    // and it has to keep counting on the frames where no pawn is on screen and
-    // mergePaths has nothing to send. With the pref off this is one dictionary
-    // read and nothing else.
-    sb_push_count_text(espView);
+    // Before the geometry, and outside every gate below it, because text is not
+    // a shape: the counter has to keep counting on the frames where no pawn is
+    // on screen and mergePaths has nothing to send. With the pref off this is
+    // one dictionary read and nothing else.
+    sb_push_overlay_text(espView);
 
     g_sbSummaryAttempts++;
 
