@@ -173,8 +173,22 @@ static uint64_t g_sbAlignStr = 0;
 // up, and this puts a bound on it no matter what the count does. The count has
 // hysteresis of its own, which should keep it near one change a second; this is
 // what stops a bad frame from turning into forty.
-#define SB_TEXT_MIN_INTERVAL_US 500000ULL
-static uint64_t g_sbNextTextUS = 0;
+// A floor between two wakeups, not a gate on reading.
+//
+// It was 500ms and it wrapped the whole staging block, the signal included, which
+// meant a change of the count waited on average a quarter of a second to even be
+// noticed, before the text thread had been told anything. Added to the 85ms of
+// hysteresis in the app and the retry when the transport is busy, that is the
+// second the number was taking to fall after a kill, measured on the device.
+//
+// The floor is on the wakeup now, not on the reading. Reading is a KVC lookup
+// and a string compare in this process, which costs nothing next to the forty
+// preferences the frame already reads, so there is no reason to skip it. 60ms is
+// sixteen wakeups a second, which bounds the pathological case where the count
+// really does change every frame, and is far below the threshold where a delay
+// is visible.
+#define SB_TEXT_SIGNAL_MIN_US 60000ULL
+static uint64_t g_sbNextSignalUS = 0;
 
 // Ownership of the transport.
 //
@@ -1622,19 +1636,18 @@ void SBRemotePushESPFrame(UIView *espView) {
     // turn whenever a publish holds the transport. The two run at their own
     // rates and the geometry is never the one waiting.
     //
-    // The cost. This is the frame path. The interval gate above lets frames
-    // through every 8ms and the ESP render loop calls in far more often than
-    // that, so an unconditional read is a KVC lookup and a UTF8String conversion
-    // per frame for a value that rarely differs.
+    // The cost. This is the frame path, so the read is a KVC lookup and a string
+    // compare every frame rather than on a timer. That is deliberate now: the
+    // timer used to wrap the signal as well, and a signal that waits on a timer
+    // is a delay, not a ceiling. Reading costs nothing, so it happens every
+    // frame, and the floor between two wakeups lives on the signal instead.
     static int s_textPrev = -1;
     const int textOn = ESPPrefsBool(@"SbCountText", NO) ? 1 : 0;
     const int textChanged = (s_textPrev != textOn);
     s_textPrev = textOn;
     g_sbTextStageBounds = espView.bounds;
     {
-        const uint64_t tTxt = now_us();
-        if (textChanged || tTxt >= g_sbNextTextUS) {
-            g_sbNextTextUS = tTxt + SB_TEXT_MIN_INTERVAL_US;
+        {
             SbTextReq r;
             // Field by field, not memset. The struct holds an NSString, so it is
             // not trivially default initialisable and memset on it is rejected
@@ -1687,7 +1700,11 @@ void SBRemotePushESPFrame(UIView *espView) {
                          : ![r.text isEqualToString:prev];
             if (textChanged || differs) {
                 g_sbTextStaged = r.text;
-                if (g_sbTextWake) dispatch_semaphore_signal(g_sbTextWake);
+                const uint64_t tSig = now_us();
+                if (g_sbTextWake && (textChanged || tSig >= g_sbNextSignalUS)) {
+                    g_sbNextSignalUS = tSig + SB_TEXT_SIGNAL_MIN_US;
+                    dispatch_semaphore_signal(g_sbTextWake);
+                }
             }
         }
     }
