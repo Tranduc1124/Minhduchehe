@@ -41,6 +41,16 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *camSwitch;
 @property (nonatomic, strong) UISlider *camSlider;
 @property (nonatomic, strong) UILabel *camValueLabel;
+@property (nonatomic, strong) UILabel *fovLabel;
+@property (nonatomic, strong) UISwitch *fovSwitch;
+@property (nonatomic, strong) UISlider *fovSlider;
+@property (nonatomic, strong) UILabel *fovValueLabel;
+@property (nonatomic, strong) UILabel *boxLabel;
+@property (nonatomic, strong) UISwitch *boxSwitch;
+@property (nonatomic, strong) UILabel *lineLabel;
+@property (nonatomic, strong) UISwitch *lineSwitch;
+@property (nonatomic, strong) UILabel *hpLabel;
+@property (nonatomic, strong) UISwitch *hpSwitch;
 
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
@@ -409,6 +419,85 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _camValueLabel.text = [NSString stringWithFormat:@"%.0f", _camSlider.value];
     [_togglesCard addSubview:_camValueLabel];
 
+    // The FOV ring, and the three shapes that were only reachable from the
+    // SpringBoard menu, on the same card as Aim and Cam PC.
+    //
+    // These cost nothing to expose. The renderer already gates each shape on its
+    // own pref: isBox, isLine and isHealth in ESPRenderPawnCore, isShowFovCircle
+    // on the ring. A shape that is off never gets a segment appended to its
+    // buffer, so buffers.boxDirty stays false, MenuViewApplyPath takes its else
+    // branch and sets layer.path to nil, and mergePaths skips a nil path. Turning
+    // a shape off therefore removes bytes and remote calls rather than adding
+    // any, which is the only direction of change that is safe on this tree.
+    //
+    // The ring additionally needed untangling from the aimbot, which is a change
+    // in esp.mm rather than here.
+    _fovLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _fovLabel.text = @"Vòng FOV";
+    _fovLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _fovLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_fovLabel];
+
+    _fovSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _fovSwitch.onTintColor = [self accentGreen];
+    _fovSwitch.on = ESPPrefsBool(@"ShowFovCircle", YES);
+    [_fovSwitch addTarget:self action:@selector(fovSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_fovSwitch];
+
+    // FovSize, capped at 190 because the short edge of an 844x390 landscape
+    // screen is 390 and a radius past 195 runs off the top and bottom. The
+    // minimum is 10 rather than 0 so the ring cannot collapse to a dot and look
+    // like a stuck pixel.
+    _fovSlider = [[UISlider alloc] initWithFrame:CGRectZero];
+    _fovSlider.minimumValue = 10.0f;
+    _fovSlider.maximumValue = 190.0f;
+    _fovSlider.value = ESPPrefsFloat(@"FovSize", 120.0f);
+    _fovSlider.minimumTrackTintColor = [self accentGreen];
+    [_fovSlider addTarget:self action:@selector(fovSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_fovSlider];
+
+    _fovValueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _fovValueLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold];
+    _fovValueLabel.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+    _fovValueLabel.text = [NSString stringWithFormat:@"%.0f", _fovSlider.value];
+    [_togglesCard addSubview:_fovValueLabel];
+
+    _boxLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _boxLabel.text = @"Khung (Box)";
+    _boxLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _boxLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_boxLabel];
+
+    _boxSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _boxSwitch.onTintColor = [self accentGreen];
+    _boxSwitch.on = ESPPrefsBool(@"Box", YES);
+    [_boxSwitch addTarget:self action:@selector(boxSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_boxSwitch];
+
+    _lineLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _lineLabel.text = @"Đường kẻ (Line)";
+    _lineLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _lineLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_lineLabel];
+
+    _lineSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _lineSwitch.onTintColor = [self accentGreen];
+    _lineSwitch.on = ESPPrefsBool(@"Line", YES);
+    [_lineSwitch addTarget:self action:@selector(lineSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_lineSwitch];
+
+    _hpLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _hpLabel.text = @"Thanh máu (HP)";
+    _hpLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _hpLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_hpLabel];
+
+    _hpSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _hpSwitch.onTintColor = [self accentGreen];
+    _hpSwitch.on = ESPPrefsBool(@"Health", YES);
+    [_hpSwitch addTarget:self action:@selector(hpSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_hpSwitch];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -594,8 +683,9 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
-    // Quick toggles card (Aimbot / ESP / CamPC + slider)
-    CGFloat togglesH = 176.0f;
+    // Quick toggles card (Aimbot / ESP / CamPC / FOV + slider, then Box / Line / HP)
+    // 176 + 3 rows of 40 for the FOV block and 4 rows of 40 for the three shapes.
+    CGFloat togglesH = 376.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
     _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
@@ -605,6 +695,16 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _camSwitch.frame = CGRectMake(cardW - 68, 90, 51, 31);
     _camSlider.frame = CGRectMake(16, 128, cardW - 90, 30);
     _camValueLabel.frame = CGRectMake(cardW - 64, 130, 48, 24);
+    _fovLabel.frame = CGRectMake(16, 168, 200, 24);
+    _fovSwitch.frame = CGRectMake(cardW - 68, 164, 51, 31);
+    _fovSlider.frame = CGRectMake(16, 202, cardW - 90, 30);
+    _fovValueLabel.frame = CGRectMake(cardW - 64, 204, 48, 24);
+    _boxLabel.frame = CGRectMake(16, 242, 200, 24);
+    _boxSwitch.frame = CGRectMake(cardW - 68, 238, 51, 31);
+    _lineLabel.frame = CGRectMake(16, 282, 200, 24);
+    _lineSwitch.frame = CGRectMake(cardW - 68, 278, 51, 31);
+    _hpLabel.frame = CGRectMake(16, 322, 200, 24);
+    _hpSwitch.frame = CGRectMake(cardW - 68, 318, 51, 31);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -749,6 +849,45 @@ static const CGFloat kMenuButtonSize = 56.0f;
     float v = sender.value;
     _camValueLabel.text = [NSString stringWithFormat:@"%.0f", v];
     ESPPrefsSetFloat(@"CamPCValue", v);
+    ESPSyncFromPrefs();
+}
+
+- (void)fovSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"ShowFovCircle", sender.on);
+    ESPSyncFromPrefs();
+}
+
+// FovSize, and not Fov. The ring has its own radius, read from its own pref, and
+// nothing about the aim reaches it, so dragging this does not move the aim.
+// This is the whole point: the circle used to be sized from aimFov, so the only
+// way to shrink it was to shorten how far the aimbot throws.
+- (void)fovSliderChanged:(UISlider *)sender {
+    float v = sender.value;
+    _fovValueLabel.text = [NSString stringWithFormat:@"%.0f", v];
+    // Live, not the throttled setter, so the ring follows the thumb. The reader
+    // in esp.mm re-reads the pref every frame and the write is a single
+    // NSUserDefaults key, so there is nothing to throttle.
+    ESPPrefsSetFloatLive(@"FovSize", v);
+    ESPSyncFromPrefs();
+}
+
+// Box, Line and Health. Each is already a separate gate in the renderer, so
+// flipping one writes a pref, the next frame stops appending to that one
+// buffer, and its layer path is set to nil. No new drawing code and no new
+// remote call: the shapes that are off take fewer bytes than the shapes that are
+// on.
+- (void)boxSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Box", sender.on);
+    ESPSyncFromPrefs();
+}
+
+- (void)lineSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Line", sender.on);
+    ESPSyncFromPrefs();
+}
+
+- (void)hpSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Health", sender.on);
     ESPSyncFromPrefs();
 }
 

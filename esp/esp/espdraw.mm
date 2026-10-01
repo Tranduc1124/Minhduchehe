@@ -51,14 +51,19 @@ static inline void ESPAddCircle(CGMutablePathRef path, CGPoint center, CGFloat r
     CGPathAddEllipseInRect(path, NULL, rect);
 }
 
+// drawRing, not aimbotEnabled. The flag used to be the aimbot's, and the
+// argument name still said so after the caller stopped passing it, which is how
+// a reader ends up believing the ring belongs to the aimbot. It is a switch in
+// its own right now. fovRadius is a screen radius in points, nothing to do with
+// aim range.
 BOOL RenderFOVCirclePath(
     CGMutablePathRef path,
     float viewWidth,
     float viewHeight,
-    BOOL aimbotEnabled,
+    BOOL drawRing,
     float fovRadius
 ) {
-    if (!path || !aimbotEnabled || fovRadius <= 0) return NO;
+    if (!path || !drawRing || fovRadius <= 0) return NO;
     // FIX "FOV hình vuông": SB mirror serializer (serFunc) flatten curve → line,
     // AddEllipse thành gạch vuông. Vẽ polyline 72 đoạn — giữ nguyên hình tròn
     // qua cả in-app layer lẫn mirror path (chỉ có Move/Line ops).

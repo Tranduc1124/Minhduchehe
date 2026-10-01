@@ -1546,7 +1546,14 @@ bool Norecoil = NO;
 bool isSpeed = NO;           // PlayerAttributes.RunSpeedUpScale boost
 float speedvalue = 1.0f;     // Brutal run scale when Norecoil ON (pref BrutalSpeed)
 float moveSpeedScale = 1.0f; // Speed multiplier (1.0 = off/normal)
-bool isShowFovCircle = YES;  // Draw FOV ring when Aimbot range = FOV
+bool isShowFovCircle = YES;  // Draw the FOV ring. Not tied to the aimbot any more.
+// The ring's radius, as a screen radius in points. It used to be aimFov, which
+// welded two unrelated settings together: the only way to shrink the circle was
+// to shorten how far the aim reaches. Free Fire here is 844x390 landscape, so
+// viewHeight is 390 and anything past about 190 runs off the top and bottom.
+// The slider is capped at 190 for that reason and the clamp below is the
+// backstop for a pref written by an older build.
+float fovSize = 120.0f;
 bool isEspCheckVisible = NO;
 bool isAimIgnoreBot = NO; bool isAimIgnoreKnock = NO;
 // isAimBehindWall defined near wall helpers (default NO).
@@ -2475,8 +2482,17 @@ void ESPSyncFromPrefs(void) {
         isSpeed = NO;
         moveSpeedScale = 1.0f;
     }
-    // FOV ring visibility (only drawn when Aimbot + sphere FOV mode).
+    // FOV ring visibility. The aimbot and aimSphereMode are deliberately not in
+    // this condition: they used to be, and the effect was that turning the
+    // aimbot off deleted the ring, choosing the 180 or 360 sphere deleted it too,
+    // and the only way to make the circle smaller was to weaken the aim.
     isShowFovCircle = ESPPrefsBool(@"ShowFovCircle", YES);
+    // 10 to 190. Below 5 the ring is a dot and above 190 it is clipped by the
+    // short edge of the screen, so both ends are refused rather than passed to
+    // cosf and sinf as-is.
+    fovSize = ESPPrefsFloat(@"FovSize", 120.0f);
+    if (fovSize < 5.0f)  fovSize = 120.0f;
+    if (fovSize > 190.0f) fovSize = 190.0f;
 
     isESP      = ESPPrefsBool(@"EnableESP", YES);
     isESP2     = ESPPrefsBool(@"EnableESP2", NO);
@@ -3329,10 +3345,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
         ESPGeometryBuffersRelease(&buffers);
 
         CGMutablePathRef fovPath = CGPathCreateMutable();
-        // FOV circle only for Aimbot FOV mode (0) + ShowFovCircle ON.
-        // 180/360 hide the ring. Assist uses game crosshair (no FOV ring).
+        // The ring is a circle on the screen in its own right, so its visibility
+        // is ShowFovCircle alone and its radius is FovSize. It used to be gated
+        // on isAimbot && aimSphereMode == 0 and sized from aimFov.
         BOOL hasFov = RenderFOVCirclePath(fovPath, viewWidth, viewHeight,
-                                          isAimbot && aimSphereMode == 0 && isShowFovCircle, aimFov);
+                                          isShowFovCircle, fovSize);
         self.fovLayer.path = hasFov ? fovPath : nil;
         CGPathRelease(fovPath);
 
