@@ -1,5 +1,4 @@
 #import "esp.h"
-#import "esptext.h"
 #import "GameLogic.h"
 #import "mahoa.h"
 #import <CoreGraphics/CoreGraphics.h>
@@ -302,18 +301,8 @@ static void ESPRenderPawnCore(
     if (isName && textCallback) {
         NSString *dispName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (dispName.length > 0) {
-            const CGRect nf = CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f,
-                                         200.0f, dynFontSize + 4.0f);
             // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-            textCallback(callbackContext, dispName, nf, [UIColor yellowColor], dynFontSize, NO);
-            // Recorded here rather than inside addText: because this is the only
-            // place the pawn is in hand. The app's own text pool has no stable
-            // key, so the manifest is what makes a name follow its player.
-            {
-                static const CGFloat yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
-                ESPTextManifestAdd(PawnObject, ESP_TEXT_KIND_NAME, dispName,
-                                   nf, dynFontSize, yellow);
-            }
+            textCallback(callbackContext, dispName, CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f, 200.0f, dynFontSize + 4.0f), [UIColor yellowColor], dynFontSize, NO);
         }
     }
 
@@ -322,15 +311,8 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     if (isDis && textCallback) {
         NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
-        const CGRect df = CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f,
-                                     200.0f, dynFontSize + 4.0f);
         // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-        textCallback(callbackContext, distString, df, [UIColor whiteColor], dynFontSize, NO);
-        {
-            static const CGFloat white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-            ESPTextManifestAdd(PawnObject, ESP_TEXT_KIND_DISTANCE, distString,
-                               df, dynFontSize, white);
-        }
+        textCallback(callbackContext, distString, CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f, 200.0f, dynFontSize + 4.0f), [UIColor whiteColor], dynFontSize, NO);
     }
 
     // ---------------------------------------------------------

@@ -172,7 +172,3 @@ Vector3 ResolveHeadWorldPosForESP(uint64_t pawn);
 @interface ESPOverlayView : UIView
 - (instancetype)initWithFrame:(CGRect)frame;
 @end
-// The text manifest lives in esptext.h, not here. It has to: this header is
-// reached by remote/SpringBoardOverlay.m, which is a .m file, and this header
-// pulls in C++ through GameLogic.h.
-#import "esptext.h"

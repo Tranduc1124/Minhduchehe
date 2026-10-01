@@ -1,5 +1,4 @@
 #import "esp.h"
-#import "esptext.h"
 #import "ESPPrefs.h"
 #import "offset.h"
 #import "GameOffsets.h"
@@ -3270,12 +3269,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
         const uint64_t tPhase0 = ESPPhaseNowUS();
         [self resetReusableLayers];
 
-        // The manifest is rebuilt from empty every frame, before any pawn is
-        // walked, so a label that is not drawn this frame is simply not in it.
-        // That is what makes the overlay's reconcile a single walk: absence is
-        // the delete.
-        ESPTextManifestReset();
-
         // Free Fire renders landscape. This process never rotates, because it
         // is a background app while the game owns the screen, so self.bounds is
         // permanently the portrait pair (390x844). The projection matrix read
@@ -3485,68 +3478,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
         }
     }
 }
-
-// The text manifest.
-//
-// Deliberately dumb: a fixed array, rewritten from empty every frame, written
-// beside the draw call that already has the pawn in hand. No comparison against
-// the previous frame here, because the reader already knows what it last sent, per
-// pawn, because it holds a slot for each one. Comparing on this side would mean
-// keeping a second copy of every entry and scanning it, to arrive at a number the
-// other side can work out for free while it is reconciling anyway.
-//
-// Written on the render thread and read on the text thread. That is the same
-// arrangement the geometry uses: bytes are produced on one thread and consumed on
-// another, and the sequence number in the header is what tells the reader whether
-// it is looking at a whole frame. Entries are only ever appended and the count
-// only ever rises within a frame, so a reader that takes the count and the entries
-// together sees a consistent prefix.
-static EspTextManifest g_espTextManifest;
-
-extern "C" void ESPTextManifestReset(void) {
-    g_espTextManifest.count = 0;
-    g_espTextManifest.overflow = 0;
-    g_espTextManifest.frame++;
-}
-
-extern "C" int32_t ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
-                           CGRect frame, CGFloat size, const CGFloat *rgba) {
-    if (!text || text.length == 0) return 0;
-    if (g_espTextManifest.count >= ESP_TEXT_MANIFEST_MAX) {
-        g_espTextManifest.overflow++;
-        return 0;
-    }
-    EspTextEntry *e = &g_espTextManifest.e[g_espTextManifest.count];
-    memset(e, 0, sizeof(*e));
-    e->pawn = pawn;
-    e->kind = (uint32_t)kind;
-    e->x = (float)frame.origin.x;
-    e->y = (float)frame.origin.y;
-    e->w = (float)frame.size.width;
-    e->h = (float)frame.size.height;
-    e->size = (float)size;
-    e->r = rgba ? (float)rgba[0] : 1.0f;
-    e->g = rgba ? (float)rgba[1] : 1.0f;
-    e->b = rgba ? (float)rgba[2] : 1.0f;
-    e->a = rgba ? (float)rgba[3] : 1.0f;
-
-    // Truncated rather than dropped, so a long name still shows. Cutting a UTF-8
-    // sequence mid character would put a broken string in front of
-    // +[NSString stringWithUTF8String:] in the target, which returns nil, and the
-    // label would go blank instead of showing a shorter name.
-    const char *utf8 = text.UTF8String;
-    if (!utf8) return 0;
-    size_t n = strlen(utf8);
-    if (n > ESP_TEXT_NAME_MAX - 1) n = ESP_TEXT_NAME_MAX - 1;
-    memcpy(e->text, utf8, n);
-    e->text[n] = 0;
-    e->len = (uint16_t)n;
-
-    g_espTextManifest.count++;
-    return 1;
-}
-
-extern "C" const EspTextManifest *ESPTextManifestGet(void) { return &g_espTextManifest; }
 
 // Hysteresis table behind the enemy count. See the tally at the end of the pawn
 // loop: a pawn counts if it was drawn recently, not only if it is drawn now.
