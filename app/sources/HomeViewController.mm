@@ -504,9 +504,13 @@ static const CGFloat kMenuButtonSize = 56.0f;
     // game is in front. Off by default and that is not caution for its own sake:
     // the label has to be turned a quarter turn by hand to match the overlay's
     // portrait window, and that placement cannot be checked without a device.
-    // With the switch off the overlay makes no call at all for it.
+    //
+    // This is not the same switch as the menu's own Count. That one decides
+    // whether the app counts at all; this one decides whether the count is
+    // mirrored into SpringBoard. Both were on screen and both read as the same
+    // control, which is why the mirror's switch is labelled plainly.
     _sbTextLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    _sbTextLabel.text = @"Counter lên SpringBoard";
+    _sbTextLabel.text = @"Đếm người";
     _sbTextLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     _sbTextLabel.textColor = [UIColor whiteColor];
     [_togglesCard addSubview:_sbTextLabel];

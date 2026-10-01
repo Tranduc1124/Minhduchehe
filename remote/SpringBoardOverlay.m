@@ -114,6 +114,14 @@ typedef struct {
 static SbTextSlot g_sbText[SB_TEXT_SLOTS];
 // kCAAlignCenter, built once in the target and shared by every slot.
 static uint64_t g_sbAlignStr = 0;
+// How often the app's text is read. The counter's string changes about once a
+// second, so four times a second is four times more often than it needs, and the
+// point of the gate is that the frame path does no work at all between ticks:
+// the publish interval above is 8ms and the ESP render loop calls in far more
+// often than that, so reading on every call was a KVC lookup and a UTF8String
+// conversion at frame rate for a string that changes once a second.
+#define SB_TEXT_MIN_INTERVAL_US 250000ULL
+static uint64_t g_sbNextTextUS = 0;
 
 static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
@@ -309,27 +317,26 @@ static int sb_text_push_string(uint64_t tl, const char *cstr) {
 // Creates a colour in SpringBoard, but only when it has actually changed. The
 // counter is one of a small number of flat colours, so after the first few
 // changes this costs nothing at all.
-static void sb_text_ensure_color(SbTextSlot *sl, uint64_t tl, CGColorRef c) {
-    if (!c) return;
-    const size_t n = CGColorGetNumberOfComponents(c);
-    const CGFloat *comp = CGColorGetComponents(c);
-    if (n < 3 || !comp) return;
-    // Slots 0 to 2 are the colour channels for every RGB and every grey model,
-    // and alpha is last. These are flat UIColors, so grey never arrives here
-    // with a different meaning.
-    const float r = (float)comp[0], g = (float)comp[1], b = (float)comp[2];
-    const float a = (n >= 4) ? (float)comp[n - 1] : 1.0f;
+//
+// The components arrive as four doubles rather than a CGColorRef because the
+// colour is read on the app's thread and sent across. A CGColorRef captured
+// into a block is not retained under ARC, so between the read and the send the
+// app's layer could have replaced it and the pointer would be stale. Four
+// doubles cannot go stale.
+static void sb_text_ensure_color(SbTextSlot *sl, uint64_t tl,
+                                double cr, double cg, double cb, double ca) {
+    const float r = (float)cr, g = (float)cg, b = (float)cb, a = (float)ca;
     if (sl->color && fabsf(r - sl->r) < 0.004f && fabsf(g - sl->g) < 0.004f &&
         fabsf(b - sl->b) < 0.004f && fabsf(a - sl->a) < 0.004f) return;
     uint64_t cls = r_class("UIColor");
     if (!r_is_objc_ptr(cls)) return;
     double v[4] = { r, g, b, a };
-    uint64_t col = r_msg2_main_raw(cls, "colorWithRed:green:blue:alpha:",
-                                   &v[0], 8, &v[1], 8, &v[2], 8, &v[3], 8);
-    uint64_t cg = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
-    if (!r_is_objc_ptr(cg)) return;
-    sl->color = cg; sl->r = r; sl->g = g; sl->b = b; sl->a = a;
-    r_msg2_main(tl, "setForegroundColor:", cg, 0,0,0);
+    uint64_t cObj = r_msg2_main_raw(cls, "colorWithRed:green:blue:alpha:",
+                                    &v[0], 8, &v[1], 8, &v[2], 8, &v[3], 8);
+    uint64_t cCG = r_is_objc_ptr(cObj) ? r_msg2_main(cObj, "CGColor", 0,0,0,0) : 0;
+    if (!r_is_objc_ptr(cCG)) return;
+    sl->color = cCG; sl->r = r; sl->g = g; sl->b = b; sl->a = a;
+    r_msg2_main(tl, "setForegroundColor:", cCG, 0,0,0);
 }
 
 // Places the label so that, after the quarter turn, its glyphs occupy exactly
@@ -401,29 +408,29 @@ static void sb_text_forget(void) {
 // changes every frame would cost about seven calls every frame, and twenty of
 // them would be thousands of calls a second, which is why the pool alone is not
 // enough for the per player text and the update rate has to come down too.
-static void sb_text_sync(int slot, UIView *espView, NSString *key, double landH) {
-    if (slot < 0 || slot >= SB_TEXT_SLOTS || !espView) return;
+//
+// The caller supplies the text, the colour components, the frame and the size
+// rather than this reading the app's layer. That is not tidiness, it is a race:
+// the app writes statusLayer.string on its own thread, and a background thread
+// reading it mid write is a torn read waiting to happen. The existing code draws
+// the same line by copying the serialised bytes on the calling thread and only
+// decoding them on the publish thread, and the text is read the same way.
+static void sb_text_send(int slot, NSString *text,
+                         double cr, double cg, double cb, double ca,
+                         CGRect frame, CGFloat fontSize, double landH) {
+    if (slot < 0 || slot >= SB_TEXT_SLOTS) return;
     SbTextSlot *sl = &g_sbText[slot];
 
-    id obj = [espView valueForKey:key];
-    if (![obj isKindOfClass:[CATextLayer class]]) return;
-    CATextLayer *src = (CATextLayer *)obj;
-    // CATextLayer declares string as id in this SDK, so the type is pinned here
-    // once instead of at every use.
-    NSString *want = (NSString *)src.string;
-    if (!want) return;
-    const char *c = want.UTF8String;
-    const BOOL hidden = src.hidden || want.length == 0 || !c;
-
-    if (hidden) {
+    if (!text || text.length == 0) {
         if (r_is_objc_ptr(sl->layer) && !sl->hidden) {
             r_msg2_main(sl->layer, "setHidden:", 1, 0,0,0);
             sl->hidden = 1;
         }
         return;
     }
-    // The common case, and the one that runs every frame. Nothing to say and
-    // nothing to do.
+    const char *c = text.UTF8String;
+    if (!c) return;
+    // The common case. Nothing to say and nothing to do.
     if (r_is_objc_ptr(sl->layer) && !sl->hidden && strcmp(c, sl->last) == 0) return;
 
     if (!r_is_objc_ptr(sl->layer)) {
@@ -466,11 +473,10 @@ static void sb_text_sync(int slot, UIView *espView, NSString *key, double landH)
         sl->color = 0; sl->r = sl->g = sl->b = sl->a = -1;
     }
 
-    double fs = (double)src.fontSize;
+    double fs = (double)fontSize;
     r_msg2_main_raw(sl->layer, "setFontSize:", &fs, 8, NULL,0,NULL,0,NULL,0);
-    sb_text_ensure_color(sl, sl->layer, src.foregroundColor);
-    const CGRect f = src.frame;
-    sb_text_place(sl->layer, &f, landH);
+    sb_text_ensure_color(sl, sl->layer, cr, cg, cb, ca);
+    sb_text_place(sl->layer, &frame, landH);
     if (!sb_text_push_string(sl->layer, c)) return;
     snprintf(sl->last, sizeof(sl->last), "%s", c);
     if (sl->hidden) {
@@ -487,35 +493,6 @@ static void sb_text_sync(int slot, UIView *espView, NSString *key, double landH)
         return;
     }
     NSLog(@"[SB-TEXT] slot %d set \"%s\" size=%.0f", slot, sl->last, fs);
-}
-
-// The text that goes over to SpringBoard.
-//
-// Every other shape here is a path, and a path cannot carry letters. mergePaths
-// reads kShapeKeys, which is sixteen CAShapeLayers, and the decoder turns each
-// one into CGPathAddRects and CGPathAddLines. Text is a CATextLayer rather than
-// a path, so it never crossed over, and existed only while the app was in the
-// foreground. RenderTotalEnemyCount at espdraw.mm:85 turned out to be dead code
-// that nothing calls; the live counter is statusLayer, built at esp.mm:3381.
-//
-// The counter is the only source wired up, and deliberately. Its string changes
-// about once a second, so a change costs about eleven calls against a baseline
-// of sixty to six hundred a second. The name and distance labels change every
-// frame, and twenty of those at that rate is thousands of calls a second, so
-// they need their update rate cut before they can be added, not just a slot in
-// the pool. The pool exists so that adding them is a table entry and an update
-// interval rather than a new mechanism.
-//
-// The pref is off by default and that is the whole safety story: with it off not
-// one remote call is made for text and the screen looks exactly as it did.
-static void sb_push_overlay_text(UIView *espView) {
-    if (!espView) return;
-    if (!ESPPrefsBool(@"SbCountText", NO)) return;
-
-    const CGRect vb = espView.bounds;
-    const double landH = (vb.size.width > vb.size.height) ? vb.size.height : vb.size.width;
-
-    sb_text_sync(SB_TEXT_SLOT_COUNT, espView, @"statusLayer", landH);
 }
 
 static BOOL mergePaths(UIView *espView, NSMutableData *d) {
@@ -1242,12 +1219,6 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
     g_sbSessionDead = 0;
 
-    // Before the geometry, and outside every gate below it, because text is not
-    // a shape: the counter has to keep counting on the frames where no pawn is
-    // on screen and mergePaths has nothing to send. With the pref off this is
-    // one dictionary read and nothing else.
-    sb_push_overlay_text(espView);
-
     g_sbSummaryAttempts++;
 
     uint64_t t = now_us();
@@ -1280,6 +1251,62 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
+
+    // Text is read here, on the thread that writes it, and sent from the publish
+    // queue after the geometry. Three things forced that split.
+    //
+    // The race. The app assigns statusLayer.string on its own thread, so reading
+    // it from the publish queue can catch it mid write. The geometry already
+    // draws this line, copying the serialised bytes here and only decoding them
+    // on the publish thread, and the text is read the same way.
+    //
+    // The cost. This is the frame path. The interval gate above lets frames
+    // through every 8ms and the ESP render loop calls in far more often than
+    // that, so an unconditional read is a KVC lookup and a UTF8String conversion
+    // per frame for a string that changes about once a second.
+    //
+    // The blocking. The first version made its remote calls synchronously right
+    // here, on the render thread, in front of the geometry. Eleven crossing calls
+    // block the frame that is building the boxes, which is what the lag was: the
+    // ESP moved in visible steps rather than smoothly. Text is now sent from the
+    // publish thread, after the frame is already on screen, so it cannot delay
+    // it and a failure in it cannot drop one.
+    static int s_textPrev = -1;
+    const int textOn = ESPPrefsBool(@"SbCountText", NO) ? 1 : 0;
+    const int textChanged = (s_textPrev != textOn);
+    s_textPrev = textOn;
+
+    NSString *textSend = nil;
+    // Four scalars and not a double[4]: a block cannot capture a C array, and a
+    // struct would work but four doubles say the same thing without inventing a
+    // type for it.
+    double colR = 1.0, colG = 0.0, colB = 0.0, colA = 1.0;
+    CGRect frameSend = CGRectZero;
+    CGFloat sizeSend = 0.0;
+    if (textOn) {
+        const uint64_t tTxt = now_us();
+        if (textChanged || tTxt >= g_sbNextTextUS) {
+            g_sbNextTextUS = tTxt + SB_TEXT_MIN_INTERVAL_US;
+            id obj = [espView valueForKey:@"statusLayer"];
+            if ([obj isKindOfClass:[CATextLayer class]]) {
+                CATextLayer *src = (CATextLayer *)obj;
+                // CATextLayer declares string as id in this SDK.
+                NSString *s = (NSString *)src.string;
+                if (s.length > 0 && !src.hidden) {
+                    textSend = s;
+                    frameSend = src.frame;
+                    sizeSend = src.fontSize;
+                    CGColorRef c = src.foregroundColor;
+                    const size_t nc = c ? CGColorGetNumberOfComponents(c) : 0;
+                    const CGFloat *cc = c ? CGColorGetComponents(c) : NULL;
+                    if (nc >= 3 && cc) {
+                        colR = cc[0]; colG = cc[1]; colB = cc[2];
+                        colA = (nc >= 4) ? cc[nc - 1] : 1.0;
+                    }
+                }
+            }
+        }
+    }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
@@ -1647,6 +1674,33 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             if (drawn > 0) {
                 sb_invoke_cached_main_raw();
+
+                // Text goes out after the geometry, never before it, so its
+                // latency lands on a frame that is already on screen and a
+                // failure in it cannot cost one. It runs here rather than in the
+                // caller because these are the remote calls, and this is the
+                // thread that is allowed to make them.
+                //
+                // The off branch is the fix for the switch doing nothing. Stopping
+                // the updates is not the same as taking the text away: the label
+                // was already in SpringBoard and stayed there for the life of the
+                // session, which is what was reported. sb_text_send with no text
+                // hides the slot, and it costs one call the first time and none
+                // after that.
+                {
+                    const CGRect vb = espView.bounds;
+                    const double landH = (vb.size.width > vb.size.height)
+                                       ? vb.size.height : vb.size.width;
+                    if (textOn) {
+                        sb_text_send(SB_TEXT_SLOT_COUNT, textSend,
+                                     colR, colG, colB, colA,
+                                     frameSend, sizeSend, landH);
+                    } else if (textChanged) {
+                        sb_text_send(SB_TEXT_SLOT_COUNT, nil,
+                                     0, 0, 0, 0, CGRectZero, 0, landH);
+                    }
+                }
+
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
                 g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
