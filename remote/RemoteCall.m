@@ -290,6 +290,14 @@ static bool remote_call_should_log_result(const char *name, bool stable)
         return true;
 
     static const char *quietSymbols[] = {
+        // The overlay draws with these and nothing else, 7 to 11 times per
+        // publish. They were missing here, so every single drawing call printed
+        // its return value to stderr, and stderr is unbuffered when it is a
+        // pipe, so that is a write syscall per call on the frame path.
+        "CGPathCreateMutable",
+        "CGPathAddRects",
+        "CGPathAddLines",
+        "CGPathRelease",
         "malloc",
         "free",
         "objc_msgSend",
@@ -1225,7 +1233,23 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
     ExceptionMessage exc;
-    RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
+    // The wait1 begin and wait1 caught traces used to be unconditional NSLogs
+    // here, and the wait2 pair had the same two. One successful call printed
+    // four of them and a publish makes 7 to 11 calls, so 28 to 44 synchronous
+    // NSLogs per publish, each formatting into a 1KB buffer and going out
+    // through os_log. NSLog is a write, not a memcpy, and it is the reason
+    // [SB-CALL] showed the crossings at a third of a millisecond each while the
+    // wall clock per call was two and a half.
+    //
+    // Deleted rather than gated. A gate needs an environment lookup or a new
+    // global, and either adds state to the one function that must not gain any:
+    // this is where the mutex lives that every crossing in the process
+    // serialises behind. A diagnostic that cannot pay for itself is not worth a
+    // branch here.
+    //
+    // Nothing was lost. Every fault case on this path is still unconditional:
+    // wait1 TIMEOUT, wait1 REJECT non-live state, wait2 TIMEOUT, and the
+    // restore_trojan_thread lines.
     const uint64_t tCallStart = rc_now_us();
     if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
@@ -1233,10 +1257,6 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
-            name ?: "(addr-call)",
-            (unsigned long long)native_strip(exc.threadState.__pc),
-            (unsigned long long)native_strip(exc.threadState.__lr));
 
     // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
     // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
@@ -1275,7 +1295,6 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     }
 
     ExceptionMessage exc2;
-    RC_DIAG("stable/%s wait2 begin", name ?: "(addr-call)");
     if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
@@ -1286,11 +1305,6 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
-    RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
-            name ?: "(addr-call)",
-            (unsigned long long)native_strip(exc2.threadState.__pc),
-            (unsigned long long)native_strip(exc2.threadState.__lr),
-            (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
     reply_with_state(&exc2, &exc2.threadState);
     rc_note_call_cost(tCallStart, tW1Done, tSignDone);
