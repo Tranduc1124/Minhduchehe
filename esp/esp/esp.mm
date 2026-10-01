@@ -3391,11 +3391,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
             UIColor *redText = [UIColor colorWithRed:1.0f green:0.0f blue:0.0f alpha:1.0f];
 
             if (stats.realCount == 0 && stats.botCount == 0) {
-                // "Ful" and not "CLEAR". The counter answers one question, which
-                // is how many, and "CLEAR" was answering a different one in
-                // words the same reader has to decode. Three letters, and the
-                // same width whatever the number would have been.
-                countText = @"Ful";
+                // Two dashes and not a word. The counter answers one question,
+                // which is how many, and "CLEAR" and then "Ful" were both
+                // answering a different one in letters the same reader has to
+                // decode. "--" is the same width whatever the number would have
+                // been, and unlike a single dash it cannot be mistaken for a
+                // stray mark on the screen.
+                countText = @"--";
                 countColor = redText;
                 fontSize = 25.0f;
             } else {
