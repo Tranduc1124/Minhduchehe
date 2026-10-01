@@ -155,6 +155,13 @@ static SbTextSlot g_sbText[SB_TEXT_SLOTS];
 static uint64_t g_sbTextShape = 0;      // the CAShapeLayer, filled, in the target
 static uint64_t g_sbTextPath  = 0;      // its CGMutablePath, in the target
 static uint64_t g_sbTextFill  = 0;      // its CGColor, in the target
+// Whether the counter's layer is currently showing something, which is not the
+// same as whether the pref is on. A CAShapeLayer keeps the last path it was given
+// until it is given another, so with the pref off and no marker arriving the layer
+// goes on showing the digits that were switched off. This is what lets the publish
+// tell "off and already cleared" from "off but still showing the old number", and
+// pay for the empty path only on the edge.
+static int      s_sbTextLive   = 0;
 // The built outline and what it was built from. Both in this process, so there is
 // no remote state to lose on a rearm.
 static CGPathRef g_sbTextGlyphPath = NULL;
@@ -908,6 +915,12 @@ static void sb_forget_local_paint_state(void) {
     g_sbInvokeSel = 0;
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
+    // The remote session is going away, so the path it was holding is not ours to
+    // release later. Clearing it here also puts the off edge back to "nothing is
+    // showing", so a rearmed overlay that starts with the counter off does not try
+    // to clear a layer from the previous session.
+    g_sbTextPath = 0;
+    s_sbTextLive = 0;
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -1443,21 +1456,15 @@ int SBoardStartOverlay(void) {
         // Red, matching the app's counter. Built here rather than mirrored,
         // because a CGColor is an object in the target and the app's is in this
         // process, and the counter has been red for every version of it.
-        // Blue, deliberately, and not red.
+        // Red, and it stays a flat literal rather than coming from the app's colour
+        // preference, because the one time it was worth knowing exactly which layer
+        // a colour came from is the time it should not have moved.
         //
-        // The device ruled out both of my theories and left a contradiction. The
-        // glyph is 12.4 by 17.6 at 415.7, which is 377 plus half of 90 minus the
-        // width, so the transform is right. The text path carried L16 and nothing
-        // else, so the FOV's 73 points never arrived there. And a filled path that
-        // small cannot be a red disc the size of the FOV ring. So something is
-        // being filled that is not the glyph path, and a red fill cannot tell me
-        // whether the text layer is the thing drawing it.
-        //
-        // Blue answers that in one build. If the FOV turns blue, the text layer is
-        // drawing it and the path in the target is not the path that was sent. If
-        // it stays red, the text layer is innocent and the geometry layer is being
-        // recoloured, which is a different line of enquiry entirely.
-        double tc[4] = { 0.0, 0.0, 1.0, 1.0 };
+        // It was blue for three builds while the FOV was being tracked down, and
+        // that is how the cause was finally found: with both layers filled the same
+        // way, the FOV turning blue proved the ring was on the counter's layer. The
+        // ring is white and a thin ring again, so the instrument has done its job.
+        double tc[4] = { 1.0, 0.0, 0.0, 1.0 };
         uint64_t tCol = r_msg2_main_raw(r_class("UIColor"),
                                         "colorWithRed:green:blue:alpha:",
                                         &tc[0], 8, &tc[1], 8, &tc[2], 8, &tc[3], 8);
@@ -1492,6 +1499,10 @@ int SBoardStartOverlay(void) {
         r_msg2_main_raw(tShape, "setClip:", clip, 32, NULL,0,NULL,0,NULL,0);
         sb_disable_layer_actions(tShape);
         g_sbTextShape = tShape;
+        // A brand new layer holds no path, so nothing is showing and the off edge
+        // in the publish must not skip its one clearing call on this session's
+        // account.
+        s_sbTextLive = 0;
         uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
         if (r_is_objc_ptr(cLayer)) {
             r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
@@ -2381,10 +2392,50 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
             // Without the gate it ran on every publish even with the counter off,
             // handing a fresh empty path to a filled layer sixty times a second,
             // which is a wasted main thread wakeup and a wasted redraw.
+            // Turning the counter OFF, which the gate above made impossible.
+            //
+            // This is my bug, from d205b8bf4. Gating setPath: on textPathReady was
+            // right: it removed thirteen crossings and 24ms of usleep from every
+            // publish. But a CAShapeLayer keeps whatever path it was last handed
+            // for the life of the session, and nothing else here clears it. No
+            // setHidden, no removeFromSuperlayer, no setOpacity, and the old
+            // sb_text_send slot path that did hide it is dead code whose only
+            // caller has none. So with the pref off there is no layer 16 marker,
+            // textPathReady stays 0, setPath: never runs, and the digits the user
+            // just switched off stay on screen permanently. Turning it off did
+            // nothing at all.
+            //
+            // The fix is the off edge, once. A CAShapeLayer has no clearPath, so
+            // an empty path is handed over instead, which is what the ungated code
+            // was doing sixty times a second. Once is enough: the layer then holds
+            // an empty path and there is nothing to redraw, so every later publish
+            // with the counter off costs nothing, which is the whole point of the
+            // gate. This also covers the other way the marker goes missing, where
+            // the app hides its own statusLayer, since both arrive here as the same
+            // absence of a marker.
+            if (!textPathReady && s_sbTextLive && r_is_objc_ptr(g_sbTextShape)) {
+                s_sbTextLive = 0;
+                uint64_t empty = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                calls++;
+                if (r_is_objc_ptr(empty)) {
+                    r_msg2_main(g_sbTextShape, "setPath:", empty, 0,0,0);
+                    calls++;
+                    // Handed to the layer and kept, so the next marker releases it
+                    // in the block above instead of leaking it. g_sbTextPath is left
+                    // pointing at what the layer actually holds, so the two never
+                    // disagree about who owns the old path.
+                    if (r_is_objc_ptr(g_sbTextPath)) {
+                        dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
+                        calls++;
+                    }
+                    g_sbTextPath = empty;
+                }
+            }
             if (textPathReady && r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
                 r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
+                s_sbTextLive = 1;
                 // What actually went on the text layer. The FOV ring came out as a
                 // solid red disc, which is what a filled closed circle looks like,
                 // so either a geometry run reached this path or the glyphs did. The
