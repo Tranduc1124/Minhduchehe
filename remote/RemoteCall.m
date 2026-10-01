@@ -1254,10 +1254,29 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
-    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
+    uint64_t parkPC = native_strip(exc.threadState.__pc);
+    // The "(expect 0x301)" in this line was wrong for the whole life of the file.
+    // 0x301 is only the creation-time park, seen by the first stable call of a
+    // session. Every call after it sees the thread re-faulting at 0x401, because a
+    // call ends by republishing the faulted state, and that state's __pc is 0x401.
+    // So this message has been printing a warning on every single healthy call and
+    // the warning told us nothing, which is the worst kind of diagnostic.
+    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx",
             name ?: "(addr-call)",
-            (unsigned long long)native_strip(exc.threadState.__pc),
+            (unsigned long long)parkPC,
             (unsigned long long)native_strip(exc.threadState.__lr));
+
+    // A park is 0x301, the creation-time one, or 0x401, the one every completed
+    // call leaves behind. Anything else on this port is a fault from the callee
+    // that ran past where we thought the session was, and signing pc=<callee> onto
+    // it is how a desynchronised thread gets handed a second call while it is
+    // still executing the first one. Refuse instead.
+    if (parkPC != (uint64_t)FAKE_PC_TROJAN && parkPC != (uint64_t)FAKE_LR_TROJAN) {
+        RC_DIAG("stable/%s wait1: port delivered PC=0x%llx, not a park; session failed",
+                name ?: "(addr-call)", (unsigned long long)parkPC);
+        g_RC_success = false;
+        return 0;
+    }
 
     // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
     // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
@@ -1307,11 +1326,52 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
+    uint64_t retPC = native_strip(exc2.threadState.__pc);
+    uint64_t retLR = native_strip(exc2.threadState.__lr);
+
+    // Did the callee return, or did it fault?
+    //
+    // This is the check that was missing and it is the whole loop. Every remote
+    // call signs the thread with __lr = FAKE_LR_TROJAN, 0x401, so a call that
+    // completed comes back here with __pc = 0x401. A call whose callee faulted
+    // comes back with __pc somewhere in the callee instead, and at that point x0
+    // is not a return value, it is whatever register the faulting code had
+    // loaded. Reading it as a result hands the overlay a garbage pointer, the
+    // overlay sends it the next message as a receiver, and that message faults at
+    // objc_msgSend+0x20 reading a bogus isa. One bad value becomes two bad
+    // values, in a frame that is several hundred calls long.
+    //
+    // The device log from 2026-09-30 22:03:17 shows a real instance of the value
+    // being wrong rather than the code being wrong:
+    //   stable/objc_msgSend wait2 exc=0x1 code=0x101/0x401 PC=0x401 x0=0x194a07520
+    // 0x194a07520 is out of the shared cache, not out of SpringBoard's heap, and
+    // r_is_objc_ptr only rejects below 0x100000000, so it passed and it was used.
+    //
+    // The parked thread is put back on 0x401 rather than being replied verbatim,
+    // which would resume it inside the callee with nothing re-parking it. This
+    // path costs two remote_pac calls, but the session gate above means it can
+    // only be reached once per publish frame, so the price is not paid on the
+    // working path at all.
+    if (retPC != (uint64_t)FAKE_LR_TROJAN && retPC != (uint64_t)FAKE_PC_TROJAN) {
+        RC_DIAG("stable/%s wait2: callee faulted at PC=0x%llx LR=0x%llx x0=0x%llx "
+                "— not a return; session failed",
+                name ?: "(addr-call)",
+                (unsigned long long)retPC,
+                (unsigned long long)retLR,
+                (unsigned long long)exc2.threadState.__x[0]);
+        arm_thread_state64_internal park = exc2.threadState;
+        for (int i = 0; i <= 8; i++) park.__x[i] = 0;
+        sign_state(g_RC_trojanThreadAddr, &park, FAKE_LR_TROJAN, FAKE_LR_TROJAN);
+        reply_with_state(&exc2, &park);
+        g_RC_success = false;
+        return 0;
+    }
+
     uint64_t retValue = exc2.threadState.__x[0];
     RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
             name ?: "(addr-call)",
-            (unsigned long long)native_strip(exc2.threadState.__pc),
-            (unsigned long long)native_strip(exc2.threadState.__lr),
+            (unsigned long long)retPC,
+            (unsigned long long)retLR,
             (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
     //
