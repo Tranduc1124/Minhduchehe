@@ -177,13 +177,6 @@ static void ESPRenderPawnCore(
 
     float worldHeight = fabsf(HeadPos.y - RightToePos.y);
 
-    Vector3 L_Ankle      = getPositionExt(getLeftAnkle(PawnObject));
-    Vector3 R_Ankle      = getPositionExt(getRightAnkle(PawnObject));
-    Vector3 L_ForeArm    = getPositionExt(getLeftElbow(PawnObject));
-    Vector3 R_ForeArm    = getPositionExt(getRightElbow(PawnObject));
-    Vector3 L_Hand       = getPositionExt(getLeftHand(PawnObject));
-    Vector3 R_Hand       = getPositionExt(getRightHand(PawnObject));
-
     Vector3 HeadTop = HeadPos; HeadTop.y += 0.2f;
     Vector3 w2sHead    = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
     Vector3 w2sToe     = WorldToScreenLayer(RightToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
@@ -236,6 +229,20 @@ static void ESPRenderPawnCore(
 
     CGFloat dynFontSize = fmaxf(4.5f, fminf(10.0f, 350.0f / fmaxf(dis, 1.0f)));
     float centerX = x + boxWidth * 0.5f;
+
+    // ---------------------------------------------------------
+    // BONE — bỏ hẳn.
+    //
+    // Một người là 13 đoạn xương, mỗi đoạn là một CGPathAddLines riêng vì
+    // các đoạn không liền nhau. Đó là 13 remote call cho mỗi người, và log
+    // 13:32 ghi rõ sub=69 limb=56 calls=67: gần như toàn bộ khung hình là
+    // xương. Bỏ xương không chỉ cho đúng ngoại hình, nó cắt số call mà
+    // không thay đổi bất cứ thứ gì khác.
+    //
+    // Sáu lần đọc bộ nhớ lấy khớp tay chân cũng đi cùng, vì chúng chỉ tồn
+    // tại cho hình xương. Không có chúng thì khung hình đọc ít đi sáu địa
+    // chỉ mỗi người mỗi lần vẽ, ở một vòng lặp đang chạy 30 lần giây.
+    // ---------------------------------------------------------
 
     // ---------------------------------------------------------
     // WEAPON
@@ -304,27 +311,43 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // THANH MÁU
+    // THANH MÁU — ngang, nằm trên đỉnh đầu, một màu.
+    //
+    // Trước đây là một thanh dọc 2pt bám bên trái box, chia ba đoạn màu
+    // theo lượng máu. Cả ba điều đó sai với yêu cầu: nó dọc chứ không
+    // ngang, nó không nằm trên đầu, và ba màu là ba layer riêng trong khi
+    // SpringBoard chỉ có một CAShapeLayer nên tất cả đều bị gộp về một màu
+    // viền duy nhất. Ba layer cho ba màu là ba lần present để rồi không
+    // thấy màu nào cả.
+    //
+    // Nên còn một đường, một màu. Thanh là hình chữ nhật nên decoder ở
+    // SpringBoard nhận ra bốn góc và gom vào CGPathAddRects, tức nó tốn
+    // đúng một call bất kể có bao nhiêu người trên màn hình.
+    //
+    // Cao 2.5pt thì nó ra một khung rỗng, và đó là lỗi đo được chứ không phải
+    // cảm giác. SpringBoard chỉ có nét vẽ, không có tô: nét 0.75 tô đều lên
+    // cả bốn cạnh, nên một hình chữ nhật cao 2.5 có cạnh trên che từ -0.375
+    // tới +0.375 và cạnh dưới che từ +2.125 tới +2.875, giữa lại hở 1.75pt.
+    // Máy chụp màn hình cho thấy đúng cái khung rỗng đó.
+    //
+    // Muốn nó đặc thì chiều cao phải nhỏ hơn hoặc bằng nét vẽ, để hai cạnh
+    // chồng lên nhau. Một hình chữ nhật cao đúng 0.75 cho dải đặc 1.5pt, quá
+    // mảnh để đọc trên một box cao 60px. Nên khoẻ theo chiều dọc: ba hình
+    // chữ nhật cao 0.75 chồng lên nhau, dải đặc 3pt, vẫn gom trong cùng một
+    // lệnh CGPathAddRects, không tốn thêm call nào.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barWidth = 2.0f;
+        const CGFloat barH = 0.75f;      // bằng nét vẽ, để hai cạnh dính nhau
+        const CGFloat barGap = 1.5f;
+        const CGFloat barW = boxWidth * healthRatio;
+        const CGFloat barTop = y - barGap - 3.0f * barH;
 
-        CGFloat barX = x - barWidth - 1.0f;
-        CGFloat barHeight = boxHeight;
-        CGFloat filledTop = y + barHeight - (barHeight * healthRatio);
-
-        CGRect fillRect = CGRectMake(barX, filledTop, barWidth, barHeight * healthRatio);
-        if (CurHP >= 150) {
-            CGPathAddRect(buffers->hpFillGreenPath, NULL, fillRect);
-            buffers->hpFillGreenDirty = true;
-        } else if (CurHP >= 75) {
-            CGPathAddRect(buffers->hpFillOrangePath, NULL, fillRect);
-            buffers->hpFillOrangeDirty = true;
-        } else if (CurHP > 0) {
-            CGPathAddRect(buffers->hpFillRedPath, NULL, fillRect);
-            buffers->hpFillRedDirty = true;
+        for (int seg = 0; seg < 3; seg++) {
+            CGPathAddRect(buffers->hpFillGreenPath, NULL,
+                          CGRectMake(x, barTop + seg * barH, barW, barH));
         }
+        buffers->hpFillGreenDirty = true;
     }
 }
 

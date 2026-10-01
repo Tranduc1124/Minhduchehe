@@ -17,9 +17,12 @@
 
 #import "SpringBoardOverlay.h"
 #import "RemoteCall.h"
+#import "PAC.h"
 #import "remote_objc.h"
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
+#import <unistd.h>
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
@@ -436,6 +439,133 @@ static int sb_open_session(void) {
     return 0;
 }
 
+// One-shot cost probe.
+//
+// The two numbers that decide the whole drawing design have never been measured
+// apart. [SB-PUSH] puts every CoreGraphics call and the present into one wall
+// clock, and the only samples the device log has are calls=2 ms=6 and
+// calls=67 ms=27. Those two are only compatible with a fixed cost near 5.4ms
+// per publish on top of near 0.32ms per remote call, and nothing in the log
+// says which call the 5.4ms belongs to. Guessing at that produced four wrong
+// designs today, so it is measured instead.
+//
+// This runs once, at overlay start, and draws nothing. The only layer call is
+// the same setPath: present every publish makes, and the path it hands over is
+// replaced by the first real frame. Every remote call below is one the publish
+// loop already makes, so the numbers are the numbers the design needs.
+static uint64_t sb_now_ns(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
+static void sb_cost_probe(void) {
+    static int s_done = 0;
+    if (s_done) return;
+    s_done = 1;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+
+    // A. Local symbol lookup, nothing crosses the process boundary.
+    // do_remote_call_stable runs exactly this on every single call, so this is
+    // the per-call cost that resolving the address once would remove.
+    uint64_t tA = sb_now_ns();
+    for (int i = 0; i < 2000; i++) dlsym(RTLD_DEFAULT, "getpid");
+    uint64_t aDlsym = (sb_now_ns() - tA) / 2000ULL;
+
+    // B. One bare remote call, looked up by name every time. This is what the
+    // publish loop pays per CGPath call today.
+    uint64_t tB = sb_now_ns();
+    for (int i = 0; i < 20; i++) r_dlsym_call(R_TIMEOUT, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t bByName = (sb_now_ns() - tB) / 20ULL;
+
+    // C. The identical call with the address resolved once. B minus C is the
+    // whole value of never looking the name up again.
+    uint64_t getpidAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
+    uint64_t pidCheck = do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t tC = sb_now_ns();
+    for (int i = 0; i < 20; i++) do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t cByAddr = (sb_now_ns() - tC) / 20ULL;
+
+    // D. Cold call. If the fixed cost is a re-arm, the first call after an idle
+    // gap is the expensive one and the rest are cheap, and that shows up here
+    // as a large number sitting next to C.
+    usleep(SB_MIN_PUBLISH_INTERVAL_US);
+    uint64_t tD = sb_now_ns();
+    do_remote_call_stable_addr(R_TIMEOUT, getpidAddr, "getpid", 0,0,0,0,0,0,0,0);
+    uint64_t dCold = sb_now_ns() - tD;
+
+    // E. Path creation, once per publish, because CGPathClear and CGPathReset
+    // are both absent from CoreGraphics.tbd on iOS 17.5 and a fresh path is the
+    // only way to empty one.
+    uint64_t made[8] = {0};
+    uint64_t tE = sb_now_ns();
+    for (int i = 0; i < 8; i++) made[i] = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    uint64_t eCreate = (sb_now_ns() - tE) / 8ULL;
+
+    // F. Two point polyline, the smallest thing a publish can draw.
+    double seg2[4] = {10.0, 10.0, 40.0, 40.0};
+    remote_write(ptsBuffer(), seg2, sizeof(seg2));
+    uint64_t tF = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddLines", made[i], 0, ptsBuffer(), 2, 0,0,0,0);
+    uint64_t fLines = (sb_now_ns() - tF) / 8ULL;
+
+    // G. CGPathAddRects is the only primitive that loops inside SpringBoard,
+    // which is the only reason the rectangle batch is cheap at all. One call
+    // and sixteen calls' worth of rectangles, to separate the per-call cost from
+    // the per-rectangle cost. If the per-rectangle cost is negligible then
+    // every shape that is a rectangle is free and the design stops having to
+    // care about call counts, which is the whole question here.
+    double rects16[64];
+    for (int i = 0; i < 16; i++) {
+        rects16[i*4+0] = 10.0 + (double)i;
+        rects16[i*4+1] = 10.0 + (double)i;
+        rects16[i*4+2] = 6.0;
+        rects16[i*4+3] = 4.0;
+    }
+    remote_write(ptsBuffer(), rects16, sizeof(rects16));
+    uint64_t tG1 = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddRects", made[i], 0, ptsBuffer(), 1, 0,0,0,0);
+    uint64_t gRect1 = (sb_now_ns() - tG1) / 8ULL;
+    uint64_t tG16 = sb_now_ns();
+    for (int i = 0; i < 8; i++) dlsym_remote("CGPathAddRects", made[i], 0, ptsBuffer(), 16, 0,0,0,0);
+    uint64_t gRect16 = (sb_now_ns() - tG16) / 8ULL;
+
+    // H. remote_write. It is a memcpy into a page already shared with
+    // SpringBoard, so it should cost nothing next to a call. If it does not,
+    // then the transport is not the one RemoteCall.m says it is.
+    uint64_t tH = sb_now_ns();
+    for (int i = 0; i < 8; i++) remote_write(ptsBuffer(), rects16, sizeof(rects16));
+    uint64_t hWrite = (sb_now_ns() - tH) / 8ULL;
+
+    // I. The present, once per layer. This is the number that decides how many
+    // colours the overlay can afford at all.
+    uint64_t tI = sb_now_ns();
+    for (int i = 0; i < 4; i++) sb_invoke_cached_main_raw();
+    uint64_t iPresent = (sb_now_ns() - tI) / 4ULL;
+
+    for (int i = 0; i < 8; i++) {
+        if (made[i]) dlsym_remote("CGPathRelease", made[i], 0,0,0,0,0,0,0);
+    }
+
+    NSLog(@"[SB-PROBE] n=20 dlsymLocal=%.1fus callByName=%.1fus callByAddr=%.1fus "
+          @"cold=%.1fus create=%.1fus addLines2=%.1fus addRects1=%.1fus "
+          @"addRects16=%.1fus write512B=%.1fus present=%.1fus pidOk=%d",
+          aDlsym / 1000.0, bByName / 1000.0, cByAddr / 1000.0, dCold / 1000.0,
+          eCreate / 1000.0, fLines / 1000.0, gRect1 / 1000.0, gRect16 / 1000.0,
+          hWrite / 1000.0, iPresent / 1000.0, (int)(pidCheck != 0));
+
+    // A probe that breaks the session must not take the overlay down with it.
+    if (remote_call_has_local_state() && !remote_call_current_success()) {
+        NSLog(@"[SB-PROBE] session unhealthy after probe — dropping it so the rearm path rebuilds clean");
+        abandon_remote_call();
+        pthread_mutex_lock(&g_sbLock);
+        g_sbOverlayOn = NO;
+        pthread_mutex_unlock(&g_sbLock);
+        g_sbRearmAfterUS = now_us() + 2000000ULL;
+    }
+}
+
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return 0; }
@@ -483,6 +613,21 @@ int SBoardStartOverlay(void) {
     uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
+    // Built with four separate CGFloats, which is the call the diagnostic proved
+    // carries its arguments: numberWithDouble: on the same path came back
+    // describing itself as 1.5, and setLineWidth: read straight back out of the
+    // CALayer as 1.50. So four doubles in one call is not the open question it
+    // was three rounds ago.
+    double greenRGBA[4] = { 0.0, 1.0, 0.0, 1.0 };
+    uint64_t greenColor = r_is_objc_ptr(clsCol)
+                        ? r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                          &greenRGBA[0], 8, &greenRGBA[1], 8,
+                                          &greenRGBA[2], 8, &greenRGBA[3], 8)
+                        : 0;
+    uint64_t greenCGColor = r_is_objc_ptr(greenColor)
+                          ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
+    if (!r_is_objc_ptr(greenCGColor)) greenCGColor = whiteCGColor;
+
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
@@ -507,13 +652,194 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
+    // [SB-COLOR] proves whether a multi argument selector can carry its
+    // arguments at all, before any second shape layer is attempted.
+    //
+    // The previous six layer attempt drew nothing, and its colour call was
+    // written as r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+    // rgba, 32, ...), that is one 32 byte pointer. Reading r_msg_main_raw shows
+    // why that cannot work. It does not marshal through the x0..x7 injector at
+    // all: it asks the real method signature for numberOfArguments, allocates a
+    // buffer per argument and calls setArgument:atIndex: once for each. Passing
+    // only a0 meant the remaining three arguments were never written, so the
+    // selector ran with three uninitialised CGFloats and every group got a
+    // colour nobody chose.
+    //
+    // The right call passes four separate eight byte doubles, which is what this
+    // does. The colour is then read back through CGColor and its components
+    // printed, so the device says what actually arrived instead of the log
+    // claiming success on a call that may have produced anything.
+    //
+    //   rgba matching the request -> the transport is fine, a second layer for
+    //                                fill is safe to build
+    //   rgba wrong                 -> the marshalling is still wrong and the
+    //                                number printed here says which part
+    {
+        // Everything is printed under one prefix because the device log filter
+        // takes a single term, and splitting this across two prefixes cost a round.
+        //
+        // What is already established, by the log and not by reasoning:
+        //   got=0.00,0.00,0.00,0.00 while col=1 and cg=1
+        // col being non zero means r_write_remote_arg returned true, because a
+        // false there sets argsOK false and the function returns 0. So the four
+        // doubles were written to SpringBoard and read back matching. The read
+        // side is sound too, because got starts at minus one and the sentinel
+        // never appears. The write is confirmed good and the read is confirmed
+        // good, and the value is still zero, so the argument is lost between the
+        // buffer and the selector reading it.
+        //
+        // That leaves one untested step in r_msg_main_raw: maxUserArgs comes
+        // from numberOfArguments on the signature, and if that is wrong then no
+        // setArgument:atIndex: is ever issued and the selector reads whatever
+        // happens to be in d0 to d3. So numArgs is printed here. The expectation
+        // for a four argument selector plus self and _cmd is six.
+        const uint64_t colSel = r_sel("colorWithRed:green:blue:alpha:");
+        uint64_t sig = r_is_objc_ptr(colSel)
+                      ? r_msg(clsCol, r_sel("methodSignatureForSelector:"), colSel, 0, 0, 0)
+                      : 0;
+        uint64_t numArgs = r_is_objc_ptr(sig)
+                         ? r_msg2(sig, "numberOfArguments", 0, 0, 0, 0) : 0;
+
+        double want[4] = { 0.0, 1.0, 0.0, 1.0 };   // opaque green, the health bar
+        // Probe on for this one call only, so r_msg_main_raw reads the arguments
+        // back out of the invocation just before invoking. That is the one step
+        // between "the bytes are in the target's buffer", which is proven, and
+        // "the selector used them", which is not.
+        r_arg_probe_enabled = true;
+        uint64_t col = r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
+                                       &want[0], 8, &want[1], 8,
+                                       &want[2], 8, &want[3], 8);
+        r_arg_probe_enabled = false;
+        double invGot[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 4 && i < (int)r_arg_probe_n; i++) {
+            uint64_t bits = r_arg_probe_got[i];
+            memcpy(&invGot[i], &bits, 8);
+        }
+        uint64_t cg  = r_is_objc_ptr(col) ? r_msg2_main(col, "CGColor", 0,0,0,0) : 0;
+
+        // Number of components the target's colour actually has. A colour made
+        // from red, green, blue and alpha is normally four or five depending on
+        // whether the space is extended, and the out buffer is sized for that
+        // rather than assuming four.
+        uint64_t ncomp = 0;
+        if (r_is_objc_ptr(cg)) {
+            ncomp = dlsym_remote("CGColorGetNumberOfComponents", cg, 0,0,0,0,0,0,0);
+        }
+
+        // The out buffer is poisoned with a sentinel before the call. This is the
+        // measurement that was missing for four rounds: the buffer came from malloc
+        // and was never written to, and a fresh page reads as sixteen zero bytes,
+        // which is exactly what was logged. A printed zero in a buffer nobody
+        // wrote is not a measurement, and treating it as one is what sent the last
+        // three rounds chasing a colour that may never have been black.
+        double got[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        uint64_t raw[4] = { 0, 0, 0, 0 };
+        bool wrote = false;
+        if (r_is_objc_ptr(cg) && ncomp >= 1 && ncomp <= 8) {
+            uint64_t outBuf = dlsym_remote("malloc", 64, 0,0,0,0,0,0,0);
+            if (outBuf) {
+                double sentinel[8] = { -7, -7, -7, -7, -7, -7, -7, -7 };
+                for (int k = 0; k < 3; k++) {
+                    remote_write(outBuf, sentinel, sizeof(sentinel));
+                    dlsym_remote("CGColorGetComponents", cg, outBuf, 0,0,0,0,0,0);
+                    remote_read(outBuf, got, sizeof(got));
+                    remote_read(outBuf, raw, 16);
+                    if (got[0] != -7.0) { wrote = true; break; }
+                }
+                dlsym_remote("free", outBuf, 0,0,0,0,0,0,0);
+            }
+        }
+
+        // The float layout theory is dead and the raw bytes say so: raw was
+        // sixteen zero bytes, so the out buffer really was zero, and both dbl and
+        // flt read the same zeros. The colour is black, not misread.
+        //
+        // The second invocation told us nothing. It returned the value 1, and
+        // r_is_objc_ptr accepts any pointer above 0x100000000, so asking address 1
+        // for CGColor gave nil and noRet was never measured. That result is dropped
+        // rather than reinterpreted, because reading a conclusion out of a garbage
+        // pointer is how the last two rounds went wrong.
+        //
+        // The measurement moves to a channel that returns text.
+        // +[NSNumber numberWithDouble:] takes one CGFloat through exactly the same
+        // path and hands back an object, and -description on that object prints the
+        // number as characters. The colour test spent three rounds proving that a
+        // printed zero was a real zero and not a misread layout, and every one of
+        // those rounds was spent on the reading rather than on the transport. A
+        // string has no such ambiguity: 1.5 and 0.0 are different strings, and no
+        // byte layout turns one into the other.
+        //
+        // The integer case is the control. It travels through identical code with a
+        // different register class, so T1 alone says whether the difference is
+        // specifically about a floating point value, and T2 alone says whether the
+        // path works at all. If T2 prints 7 then arguments arrive and a double is
+        // the only thing that does not, which is a far narrower fault to fix than
+        // arguments do not arrive.
+        char t1[48] = { 0 };
+        char t2[48] = { 0 };
+        double wantInt = 7.0;
+        double wantDbl = 1.5;
+
+        uint64_t NSNum = r_class("NSNumber");
+        uint64_t nDbl = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantDbl, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        uint64_t nInt = r_is_objc_ptr(NSNum)
+                      ? r_msg2_main_raw(NSNum, "numberWithDouble:", &wantInt, 8,
+                                        NULL, 0, NULL, 0, NULL, 0) : 0;
+        if (r_is_objc_ptr(nDbl)) {
+            uint64_t ds = r_msg2_main(nDbl, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(ds)) r_read_nsstring(ds, t1, sizeof(t1));
+        }
+        if (r_is_objc_ptr(nInt)) {
+            uint64_t is = r_msg2_main(nInt, "description", 0, 0, 0, 0);
+            if (r_is_objc_ptr(is)) r_read_nsstring(is, t2, sizeof(t2));
+        }
+
+        NSLog(@"[SB-COLOR] numArgs=%llu col=%d cg=%d ncomp=%llu wrote=%d "
+              @"want=%.2f,%.2f,%.2f,%.2f inv=%.2f,%.2f,%.2f,%.2f "
+              @"ret=%.2f,%.2f,%.2f,%.2f dbl=<%s> int=<%s>",
+              (unsigned long long)numArgs,
+              (int)r_is_objc_ptr(col), (int)r_is_objc_ptr(cg),
+              (unsigned long long)ncomp, (int)wrote,
+              want[0], want[1], want[2], want[3],
+              invGot[0], invGot[1], invGot[2], invGot[3],
+              got[0], got[1], got[2], got[3],
+              t1, t2);
+    }
+
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+    // White. It was green, and that was deliberate: commit 69cab125 set the
+    // stroke to green as a one-round proof that four CGFloat arguments survive
+    // the crossing, so the colour could be read off the screen instead of off a
+    // log line that had already been wrong four times. The proof was made and
+    // the diagnostic was never taken back down, so the overlay has been drawing
+    // green ever since. The requested ESP is monochrome white.
     if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] white=%d cg=%d", (int)r_is_objc_ptr(whiteColor),
+          (int)r_is_objc_ptr(whiteCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
-    double lw = 1.5;
+    // 0.75, down from 1.5. At 1.5 the box reads as a thick slab on a phone
+    // screen and the horizontal health bar 2.5pt tall disappears into its own
+    // outline. Half a point is the thinnest CAShapeLayer stroke that still
+    // rasterises to a full pixel row on this display.
+    double lw = 0.75;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
+
+    // Read the width straight back out of SpringBoard's own CALayer. This is the
+    // most direct measurement available: it is the exact call the overlay depends
+    // on for its stroke weight, and the read uses getReturnValue: into a target
+    // buffer followed by remote_read, which is the same read path already proven
+    // good by the colour test. No reinterpretation and no colour space involved.
+    //
+    // The sentinel is minus one, so a value of 0.00 is a real zero and minus one
+    // means the read did not happen.
+    double lwBack = -1.0;
+    bool lwOK = r_msg2_main_struct_ret(shape, "lineWidth", &lwBack, 8,
+                                       NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    NSLog(@"[SB-COLOR] lw want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
@@ -546,6 +872,9 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    // Measures what one call and one present actually cost, once, before any
+    // frame depends on the answer. See sb_cost_probe.
+    sb_cost_probe();
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",

@@ -256,6 +256,11 @@ static uint64_t r_method_signature(uint64_t obj, uint64_t sel)
                                  types, 0, 0, 0);
 }
 
+bool     r_arg_probe_enabled = false;
+uint64_t r_arg_probe_n = 0;
+uint64_t r_arg_probe_got[4] = { 0, 0, 0, 0 };
+uint64_t r_arg_probe_alt = 0;
+
 static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSize, size_t remoteSize)
 {
     if (!remoteBuf || remoteSize == 0) return false;
@@ -274,7 +279,54 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
         memcpy(localBuf, arg, copySize);
     }
 
-    bool ok = remote_write(remoteBuf, localBuf, remoteSize);
+    // remote_write goes through the vm_map_entry hijack, so it can silently land
+    // in a stale alias and leave the target's real page untouched, and the file
+    // says so at the top of this one. This function called it exactly once and
+    // trusted the return, so a write that went nowhere looked identical to a write
+    // that worked.
+    //
+    // The device log separated the two. A colour built from four doubles for
+    // 0,1,0,1 came back as a valid UIColor with a valid CGColor, and reading the
+    // components out of SpringBoard gave 0,0,0,0 rather than the -1 the sentinel
+    // starts at. A read that fails leaves the sentinel, so remote_read works and
+    // the target genuinely holds zeros. The write is the half that never arrived.
+    // The argument was then handed to setArgument:atIndex:, which is a pointer to
+    // bytes the target never received, so the selector ran on zeroes.
+    //
+    // r_alloc_str in this same file already had the answer for the string case:
+    // clear the cache, retry, and verify by reading the target's own bytes back.
+    // This does the same, comparing the value rather than a length, so a CGFloat
+    // is checked as well as a C string.
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        remote_clear_shmem_cache();
+        if (!remote_write(remoteBuf, localBuf, remoteSize)) continue;
+
+        uint8_t vstack[64];
+        void *vbuf = vstack;
+        void *vheap = NULL;
+        if (remoteSize > sizeof(vstack)) {
+            vheap = calloc(1, remoteSize);
+            if (!vheap) break;
+            vbuf = vheap;
+        }
+        bool match = remote_read(remoteBuf, vbuf, remoteSize) &&
+                     memcmp(vbuf, localBuf, remoteSize) == 0;
+        if (vheap) free(vheap);
+        if (match) { ok = true; break; }
+        // Only reached when the target did not receive the bytes. Logged once
+        // per distinct buffer so a persistent failure is visible in the device
+        // log instead of showing up later as a colour or a size that silently
+        // came out wrong.
+        static uint64_t s_lastWarned = 0;
+        if (remoteBuf != s_lastWarned) {
+            s_lastWarned = remoteBuf;
+            NSLog(@"[RemoteObjC] remote_write did not reach target buf=0x%llx size=%zu "
+                  "after %d attempts", (unsigned long long)remoteBuf, remoteSize,
+                  attempt + 1);
+        }
+    }
+
     if (localBuf != stackBuf) free(localBuf);
     return ok;
 }
@@ -308,6 +360,9 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
+    // The argument buffers must outlive invoke, see the comment at the free
+    // below. Held here so the error paths can release them too.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -316,28 +371,118 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
             argsOK = false;
             continue;
         }
+        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
     if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
 
     r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
+    if (r_arg_probe_enabled) {
+        r_arg_probe_n = maxUserArgs;
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            r_arg_probe_got[i] = 0;
+            if (!argBufs[i]) continue;
+            uint64_t outBuf = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
+            if (!outBuf) continue;
+            // Poison the buffer first, so a getArgument that writes nothing is
+            // distinguishable from one that wrote zero.
+            remote_write64(outBuf, 0);
+            r_msg2(inv, "getArgument:atIndex:", outBuf, i + 2, 0, 0);
+            r_arg_probe_got[i] = remote_read64(outBuf);
+            r_free(outBuf);
+        }
+
+        // Second invocation, identical in every way except that retainArguments
+        // is not called. Same buffers, same pointers, same order.
+        //
+        // The probe above measured getArgument:atIndex: reading 0,1,0,1 out of
+        // the invocation, and the selector then produced a colour whose
+        // components were sixteen literal zero bytes rather than a misread
+        // layout, since flt and dbl agreed and raw was all zero. So the
+        // invocation holds the values and invoke does not use them, which means
+        // invoke reads somewhere getArgument does not read.
+        //
+        // The only step between the two is retainArguments, and its documented
+        // job is to keep object arguments alive, which is nothing to do with a
+        // CGFloat. If skipping it produces the right colour, then calling it is
+        // what moves the arguments somewhere invoke cannot see, and the fix is
+        // to stop calling it for scalar arguments. If both invocations are black
+        // then it is not retainArguments and the fault is inside invoke itself.
+        r_arg_probe_alt = 0;
+        {
+            uint64_t inv2 = r_msg_retained_return(NSInvocation,
+                                                   r_sel("invocationWithMethodSignature:"),
+                                                   sig, 0, 0, 0);
+            if (r_is_objc_ptr(inv2)) {
+                r_msg2(inv2, "setTarget:", obj, 0, 0, 0);
+                r_msg2(inv2, "setSelector:", sel, 0, 0, 0);
+                for (uint64_t i = 0; i < maxUserArgs; i++) {
+                    if (argBufs[i]) {
+                        r_msg2(inv2, "setArgument:atIndex:", argBufs[i], i + 2, 0, 0);
+                    }
+                }
+                uint64_t ps2 = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+                uint64_t iv2 = r_sel("invoke");
+                if (ps2 && iv2) r_msg(inv2, ps2, iv2, 0, 1, 0);
+
+                uint64_t rl2 = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
+                if (rl2 > 0 && rl2 <= 8) {
+                    uint64_t rb2 = r_call_stable(R_TIMEOUT, "malloc", 8, 0,0,0,0,0,0,0);
+                    if (rb2) {
+                        remote_write64(rb2, 0);
+                        r_msg2(inv2, "getReturnValue:", rb2, 0, 0, 0);
+                        r_arg_probe_alt = remote_read64(rb2);
+                        r_free(rb2);
+                    }
+                }
+                r_msg2(inv2, "release", 0, 0, 0, 0);
+            }
+        }
+    }
+
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
     r_msg(inv, performSel, invokeSel, 0, 1, 0);
+
+    // Only now is it safe to free. setArgument:atIndex: stores the pointer and
+    // copies nothing, and retainArguments only retains arguments that are
+    // objects, so a CGFloat argument is read straight out of this buffer when
+    // invoke runs. Freeing it before invoke is why every number this transport
+    // carried arrived as zero.
+    //
+    // The device log proved it rather than suggesting it. Creating a colour with
+    // colorWithRed:green:blue:alpha: and four separate doubles for 0,1,0,1
+    // returned a valid object and a valid CGColor, and reading the components
+    // back out of SpringBoard gave 0,0,0,0:
+    //
+    //   [SB-COLOR] want=0.00,1.00,0.00,1.00 got=0.00,0.00,0.00,0.00 col=1 cg=1
+    //
+    // This also explains a long standing oddity. setLineWidth: was given 1.5 and
+    // the overlay looked as though it had been honoured, but a zero line width
+    // falls back to the CALayer default of one, which is close enough to 1.5 that
+    // nothing ever looked wrong. It was never actually being set.
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 
     uint64_t ret = 0;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
@@ -418,6 +563,8 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
 
     bool argsOK = true;
     uint64_t userArgs[4] = { a0, a1, a2, a3 };
+    // Held until after invoke. See the comment at the free in r_msg_main_raw.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
                                         8, 0, 0, 0, 0, 0, 0, 0);
@@ -425,21 +572,40 @@ void r_msg2_main_async(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
-        if (remote_write64(argBuf, userArgs[i])) {
+        argBufs[i] = argBuf;
+        // Same verified writer as the other two sites, so a stale alias is
+        // retried here too rather than becoming a silent zero pointer.
+        if (r_write_remote_arg(argBuf, &userArgs[i], sizeof(userArgs[i]), 8)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
-    if (!argsOK) return;
+    if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
+        return;
+    }
 
     r_msg2(inv, "retainArguments", 0, 0, 0, 0);
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
-    if (performSel && invokeSel) r_msg(inv, performSel, invokeSel, 0, 0, 0);
+    if (performSel && invokeSel) {
+        // waitUntilDone is 1, not 0. The argument buffers are only valid until
+        // the invocation has run, and this function has no way to learn when a
+        // queued invocation finished, so it must be told to wait. The previous 0
+        // meant the buffers below were freed while the main thread had not yet
+        // read them.
+        r_msg(inv, performSel, invokeSel, 0, 1, 0);
+    }
+    // Safe now that invoke has returned. See the comment at the free in
+    // r_msg_main_raw.
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 }
 
 uint64_t r_msg2_main_raw(uint64_t obj, const char *selName,
@@ -491,6 +657,8 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     bool argsOK = true;
     const void *argData[4] = { a0, a1, a2, a3 };
     size_t argSizes[4] = { a0Size, a1Size, a2Size, a3Size };
+    // Held until after invoke. See the comment at the free in r_msg_main_raw.
+    uint64_t argBufs[4] = { 0, 0, 0, 0 };
     for (uint64_t i = 0; i < maxUserArgs; i++) {
         size_t argBufLen = (argSizes[i] > 8) ? argSizes[i] : 8;
         uint64_t argBuf = r_call_stable(R_TIMEOUT, "malloc",
@@ -499,15 +667,18 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
             argsOK = false;
             continue;
         }
+        argBufs[i] = argBuf;
         if (r_write_remote_arg(argBuf, argData[i], argSizes[i], argBufLen)) {
             r_msg2(inv, "setArgument:atIndex:", argBuf, i + 2, 0, 0);
         } else {
             argsOK = false;
         }
-        r_free(argBuf);
     }
 
     if (!argsOK) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
@@ -517,10 +688,17 @@ bool r_msg2_main_struct_ret(uint64_t obj, const char *selName,
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     uint64_t invokeSel = r_sel("invoke");
     if (!performSel || !invokeSel) {
+        for (uint64_t i = 0; i < maxUserArgs; i++) {
+            if (argBufs[i]) r_free(argBufs[i]);
+        }
         r_msg2(inv, "release", 0, 0, 0, 0);
         return false;
     }
     r_msg(inv, performSel, invokeSel, 0, 1, 0);
+
+    for (uint64_t i = 0; i < maxUserArgs; i++) {
+        if (argBufs[i]) r_free(argBufs[i]);
+    }
 
     bool ok = false;
     uint64_t retLen = r_msg2(sig, "methodReturnLength", 0, 0, 0, 0);
