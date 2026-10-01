@@ -644,7 +644,22 @@ static CGPathRef sb_text_glyphs(const char *utf8, CGFloat size, CGRect frame) {
     double penX = dx;
     for (CFIndex i = 0; i < n; i++) {
         if (glyphs[i] != 0) {
-            CGAffineTransform m = CGAffineTransformMakeTranslation(penX, dy);
+            // d = -1, and that is the whole fix for the text reading backwards.
+            //
+            // CoreText hands back glyph outlines in font space, where y grows
+            // upwards from the baseline. Everything else in this file works in the
+            // app's space, where y grows downwards: sbEmit's px = landH - sy says
+            // so, and the geometry is visibly correct on the device. Placing a
+            // font-space path into that space without flipping it puts every glyph
+            // the right way up in a coordinate system that runs the other way, so
+            // the counter came out mirrored along the baseline.
+            //
+            // So one scale of -1 on y, then the translation. CGAffineTransformMake
+            // builds [a b 0; c d 0; tx ty 1] applied as (u*a + v*c + tx, u*b +
+            // v*d + ty), which with c = 0 and d = -1 sends a glyph above the
+            // baseline, v positive, to y below the baseline point: above it on a
+            // screen.
+            CGAffineTransform m = CGAffineTransformMake(1.0, 0.0, 0.0, -1.0, penX, dy);
             CGPathRef g = CTFontCreatePathForGlyph(font, glyphs[i], &m);
             if (g) { CGPathAddPath(out, NULL, g); CGPathRelease(g); }
         }
@@ -1964,6 +1979,10 @@ void SBRemotePushESPFrame(UIView *espView) {
                 g_sbTextPath = 0;
                 rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             }
+            uint32_t dstCount = 0;                 // runs sent to the text path
+            uint32_t tCount = 0;                   // and their shapes
+            uint8_t  tPts[64];
+            uint32_t tPtsN[64];
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
@@ -1993,6 +2012,15 @@ void SBRemotePushESPFrame(UIView *espView) {
                             dstLayer = curLayer;
                             dstPath = (curLayer == SB_TEXT_LAYER_INDEX && r_is_objc_ptr(rpT))
                                     ? rpT : rp;
+                            if (dstPath == rpT && tCount < 64) {
+                                // Which run went to the text path, so a wrong
+                                // destination is readable off the device instead
+                                // of guessed at. The FOV arriving here is a 73
+                                // point run and would say so.
+                                tPts[tCount] = (uint8_t)curLayer;
+                                tPtsN[tCount] = 0;
+                                tCount++;
+                            }
                         }
                         continue;
                     }
@@ -2021,6 +2049,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
+                if (tCount > 0 && dstPath == rpT) tPtsN[tCount - 1] += (uint32_t)np;
                 if (np > maxPts) maxPts = np;
                 if (np > 8) nBig++;
                 if (np == 2) c2++;
@@ -2191,6 +2220,27 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
+                // What actually went on the text layer. The FOV ring came out as a
+                // solid red disc, which is what a filled closed circle looks like,
+                // so either a geometry run reached this path or the glyphs did. The
+                // two numbers settle it without a guess: subpaths and points are
+                // the count for a layer of one or two glyphs, and a FOV ring is 73
+                // points on its own.
+                {
+                    static uint64_t s_txtLogUS = 0;
+                    const uint64_t tL = now_us();
+                    if (tL >= s_txtLogUS) {
+                        s_txtLogUS = tL + 1000000ULL;
+                        uint32_t tp = 0, tn = 0;
+                        for (uint32_t k = 0; k < tCount; k++) {
+                            if (tPts[k] == SB_TEXT_LAYER_INDEX) { tn++; tp += tPtsN[k]; }
+                        }
+                        NSLog(@"[SB-TEXT] present text=%llx subpaths=%u points=%u "
+                              @"frame=%llx",
+                              (unsigned long long)rpT, tn, tp,
+                              (unsigned long long)g_sbTextPath);
+                    }
+                }
             }
 
             if (drawn > 0) {
