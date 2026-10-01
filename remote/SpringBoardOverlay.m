@@ -166,7 +166,12 @@ static pthread_t       g_sbTextThread = 0;
 // conversion without touching the view. Written by the app's thread while it
 // stages a request, read by the text thread, and it only ever changes when the
 // device rotates, so a stale read costs one frame of a wrong landH.
-static CGRect g_sbTextStageBounds = CGRectZero;
+//
+// Spelled out rather than CGRectZero. CGRectZero is not a compile time constant
+// in every SDK, and a static initialiser has to be one: the 18.6 SDK that the
+// build workflow uses rejects it, while the 17.5 SDK on this machine accepts it.
+// The literal is a constant in both.
+static CGRect g_sbTextStageBounds = { { 0.0, 0.0 }, { 0.0, 0.0 } };
 // Defined next to SBRemotePushESPFrame, which is where the text belongs, and
 // called from SBoardStartOverlay, which is above it.
 static void sb_text_thread_start(void);
@@ -1429,7 +1434,14 @@ void SBRemotePushESPFrame(UIView *espView) {
         if (textChanged || tTxt >= g_sbNextTextUS) {
             g_sbNextTextUS = tTxt + SB_TEXT_MIN_INTERVAL_US;
             SbTextReq r;
-            memset(&r, 0, sizeof(r));
+            // Field by field, not memset. The struct holds an NSString, so it is
+            // not trivially default initialisable and memset on it is rejected
+            // under the warning the build workflow turns into an error. Assigning
+            // the fields is also what lets ARC release the previous string.
+            r.text = nil;
+            r.col[0] = 1.0; r.col[1] = 0.0; r.col[2] = 0.0; r.col[3] = 1.0;
+            r.frame = CGRectMake(0, 0, 0, 0);
+            r.fontSize = 0.0;
             r.on = textOn;
             r.changed = textChanged;
             if (textOn) {
