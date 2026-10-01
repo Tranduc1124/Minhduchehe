@@ -54,6 +54,21 @@
 // half a frame, which leaves no boundary to fall on.
 #define SB_MIN_PUBLISH_INTERVAL_US 8000ULL
 
+// Startup diagnostics.
+//
+// Three measurement blocks still run on the way to the first painted frame, and
+// between them they cost roughly a hundred and fifteen remote calls: the cost
+// probe alone is about ninety, plus two thousand local dlsym lookups and an 8ms
+// sleep. They are measurements, not work. The cost probe prints [SB-PROBE], the
+// colour probe prints [SB-COLOR] with the components that arrived, and the
+// lineWidth read-back proves the stroke call carried its argument. All three
+// answered their questions and the answers are written down beside them.
+//
+// Off by default, which is the only place this kind of thing should ever end up:
+// a diagnostic that delays the first frame is a cost with no benefit, and the
+// person who needs to re-measure can turn it on and read the same three lines.
+#define SB_STARTUP_DIAGNOSTICS 0
+
 // Skeleton limbs are the only ESP element with no batchable CoreGraphics
 // primitive: each one needs its own CGPathAddLines call, because the SDK has
 // nothing that strokes N disjoint segments at once. 12 players x 12 limbs is
@@ -994,6 +1009,7 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
+#if SB_STARTUP_DIAGNOSTICS
     // [SB-COLOR] proves whether a multi argument selector can carry its
     // arguments at all, before any second shape layer is attempted.
     //
@@ -1150,6 +1166,8 @@ int SBoardStartOverlay(void) {
               t1, t2);
     }
 
+#endif
+
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
@@ -1178,10 +1196,12 @@ int SBoardStartOverlay(void) {
     //
     // The sentinel is minus one, so a value of 0.00 is a real zero and minus one
     // means the read did not happen.
+#if SB_STARTUP_DIAGNOSTICS
     double lwBack = -1.0;
     bool lwOK = r_msg2_main_struct_ret(shape, "lineWidth", &lwBack, 8,
                                        NULL, 0, NULL, 0, NULL, 0, NULL, 0);
     NSLog(@"[SB-COLOR] lw want=%.2f got=%.2f ok=%d", lw, lwBack, (int)lwOK);
+#endif
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
@@ -1218,9 +1238,13 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
-    // Measures what one call and one present actually cost, once, before any
-    // frame depends on the answer. See sb_cost_probe.
+    // The cost probe, the colour probe and the lineWidth read-back are all behind
+    // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
+    // between them they were about a hundred and fifteen remote calls of
+    // measurement in front of the first painted frame.
+#if SB_STARTUP_DIAGNOSTICS
     sb_cost_probe();
+#endif
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
     // The text thread outlives any single session: it wakes, finds no session or
