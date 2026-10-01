@@ -105,6 +105,12 @@ static uint64_t g_sbSetPathInv = 0;
 static uint64_t g_sbSetPathArgBuf = 0;
 static uint64_t g_sbPerformMainSel = 0;
 static uint64_t g_sbInvokeSel = 0;
+// Same pair for the text layer, which had no equivalent. It was going through
+// r_msg2_main, which builds a whole NSInvocation from scratch on every publish
+// and settles before each of its inner messages, and settle is usleep(3000).
+// Nine of those is 27ms of the 55ms a publish takes.
+static uint64_t g_sbTextInv = 0;
+static uint64_t g_sbTextArgBuf = 0;
 
 // Text in SpringBoard, as a fixed pool of CATextLayers.
 //
@@ -917,6 +923,14 @@ static void sb_forget_local_paint_state(void) {
     g_sbSetPathArgBuf = 0;
     g_sbPerformMainSel = 0;
     g_sbInvokeSel = 0;
+    if (r_is_objc_ptr(g_sbTextInv) && remote_call_has_local_state()) {
+        r_msg2(g_sbTextInv, "release", 0,0,0,0);
+    }
+    if (g_sbTextArgBuf && remote_call_has_local_state()) {
+        dlsym_remote("free", g_sbTextArgBuf, 0,0,0,0,0,0,0);
+    }
+    g_sbTextInv = 0;
+    g_sbTextArgBuf = 0;
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
     // The remote session is going away, so the path it was holding is not ours to
@@ -1052,6 +1066,90 @@ static void sb_invoke_cached_main_raw(void) {
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
+}
+
+// The text layer's twin of sb_ensure_setpath_invocation /
+// sb_invoke_cached_main_raw. One invocation, built once, reused for the life of
+// the session.
+//
+// r_msg2_main, which is what the text layer used, is the expensive spelling of
+// the same thing. r_msg_main_raw assembles an NSInvocation through
+// methodSignatureForSelector:, invocationWithMethodSignature:, setTarget:,
+// setSelector:, malloc, setArgument:atIndex: and retainArguments, then performs
+// it and frees it again. Eight of those inner messages are r_msg2, and every
+// r_msg2 calls r_settle, which is usleep(3000) as sb_open_session set it. That
+// is thirteen crossings and about 27ms of our own thread doing nothing, on
+// every publish, to hand a layer one pointer it already knew last time.
+//
+// Sleeping is not what makes it correct. do_remote_call_stable serialises every
+// crossing behind one mutex, and the perform below is asynchronous with
+// waitUntilDone NO, so there is no barrier for a sleep to provide. The geometry
+// layer has been doing exactly this without a settle since the comment at
+// sb_invoke_cached_main_raw was written, on the call that actually reaches
+// SpringBoard's main thread.
+static BOOL sb_ensure_text_setpath_invocation(void) {
+    if (r_is_objc_ptr(g_sbTextInv) && g_sbTextArgBuf) return YES;
+    if (!r_is_objc_ptr(g_sbTextShape)) return NO;
+
+    uint64_t setPathSel = r_sel("setPath:");
+    if (!setPathSel) return NO;
+
+    uint64_t sigSel = r_sel("methodSignatureForSelector:");
+    uint64_t sig = r_msg(g_sbTextShape, sigSel, setPathSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+
+    r_msg2(inv, "setTarget:", g_sbTextShape, 0, 0, 0);
+    r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
+
+    uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+    if (!argBuf) {
+        r_msg2(inv, "release", 0, 0, 0, 0);
+        return NO;
+    }
+    remote_write64(argBuf, 0);
+    // Index 2, not 1. setPath: is an instance method, so slot 1 is self and the
+    // path is the first real argument.
+    r_msg2(inv, "setArgument:atIndex:", argBuf, 2, 0, 0);
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+
+    g_sbTextInv = inv;
+    g_sbTextArgBuf = argBuf;
+    NSLog(@"[SBOverlay] TextPathInvocation=0x%llx argBuf=0x%llx", inv, argBuf);
+    return YES;
+}
+
+// Returns YES when the path was handed to the layer, NO when the caller should
+// fall back. The fallback matters: if the invocation cannot be built the text
+// must still appear, so the caller keeps one r_msg2_main for that case. That
+// costs 27ms but only once per session, which is what the old code paid on
+// every single publish.
+static BOOL sb_invoke_text_cached_main_raw(uint64_t path) {
+    if (!r_is_objc_ptr(path)) return NO;
+    if (!sb_ensure_text_setpath_invocation()) return NO;
+    remote_write64(g_sbTextArgBuf, path);
+    // Read the pointer back before handing it over, for the same reason the
+    // geometry layer does: remote_write64 is a memcpy into a page shared with
+    // the target and can land on a page the target is not actually using, in
+    // which case it reports success and the target never sees the bytes. The
+    // cost is a memcpy from a page already mapped and no crossing at all.
+    if (remote_read64(g_sbTextArgBuf) != path) {
+        g_sbPathArgMisses++;
+        return NO;
+    }
+    uint64_t setArgSel = r_sel("setArgument:atIndex:");
+    if (!setArgSel) return NO;
+    if (!r_msg(g_sbTextInv, setArgSel, g_sbTextArgBuf, 2, 0, 0)) return NO;
+    if (g_sbPerformMainSel && g_sbInvokeSel) {
+        r_msg(g_sbTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
+    return YES;
 }
 
 static int sb_open_session(void) {
@@ -2489,10 +2587,17 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
             // malloc, setArgument:atIndex:, retainArguments, then performs it with
             // waitUntilDone set to YES, then frees and releases. Eight of those
             // inner calls are r_msg2, and every r_msg2 calls r_settle, which is
-            // usleep(3000) as set in sb_open_session. So one line here costs
-            // thirteen crossings and about 24 milliseconds of sleeping per
-            // publish, and because the perform waits, the sleep is serial rather
-            // than overlapped with anything.
+            // usleep(3000) as set in sb_open_session. That is thirteen crossings
+            // and about 27ms of sleeping per publish, and because the perform
+            // waits, the sleep is serial rather than overlapped with anything.
+            //
+            // Measured, not assumed: a publish took 55ms and one remote call took
+            // 0.33ms, so the crossings cannot account for it. 9 x 3ms of sleep
+            // plus 13 x 0.33ms of crossings plus about 24ms of the rest of the
+            // publish closes the 55ms. Both setPath: calls on this layer now go
+            // through the cached invocation instead, so the sleeping is gone and
+            // r_msg2_main survives only as the fallback for a session where that
+            // invocation could not be built.
             //
             // Without the gate it ran on every publish even with the counter off,
             // handing a fresh empty path to a filled layer sixty times a second,
@@ -2500,8 +2605,8 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
             // Turning the counter OFF, which the gate above made impossible.
             //
             // This is my bug, from d205b8bf4. Gating setPath: on textPathReady was
-            // right: it removed thirteen crossings and 24ms of usleep from every
-            // publish. But a CAShapeLayer keeps whatever path it was last handed
+            // right: it stopped the ungated call from running when there was no
+            // counter. But a CAShapeLayer keeps whatever path it was last handed
             // for the life of the session, and nothing else here clears it. No
             // setHidden, no removeFromSuperlayer, no setOpacity, and the old
             // sb_text_send slot path that did hide it is dead code whose only
@@ -2523,7 +2628,13 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 uint64_t empty = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
                 calls++;
                 if (r_is_objc_ptr(empty)) {
-                    r_msg2_main(g_sbTextShape, "setPath:", empty, 0,0,0);
+                    // Cached path first: two crossings, no sleep. The r_msg2_main
+                    // is only the fallback for a session where the invocation
+                    // could not be built, and it runs on this edge once, not on
+                    // every publish.
+                    if (!sb_invoke_text_cached_main_raw(empty)) {
+                        r_msg2_main(g_sbTextShape, "setPath:", empty, 0,0,0);
+                    }
                     calls++;
                     // Handed to the layer and kept, so the next marker releases it
                     // in the block above instead of leaking it. g_sbTextPath is left
@@ -2537,7 +2648,14 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 }
             }
             if (textPathReady && r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
-                r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
+                // Two crossings instead of thirteen, and none of them sleep.
+                // This was the single largest cost in a publish: r_msg2_main
+                // settles nine times here, nine times usleep(3000), which is
+                // 27ms of the 55ms the whole publish took. It ran on every
+                // frame and it was the counter doing it.
+                if (!sb_invoke_text_cached_main_raw(rpT)) {
+                    r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
+                }
                 calls++;
                 g_sbTextPath = rpT;
                 s_sbTextLive = 1;
