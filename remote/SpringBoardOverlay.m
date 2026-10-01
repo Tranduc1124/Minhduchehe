@@ -1418,39 +1418,22 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
     g_sbSessionDead = 0;
 
-    g_sbSummaryAttempts++;
-
-    uint64_t t = now_us();
-    if (t < g_sbNextPublishUS) {
-        g_sbSummarySkips++;
-        return;
-    }
-
-    static NSMutableData *ops = nil;
-    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
-
-    if (!mergePaths(espView, ops)) {
-        g_sbSummarySkips++;
-        return;
-    }
-
-    static int s_remoteBusy = 0;
-    if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
-        // How long one publish holds the flag, and how often a frame arrives
-        // while it is still held. The interval gate lets frames through
-        // non-blockingly, so a drop here is not a wait, it is a collision with
-        // the publish still in flight. With a frame cost of 10ms and a frame
-        // period of 16.6ms the flag should be free again in time, and a
-        // bdrops that climbs says it is not.
-        g_sbBusyDrops++;
-        g_sbSummarySkips++;
-        return;
-    }
-    const uint64_t tAcquire = now_us();
-
-    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
-    NSData *frameBytes = [ops copy];
-
+    // Text sampling lives here, above every publish gate, and that placement is
+    // the fix rather than a detail. It used to sit after the interval gate, after
+    // mergePaths and after the in flight check, which meant the counter was only
+    // ever looked at on the frames where geometry was about to be drawn.
+    //
+    // With nothing on screen mergePaths reports nothing to send and this function
+    // returned before reaching it, so the pref was never read, so the switch had
+    // no effect for as long as the screen was empty. That is what was reported:
+    // the toggle did nothing. And at the start of a match the counter could not
+    // appear until the first publish that had something to draw, which is why it
+    // came up behind the ESP rather than with it.
+    //
+    // The counter is not a shape and shares none of the geometry's conditions, so
+    // its sampling must not sit behind them. The 500ms ceiling below is the only
+    // thing that limits how often it reads, and that is a ceiling on work, not a
+    // dependency on the drawing.
     // Text is sampled here, on the thread that writes it, and sent by the text
     // thread. Three things forced that split.
     //
@@ -1535,6 +1518,40 @@ void SBRemotePushESPFrame(UIView *espView) {
             }
         }
     }
+
+
+    g_sbSummaryAttempts++;
+
+    uint64_t t = now_us();
+    if (t < g_sbNextPublishUS) {
+        g_sbSummarySkips++;
+        return;
+    }
+
+    static NSMutableData *ops = nil;
+    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
+
+    if (!mergePaths(espView, ops)) {
+        g_sbSummarySkips++;
+        return;
+    }
+
+    static int s_remoteBusy = 0;
+    if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+        // How long one publish holds the flag, and how often a frame arrives
+        // while it is still held. The interval gate lets frames through
+        // non-blockingly, so a drop here is not a wait, it is a collision with
+        // the publish still in flight. With a frame cost of 10ms and a frame
+        // period of 16.6ms the flag should be free again in time, and a
+        // bdrops that climbs says it is not.
+        g_sbBusyDrops++;
+        g_sbSummarySkips++;
+        return;
+    }
+    const uint64_t tAcquire = now_us();
+
+    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+    NSData *frameBytes = [ops copy];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
