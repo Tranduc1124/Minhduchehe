@@ -436,9 +436,20 @@ static void sb_text_sync(int slot, UIView *espView, NSString *key, double landH)
         // this went wrong.
         double zero[2] = { 0.0, 0.0 };
         r_msg2_main_raw(tl, "setAnchorPoint:", zero, 16, NULL,0,NULL,0,NULL,0);
-        // kCAAlignCenter, built once and shared by every slot. r_nsstr_retained
-        // is about six operations and the value never changes.
-        if (!r_is_objc_ptr(g_sbAlignStr)) g_sbAlignStr = r_nsstr_retained("kCAAlignCenter");
+        // "center", and not "kCAAlignCenter".
+        //
+        // alignmentMode takes a string, and kCAAlignCenter is the name of the
+        // constant whose value is @"center". Passing the constant's name passes
+        // a string the target has never heard of, so the setter keeps the
+        // default, the default is natural, and natural puts the glyphs against
+        // the leading edge of the bounds. That is a left aligned label in a
+        // frame built to be centred, which put the count about 45 points left of
+        // the middle on the device. There is no warning for it: a CALayer
+        // accepts any string here and simply does not recognise it.
+        //
+        // Built once and shared by every slot. r_nsstr_retained is about six
+        // operations and the value never changes.
+        if (!r_is_objc_ptr(g_sbAlignStr)) g_sbAlignStr = r_nsstr_retained("center");
         if (r_is_objc_ptr(g_sbAlignStr)) r_msg2_main(tl, "setAlignmentMode:", g_sbAlignStr, 0,0,0);
         // Without this the glyphs rasterise at scale 1 and are scaled up, which
         // on a 3x panel is the difference between readable and a grey smear.

@@ -3391,11 +3391,12 @@ static inline uint64_t ESPPhaseNowUS(void) {
             UIColor *redText = [UIColor colorWithRed:1.0f green:0.0f blue:0.0f alpha:1.0f];
 
             if (stats.realCount == 0 && stats.botCount == 0) {
-                // "Ful" and not "CLEAR". The counter answers one question, which
-                // is how many, and "CLEAR" was answering a different one in
-                // words the same reader has to decode. Three letters, and the
-                // same width whatever the number would have been.
-                countText = @"Ful";
+                // A dash and not a word. The counter answers one question, which
+                // is how many, and every word it used to answer it in, CLEAR
+                // then Ful, was a different question spelled out in letters the
+                // same reader has to decode. One glyph, and the same width
+                // whatever the number would have been.
+                countText = @"-";
                 countColor = redText;
                 fontSize = 25.0f;
             } else {
@@ -4212,47 +4213,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
             ? Vector3::Distance(myLocation, IsZeroVec(aimPos) ? headBonePos : aimPos)
             : tempDisForAim;
 
-        // Count enemies for ESP number only:
-        // - not self / not teammate (already skipped)
-        // - alive (CurHP > 0) — knocked still counts as a person
-        // - within ESP distance
-        // - dedup by pawn
-        // - bots only if EspBot PREF is on (not the forced isEspBot from AimOnBot)
-        // Count: real players only by default; bots only if EspBot switch is ON in prefs
-        // (not the temporary isEspBot forced by AimOnBot — that inflated count by +bots).
-        // EspBot pref once per frame (not every pawn — was re-reading defaults 100×).
-        static bool s_espBotPref = false;
-        static int s_espBotFrame = -1;
-        if (s_espBotFrame != g_cacheFrameCounter) {
-            s_espBotFrame = g_cacheFrameCounter;
-            s_espBotPref = ESPPrefsBool(@"EspBot", NO);
-        }
-        bool shouldCountEnemy = true;
-        if (isBot && !s_espBotPref) shouldCountEnemy = false;
-        if (CurHP <= 0) shouldCountEnemy = false; // CurHP<=0 is terminal; ignore lagged isKnocked for counting ghosts.
-        float countDis = dis;
-        float countLimit = fmaxf(espDistanceLimit, 1.0f);
-        if (shouldCountEnemy && countDis <= countLimit && countDis >= 1.5f) {
-            uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
-            uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
-            static uint64_t s_countSeen[128];
-            static int s_countFrame = -1;
-            static int s_countN = 0;
-            if (s_countFrame != g_cacheFrameCounter) {
-                s_countFrame = g_cacheFrameCounter;
-                s_countN = 0;
-            }
-            bool dup = false;
-            for (int ci = 0; ci < s_countN; ci++) {
-                if (s_countSeen[ci] == dedupKey) { dup = true; break; }
-            }
-            if (!dup && s_countN < 128) {
-                s_countSeen[s_countN++] = dedupKey;
-                if (isBot) stats.botCount++;
-                else stats.realCount++;
-            }
-        }
-
         // Check Visible: Camera bit OR vehicle passenger — always draw people in cars.
         const bool mounted = treatAsVehicle;
         bool espVisible = !isEspCheckVisible || isFPP || isCamVis || isKnocked || mounted;
@@ -4271,6 +4231,41 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
         if (CurHP <= 0) continue;
+
+        // Count exactly what is drawn, here, where wantDraw is decided.
+        //
+        // This used to be a second filter of its own, sitting further up, and
+        // the two drifted apart. It skipped bots unless the EspBot pref was on,
+        // skipped anything with CurHP <= 0, and applied the distance limit a
+        // second time. Drawing has its own rules and they are looser: a bot is
+        // drawn whenever isEspBot is set, which the aim can force on for a
+        // single frame. The result on the device was three boxes on the screen
+        // and a counter reading zero, because the three were bots and the
+        // counter did not count bots by default.
+        //
+        // A number that disagrees with the picture beside it is worse than no
+        // number, so there is one decision now and it is wantDraw. Dedup stays
+        // because the player dictionary can name the same pawn twice.
+        if (wantDraw) {
+            const uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
+            const uint64_t dedupKey = (uid != 0) ? uid : PawnObject;
+            static uint64_t s_countSeen[128];
+            static int s_countFrame = -1;
+            static int s_countN = 0;
+            if (s_countFrame != g_cacheFrameCounter) {
+                s_countFrame = g_cacheFrameCounter;
+                s_countN = 0;
+            }
+            bool dup = false;
+            for (int ci = 0; ci < s_countN; ci++) {
+                if (s_countSeen[ci] == dedupKey) { dup = true; break; }
+            }
+            if (!dup && s_countN < 128) {
+                s_countSeen[s_countN++] = dedupKey;
+                if (isBot) stats.botCount++;
+                else stats.realCount++;
+            }
+        }
 
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
