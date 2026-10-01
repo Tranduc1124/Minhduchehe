@@ -3503,13 +3503,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
 // together sees a consistent prefix.
 static EspTextManifest g_espTextManifest;
 
-void ESPTextManifestReset(void) {
+extern "C" void ESPTextManifestReset(void) {
     g_espTextManifest.count = 0;
     g_espTextManifest.overflow = 0;
     g_espTextManifest.frame++;
 }
 
-int32_t ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
+extern "C" int32_t ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
                            CGRect frame, CGFloat size, const CGFloat *rgba) {
     if (!text || text.length == 0) return 0;
     if (g_espTextManifest.count >= ESP_TEXT_MANIFEST_MAX) {
@@ -3546,7 +3546,7 @@ int32_t ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
     return 1;
 }
 
-const EspTextManifest *ESPTextManifestGet(void) { return &g_espTextManifest; }
+extern "C" const EspTextManifest *ESPTextManifestGet(void) { return &g_espTextManifest; }
 
 // Hysteresis table behind the enemy count. See the tally at the end of the pawn
 // loop: a pawn counts if it was drawn recently, not only if it is drawn now.

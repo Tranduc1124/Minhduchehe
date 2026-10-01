@@ -61,11 +61,38 @@ typedef struct {
     EspTextEntry e[ESP_TEXT_MANIFEST_MAX];
 } EspTextManifest;
 
+// C linkage, and it has to be explicit.
+//
+// The definitions live in esp.mm, which theos compiles as Objective-C++, where a
+// plain function definition gets C++ linkage and a mangled name. The one reader in
+// a .m file, SpringBoardOverlay.m, compiles as Objective-C and asks for the
+// unmangled name. Those two do not meet, and the build failed at the link with
+//
+//    Undefined symbols for architecture arm64:
+//      "_ESPTextManifestGet", referenced from:
+//          _sb_text_thread_main in SpringBoardOverlay.m.o
+//
+// on the getter only, because the other two are called from .mm files on both sides
+// and matched. The guard is here rather than being left to the C++ rule of picking
+// up a prior declaration's linkage, because relying on that is exactly the kind of
+// thing that breaks the next time a file moves.
+//
+// pid.h opens with a bare extern "C" and this does not, and that is deliberate:
+// this header is included from a .m file, where extern "C" is a syntax error, which
+// is the first error this whole thing produced.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Once per frame, before anything is drawn.
 void ESPTextManifestReset(void);
 // Returns 1 if the entry was recorded, 0 if the text was empty or the cap was hit.
 int32_t  ESPTextManifestAdd(uint64_t pawn, int kind, NSString *text,
                             CGRect frame, CGFloat size, const CGFloat *rgba);
 const EspTextManifest *ESPTextManifestGet(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* esptext_h */
