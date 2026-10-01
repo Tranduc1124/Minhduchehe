@@ -1428,6 +1428,21 @@ int SBoardStartOverlay(void) {
     double lw = 0.75;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
 
+    // Round joins, because every snapline leaves the same point and the fan draws
+    // each ray as origin, target, origin. At the origin between two rays the
+    // default miter join is asked for a corner whose two legs are frequently
+    // near-opposite, since two players standing roughly below one another send
+    // one ray up and the next down. The miter limit clips that to a bevel, but
+    // the artifact sits at the top centre of the screen, right where the counter
+    // is drawn, so it is worth not having.
+    //
+    // CALineJoin is a string type, not an enum that crosses as a number, so the
+    // value has to be a real NSString in the target. That is the same trap as
+    // alignmentMode, where passing the constant's name instead of its value fell
+    // back to natural with no warning at all.
+    uint64_t ljRound = r_nsstr_retained("round");
+    if (r_is_objc_ptr(ljRound)) r_msg2_main(shape, "setLineJoin:", ljRound, 0,0,0);
+
     // Read the width straight back out of SpringBoard's own CALayer. This is the
     // most direct measurement available: it is the exact call the overlay depends
     // on for its stroke weight, and the read uses getReturnValue: into a target

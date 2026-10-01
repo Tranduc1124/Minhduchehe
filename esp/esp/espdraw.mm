@@ -39,11 +39,10 @@ UIFont *GetCustomFont(CGFloat size) {
     return [UIFont fontWithName:NSSENCRYPT("arialbd") size:size] ?: [UIFont boldSystemFontOfSize:size];
 }
 
-static inline void ESPAddLine(CGMutablePathRef path, CGPoint p1, CGPoint p2) {
-    if (!path) return;
-    CGPathMoveToPoint(path, NULL, p1.x, p1.y);
-    CGPathAddLineToPoint(path, NULL, p2.x, p2.y);
-}
+// Snapline rays go through ESPAddFanRay in esp.h, not a per-player subpath
+// helper like the circle and rect ones below. The reasoning, including why
+// batching them as rectangles was tried and did not work, is written there
+// because it is the kind of thing that gets "fixed" back without being read.
 
 static inline void ESPAddCircle(CGMutablePathRef path, CGPoint center, CGFloat radius) {
     if (!path) return;
@@ -280,9 +279,9 @@ static void ESPRenderPawnCore(
         CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
         CGPoint boxTopCenter = CGPointMake(centerX, y);
 
-        if (isKnocked) { ESPAddLine(buffers->snaplineKnockedPath, lineStart, boxTopCenter); buffers->snaplineKnockedDirty = true; }
-        else if (isBot) { ESPAddLine(buffers->snaplineBotPath, lineStart, boxTopCenter); buffers->snaplineBotDirty = true; }
-        else { ESPAddLine(buffers->snaplinePath, lineStart, boxTopCenter); buffers->snaplineDirty = true; }
+        if (isKnocked) { ESPAddFanRay(buffers->snaplineKnockedPath, lineStart, boxTopCenter, &buffers->snaplineKnockedFanStarted); buffers->snaplineKnockedDirty = true; }
+        else if (isBot) { ESPAddFanRay(buffers->snaplineBotPath, lineStart, boxTopCenter, &buffers->snaplineBotFanStarted); buffers->snaplineBotDirty = true; }
+        else { ESPAddFanRay(buffers->snaplinePath, lineStart, boxTopCenter, &buffers->snaplineFanStarted); buffers->snaplineDirty = true; }
     }
 
     // ---------------------------------------------------------

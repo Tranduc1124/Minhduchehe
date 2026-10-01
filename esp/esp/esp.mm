@@ -4478,17 +4478,27 @@ static int      s_espCountN = 0;
                 float rightX = screenCenter.x + cos(angle + 0.09f) * tailRadius;
                 float rightY = screenCenter.y + sin(angle + 0.09f) * tailRadius;
 
-                CGMutablePathRef alertPath = s.isKnocked ? buffers->snaplineKnockedPath : (s.isBot ? buffers->snaplineBotPath : buffers->snaplinePath);
+                // Onto the alert layer, not onto a snapline layer.
+                //
+                // It used to go onto whichever snapline path matched the player,
+                // which was two bugs at once. It put a moveTo in the middle of the
+                // fan, so the decoder split the run there and the layer that had
+                // just become one polyline per layer was back to several, and it
+                // meant the off-screen markers cost a remote call each, exactly the
+                // term the fan was introduced to remove.
+                //
+                // It also belongs on alertLayer on its own terms: it is a triangle
+                // drawn around a player who is off screen, not a line from the top
+                // of the screen, and alertLayer already exists and is already
+                // published at kShapeKeys index 13.
                 CGMutablePathRef tempTriangle = CGPathCreateMutable();
                 CGPathMoveToPoint(tempTriangle, NULL, leftX, leftY);
                 CGPathAddLineToPoint(tempTriangle, NULL, tipX, tipY);
                 CGPathAddLineToPoint(tempTriangle, NULL, rightX, rightY);
                 CGPathAddLineToPoint(tempTriangle, NULL, leftX, leftY);
-                CGPathAddPath(alertPath, NULL, tempTriangle);
+                CGPathAddPath(buffers->alertPath, NULL, tempTriangle);
                 CGPathRelease(tempTriangle);
-                if (s.isKnocked) buffers->snaplineKnockedDirty = YES;
-                else if (s.isBot) buffers->snaplineBotDirty = YES;
-                else buffers->snaplineDirty = YES;
+                buffers->alertDirty = YES;
             }
 
             if (isAlertNum && !(veryCrowded && s.dis > 55.f)) {
@@ -4620,18 +4630,25 @@ static int      s_espCountN = 0;
                         buffers->snaplineDirty = YES;
                     }
                     CGPathAddRect(currentBoxPath, NULL, CGRectMake(boxX, boxY, boxWidth, boxHeight));
-                    // Snapline stays a real slanted line, one per player.
+                    // Snapline stays a real slanted line. It was briefly redrawn as
+                    // rectangles to save a remote call, and that was a bad trade:
+                    // a slanted line's corners are not its bounding box's corners,
+                    // so the decoder's rectangle test rejected it anyway, and the
+                    // elbow it drew hid the nearer player behind the farther one.
                     //
-                    // It was briefly redrawn as two rectangles to save a remote
-                    // call, and that was a bad trade. Every horizontal segment
-                    // starts at the same screen centre, so with two or more
-                    // players on screen the segments overlap and the farther one
-                    // hides the nearer one, which reads as a single line
-                    // pointing at one player. The elbow is cheaper and wrong.
-                    // A polyline per player is one remote call and gives the
-                    // fan the reference actually shows.
-                    CGPathMoveToPoint(currentLinePath, NULL, screenCenter.x, 45.0f);
-                    CGPathAddLineToPoint(currentLinePath, NULL, centerX, boxY);
+                    // What works is the fan. Every ray starts at the same point, so
+                    // the layer is one polyline going origin, target, origin, target
+                    // and so on: one remote call for the layer rather than one per
+                    // player. See ESPAddFanRay in espdraw.mm for why the doubled leg
+                    // is what stops CGPathAddLines from stringing a cable between
+                    // one player and the next.
+                    bool *fanStarted = &buffers->snaplineFanStarted;
+                    if (s.isKnocked) fanStarted = &buffers->snaplineKnockedFanStarted;
+                    else if (s.isBot) fanStarted = &buffers->snaplineBotFanStarted;
+                    ESPAddFanRay(currentLinePath,
+                                 CGPointMake(screenCenter.x, 45.0f),
+                                 CGPointMake(centerX, boxY),
+                                 fanStarted);
 
                     const bool liteOnScreen = (w2sHead.x >= -ep && w2sHead.x <= viewWidth + ep &&
                                                w2sHead.y >= -ep && w2sHead.y <= viewHeight + ep);

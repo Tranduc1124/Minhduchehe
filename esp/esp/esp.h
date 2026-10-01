@@ -5,6 +5,46 @@
 #import "GameLogic.h"
 #import "WeaponTextures.h"
 
+// One ray of a snapline fan, drawn as part of a single polyline for the whole
+// layer rather than as its own subpath.
+//
+// Every snapline leaves the same point: layerWidth/2, 35 in one mode, the screen
+// centre in the other. That makes a layer a fan from one origin, and
+// CGPathAddLines joins consecutive points, so one polyline holding every ray costs
+// one remote call for the layer instead of one per player. With twenty to thirty
+// players that is the difference between twenty to thirty crossings a publish and
+// one, and it is the only term in the overlay that scaled with the player count.
+//
+// Each ray goes out as origin, target, origin. The doubled leg is what fills the
+// gap CGPathAddLines would otherwise leave by joining one player's target to the
+// next player's origin, which would be a cable strung across the screen instead of
+// a fan. Redrawing a ray in the opposite direction is idempotent under an opaque
+// stroke, which all three snapline colours are; see where they are built in
+// esp.mm. If anyone ever gives the stroke an alpha below one, the doubled leg
+// reads as a darker seam and this needs revisiting. That note belongs here, at the
+// emitter, rather than in a commit message nobody will read when they try it.
+//
+// The count is always 2N+1, so always odd, and the decoder's four point rectangle
+// test and its two point line branch can never claim a fan. It lands in the generic
+// polyline branch, which is the one it wants anyway.
+//
+// This was previously attempted as rectangles, which is the obvious way to batch
+// it, and that was wrong twice over: a slanted line's corners are not its bounding
+// box's corners so the rectangle test rejected it, and the elbow it drew hid the
+// nearer player behind the farther one. The fan needs neither workaround.
+//
+// It lives here rather than in espdraw.mm because both emitters need it and
+// espdraw.mm's helpers are file static.
+static inline void ESPAddFanRay(CGMutablePathRef path, CGPoint origin, CGPoint target, bool *started) {
+    if (!path || !started) return;
+    if (!*started) {
+        CGPathMoveToPoint(path, NULL, origin.x, origin.y);
+        *started = true;
+    }
+    CGPathAddLineToPoint(path, NULL, target.x, target.y);
+    CGPathAddLineToPoint(path, NULL, origin.x, origin.y);
+}
+
 typedef struct {
     CGMutablePathRef boxPath;
     CGMutablePathRef boxBotPath;
@@ -36,6 +76,16 @@ typedef struct {
     bool snaplineDirty;
     bool snaplineBotDirty;
     bool snaplineKnockedDirty;
+
+    // Whether each snapline path already holds its moveTo. Every snapline in a
+    // layer leaves the same point, so the whole layer is one fan from one origin
+    // and can go out as a single polyline: one remote call per layer instead of
+    // one per player, which is the only per-player term in the whole overlay.
+    // These reset with the struct, which is rebuilt every frame, so no fan ever
+    // carries its origin over from the previous frame.
+    bool snaplineFanStarted;
+    bool snaplineBotFanStarted;
+    bool snaplineKnockedFanStarted;
     
     bool hpFillGreenDirty;
     bool hpFillOrangeDirty;
