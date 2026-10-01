@@ -890,7 +890,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             addSwitchRow([self localized:@(oxorany("Line Esp")) viText:@(oxorany("Đường kẻ"))], @(oxorany("Line")), NO);
             addSwitchRow([self localized:@(oxorany("Box Esp")) viText:@(oxorany("Khung ESP"))], @(oxorany("Box")), YES);
             addSwitchRow([self localized:@(oxorany("Info Esp")) viText:@(oxorany("Thông tin"))], @(oxorany("Name")), YES);
-            addSwitchRow([self localized:@(oxorany("Bone Esp")) viText:@(oxorany("Xương ESP"))], @(oxorany("Bone")), NO);
             addSwitchRow([self localized:@(oxorany("Health Esp")) viText:@(oxorany("Thanh Máu"))], @(oxorany("Health")), NO);
             addSwitchRow([self localized:@(oxorany("Distance Esp")) viText:@(oxorany("Cự ly"))], @(oxorany("Distance")), YES);
             addSwitchRow([self localized:@(oxorany("Weapon Esp")) viText:@(oxorany("Vũ khí"))], @(oxorany("Weapon")), NO);
@@ -899,6 +898,8 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             addSwitchRow([self localized:@(oxorany("Show Count")) viText:@(oxorany("Đếm Người"))], @(oxorany("Count")), YES);
             addSwitchRow([self localized:@(oxorany("Alert 360°")) viText:@(oxorany("Cảnh báo 360°"))], @(oxorany("Alert360")), NO);
             addSwitchRow([self localized:@(oxorany("Alert Num")) viText:@(oxorany("Số hiệu cảnh báo"))], @(oxorany("AlertNum")), NO);
+
+
 
             addSectionHeader(@(oxorany("Modes & Setting")));
 
@@ -942,7 +943,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             BOOL showName = ESPPrefsBool(@(oxorany("Name")), YES);
             BOOL showDist = ESPPrefsBool(@(oxorany("Distance")), YES);
             BOOL showHealth = ESPPrefsBool(@(oxorany("Health")), YES);
-            BOOL showBone = ESPPrefsBool(@(oxorany("Bone")), NO);
             BOOL showLine = ESPPrefsBool(@(oxorany("Line")), NO);
 
             CGFloat cardH = 230.0f;
@@ -981,7 +981,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 @[ @"Name", @(showName) ],
                 @[ @"Distance", @(showDist) ],
                 @[ @"Health", @(showHealth) ],
-                @[ @"Bone", @(showBone) ],
                 @[ @"Line", @(showLine) ],
             ];
             for (NSArray *row in rows) {
@@ -1072,11 +1071,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 line.backgroundColor = MDAccentSoft(0.8f);
                 [stage addSubview:line];
             }
-            if (showBone) {
-                UIView *bone = [[UIView alloc] initWithFrame:CGRectMake(scx - 1, 64, 2, 70)];
-                bone.backgroundColor = [UIColor colorWithWhite:0.9 alpha:0.7];
-                [stage addSubview:bone];
-            }
 
             y += cardH + 12.0f;
         }
@@ -1090,10 +1084,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                                                        y:y width:contentWidth textColor:textColor];
             y = [self appendColorControlSectionWithTitle:[self localized:@(oxorany("Line Color")) viText:@(oxorany("Màu Line"))]
                                                   prefix:@(oxorany("Line"))
-                                              defaultRGB:0.0f :1.0f :1.0f
-                                                       y:y width:contentWidth textColor:textColor];
-            y = [self appendColorControlSectionWithTitle:[self localized:@(oxorany("Bone Color")) viText:@(oxorany("Màu Bone"))]
-                                                  prefix:@(oxorany("Bone"))
                                               defaultRGB:0.0f :1.0f :1.0f
                                                        y:y width:contentWidth textColor:textColor];
             y = [self appendColorControlSectionWithTitle:[self localized:@(oxorany("FOV Color")) viText:@(oxorany("Màu FOV"))]
@@ -2058,7 +2048,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
 
                 ESPPrefsSetBool(@(oxorany("EnableESP")), NO);
                 ESPPrefsSetBool(@(oxorany("Name")), NO);
-                ESPPrefsSetBool(@(oxorany("Bone")), NO);
                 ESPPrefsSetBool(@(oxorany("Distance")), NO);
                 ESPPrefsSetBool(@(oxorany("Weapon")), NO);
                 ESPPrefsSetBool(@(oxorany("EspBot")), NO);
@@ -2285,7 +2274,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         if ([key isEqualToString:@(oxorany("EnableESP"))] || [key isEqualToString:@(oxorany("EnableESP2"))] ||
             [key isEqualToString:@(oxorany("Box"))] || [key isEqualToString:@(oxorany("Name"))] ||
             [key isEqualToString:@(oxorany("Distance"))] || [key isEqualToString:@(oxorany("Health"))] ||
-            [key isEqualToString:@(oxorany("Bone"))] || [key isEqualToString:@(oxorany("Line"))]) {
+            [key isEqualToString:@(oxorany("Line"))]) {
             if (self.currentTab == MenuTabESP) {
                 [self loadTabContent:self.currentTab];
             }

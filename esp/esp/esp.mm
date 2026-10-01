@@ -1536,7 +1536,7 @@ int g_PlayerDrawIndex = 1;
 
 bool isESP = YES;
 bool isESP2 = NO; 
-bool isBox = YES; bool isBone = YES; bool isHealth = YES;
+bool isBox = YES; bool isHealth = YES;
 int boxMode = 0; 
 bool isName = YES; bool isDis = YES; bool isLine = YES;
 bool isEspBot = NO; bool isWeapon = NO; bool isCount = YES; 
@@ -1573,9 +1573,6 @@ float boxThick = 1.0f;
 float boxR = 0.0f, boxG = 1.0f, boxB = 1.0f;
 // 0 = Color Picker (custom RGB), 1 = Rainbow cycle
 int boxColorMode = 0;
-float boneThick = 1.2f;
-float boneR = 0.0f, boneG = 1.0f, boneB = 1.0f;
-int boneColorMode = 0;
 float lineThick = 1.0f;
 float lineR = 0.0f, lineG = 1.0f, lineB = 1.0f;
 int lineColorMode = 0;
@@ -2390,9 +2387,6 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.boxPath = ESPCreateMutablePath();
     buffers.boxBotPath = ESPCreateMutablePath();
     buffers.boxKnockedPath = ESPCreateMutablePath();
-    buffers.bonePath = ESPCreateMutablePath();
-    buffers.boneBotPath = ESPCreateMutablePath();
-    buffers.boneKnockedPath = ESPCreateMutablePath();
     buffers.snaplinePath = ESPCreateMutablePath();
     buffers.snaplineBotPath = ESPCreateMutablePath();
     buffers.snaplineKnockedPath = ESPCreateMutablePath();
@@ -2403,7 +2397,6 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.alertPath = ESPCreateMutablePath();
     
     buffers.boxDirty = buffers.boxBotDirty = buffers.boxKnockedDirty = NO;
-    buffers.boneDirty = buffers.boneBotDirty = buffers.boneKnockedDirty = NO;
     buffers.snaplineDirty = buffers.snaplineBotDirty = buffers.snaplineKnockedDirty = NO;
     buffers.hpFillGreenDirty = buffers.hpFillOrangeDirty = buffers.hpFillRedDirty = NO;
     buffers.bgFillBlackDirty = buffers.alertDirty = NO;
@@ -2424,7 +2417,6 @@ static void espCountPathElements(void *info, const CGPathElement *e) {
 static inline void ESPGeometryBuffersRelease(ESPGeometryBuffers *buffers) {
     if (!buffers) return;
     ESPReleasePath(buffers->boxPath); ESPReleasePath(buffers->boxBotPath); ESPReleasePath(buffers->boxKnockedPath);
-    ESPReleasePath(buffers->bonePath); ESPReleasePath(buffers->boneBotPath); ESPReleasePath(buffers->boneKnockedPath);
     ESPReleasePath(buffers->snaplinePath); ESPReleasePath(buffers->snaplineBotPath);
     ESPReleasePath(buffers->snaplineKnockedPath); ESPReleasePath(buffers->hpFillGreenPath);
     ESPReleasePath(buffers->hpFillOrangePath); ESPReleasePath(buffers->hpFillRedPath); 
@@ -2480,9 +2472,6 @@ void ESPSyncFromPrefs(void) {
 
     isESP      = ESPPrefsBool(@"EnableESP", YES);
     isESP2     = ESPPrefsBool(@"EnableESP2", NO);
-    isBox      = ESPPrefsBool(@"Box", YES);
-    boxMode    = (int)ESPPrefsFloat(@"BoxMode", 0.0f);
-    isBone     = ESPPrefsBool(@"Bone", YES);
     isHealth   = ESPPrefsBool(@"Health", YES);
     isName     = ESPPrefsBool(@"Name", YES);
     // "Distance" is ESP toggle (bool). Aim range uses dedicated "AimDistance".
@@ -2623,11 +2612,6 @@ void ESPSyncFromPrefs(void) {
     if (boxColorMode < 0) boxColorMode = 0;
     if (boxColorMode > 1) boxColorMode = 1;
 
-    boneThick = ESPPrefsFloat(@"BoneThickness", 1.0f);
-    boneR = ESPPrefsFloat(@"BoneColorR", 0.0f); boneG = ESPPrefsFloat(@"BoneColorG", 1.0f); boneB = ESPPrefsFloat(@"BoneColorB", 1.0f);
-    boneColorMode = (int)ESPPrefsFloat(@"BoneColorMode", 0.0f);
-    if (boneColorMode < 0) boneColorMode = 0;
-    if (boneColorMode > 1) boneColorMode = 1;
 
     lineThick = ESPPrefsFloat(@"LineThickness", 1.0f);
     lineR = ESPPrefsFloat(@"LineColorR", 0.0f); lineG = ESPPrefsFloat(@"LineColorG", 1.0f); lineB = ESPPrefsFloat(@"LineColorB", 1.0f);
@@ -2662,9 +2646,6 @@ void ESPSyncFromPrefs(void) {
 @property (nonatomic, strong) CAShapeLayer *boxLayer;
 @property (nonatomic, strong) CAShapeLayer *boxBotLayer;
 @property (nonatomic, strong) CAShapeLayer *boxKnockedLayer;
-@property (nonatomic, strong) CAShapeLayer *boneLayer;
-@property (nonatomic, strong) CAShapeLayer *boneBotLayer;
-@property (nonatomic, strong) CAShapeLayer *boneKnockedLayer;
 @property (nonatomic, strong) CAShapeLayer *snaplineLayer;
 @property (nonatomic, strong) CAShapeLayer *snaplineBotLayer;
 @property (nonatomic, strong) CAShapeLayer *snaplineKnockedLayer;
@@ -2722,8 +2703,6 @@ static void ESPViewAddImageCallback(void *context, UIImage *image, CGRect frame)
 - (void)clearAllContent {
     self.boxLayer.path = nil; 
     self.boxBotLayer.path = nil; self.boxKnockedLayer.path = nil;
-    self.boneLayer.path = nil; 
-    self.boneBotLayer.path = nil; self.boneKnockedLayer.path = nil;
     self.snaplineLayer.path = nil; 
     self.snaplineBotLayer.path = nil; self.snaplineKnockedLayer.path = nil; 
     self.hpFillGreenLayer.path = nil; self.hpFillOrangeLayer.path = nil;
@@ -2949,13 +2928,10 @@ static void ESPDiagHeartbeat(void) {
     
     self.snaplineLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
     self.boxLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
-    self.boneLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
     self.snaplineBotLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
     self.boxBotLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
-    self.boneBotLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
     self.snaplineKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
     self.boxKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
-    self.boneKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2]; 
     
     self.fovLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ];
     self.aimAssistLayer = [self buildShapeLayerWithStroke:[UIColor cyanColor] fill:UIColor.clearColor lineWidth:1.5f zPos:baseZ + 6];
@@ -2971,7 +2947,7 @@ static void ESPDiagHeartbeat(void) {
     self.alertNumOrangeLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
     self.alertNumRedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
 
-    NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
+    NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
 
     for (CAShapeLayer *layer in layers) {
         [_secureCanvas.layer addSublayer:layer];
@@ -3109,16 +3085,15 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // reads every vsync (that hitch made ESP stutter on Pro).
         {
             static CFTimeInterval s_lastColorPref = 0;
-            static int s_liveBoxMode = 0, s_liveLineMode = 0, s_liveBoneMode = 0, s_liveFovMode = 0;
+            static int s_liveBoxMode = 0, s_liveLineMode = 0, s_liveFovMode = 0;
             static float s_liveBoxR = 0, s_liveBoxG = 1, s_liveBoxB = 1;
             static float s_liveLineR = 0, s_liveLineG = 1, s_liveLineB = 1;
-            static float s_liveBoneR = 0, s_liveBoneG = 1, s_liveBoneB = 1;
             static float s_liveFovR = 1, s_liveFovG = 1, s_liveFovB = 0;
             const bool anyRainbow =
                 (boxColorMode == 1) || (lineColorMode == 1) ||
-                (boneColorMode == 1) || (fovColorMode == 1) ||
+                (fovColorMode == 1) ||
                 (s_liveBoxMode == 1) || (s_liveLineMode == 1) ||
-                (s_liveBoneMode == 1) || (s_liveFovMode == 1);
+                (s_liveFovMode == 1);
             const bool refreshColorPrefs =
                 (s_lastColorPref <= 0.0) ||
                 (now - s_lastColorPref > (anyRainbow ? 0.033 : 0.12));
@@ -3126,7 +3101,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 s_lastColorPref = now;
                 s_liveBoxMode  = (int)ESPPrefsFloat(@"BoxColorMode",  (float)boxColorMode);
                 s_liveLineMode = (int)ESPPrefsFloat(@"LineColorMode", (float)lineColorMode);
-                s_liveBoneMode = (int)ESPPrefsFloat(@"BoneColorMode", (float)boneColorMode);
                 s_liveFovMode  = (int)ESPPrefsFloat(@"FovColorMode",  (float)fovColorMode);
                 s_liveBoxR = ESPPrefsFloat(@"BoxColorR", boxR);
                 s_liveBoxG = ESPPrefsFloat(@"BoxColorG", boxG);
@@ -3134,9 +3108,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 s_liveLineR = ESPPrefsFloat(@"LineColorR", lineR);
                 s_liveLineG = ESPPrefsFloat(@"LineColorG", lineG);
                 s_liveLineB = ESPPrefsFloat(@"LineColorB", lineB);
-                s_liveBoneR = ESPPrefsFloat(@"BoneColorR", boneR);
-                s_liveBoneG = ESPPrefsFloat(@"BoneColorG", boneG);
-                s_liveBoneB = ESPPrefsFloat(@"BoneColorB", boneB);
                 s_liveFovR = ESPPrefsFloat(@"FovColorR", fovR);
                 s_liveFovG = ESPPrefsFloat(@"FovColorG", fovG);
                 s_liveFovB = ESPPrefsFloat(@"FovColorB", fovB);
@@ -3152,17 +3123,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
             } else {
                 float drawBoxR = s_liveBoxR, drawBoxG = s_liveBoxG, drawBoxB = s_liveBoxB;
                 float drawLineR = s_liveLineR, drawLineG = s_liveLineG, drawLineB = s_liveLineB;
-                float drawBoneR = s_liveBoneR, drawBoneG = s_liveBoneG, drawBoneB = s_liveBoneB;
                 float drawFovR = s_liveFovR, drawFovG = s_liveFovG, drawFovB = s_liveFovB;
                 ESPResolveDrawColor(s_liveBoxMode, s_liveBoxR, s_liveBoxG, s_liveBoxB, 0.00f, &drawBoxR, &drawBoxG, &drawBoxB);
                 ESPResolveDrawColor(s_liveLineMode, s_liveLineR, s_liveLineG, s_liveLineB, 0.25f, &drawLineR, &drawLineG, &drawLineB);
-                ESPResolveDrawColor(s_liveBoneMode, s_liveBoneR, s_liveBoneG, s_liveBoneB, 0.50f, &drawBoneR, &drawBoneG, &drawBoneB);
                 ESPResolveDrawColor(s_liveFovMode, s_liveFovR, s_liveFovG, s_liveFovB, 0.75f, &drawFovR, &drawFovG, &drawFovB);
 
                 self.boxLayer.lineWidth = boxThick;
                 self.boxLayer.strokeColor = [UIColor colorWithRed:drawBoxR green:drawBoxG blue:drawBoxB alpha:1.0f].CGColor;
-                self.boneLayer.lineWidth = boneThick;
-                self.boneLayer.strokeColor = [UIColor colorWithRed:drawBoneR green:drawBoneG blue:drawBoneB alpha:1.0f].CGColor;
                 self.snaplineLayer.lineWidth = lineThick;
                 self.snaplineLayer.strokeColor = [UIColor colorWithRed:drawLineR green:drawLineG blue:drawLineB alpha:1.0f].CGColor;
                 self.fovLayer.lineWidth = fovThick;
@@ -3197,7 +3164,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
             _secureCanvas = _secureTextField.subviews.firstObject ?: _secureTextField;
             _secureCanvas.userInteractionEnabled = NO; 
             
-            NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
+            NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
             for (CAShapeLayer *layer in layers) {
                 [_secureCanvas.layer addSublayer:layer];
             }
@@ -3297,9 +3264,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
         MenuViewApplyPath(self.boxLayer, showVisuals ? buffers.boxPath : nil, buffers.boxDirty);
         MenuViewApplyPath(self.boxBotLayer, showVisuals ? buffers.boxBotPath : nil, buffers.boxBotDirty);
         MenuViewApplyPath(self.boxKnockedLayer, showVisuals ? buffers.boxKnockedPath : nil, buffers.boxKnockedDirty);
-        MenuViewApplyPath(self.boneLayer, showVisuals ? buffers.bonePath : nil, buffers.boneDirty);
-        MenuViewApplyPath(self.boneBotLayer, showVisuals ? buffers.boneBotPath : nil, buffers.boneBotDirty);         
-        MenuViewApplyPath(self.boneKnockedLayer, showVisuals ? buffers.boneKnockedPath : nil, buffers.boneKnockedDirty); 
         MenuViewApplyPath(self.snaplineLayer, showVisuals ? buffers.snaplinePath : nil, buffers.snaplineDirty);
         MenuViewApplyPath(self.snaplineBotLayer, showVisuals ? buffers.snaplineBotPath : nil, buffers.snaplineBotDirty);
         MenuViewApplyPath(self.snaplineKnockedLayer, showVisuals ? buffers.snaplineKnockedPath : nil, buffers.snaplineKnockedDirty);
@@ -3311,9 +3275,8 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // The dirty flags are read by the [APP-LAYER] diagnostic further down,
         // which runs after ESPGeometryBuffersRelease has freed the paths, so
         // they are copied here while the buffers are still alive.
-        static int s_dirtyBox = 0, s_dirtyBone = 0, s_dirtySnap = 0, s_dirtyHpG = 0;
+        static int s_dirtyBox = 0, s_dirtySnap = 0, s_dirtyHpG = 0;
         s_dirtyBox = buffers.boxDirty;
-        s_dirtyBone = buffers.boneDirty;
         s_dirtySnap = buffers.snaplineDirty;
         s_dirtyHpG  = buffers.hpFillGreenDirty;
 
@@ -3342,20 +3305,19 @@ static inline uint64_t ESPPhaseNowUS(void) {
         {
             static uint32_t s_layerLogTick = 0;
             if ((++s_layerLogTick % 60u) == 1u) {
-                ESPPathCountCtx bx = {0,0}, bn = {0,0}, sn = {0,0}, fv = {0,0}, am = {0,0};
+                ESPPathCountCtx bx = {0,0}, sn = {0,0}, fv = {0,0}, am = {0,0};
                 CGPathApply(self.boxLayer.path, &bx, espCountPathElements);
-                CGPathApply(self.boneLayer.path, &bn, espCountPathElements);
                 CGPathApply(self.snaplineLayer.path, &sn, espCountPathElements);
                 CGPathApply(self.fovLayer.path, &fv, espCountPathElements);
                 CGPathApply(self.aimAssistLayer.path, &am, espCountPathElements);
-                NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d bone=%d hp=%d show=%d | "
-                      @"box=%u/%u bone=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
-                      @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
-                      (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isBone, (int)isHealth,
+                NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d hp=%d show=%d | "
+                      @"box=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
+                      @"dirty box=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
+                      (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isHealth,
                       (int)showVisuals,
-                      bx.n, bx.curves, bn.n, bn.curves, sn.n, sn.curves,
+                      bx.n, bx.curves, sn.n, sn.curves,
                       fv.n, fv.curves, am.n, am.curves,
-                      (int)s_dirtyBox, (int)s_dirtyBone,
+                      (int)s_dirtyBox,
                       (int)s_dirtySnap, (int)s_dirtyHpG,
                       (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil));
             }
