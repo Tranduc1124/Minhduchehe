@@ -20,6 +20,7 @@
 #import "PAC.h"
 #import "remote_objc.h"
 #import "ESPPrefs.h"
+#import <CoreText/CoreText.h>
 #import "../../kexploit/kexploit_opa334.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -127,6 +128,44 @@ typedef struct {
 } SbTextSlot;
 
 static SbTextSlot g_sbText[SB_TEXT_SLOTS];
+
+// The counter, drawn as a filled path on a layer of its own.
+//
+// It was a CATextLayer, and that was the wrong tool. A CATextLayer's string
+// setter makes SpringBoard's main thread run CoreText layout and then rasterise
+// glyphs at contentsScale 3, and the overlay's calls are
+// performSelectorOnMainThread:withObject:waitUntilDone:YES, so every call after it
+// queues behind that work. The device log put a number on it: 8 geometry calls
+// cost 6 to 12ms, so a crossing is about 1ms, while one counter change cost 391 to
+// 822ms, so a change was costing tens of milliseconds per call. The publishes that
+// followed a change ran ms=391, 507, 703 and 822 against 6 to 12 for the rest, ups
+// fell from 50 a second to 4, and bdrops climbed to 51. One digit cost the ESP
+// half a second.
+//
+// A path has no layout. The main thread is handed geometry and fills it, and the
+// glyph outlines are computed here, in this process, where CoreText is free.
+//
+// This is the second layer in SpringBoard and it is the first thing drawn other
+// than the geometry, which is not the same claim as the FOV split that died in
+// 75747c3c4: that added a layer, a path, a point buffer, an NSInvocation and a
+// string all at once, on a session whose every remote operation can clear
+// g_RC_success. This adds a layer, a path and one setPath, all of them lazy, and
+// nothing it does can reach g_sbShape: a failure here leaves the geometry exactly
+// as it was and the counter simply does not appear.
+static uint64_t g_sbTextShape = 0;      // the CAShapeLayer, filled, in the target
+static uint64_t g_sbTextPath  = 0;      // its CGMutablePath, in the target
+static uint64_t g_sbTextFill  = 0;      // its CGColor, in the target
+// The built outline and what it was built from. Both in this process, so there is
+// no remote state to lose on a rearm.
+static CGPathRef g_sbTextGlyphPath = NULL;
+static char      g_sbTextGlyphFor[40];
+static double    g_sbTextGlyphSize = 0;
+#define SB_TEXT_GLYPH_MAX 40
+// The index kShapeKeys does not have. The sixteen CAShapeLayers are the
+// geometry's; this one is ours, and it is written into the same op stream after
+// them so the decoder's existing marker carries it with no new framing.
+#define SB_TEXT_LAYER_INDEX 16
+
 // kCAAlignCenter, built once in the target and shared by every slot.
 static uint64_t g_sbAlignStr = 0;
 // How often the app's text is read. The counter's string changes about once a
@@ -394,6 +433,19 @@ static void serFunc(void *info, const CGPathElement *e) {
 // there is nothing to leak, and r_nsstr_retained's pair is a +1 retain that
 // nothing ever balances. And it is one call instead of two. The cost either way
 // is r_alloc_str, which is a malloc, a remote_writeStr and a verification read.
+// The text layer's path in the target. Its own CGMutablePath, not the geometry's:
+// the counter is filled and the geometry is stroked, and a CAShapeLayer has one
+// fill colour, so they cannot share a path without the counter becoming an
+// outline or the boxes becoming solid.
+//
+// Placed here rather than beside the declaration, because it calls dlsym_remote
+// and that is defined further down the file.
+static uint64_t sb_text_path(void) {
+    if (g_sbTextPath) return g_sbTextPath;
+    g_sbTextPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    return g_sbTextPath;
+}
+
 static uint64_t sb_text_make_nsstring(const char *cstr) {
     uint64_t cls = r_class("NSString");
     uint64_t buf = r_alloc_str(cstr);
@@ -527,6 +579,83 @@ static void sb_text_forget(void) {
 // also replaces the trick of setting the string before addSublayer:, because the
 // fade on a newly added sublayer is itself a transaction and this turns those
 // off too.
+// The glyph outline for a string, as a filled path, built in this process.
+//
+// Built here, in the app's own process, where CoreText is free. That is the whole
+// point: the same characters in a CATextLayer on the far side of the process
+// boundary make SpringBoard's main thread lay them out and rasterise them, and the
+// device log put that at 391 to 822ms for a two digit number.
+//
+// CTFontCreatePathForGlyph and not CTLineCreatePath. The latter is a macOS API and
+// is not in the iOS SDK at all, so the outline is assembled a glyph at a time and
+// the advances are added by hand. CTFontGetGlyphsForCharacters supplies the glyph
+// indices and CTFontGetAdvancesForGlyph supplies the widths, which is the same
+// arithmetic CTLine would have done.
+//
+// The result is positioned the way CATextLayer had been positioning it inside the
+// app's own frame, centred horizontally, so the counter does not move on screen
+// when this replaces it.
+static CGPathRef sb_text_glyphs(const char *utf8, CGFloat size, CGRect frame) {
+    if (!utf8 || !*utf8) return NULL;
+    NSString *s = [NSString stringWithUTF8String:utf8];
+    if (!s.length) return NULL;
+
+    CTFontRef font = CTFontCreateWithName(CFSTR("Helvetica-Bold"), size, NULL);
+    if (!font) return NULL;
+
+    // UTF-8 to unichar. Surrogate pairs are not handled: the counter is digits
+    // and a dash, and a name would need a proper decoder rather than a second
+    // guess at one.
+    UniChar ch[64];
+    CFIndex n = 0;
+    for (const unsigned char *p = (const unsigned char *)utf8; *p && n < 64; ) {
+        unsigned int cp;
+        if (*p < 0x80)                { cp = *p++; }
+        else if ((*p & 0xE0) == 0xC0) { cp = (*p++ & 0x1F) << 6; cp |= (*p++ & 0x3F); }
+        else if ((*p & 0xF0) == 0xE0) { cp = (*p++ & 0x0F) << 12;
+                                         cp |= (*p++ & 0x3F) << 6; cp |= (*p++ & 0x3F); }
+        else                          { cp = 0xFFFD; p++; }
+        if (cp > 0xFFFF) { cp = 0xFFFD; }
+        ch[n++] = (UniChar)cp;
+    }
+    if (n == 0) { CFRelease(font); return NULL; }
+
+    CGGlyph glyphs[64];
+    CGSize advances[64];
+    if (!CTFontGetGlyphsForCharacters(font, ch, glyphs, n)) { CFRelease(font); return NULL; }
+
+    // Count last, after the arrays, and the orientation second. Read out of
+    // CTFont.h rather than assumed: the obvious order is not this one, and the
+    // compiler caught the guess twice. It also returns the summed advance, so
+    // there is no second pass to measure the width with.
+    const double totalW = CTFontGetAdvancesForGlyphs(
+            font, kCTFontOrientationHorizontal, glyphs, advances, n);
+    if (totalW <= 0.0) { CFRelease(font); return NULL; }
+
+    // CATextLayer centred the string in the frame, so the first glyph starts half
+    // the shortfall in, and the baseline sits where the frame's vertical middle
+    // puts it.
+    const double descent = CTFontGetDescent(font);
+    const double ascent  = CTFontGetAscent(font);
+    const double dx = frame.origin.x + (frame.size.width - totalW) * 0.5;
+    const double dy = frame.origin.y + (frame.size.height + ascent + descent) * 0.5 - descent;
+
+    CGMutablePathRef out = CGPathCreateMutable();
+    double penX = dx;
+    for (CFIndex i = 0; i < n; i++) {
+        if (glyphs[i] != 0) {
+            CGAffineTransform m = CGAffineTransformMakeTranslation(penX, dy);
+            CGPathRef g = CTFontCreatePathForGlyph(font, glyphs[i], &m);
+            if (g) { CGPathAddPath(out, NULL, g); CGPathRelease(g); }
+        }
+        penX += advances[i].width;
+    }
+    CFRelease(font);
+
+    if (CGPathIsEmpty(out)) { CGPathRelease(out); return NULL; }
+    return out;
+}
+
 static void sb_text_txn_begin(void) {
     uint64_t tx = r_class("CATransaction");
     if (!r_is_objc_ptr(tx)) return;
@@ -624,7 +753,41 @@ static void sb_text_send(int slot, NSString *text,
     NSLog(@"[SB-TEXT] slot %d set \"%s\" size=%.0f", slot, sl->last, fs);
 }
 
-static BOOL mergePaths(UIView *espView, NSMutableData *d) {
+// The counter's outline as it stands, or NULL when it should not be drawn. Cached
+// by string and size, so CoreText runs on a change and not on a frame.
+static CGPathRef sb_text_glyph_path_for_frame(UIView *espView) {
+    if (!g_sbTextShape) return NULL;
+    if (!ESPPrefsBool(@"SbCountText", NO)) return NULL;
+
+    id sl = [espView valueForKey:@"statusLayer"];
+    if (![sl isKindOfClass:[CATextLayer class]]) return NULL;
+    CATextLayer *src = (CATextLayer *)sl;
+    NSString *want = (NSString *)src.string;
+    if (!want.length || src.hidden) return NULL;
+    const char *c = want.UTF8String;
+    if (!c || !*c) return NULL;
+
+    const CGFloat size = src.fontSize;
+    if (g_sbTextGlyphPath && g_sbTextGlyphFor[0] != 0 &&
+        strcmp(c, g_sbTextGlyphFor) == 0 && g_sbTextGlyphSize == (double)size) {
+        return g_sbTextGlyphPath;
+    }
+    if (g_sbTextGlyphPath) { CGPathRelease(g_sbTextGlyphPath); g_sbTextGlyphPath = NULL; }
+    g_sbTextGlyphFor[0] = 0;
+    CGPathRef built = sb_text_glyphs(c, size, src.frame);
+    if (!built) return NULL;
+    g_sbTextGlyphPath = built;
+    snprintf(g_sbTextGlyphFor, sizeof(g_sbTextGlyphFor), "%s", c);
+    g_sbTextGlyphSize = (double)size;
+    NSLog(@"[SB-TEXT] glyphs \"%s\" size=%.0f frame=%.0f,%.0f,%.0f,%.0f",
+          g_sbTextGlyphFor, size, src.frame.origin.x, src.frame.origin.y,
+          src.frame.size.width, src.frame.size.height);
+    return g_sbTextGlyphPath;
+}
+
+// textPath is the counter's outline, or NULL. Passed in rather than fetched, so
+// the caller decides when a glyph rebuild happens.
+static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
     [d setLength:0];
 
     SerCtx ctx = { .data = d, .landW = 0, .landH = 0, .lastX = 0, .lastY = 0, .haveLast = 0 };
@@ -659,6 +822,19 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
         CGPathApply(p, &ctx, serFunc);
         emitted = 1;
     }
+    // The counter's glyphs go into the same stream, after the sixteen, with a
+    // marker of their own. Not a second stream: the decoder already reads one
+    // layer marker per run and already switches on it, so one more index costs a
+    // compare and rides the existing framing.
+    if (textPath) {
+        uint8_t ttag = 4;
+        uint8_t tidx = SB_TEXT_LAYER_INDEX;
+        [d appendBytes:&ttag length:1];
+        [d appendBytes:&tidx length:1];
+        CGPathApply(textPath, &ctx, serFunc);
+        emitted = 1;
+    }
+
     if (!emitted) return NO;
 
     uint32_t h = 2166136261u;
@@ -1223,8 +1399,43 @@ int SBoardStartOverlay(void) {
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
     sb_disable_layer_actions(shape);
 
-    uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
+    // The counter's layer. Filled, where the geometry's is stroked, and at the
+    // geometry's zPos plus one so the digits are not drawn under a box outline.
+    // Its path is the only thing ever handed to it.
+    uint64_t tShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+    if (r_is_objc_ptr(tShape)) {
+        r_msg2_main_raw(tShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        // Red, matching the app's counter. Built here rather than mirrored,
+        // because a CGColor is an object in the target and the app's is in this
+        // process, and the counter has been red for every version of it.
+        double tc[4] = { 1.0, 0.0, 0.0, 1.0 };
+        uint64_t tCol = r_msg2_main_raw(r_class("UIColor"),
+                                        "colorWithRed:green:blue:alpha:",
+                                        &tc[0], 8, &tc[1], 8, &tc[2], 8, &tc[3], 8);
+        uint64_t tCG = r_is_objc_ptr(tCol) ? r_msg2_main(tCol, "CGColor", 0,0,0,0) : 0;
+        if (r_is_objc_ptr(tCG)) {
+            r_msg2_main(tShape, "setFillColor:", tCG, 0,0,0);
+            g_sbTextFill = tCG;
+        }
+        r_msg2_main(tShape, "setStrokeColor:", 0, 0,0,0);
+        double tzw = 0.0;   // a filled path with no stroke
+        r_msg2_main_raw(tShape, "setLineWidth:", &tzw, 8, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(tShape, "setOpaque:", 0, 0,0,0);
+        double tz = 101.0;
+        r_msg2_main_raw(tShape, "setZPosition:", &tz, 8, NULL,0,NULL,0,NULL,0);
+        sb_disable_layer_actions(tShape);
+        g_sbTextShape = tShape;
+        uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
+        if (r_is_objc_ptr(cLayer)) {
+            r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
+            r_msg2_main(cLayer, "addSublayer:", tShape, 0,0,0);
+        }
+        NSLog(@"[SB-TEXT] layer=0x%llx fill=%d", (unsigned long long)tShape,
+              (int)r_is_objc_ptr(tCG));
+    } else {
+        uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
+        if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
+    }
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
@@ -1315,22 +1526,20 @@ static void sb_text_drain(void) {
 
 static void *sb_text_thread_main(void *arg) {
     (void)arg;
-    while (1) {
-        // Asleep until the app's thread says there is something new, or until the
-        // poll interval expires.
-        dispatch_semaphore_wait(g_sbTextWake,
-                                dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC));
-        if (pthread_mutex_trylock(&g_sbIoLock) != 0) {
-            // A publish owns the transport. Come back almost at once rather than
-            // waiting out the poll interval: a publish is over in about ten
-            // milliseconds, and a quarter of a second of extra delay is exactly
-            // what made the counter look late at the start of a match.
-            usleep(20000);
-            continue;
-        }
-        sb_text_drain();
-        pthread_mutex_unlock(&g_sbIoLock);
-    }
+    // Nothing to do, and that is the point. The counter used to be sent from
+    // here, as a CATextLayer's string, and that was costing 391 to 822ms of
+    // SpringBoard main thread work per change, which stalled the publish that
+    // draws the boxes: ms=391, 507, 703 and 822 against 6 to 12 for an ordinary
+    // frame, ups down from 50 a second to 4, bdrops to 51.
+    //
+    // The counter is a filled path now, produced by sb_text_glyph_path_for_frame
+    // and carried in the same op stream as the geometry, so it costs a few extra
+    // CGPath calls inside a publish that was happening anyway and it needs no
+    // thread of its own. What this thread would do now is race the publish for
+    // the transport, which is the whole failure mode again.
+    //
+    // Left in place rather than deleted so the removal is one line in one place
+    // if a future caller needs a per frame remote operation of its own.
     return NULL;
 }
 
@@ -1338,10 +1547,9 @@ static void sb_text_thread_start(void) {
     if (g_sbTextThread) return;
     if (!g_sbTextWake) g_sbTextWake = dispatch_semaphore_create(0);
     if (pthread_create(&g_sbTextThread, NULL, sb_text_thread_main, NULL) == 0) {
-        NSLog(@"[SB-TEXT] thread up, woken by the app thread, transport by try-lock");
+        NSLog(@"[SB-TEXT] counter is a path in the geometry stream; no text thread needed");
     } else {
         g_sbTextThread = 0;
-        NSLog(@"[SB-TEXT] thread failed to start, text falls back to the poll interval");
     }
 }
 
@@ -1549,7 +1757,7 @@ void SBRemotePushESPFrame(UIView *espView) {
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
-    if (!mergePaths(espView, ops)) {
+    if (!mergePaths(espView, sb_text_glyph_path_for_frame(espView), ops)) {
         g_sbSummarySkips++;
         return;
     }
@@ -1595,6 +1803,11 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint64_t rp = persistentPath();
             const int okAfterPath = remote_call_current_success() ? 1 : 0;
             uint64_t ptsBuf = ptsBuffer();
+            // The counter's path, in the target. Separate from the geometry's
+            // because a CAShapeLayer has one fill colour and the digits are filled
+            // while the boxes are stroked; sharing a path would make the digits
+            // outlines or the boxes solid, and neither is wanted.
+            uint64_t rpT = r_is_objc_ptr(g_sbTextShape) ? sb_text_path() : 0;
             const int okAfterBuf = remote_call_current_success() ? 1 : 0;
             if (!okBefore || !rp || !ptsBuf || !okAfterBuf || !okAfterPath) {
                 static uint64_t s_probeUS = 0;
@@ -1736,6 +1949,21 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             size_t i = 0;
             int curLayer = -1;
+            // Where this run's points go. The counter is layer 16, it is filled,
+            // and the geometry is stroked, and one CAShapeLayer has one fill
+            // colour, so the two cannot share a path. Switching on the layer
+            // marker is a compare per run; a second decode loop would be the
+            // shape of code that has broken here before.
+            uint64_t dstPath = rp;
+            int dstLayer = -1;
+            // The counter's path is replaced rather than emptied: CGPathClear and
+            // CGPathReset are both absent from CoreGraphics.tbd on this OS, so
+            // there is no way to clear a CGMutablePathRef in place, and a fresh
+            // one is one call.
+            if (r_is_objc_ptr(rpT)) {
+                g_sbTextPath = 0;
+                rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+            }
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
@@ -1751,6 +1979,21 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (op == 4) {                 // layer marker, no coordinates
                         if (i >= len) { i = len; break; }
                         curLayer = b[i++];
+                        if (curLayer != dstLayer) {
+                            // The pending rectangle batch is flushed before the
+                            // switch, or a batch begun on one layer would finish
+                            // into the next one's path.
+                            if (rectDoubles >= 4) {
+                                remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
+                                dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
+                                             rectDoubles / 4, 0, 0,0,0);
+                                calls++; drawn++;
+                                rectDoubles = 0;
+                            }
+                            dstLayer = curLayer;
+                            dstPath = (curLayer == SB_TEXT_LAYER_INDEX && r_is_objc_ptr(rpT))
+                                    ? rpT : rp;
+                        }
                         continue;
                     }
                     if (i + 16 > len) { i = len; break; }
@@ -1907,7 +2150,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 if (isRect) {
                     if (rectDoubles + 4 > (int)(sizeof(rectBuf)/sizeof(rectBuf[0]))) {
                         remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                        dlsym_remote("CGPathAddRects", rp, 0, ptsBuf,
+dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
                                      rectDoubles / 4, 0, 0,0,0);
                         calls++; drawn++;
                         rectDoubles = 0;
@@ -1930,14 +2173,24 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // never join: that is what the old single-polyline version got
                 // wrong and produced chords across the screen.
                 remote_write(ptsBuf, run, (size_t)rn * 8);
-                dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, np, 0,0,0,0);
+dlsym_remote("CGPathAddLines", dstPath, 0, ptsBuf, np, 0,0,0,0);
                 calls++; drawn++;
             }
 
             if (rectDoubles >= 4) {
                 remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                dlsym_remote("CGPathAddRects", rp, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
+dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++; drawn++;
+            }
+
+            // The counter's path goes to its own layer. One call, and the main
+            // thread fills a path instead of laying out a string, which is the
+            // whole reason for the change: ms=391 to 822 for a two digit number
+            // before, against 6 to 12 for an ordinary frame.
+            if (r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
+                r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
+                calls++;
+                g_sbTextPath = rpT;
             }
 
             if (drawn > 0) {
