@@ -2096,7 +2096,32 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
-                if (tCount > 0 && dstPath == rpT) tPtsN[tCount - 1] += (uint32_t)np;
+                // The text path may only ever receive layer 16. Enforced here,
+                // at the point of drawing, rather than only at the marker.
+                //
+                // It is enforced twice because the marker alone was not enough.
+                // Turning the counter on turned the FOV ring into a solid disc of
+                // the counter's fill, which means the FOV's geometry reached the
+                // text layer; and the marker counter said runs=1 [L16/87] on every
+                // single line, because it only tallied runs that arrived on the
+                // text path at a layer change. A run that got there another way was
+                // never counted, so the diagnostic agreed with itself and was
+                // wrong. The colour was what settled it, not the tally.
+                //
+                // So this is a backstop rather than a diagnosis: whatever route
+                // the FOV is taking, it is stopped here, and the tallies are
+                // corrected to count every run that is drawn into the text path so
+                // the log agrees with the screen next time.
+                if (dstPath == rpT && curLayer != SB_TEXT_LAYER_INDEX) {
+                    dstPath = rp;
+                    dstLayer = curLayer;
+                }
+                if (dstPath == rpT) {
+                    if (tCount == 0 || tPts[tCount - 1] != curLayer) {
+                        if (tCount < 64) { tPts[tCount] = (uint8_t)curLayer; tPtsN[tCount] = 0; tCount++; }
+                    }
+                    tPtsN[tCount - 1] += (uint32_t)np;
+                }
                 if (np > maxPts) maxPts = np;
                 if (np > 8) nBig++;
                 if (np == 2) c2++;
