@@ -2497,8 +2497,42 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 // presenting the new path.
                 {
                     static uint64_t s_sbLogUS = 0;
+                    static uint64_t s_winStartUS = 0;
+                    static uint64_t s_winUpd = 0, s_winDrops = 0, s_winHoldUS = 0;
                     uint64_t nowS = now_us();
-                    if (nowS > s_sbLogUS) {
+                    if (nowS - s_winStartUS >= 1000000ULL) {
+                        // One timer, and the window is measured rather than
+                        // assumed. The previous version had two independent one
+                        // second timers gating each other: this outer one for the
+                        // log line, and an inner one for the rate sample. They were
+                        // set microseconds apart and drifted apart, and whenever
+                        // the inner one was late at the moment the outer fired the
+                        // delta was simply not taken. The line then read ups=0 for
+                        // a second or two at a time and, on the tick where it did
+                        // sample, reported a count spanning two or more seconds
+                        // while claiming to be a rate.
+                        //
+                        // That matters more than it looks: ups=0 from that
+                        // sampler is indistinguishable from a frozen overlay, and
+                        // the one thing a sampler like this must never be is
+                        // ambiguous between "stalled" and "did not look".
+                        //
+                        // hz is now divided by the elapsed window, so it is a rate
+                        // and not a count that happens to land near one second.
+                        // holdavg is the mean stall per completed publish, which is
+                        // the number to compare against the frame period: below
+                        // 16.7ms and nothing is queueing, above it and every
+                        // frame behind is arriving late.
+                        uint64_t winUS = nowS - s_winStartUS;
+                        double hz = (double)(g_sbSummaryUpdates - s_winUpd) * 1e6 / (double)winUS;
+                        double bdropHz = (double)(g_sbBusyDrops - s_winDrops) * 1e6 / (double)winUS;
+                        uint64_t updWin = g_sbSummaryUpdates - s_winUpd;
+                        uint64_t holdSumMS = (g_sbHoldUS - s_winHoldUS) / 1000ULL;
+                        uint64_t holdAvgMS = updWin ? holdSumMS / updWin : 0;
+                        s_winStartUS = nowS;
+                        s_winUpd = g_sbSummaryUpdates;
+                        s_winDrops = g_sbBusyDrops;
+                        s_winHoldUS = g_sbHoldUS;
                         s_sbLogUS = nowS + 1000000ULL;
                         // ms = wall time of one whole publish. Divided by calls it
                         // gives the per-remote-call cost, which is the number that
@@ -2509,49 +2543,34 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                         //                   only fix the geometry.
                         // Until this is measured, both are guesses.
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
-                        // ups = publishes completed in the previous second, which
-                        // is the frame rate actually achieved rather than the one
-                        // the cap allows.
-                        static uint64_t s_prevUpd = 0, s_prevUpdUS = 0;
-                        static uint64_t s_prevDrops = 0, s_prevHold = 0;
-                        uint64_t ups = 0, bdropRate = 0, holdMS = 0;
-                        {
-                            uint64_t tU = now_us();
-                            if (tU > s_prevUpdUS + 1000000ULL) {
-                                ups = g_sbSummaryUpdates - s_prevUpd;
-                                bdropRate = g_sbBusyDrops - s_prevDrops;
-                                holdMS = (g_sbHoldUS - s_prevHold) / 1000ULL;
-                                s_prevUpd = g_sbSummaryUpdates;
-                                s_prevDrops = g_sbBusyDrops;
-                                s_prevHold = g_sbHoldUS;
-                                s_prevUpdUS = tU;
-                            }
-                        }
-                        NSLog(@"[SB-PUSH] sub=%u rect=%u limb=%u calls=%llu ms=%llu "
-                              @"maxPts=%d nBig=%d r0=%.1f,%.1f,%.1f,%.1f ups=%llu "
-                              @"bdrops=%llu hold=%llums pts2=%d pts3=%d pts4=%d "
-                              @"pts58=%d pts932=%d pts33=%d hash=%u upd=%llu att=%llu skip=%llu "
-                              @"mergedSub=%u trunc=%u",
-                              g_sbLastSubpaths, rectCount, limbCount,
+                        NSLog(@"[SB-PUSH] hz=%.1f bdropsHz=%.1f win=%llums calls=%llu "
+                              @"ms=%llu holdavg=%llums holdsum=%llums ups=%llu "
+                              @"att=%llu skip=%llu "
+                              @"sub=%u rect=%u limb=%u mergedSub=%u trunc=%u "
+                              @"pts2=%d pts3=%d pts4=%d pts58=%d pts932=%d pts33=%d "
+                              @"maxPts=%d nBig=%d",
+                              hz, bdropHz,
+                              (unsigned long long)(winUS / 1000ULL),
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
-                              maxPts, nBig,
-                              firstRect[0], firstRect[1], firstRect[2], firstRect[3],
-                              (unsigned long long)ups,
-                              (unsigned long long)bdropRate,
-                              (unsigned long long)holdMS,
-                              c2, c3, c4, c5to8, c9to32, c33p,
-                              g_sbPathHash,
-                              (unsigned long long)g_sbSummaryUpdates,
+                              (unsigned long long)holdAvgMS,
+                              (unsigned long long)holdSumMS,
+                              (unsigned long long)updWin,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
-                              g_sbSubpathCount, nTrunc);
+                              g_sbLastSubpaths, rectCount, limbCount,
+                              g_sbSubpathCount, nTrunc,
+                              c2, c3, c4, c5to8, c9to32, c33p,
+                              maxPts, nBig);
                     }
                 }
-                if ((g_sbSummaryUpdates & 0x3f) == 0) {
-                    NSLog(@"[SBOverlay] 15fps updates=%llu skips=%llu attempts=%llu",
-                          g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);
-                }
+                // The old "[SBOverlay] 15fps" line is gone. It fired every 64
+                // publishes, so it was not a rate at all: at fifty publishes a
+                // second it printed roughly every 1.3s, and at four a second it
+                // printed once every 16s. A perf line that goes quiet as the
+                // thing gets slower is worse than no line, because silence reads
+                // as "no news" when it actually means "four frames a second".
+                // [SB-PUSH] above is the rate and it is on a wall clock.
             }
         } @finally {
             // The transport goes back before the busy flag, so the text thread
