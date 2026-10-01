@@ -162,6 +162,19 @@ static SbTextReq       g_sbTextReq[2];
 static int             g_sbTextSeq = 0;
 static pthread_mutex_t g_sbTextHandoff = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t       g_sbTextThread = 0;
+// Woken by the app's thread when it has something new to send.
+//
+// Polling was the first version and it was wrong in a way the device showed
+// plainly: the counter appeared a beat after the geometry at the start of a
+// match, and flipping a switch felt slow. Both are the same 250ms sleep, and
+// both are the time between wanting to send and being awake to send. The
+// semaphore removes that wait. The thread sleeps until it is signalled, and the
+// timeout is only there so that a request staged before the semaphore existed
+// is not lost.
+static dispatch_semaphore_t g_sbTextWake = NULL;
+// The last string staged, on the app's thread only, so the semaphore is posted
+// when the value differs rather than on every frame.
+static NSString *g_sbTextStaged = nil;
 // The app view's bounds, so the text thread can do the landscape to portrait
 // conversion without touching the view. Written by the app's thread while it
 // stages a request, read by the text thread, and it only ever changes when the
@@ -1262,11 +1275,19 @@ static void sb_text_drain(void) {
 
 static void *sb_text_thread_main(void *arg) {
     (void)arg;
-    // The bounds are needed to turn the app's landscape frame into the portrait
-    // one, and they are the app view's, so the first staged request carries them.
     while (1) {
-        usleep(250000);                            // 4 Hz
-        if (pthread_mutex_trylock(&g_sbIoLock) != 0) continue;   // a publish owns it
+        // Asleep until the app's thread says there is something new, or until the
+        // poll interval expires.
+        dispatch_semaphore_wait(g_sbTextWake,
+                                dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC));
+        if (pthread_mutex_trylock(&g_sbIoLock) != 0) {
+            // A publish owns the transport. Come back almost at once rather than
+            // waiting out the poll interval: a publish is over in about ten
+            // milliseconds, and a quarter of a second of extra delay is exactly
+            // what made the counter look late at the start of a match.
+            usleep(20000);
+            continue;
+        }
         sb_text_drain();
         pthread_mutex_unlock(&g_sbIoLock);
     }
@@ -1275,11 +1296,12 @@ static void *sb_text_thread_main(void *arg) {
 
 static void sb_text_thread_start(void) {
     if (g_sbTextThread) return;
+    if (!g_sbTextWake) g_sbTextWake = dispatch_semaphore_create(0);
     if (pthread_create(&g_sbTextThread, NULL, sb_text_thread_main, NULL) == 0) {
-        NSLog(@"[SB-TEXT] thread up, transport shared with the publish by try-lock");
+        NSLog(@"[SB-TEXT] thread up, woken by the app thread, transport by try-lock");
     } else {
         g_sbTextThread = 0;
-        NSLog(@"[SB-TEXT] thread failed to start, text stays inside the publish");
+        NSLog(@"[SB-TEXT] thread failed to start, text falls back to the poll interval");
     }
 }
 
@@ -1470,6 +1492,23 @@ void SBRemotePushESPFrame(UIView *espView) {
             __sync_synchronize();
             g_sbTextSeq++;
             pthread_mutex_unlock(&g_sbTextHandoff);
+
+            // Wake the text thread only when the value it would send is actually
+            // different from the last one staged. Posting on every frame would
+            // turn a 4Hz poll into a 60Hz wakeup, and posting only on a toggle
+            // would miss a count that changed on its own.
+            //
+            // isEqualToString: rather than pointer equality, because the app
+            // builds a fresh NSString for the number whenever the count moves
+            // and two equal strings are still one thing to send.
+            NSString *prev = g_sbTextStaged;
+            BOOL differs = (r.text == nil || prev == nil)
+                         ? (r.text != prev)
+                         : ![r.text isEqualToString:prev];
+            if (textChanged || differs) {
+                g_sbTextStaged = r.text;
+                if (g_sbTextWake) dispatch_semaphore_signal(g_sbTextWake);
+            }
         }
     }
 
