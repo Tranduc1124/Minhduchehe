@@ -1,4 +1,5 @@
 #import "esp.h"
+#import "esptext.h"
 #import "ESPPrefs.h"
 #import "offset.h"
 #import "GameOffsets.h"
