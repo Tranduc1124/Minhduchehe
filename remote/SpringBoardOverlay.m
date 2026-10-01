@@ -1446,7 +1446,21 @@ int SBoardStartOverlay(void) {
         // Red, matching the app's counter. Built here rather than mirrored,
         // because a CGColor is an object in the target and the app's is in this
         // process, and the counter has been red for every version of it.
-        double tc[4] = { 1.0, 0.0, 0.0, 1.0 };
+        // Blue, deliberately, and not red.
+        //
+        // The device ruled out both of my theories and left a contradiction. The
+        // glyph is 12.4 by 17.6 at 415.7, which is 377 plus half of 90 minus the
+        // width, so the transform is right. The text path carried L16 and nothing
+        // else, so the FOV's 73 points never arrived there. And a filled path that
+        // small cannot be a red disc the size of the FOV ring. So something is
+        // being filled that is not the glyph path, and a red fill cannot tell me
+        // whether the text layer is the thing drawing it.
+        //
+        // Blue answers that in one build. If the FOV turns blue, the text layer is
+        // drawing it and the path in the target is not the path that was sent. If
+        // it stays red, the text layer is innocent and the geometry layer is being
+        // recoloured, which is a different line of enquiry entirely.
+        double tc[4] = { 0.0, 0.0, 1.0, 1.0 };
         uint64_t tCol = r_msg2_main_raw(r_class("UIColor"),
                                         "colorWithRed:green:blue:alpha:",
                                         &tc[0], 8, &tc[1], 8, &tc[2], 8, &tc[3], 8);
