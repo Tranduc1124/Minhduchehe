@@ -81,8 +81,13 @@ typedef struct {
     // layer leaves the same point, so the whole layer is one fan from one origin
     // and can go out as a single polyline: one remote call per layer instead of
     // one per player, which is the only per-player term in the whole overlay.
-    // These reset with the struct, which is rebuilt every frame, so no fan ever
-    // carries its origin over from the previous frame.
+    //
+    // These must be initialised in ESPGeometryBuffersCreate, and they are. The
+    // struct is a raw local with no memset, so "resets because the struct is
+    // rebuilt every frame" is not true on its own: it was believed to be true
+    // when the fan landed, the initialiser was never extended to match, and the
+    // three bytes came back as stack garbage that only ever went one way. Do not
+    // add a field here without adding it there.
     bool snaplineFanStarted;
     bool snaplineBotFanStarted;
     bool snaplineKnockedFanStarted;

@@ -2412,6 +2412,20 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.boxDirty = buffers.boxBotDirty = buffers.boxKnockedDirty = NO;
     buffers.boneDirty = buffers.boneBotDirty = buffers.boneKnockedDirty = NO;
     buffers.snaplineDirty = buffers.snaplineBotDirty = buffers.snaplineKnockedDirty = NO;
+    // These three are what the fan relies on to decide whether its moveTo has been
+    // emitted, and they were left out of this initialiser when the fan landed. That
+    // is a real bug and it is the worst kind: the struct is a raw local with no
+    // memset, so the three bytes came back as stack garbage, and ESPAddFanRay only
+    // ever writes them true. So whether a fan got its moveTo depended on whatever
+    // the previous frame left in that stack slot, which is exactly a line that
+    // appears and disappears on its own while the camera is still. It also meant
+    // the commit's own claim that they "reset with the struct" was simply false.
+    //
+    // Initialising them here rather than in the struct declaration is deliberate:
+    // the struct is returned by value from a function and consumed by value, so a
+    // member initialiser would be a constructor on a C struct and would not
+    // compile the way the rest of this file expects.
+    buffers.snaplineFanStarted = buffers.snaplineBotFanStarted = buffers.snaplineKnockedFanStarted = NO;
     buffers.hpFillGreenDirty = buffers.hpFillOrangeDirty = buffers.hpFillRedDirty = NO;
     buffers.bgFillBlackDirty = buffers.alertDirty = NO;
     return buffers;

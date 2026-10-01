@@ -92,6 +92,10 @@ static uint64_t g_sbPersistentPath = 0;
 static uint64_t g_sbPathRing[SB_PATH_HOLD_FRAMES] = {0};
 static int g_sbPathRingAt = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
+// How many presents were skipped because the path pointer never reached the
+// target. Zero means remote_write has not silently lost one; anything else means
+// the flicker has a cause and it is not the geometry.
+static uint64_t g_sbPathArgMisses = 0;
 static uint32_t g_sbPathHash = 0;
 static NSUInteger g_sbLastPathBytes = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
@@ -1007,7 +1011,44 @@ static void sb_invoke_cached_main_raw(void) {
         return;
     }
     remote_write64(g_sbSetPathArgBuf, persistentPath());
-    r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    // Read the pointer back before handing it over.
+    //
+    // remote_write64 is a memcpy into a page shared with the target, and the page
+    // it writes can be an alias that is no longer the target's live page, in which
+    // case it returns true and the target never sees the bytes. That is not a
+    // guess: RemoteCall.h says so in as many words about remote_write, and
+    // remote_objc.m wrote r_write_remote_arg, with a cache clear plus a read-back
+    // compare and three retries, precisely to defend against it. Every argument
+    // marshalling call uses that helper. This one does not, and this one decides
+    // which frame the screen shows.
+    //
+    // A failed write here means setPath: receives last frame's path, or one the
+    // hold ring has already released, so the layer draws a stale frame or nothing
+    // and the line blinks. Cost of checking is one memcpy from a page we already
+    // have mapped, no crossing, and skipping one present beats drawing a wrong
+    // one.
+    {
+        const uint64_t want = persistentPath();
+        if (remote_read64(g_sbSetPathArgBuf) != want) {
+            g_sbPathArgMisses++;
+            return;
+        }
+    }
+    // r_msg, not r_msg2.
+    //
+    // r_msg2 settles, and settle is usleep(3000), so this one line was sleeping
+    // three milliseconds on every publish and with the counter off that was the
+    // entire measurable cost of a publish: nine CoreGraphics crossings measured at
+    // roughly nothing, and three milliseconds of our own thread doing nothing.
+    //
+    // The sleep is pacing, not correctness. Ordering here is already guaranteed
+    // without it: do_remote_call_stable serialises every crossing behind one mutex,
+    // and the perform on the next line is asynchronous with waitUntilDone NO, so
+    // there is no barrier for a sleep to provide. That perform has never had a
+    // settle either, and it is the call that actually reaches SpringBoard's main
+    // thread.
+    uint64_t setArgSel = r_sel("setArgument:atIndex:");
+    if (setArgSel) r_msg(g_sbSetPathInv, setArgSel, g_sbSetPathArgBuf, 2, 0, 0);
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
@@ -2545,7 +2586,7 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
                         NSLog(@"[SB-PUSH] hz=%.1f bdropsHz=%.1f win=%llums calls=%llu "
                               @"ms=%llu holdavg=%llums holdsum=%llums ups=%llu "
-                              @"att=%llu skip=%llu "
+                              @"att=%llu skip=%llu argmiss=%llu "
                               @"sub=%u rect=%u limb=%u mergedSub=%u trunc=%u "
                               @"pts2=%d pts3=%d pts4=%d pts58=%d pts932=%d pts33=%d "
                               @"maxPts=%d nBig=%d",
@@ -2558,6 +2599,7 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                               (unsigned long long)updWin,
                               (unsigned long long)g_sbSummaryAttempts,
                               (unsigned long long)g_sbSummarySkips,
+                              (unsigned long long)g_sbPathArgMisses,
                               g_sbLastSubpaths, rectCount, limbCount,
                               g_sbSubpathCount, nTrunc,
                               c2, c3, c4, c5to8, c9to32, c33p,
