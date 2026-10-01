@@ -88,14 +88,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 bool remote_read_internal(uint64_t src, void *dst, uint64_t size);
 bool remote_write_internal(uint64_t dst, const void *src, uint64_t size);
 int destroy_remote_call_internal(void);
-// Hands a mach port to a thread that discards everything on it forever. Defined
-// next to destroy_remote_call(), called from both teardown paths, one of which
-// is earlier in this file.
-static void g_RC_keep_port_alive_forever(mach_port_t port);
 void abandon_remote_call_internal(void);
-// The real init. init_remote_call() is a thin wrapper that holds the IPC mutex
-// across it; see the comment on the wrapper for why that is the whole point.
-static int init_remote_call_unlocked(const char* process, bool useMigFilterBypass);
 
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
@@ -1076,9 +1069,6 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    // x8 is set here, on the way in, and cleared on every way out. See the long
-    // version at do_remote_call_stable_addr_internal; this is the same rule.
-    exc.threadState.__x[8] = 0;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &exc.threadState);
 
@@ -1099,10 +1089,6 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)exc2.threadState.__x[0]);
     uint64_t retValue = exc2.threadState.__x[0];
-    // Re-park. x8 cleared, same reason and same rule as the stable path: a
-    // parked thread has nothing outstanding, and whatever the callee left in x8
-    // is not a value this file chose.
-    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
@@ -1178,64 +1164,6 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     if (!g_RC_creatingExtraThread)
         return 0;
 
-    // The session gate.
-    //
-    // The transport is one hijacked thread in one target process, driven through
-    // two exception ports. Its phase with that thread is global, and every failure
-    // path below destroys it in a way nothing here can repair: a callee fault is
-    // republished at 0x401, which is the same address a return lands on, so wait1
-    // can no longer tell a park from the previous call's return; a wait2 that gives
-    // up leaves the call unreplied and the thread running code nobody is counting.
-    // Each of those sets g_RC_success = false, and each says in its comment that
-    // the caller must abandon or re-initialise. Nothing implemented that, so the
-    // next call went straight out on the broken transport.
-    //
-    // What makes this the most valuable single line in the file right now is the
-    // shape of the workload rather than the log. One publish frame is hundreds of
-    // remote calls. A fault on the first of them, with no gate, becomes hundreds
-    // of blind calls on a transport that has already lost its phase, and each one
-    // is another chance to leave the thread somewhere nobody is counting. With the
-    // gate it becomes one fault, one refused frame, and nothing further sent.
-    //
-    // 2026-09-30 21:50:33 device log, this gate absent. The callee faulted:
-    //   stable/objc_msgSend FAULT in the callee pc=0x18c73f020 ... reparked
-    //   caller stable tid=0x2103 name=object_getClass#1 ... success=0
-    // and the next call was issued in the same second:
-    //   stable/objc_msgSend wait1 begin timeout=10000        (alloc)
-    //   [PUSH][SB-LAST] r_msg_main_raw sel=initWithWindowScene: wait=1
-    //   [PUSH][SB-LAST] r_msg_main_raw sel=setWindowLevel: wait=1
-    //   ... 21:50:35 [PUSH][SB-LAST] r_msg_main_raw sel=addSublayer: wait=1
-    //   21:50:45 stable/objc_msgSend wait2 TIMEOUT
-    //   21:50:45 [RC-SLOW] call=objc_msgSend held=10038ms tid=8451
-    // and one second after that the next call was issued too and never came back.
-    //
-    // SpringBoard-2026-09-30-215137.ips is the result, 46 seconds later:
-    //   pid 34 thread 1551 com.apple.main-thread
-    //     "turnstile blocked on task pid 326, hops: 2, priority: 47"
-    //     60 seconds since last successful checkin -> WATCHDOG
-    // and in the same report, pid 326:
-    //   thread 5639 com.apple.root.utility-qos
-    //     turnstileInfo "turnstile has unknown inheritor"
-    //     waitInfo "mach_msg receive on port 0xff37fe3d7354cbcf name 0x4c2b"
-    // A caller of ours sat in the exception port with SpringBoard's main thread
-    // queued behind it, and nothing ever drained.
-    //
-    // The teardown already applies this exact rule to the one call it makes, at the
-    // pthread_exit: a session that has already failed is the common case there, and
-    // issuing a remote call on it is issuing a call whose reply nobody can trust.
-    // It belongs on every call, not only the last one.
-    //
-    // This block existed once, as commit 490187cf9, and was deleted as collateral
-    // by the bulk revert a90b913d6. Its own diagnostic was visible in that era's
-    // logs on the line "stable/object_getClass refused, session already failed
-    // (step=23) — port untouched", which is how we know the refused path was
-    // being taken and that the transport survived it.
-    if (!g_RC_success) {
-        RC_DIAG("stable/%s refused, session already failed — port untouched",
-                name ?: "(addr-call)");
-        return 0;
-    }
-
     if (!pcAddr) {
         printf("[%s:%d] NULL function pointer: %s\n", __FUNCTION__, __LINE__, name ?: "(addr-call)");
         g_RC_success = false;
@@ -1254,29 +1182,10 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
-    uint64_t parkPC = native_strip(exc.threadState.__pc);
-    // The "(expect 0x301)" in this line was wrong for the whole life of the file.
-    // 0x301 is only the creation-time park, seen by the first stable call of a
-    // session. Every call after it sees the thread re-faulting at 0x401, because a
-    // call ends by republishing the faulted state, and that state's __pc is 0x401.
-    // So this message has been printing a warning on every single healthy call and
-    // the warning told us nothing, which is the worst kind of diagnostic.
-    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx",
+    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
             name ?: "(addr-call)",
-            (unsigned long long)parkPC,
+            (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
-
-    // A park is 0x301, the creation-time one, or 0x401, the one every completed
-    // call leaves behind. Anything else on this port is a fault from the callee
-    // that ran past where we thought the session was, and signing pc=<callee> onto
-    // it is how a desynchronised thread gets handed a second call while it is
-    // still executing the first one. Refuse instead.
-    if (parkPC != (uint64_t)FAKE_PC_TROJAN && parkPC != (uint64_t)FAKE_LR_TROJAN) {
-        RC_DIAG("stable/%s wait1: port delivered PC=0x%llx, not a park; session failed",
-                name ?: "(addr-call)", (unsigned long long)parkPC);
-        g_RC_success = false;
-        return 0;
-    }
 
     // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
     // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
@@ -1301,9 +1210,6 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    // x8 is set here, on the way in, and cleared on every way out. See the long
-    // version at do_remote_call_stable_addr_internal; this is the same rule.
-    exc.threadState.__x[8] = 0;
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
@@ -1326,85 +1232,13 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
-    uint64_t retPC = native_strip(exc2.threadState.__pc);
-    uint64_t retLR = native_strip(exc2.threadState.__lr);
-
-    // Did the callee return, or did it fault?
-    //
-    // This is the check that was missing and it is the whole loop. Every remote
-    // call signs the thread with __lr = FAKE_LR_TROJAN, 0x401, so a call that
-    // completed comes back here with __pc = 0x401. A call whose callee faulted
-    // comes back with __pc somewhere in the callee instead, and at that point x0
-    // is not a return value, it is whatever register the faulting code had
-    // loaded. Reading it as a result hands the overlay a garbage pointer, the
-    // overlay sends it the next message as a receiver, and that message faults at
-    // objc_msgSend+0x20 reading a bogus isa. One bad value becomes two bad
-    // values, in a frame that is several hundred calls long.
-    //
-    // The device log from 2026-09-30 22:03:17 shows a real instance of the value
-    // being wrong rather than the code being wrong:
-    //   stable/objc_msgSend wait2 exc=0x1 code=0x101/0x401 PC=0x401 x0=0x194a07520
-    // 0x194a07520 is out of the shared cache, not out of SpringBoard's heap, and
-    // r_is_objc_ptr only rejects below 0x100000000, so it passed and it was used.
-    //
-    // The parked thread is put back on 0x401 rather than being replied verbatim,
-    // which would resume it inside the callee with nothing re-parking it. This
-    // path costs two remote_pac calls, but the session gate above means it can
-    // only be reached once per publish frame, so the price is not paid on the
-    // working path at all.
-    if (retPC != (uint64_t)FAKE_LR_TROJAN && retPC != (uint64_t)FAKE_PC_TROJAN) {
-        RC_DIAG("stable/%s wait2: callee faulted at PC=0x%llx LR=0x%llx x0=0x%llx "
-                "— not a return; session failed",
-                name ?: "(addr-call)",
-                (unsigned long long)retPC,
-                (unsigned long long)retLR,
-                (unsigned long long)exc2.threadState.__x[0]);
-        arm_thread_state64_internal park = exc2.threadState;
-        for (int i = 0; i <= 8; i++) park.__x[i] = 0;
-        sign_state(g_RC_trojanThreadAddr, &park, FAKE_LR_TROJAN, FAKE_LR_TROJAN);
-        reply_with_state(&exc2, &park);
-        g_RC_success = false;
-        return 0;
-    }
-
     uint64_t retValue = exc2.threadState.__x[0];
     RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
             name ?: "(addr-call)",
-            (unsigned long long)retPC,
-            (unsigned long long)retLR,
+            (unsigned long long)native_strip(exc2.threadState.__pc),
+            (unsigned long long)native_strip(exc2.threadState.__lr),
             (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
-    //
-    // x8 is cleared here rather than left as the callee returned it, and it is
-    // set to zero on the way in for the same reason. x8 is the arm64 INDIRECT
-    // RESULT register, the address a function returning a struct wider than 16
-    // bytes writes into, and its contents mean nothing once that function has
-    // returned. This file sets x0 through x7 and never touched x8, so every
-    // register it published for the next call was chosen by it except that one,
-    // and the value in it belonged to whatever the previous callee left behind.
-    //
-    // The SpringBoard crash on 2026-09-30 23:21:23 is what that costs. The dead
-    // thread was inside an NSInvocation, which is the path every cached
-    // invocation in the overlay takes, and its registers were:
-    //
-    //   pc  = 0x401                     FAKE_LR_TROJAN, the park address
-    //   x8  = 0x401                     the same value, in the selector slot
-    //   x10 = OBJC_CLASS_$_NSInvocation
-    //   x14 = OBJC_CLASS_$_NSMethodSignature
-    //   x16 = objc_autorelease
-    //   x17 = -[NSMethodSignature frameLength]
-    //
-    // A parked thread was holding the fake park address in x8 and the next call
-    // read it. 0x401 is not a pointer anything can read, so the branch landed on
-    // it and the process took SIGBUS at an address that is not in any region.
-    //
-    // Zero is the correct value for a thread that is parked rather than running:
-    // the callee has returned, so there is no indirect result outstanding. And
-    // nothing here needs a non-zero one: the only struct return in the overlay
-    // is r_msg2_main_struct_ret, which builds an NSInvocation and reads the
-    // result back through -[NSInvocation getReturnValue:], so the callee writes
-    // into the invocation's own buffer and never needs x8 at all.
-    exc2.threadState.__x[8] = 0;
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
@@ -1471,31 +1305,8 @@ void abandon_remote_call_internal(void) {
     // Skip every SB-side IPC. Caller has decided that the remote task is dead
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
-    //
-    // The call thread's exception port is not one of them. Skipping the IPC above
-    // means the thread is left exactly where it was, mid-call if it was mid-call,
-    // and a thread that is left mid-call still returns to 0x401. Handing the port
-    // to a drain thread is the only thing between that and a SIGBUS in a process
-    // we were not asked to kill. See destroy_remote_call_internal for the whole
-    // argument.
-    g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
-
-    // Same rule for the first port, and it matters more here because
-    // fail_after_creator_park calls this function after restore_trojan_thread has
-    // already returned false. g_RC_trojanThreadAddr is non-zero in exactly that
-    // case, which means SpringBoard's main thread is still parked inside an
-    // exception that was delivered to this port. Destroying the port there leaves
-    // the main thread of the process we were asked not to kill blocked forever on
-    // a dead name, with no way back and nothing left to catch it.
-    //
-    // The failure mode is a watchdog kill rather than the 0x401 SIGBUS the second
-    // port causes, so it has been invisible: it shows up as SpringBoard hanging and
-    // being restarted, which looks like the app being slow.
-    if (g_RC_trojanThreadAddr) {
-        g_RC_keep_port_alive_forever(g_RC_firstExceptionPort);
-    } else {
-        destroy_exception_port(g_RC_firstExceptionPort);
-    }
+    destroy_exception_port(g_RC_firstExceptionPort);
+    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1522,62 +1333,6 @@ void abandon_remote_call_internal(void) {
     g_RC_vphoneBridge = false;
     g_RC_trojanMem = 0;
     g_RC_threadList = [NSMutableArray new];
-}
-
-// Hands a mach port to a thread that reads it and discards every message, and
-// never comes back. See the comment at the call site for why the call thread's
-// exception port is not destroyed.
-static void *rc_port_drain_forever(void *arg) {
-    mach_port_t port = (mach_port_t)(uintptr_t)arg;
-    // Detached and never cancelled on purpose: the thing it protects is a thread
-    // in another process that has already been asked to stop, and there is no
-    // safe moment at which to stop watching it.
-    pthread_setname_np("rc-port-drain");
-    for (;;) {
-        ExceptionMessage msg;
-        // 0x160 is EXCEPTION_MSG_SIZE from Exception.m, and the receive is
-        // written the way wait_exception writes it, with MACH_RCV_TIMEOUT and a
-        // zero timeout, which is MACH_MSG_TIMEOUT_NONE and blocks forever. The
-        // size is the one the sender writes, so the message is consumed whole.
-        kern_return_t kr = mach_msg(&msg.Head, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                     0, 0x160, port,
-                                     MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-        if (kr != KERN_SUCCESS) {
-            // MACH_RCV_TIMED_OUT cannot happen with an infinite timeout, and
-            // MACH_RCV_INVALID_NAME means the port is gone, which means there is
-            // nothing left to protect. Anything else, including a bad message
-            // size, is worth another turn rather than a thread that exits and
-            // leaves the port unread.
-            if (kr == MACH_RCV_INVALID_NAME) break;
-            continue;
-        }
-        // Discard. The thread that faulted is on its way out and its state is no
-        // longer anything this process can act on, so replying would only resume
-        // a thread whose stack is about to be reclaimed.
-    }
-    return NULL;
-}
-
-static void g_RC_keep_port_alive_forever(mach_port_t port) {
-    if (!MACH_PORT_VALID(port)) return;
-    pthread_t th;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    // A small stack is right: this thread never returns and never recurses.
-    pthread_attr_setstacksize(&attr, 64 * 1024);
-    int rc = pthread_create(&th, &attr, rc_port_drain_forever,
-                            (void *)(uintptr_t)port);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) {
-        // No drain thread, so the queue could fill. Destroying the port instead is
-        // the old behaviour and the old SIGBUS; leaving it unread is a slower
-        // version of the same thing. Neither is good and neither is reachable in
-        // practice, so say so rather than choosing silently.
-        printf("[%s:%d] rc_port_drain_forever pthread_create failed rc=%d — "
-               "secondExceptionPort left installed and unread\n",
-               __FUNCTION__, __LINE__, rc);
-    }
 }
 
 int destroy_remote_call(void) {
@@ -1616,47 +1371,8 @@ int destroy_remote_call_internal(void) {
         restore_trojan_thread(&g_RC_originalState);
     }
 
-    // The call thread's exception port outlives this function.
-    //
-    // Every remote call signs the synthetic call thread with __pc = the callee and
-    // __lr = FAKE_LR_TROJAN, 0x401. When the callee returns, the thread RETs to
-    // 0x401 and faults, and that fault is the *designed* end of every call: the
-    // wait that follows it is how the return value in x0 is read. A thread that
-    // is still inside that sequence when the session is torn down therefore has
-    // a fault in flight, or is about to take one, and it will take it whether or
-    // not anyone is listening.
-    //
-    // The pthread_exit above is asked for with timeout -1, which replies and
-    // returns without waiting, so the thread has not reached pthread_exit yet at
-    // the moment the ports below would have been destroyed. Destroying them in
-    // that window is what killed SpringBoard:
-    //
-    //   23:03:09  pc=0x401  lr=0xd96d390000000401  far=0x401  esr="PC alignment"
-    //   23:21:23  pc=0x401  lr=0xbd761f0000000401  far=0x401  esr="PC alignment"
-    //   23:32:47  pc=0x401  lr=0x49021a0000000401  far=0x401  esr="PC alignment"
-    //
-    // all three with thread_start as the only frame above the fault, which is the
-    // call thread, and 0x401 is not in any region.
-    //
-    // So the port is not destroyed. It is handed to a thread that reads it and
-    // throws the messages away, forever. Draining matters as much as keeping it:
-    // a mach port whose queue fills raises an exception of its own, so leaving it
-    // installed and unread would only move the kill.
-    //
-    // The cost is one thread per torn down session, blocked in mach_msg on a port
-    // that in the steady state never fires. The port belongs to this process, so
-    // the leak is ours and not SpringBoard's.
-    g_RC_keep_port_alive_forever(g_RC_secondExceptionPort);
-
-    // See abandon_remote_call_internal. The extra-thread branch above never calls
-    // restore_trojan_thread, so coming through here with g_RC_trojanThreadAddr
-    // non-zero means the main thread is still hijacked, and destroying the port it
-    // is parked on is how SpringBoard's main thread dies.
-    if (g_RC_trojanThreadAddr) {
-        g_RC_keep_port_alive_forever(g_RC_firstExceptionPort);
-    } else {
-        destroy_exception_port(g_RC_firstExceptionPort);
-    }
+    destroy_exception_port(g_RC_firstExceptionPort);
+    destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1939,49 +1655,7 @@ static NSArray<NSNumber *> *collect_all_task_threads(uint64_t taskAddr) {
 }
 
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
-//
-// This wrapper exists only to take the IPC mutex. The body below runs unlocked, and
-// the body below used to be this function, which meant init had no serialisation at
-// all while every other entry point in the file had it.
-//
-// That is what killed SpringBoard. There are three callers and none of them
-// exclude each other: app/KernelBoot.m on a utility queue, SpringBoardOverlay.m's
-// re-arm on a utility queue, and SpringBoardOverlay.m's render-thread retry at line
-// 575 which fires synchronously whenever a session is still coming up. The render
-// thread's guard checks g_sbOverlayOn and then releases g_sbLock before doing any of
-// the work, so that check protects nothing.
-//
-// Two overlapping inits do this to each other, and every step is a few instructions:
-//   - init #1 blocks up to 15 s inside wait_exception, and 20 s inside
-//     restore_trojan_thread.
-//   - init #2 starts underneath it, overwrites g_RC_firstExceptionPort and
-//     g_RC_secondExceptionPort at the top of the body, and installs the NEW port on
-//     the NEW call thread at the install site.
-//   - init #1 then finishes and tears down, draining whatever
-//     g_RC_secondExceptionPort now points at. If that is the port init #2 just
-//     installed, the drain thread 73e0ca6ea added eats session #2's exception
-//     messages.
-//   - a call thread from either session is left parked on a port that is now dead,
-//     has no receiver, or belongs to the other session. It returns to FAKE_LR_TROJAN,
-//     0x401, faults, and there is nobody to catch it.
-//
-// That is the crash: pc = far = 0x401, lr a PAC-signed 0x401, esr "PC alignment",
-// an unnamed thread whose only frame above the fault is thread_start. It happens
-// after ten to thirty-six minutes because it needs a session to fail and then the
-// re-arm backoff to walk from 3 s to 60 s through several generations.
-//
-// The mutex is already PTHREAD_MUTEX_RECURSIVE and every remote call inside this
-// body takes it, so nesting is not the problem; init was simply the one entry point
-// that never took it.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
-    pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
-    pthread_mutex_lock(&g_universal_ipc_mutex);
-    int rc = init_remote_call_unlocked(process, useMigFilterBypass);
-    pthread_mutex_unlock(&g_universal_ipc_mutex);
-    return rc;
-}
-
-static int init_remote_call_unlocked(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
     remote_call_note_init_failure(RemoteCallInitFailureNone, 0);
     g_RC_vphoneBridge = false;
@@ -2334,9 +2008,6 @@ static int init_remote_call_unlocked(const char* process, bool useMigFilterBypas
                 drainHits,
                 (unsigned long long)native_strip(exc2.threadState.__pc),
                 (unsigned long long)native_strip(exc2.threadState.__lr));
-        // Republishing a faulted thread verbatim also republishes its x8. Same
-        // rule as the re-parks above: nothing outstanding, so zero.
-        exc2.threadState.__x[8] = 0;
         reply_with_state(&exc2, &exc2.threadState);
     }
     RC_DIAG("pre-creator drain done hits=%d", drainHits);
@@ -2345,8 +2016,6 @@ static int init_remote_call_unlocked(const char* process, bool useMigFilterBypas
         g_RC_trojanThreadAddr = firstThread;
 
     arm_thread_state64_internal newState = exc.threadState;
-    // The very first park of the session. Same rule as every other one.
-    newState.__x[8] = 0;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     RC_DIAG("creator-park signer=0x%llx signedPC=0x%llx signedLR=0x%llx flags=0x%x",
             (unsigned long long)g_RC_trojanThreadAddr,
