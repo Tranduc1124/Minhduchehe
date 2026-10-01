@@ -160,6 +160,9 @@ static uint64_t g_sbTextFill  = 0;      // its CGColor, in the target
 static CGPathRef g_sbTextGlyphPath = NULL;
 static char      g_sbTextGlyphFor[40];
 static double    g_sbTextGlyphSize = 0;
+// Set when the glyphs were rebuilt, so the publish knows the target's path is
+// stale and has to be replaced. Read and cleared by the publish thread.
+static int       g_sbTextPathDirty = 0;
 #define SB_TEXT_GLYPH_MAX 40
 // The index kShapeKeys does not have. The sixteen CAShapeLayers are the
 // geometry's; this one is ours, and it is written into the same op stream after
@@ -794,9 +797,29 @@ static CGPathRef sb_text_glyph_path_for_frame(UIView *espView) {
     g_sbTextGlyphPath = built;
     snprintf(g_sbTextGlyphFor, sizeof(g_sbTextGlyphFor), "%s", c);
     g_sbTextGlyphSize = (double)size;
-    NSLog(@"[SB-TEXT] glyphs \"%s\" size=%.0f frame=%.0f,%.0f,%.0f,%.0f",
+    // The target's path now holds the previous string's geometry and there is no
+    // way to clear it, so it has to be replaced. Set on the thread that hands the
+    // geometry over and cleared by the publish that consumes it.
+    g_sbTextPathDirty = 1;
+    // The bounding box is the measurement this whole thing is missing.
+    //
+    // Turning the counter on makes the FOV ring come out as a solid red disc and
+    // turning it off makes the FOV come back, so the cause is the text layer
+    // being drawn over the geometry rather than a run being misrouted: the point
+    // counts in [SB-TEXT] present are 81 to 389, which is one or two glyphs, and
+    // the FOV's 73 point run is not among them.
+    //
+    // What is left is that the glyph path is not the size of a digit. A digit at
+    // 25pt inside a 90 by 33 frame has a box about 15 by 20 at the frame's corner.
+    // A box anywhere near the size of the screen is a broken transform, and a
+    // filled path that big is a red screen. Local arithmetic, no remote call, and
+    // it settles the question either way.
+    const CGRect bb = CGPathGetBoundingBox(g_sbTextGlyphPath);
+    NSLog(@"[SB-TEXT] glyphs \"%s\" size=%.0f frame=%.0f,%.0f,%.0f,%.0f "
+          @"bbox=%.1f,%.1f,%.1f,%.1f",
           g_sbTextGlyphFor, size, src.frame.origin.x, src.frame.origin.y,
-          src.frame.size.width, src.frame.size.height);
+          src.frame.size.width, src.frame.size.height,
+          bb.origin.x, bb.origin.y, bb.size.width, bb.size.height);
     return g_sbTextGlyphPath;
 }
 
@@ -1973,9 +1996,19 @@ void SBRemotePushESPFrame(UIView *espView) {
             int dstLayer = -1;
             // The counter's path is replaced rather than emptied: CGPathClear and
             // CGPathReset are both absent from CoreGraphics.tbd on this OS, so
-            // there is no way to clear a CGMutablePathRef in place, and a fresh
-            // one is one call.
-            if (r_is_objc_ptr(rpT)) {
+            // there is no way to clear a CGMutablePathRef in place.
+            //
+            // The previous version of this allocated a fresh one on every publish
+            // and let the old one go. At the 50 publishes a second the overlay
+            // reaches, that is 50 CGMutablePaths a second accumulating in
+            // SpringBoard, which is a leak measured in objects per second in
+            // somebody else's process and is not a thing to leave running.
+            //
+            // It is replaced only when there is something to put in it. The
+            // publish still ends up handing the same path over unchanged when the
+            // counter has not moved, and handing the same path to setPath: again
+            // is one call that changes nothing, which is cheaper than allocating.
+            if (r_is_objc_ptr(rpT) && g_sbTextPathDirty) {
                 g_sbTextPath = 0;
                 rpT = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             }
@@ -2220,6 +2253,7 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 r_msg2_main(g_sbTextShape, "setPath:", rpT, 0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
+                g_sbTextPathDirty = 0;   // consumed; the next change sets it again
                 // What actually went on the text layer. The FOV ring came out as a
                 // solid red disc, which is what a filled closed circle looks like,
                 // so either a geometry run reached this path or the glyphs did. The
@@ -2235,10 +2269,18 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                         for (uint32_t k = 0; k < tCount; k++) {
                             if (tPts[k] == SB_TEXT_LAYER_INDEX) { tn++; tp += tPtsN[k]; }
                         }
-                        NSLog(@"[SB-TEXT] present text=%llx subpaths=%u points=%u "
-                              @"frame=%llx",
-                              (unsigned long long)rpT, tn, tp,
-                              (unsigned long long)g_sbTextPath);
+                        // The layers, not just the total. A single glyph is 80 to
+                        // 130 points once the curves are chorded, and the FOV ring
+                        // is 73 on its own, so a total near 73 means a geometry run
+                        // arrived here and a total of several hundred means more
+                        // than one did. The layer numbers say which.
+                        NSMutableString *ls = [NSMutableString string];
+                        for (uint32_t k = 0; k < tCount; k++) {
+                            [ls appendFormat:@"L%u/%u ",
+                                  (unsigned)tPts[k], (unsigned)tPtsN[k]];
+                        }
+                        NSLog(@"[SB-TEXT] present text=%llx runs=%u points=%u [%@]",
+                              (unsigned long long)rpT, tn, tp, ls);
                     }
                 }
             }
