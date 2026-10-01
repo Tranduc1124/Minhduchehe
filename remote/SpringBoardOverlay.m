@@ -1773,7 +1773,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             // overlays to SpringBoard, which is a second way to break it.
             uint64_t wait = g_sbRearmBackoffUS;
             g_sbRearmAfterUS = tGate + wait;
-            g_sbRearmBackoffUS = (wait < 60000000ULL) ? (wait * 2) : 60000000ULL;
+            // Clamp the DOUBLED value. Comparing wait against the ceiling and
+            // then assigning wait*2 is off by one step: the sequence was
+            // 5, 10, 20, 40, 80, 60, 60, so the ceiling was overshot and one
+            // attempt sat for 80 seconds behind a limit that reads 60.
+            uint64_t next = wait * 2;
+            g_sbRearmBackoffUS = (next < 60000000ULL) ? next : 60000000ULL;
             g_sbConsecFail = 0;
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 const char *why =
@@ -1913,6 +1918,28 @@ void SBRemotePushESPFrame(UIView *espView) {
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
+    // "Nothing to draw" is not "the overlay is dead". Turning a pref off, or
+    // having no player on screen, both send an empty geometry: mergePaths
+    // reports NO and the frame is dropped right here, before the publish body,
+    // so g_sbLastPublishUS stops moving. The recovery clock at the top of this
+    // function reads that stamp as a dead overlay, waits out three seconds and
+    // then spends the next five drawing nothing at all, which is the toggle lag
+    // that was reported: switch FOV off, switch it back on inside that window,
+    // and nothing appears until the backoff expires.
+    //
+    // The frames are still arriving, so the transport is provably alive. Say so
+    // by pushing the stamp forward. It is the same stamp the publish body
+    // updates when it finishes, so no new state is introduced here.
+    //
+    // g_sbLastPublishUS is monotonic and both writers run on the game main
+    // queue, so the one written here can never be older than the one the
+    // publish body writes and the clock cannot move backwards.
+    //
+    // g_sbRearmBackoffUS is deliberately NOT reset on this path. An empty screen
+    // is not a failure, so it must not earn a shorter retry either. It goes
+    // back to 5s on the first publish that completes, which is inside
+    // drawn>0, and that is where it belongs.
+    g_sbLastPublishUS = tGate;
     if (!mergePaths(espView, sb_text_glyph_path_for_frame(espView), ops)) {
         g_sbSummarySkips++;
         return;
