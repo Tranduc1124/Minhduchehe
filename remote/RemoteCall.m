@@ -7,6 +7,7 @@
 
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import <mach/mach_time.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <pthread.h>
@@ -56,6 +57,55 @@ extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, 
 #define FAKE_LR_TROJAN_CREATOR          0x201
 #define FAKE_PC_TROJAN                  0x301
 #define FAKE_LR_TROJAN                  0x401
+
+// Same monotonic microsecond clock as now_us() in SpringBoardOverlay.m, kept
+// separate so RemoteCall.m does not have to know about the overlay.
+static uint64_t rc_now_us(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (mach_absolute_time() * tb.numer / tb.denom) / 1000ULL;
+}
+
+// Per-call cost breakdown. Pure instrumentation: it reads three timestamps the
+// caller already had and adds them up. No branch here can change what a remote
+// call does, and nothing here can change how many remote calls are made.
+//
+// [SB-PUSH] measured the whole publish at 52-78ms with 7-11 calls in it, which
+// is 5.8ms per call against a 16.7ms budget for 60Hz. That number says the cost
+// is in the transport, not in the subpath count, but it does not say WHICH part
+// of the transport. Until this line exists the candidates are a guess, and the
+// previous two guesses (a stale "expect 0x301" string, and r_settle on a path
+// that does not use it) were both wrong.
+//
+// w1   wait_exception for the park
+// pac  sign_state, which calls remote_pac twice (pc and lr)
+// w2   wait_exception for the result
+// rest everything else in the call, reply_with_state included
+static uint64_t s_ccW1US, s_ccSignUS, s_ccW2US, s_ccRestUS, s_ccN, s_ccAtUS;
+
+static void rc_note_call_cost(uint64_t tStart, uint64_t tW1, uint64_t tSign) {
+    const uint64_t now = rc_now_us();
+    s_ccW1US   += (tW1   - tStart);
+    s_ccSignUS += (tSign - tW1);
+    s_ccW2US   += (now   - tSign);
+    s_ccN++;
+    if (now - s_ccAtUS < 1000000ULL) return;
+    const uint64_t win = now - s_ccAtUS;
+    const uint64_t total = s_ccW1US + s_ccSignUS + s_ccW2US;
+    s_ccRestUS = (s_ccN && total / s_ccN < win / s_ccN)
+        ? (win - total) : 0;   // wall time in the call minus the parts we timed
+    s_ccAtUS = now;
+    NSLog(@"[SB-CALL] n=%llu per=%lluus w1=%lluus pac=%lluus w2=%lluus rest=%lluus win=%llums",
+          (unsigned long long)s_ccN,
+          (unsigned long long)(s_ccN ? win / s_ccN : 0),
+          (unsigned long long)(s_ccN ? s_ccW1US / s_ccN : 0),
+          (unsigned long long)(s_ccN ? s_ccSignUS / s_ccN : 0),
+          (unsigned long long)(s_ccN ? s_ccW2US / s_ccN : 0),
+          (unsigned long long)(s_ccN ? s_ccRestUS / s_ccN : 0),
+          (unsigned long long)(win / 1000ULL));
+    s_ccW1US = s_ccSignUS = s_ccW2US = s_ccRestUS = s_ccN = 0;
+}
 
 // xnu-10002.81.5/osfmk/kern/thread.h — also defined in Thread.m
 #define TH_IN_MACH_EXCEPTION            0x8000
@@ -1176,6 +1226,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     ExceptionMessage exc;
     RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
+    const uint64_t tCallStart = rc_now_us();
     if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
         RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
@@ -1213,7 +1264,9 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
     // even though the exception arrives on the synthetic call thread.
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
+    const uint64_t tW1Done = rc_now_us();
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
+    const uint64_t tSignDone = rc_now_us();
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1240,6 +1293,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
             (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
     reply_with_state(&exc2, &exc2.threadState);
+    rc_note_call_cost(tCallStart, tW1Done, tSignDone);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
     return retValue;
