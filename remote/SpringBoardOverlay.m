@@ -1792,7 +1792,6 @@ int SBoardStartOverlay(void) {
     // Dropped here as well as in the teardown, because a rearm builds a fresh
     // window while the old pointers are still live in these globals.
     sb_text_forget();
-    g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
     // Arm the recovery clock here rather than waiting for a publish that may
@@ -1892,6 +1891,25 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    // g_sbOverlayOn is set here, at the end, not where it used to sit just after
+    // sb_text_forget near the top.
+    //
+    // SBRemotePushESPFrame returns immediately unless g_sbOverlayOn is set, so
+    // that assignment is the moment the game's frame timer is allowed to start
+    // publishing. It used to happen about ninety lines before the name layers
+    // were created, and every one of those lines is an r_msg2_main with a 3ms
+    // settle, so there was roughly a hundred and fifty milliseconds in which the
+    // overlay was live, the game was pushing frames, and the name layers did not
+    // exist yet. Those frames found g_sbNameBgShape and g_sbNameTextShape zero
+    // and routed the plate and the glyphs into the geometry path, which is
+    // stroked white with no fill. The first frame after the layers existed drew
+    // correctly, and the pair reads on screen as a flicker at startup and after
+    // every rearm.
+    //
+    // Nothing between the old and new positions reads this flag, so moving it is
+    // otherwise inert, and a build that fails part way through now leaves the
+    // overlay off rather than half-built and on screen.
+    g_sbOverlayOn = YES;
     // The cost probe, the colour probe and the lineWidth read-back are all behind
     // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
     // between them they were about a hundred and fifteen remote calls of
@@ -2589,10 +2607,32 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 rectDoubles = 0;
                             }
                             dstLayer = curLayer;
-                            dstPath = rp;
-                            if (curLayer == SB_TEXT_LAYER_INDEX && r_is_objc_ptr(rpT)) dstPath = rpT;
-                            else if (curLayer == SB_NAME_BG_INDEX && r_is_objc_ptr(rpNameBg)) dstPath = rpNameBg;
-                            else if (curLayer == SB_NAME_TEXT_INDEX && r_is_objc_ptr(rpNameText)) dstPath = rpNameText;
+                            // Never fall back to rp for a layer that needs a
+                            // fill. rp is stroked white at 0.75 and has no fill
+                            // colour, so anything routed there comes out as an
+                            // outline, and that is what the name was doing: wrong
+                            // for the window between g_sbOverlayOn being set and
+                            // these two layers existing, which is about 150ms of
+                            // r_msg2_main calls with a 3ms settle each. The frames
+                            // that landed in that window drew a white outline, and
+                            // the first frame after it drew correctly, which read
+                            // as a flicker at startup and after every rearm.
+                            //
+                            // A null destination is the right answer, not rp. The
+                            // CoreGraphics calls below take it and draw nothing,
+                            // so the name simply is not there for those frames and
+                            // appears when the layer is ready. The same guard now
+                            // covers the counter, which had it too.
+                            dstPath = 0;
+                            if (curLayer == SB_TEXT_LAYER_INDEX) {
+                                if (r_is_objc_ptr(rpT)) dstPath = rpT;
+                            } else if (curLayer == SB_NAME_BG_INDEX) {
+                                if (r_is_objc_ptr(rpNameBg)) dstPath = rpNameBg;
+                            } else if (curLayer == SB_NAME_TEXT_INDEX) {
+                                if (r_is_objc_ptr(rpNameText)) dstPath = rpNameText;
+                            } else {
+                                dstPath = rp;
+                            }
                             if (dstPath == rpT && tCount < 64) {
                                 // Which run went to the text path, so a wrong
                                 // destination is readable off the device instead
@@ -2631,6 +2671,10 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
+                // No destination, so there is nothing to add this run to. The
+                // snapline branch further down hardcodes rp rather than reading
+                // dstPath, so this has to be checked before it is reached.
+                if (!dstPath) continue;
                 // The text path may only ever receive layer 16. This is now a
                 // backstop rather than the fix, because the fix is at the marker
                 // above, but it is kept and it is keyed on runLayer rather than
