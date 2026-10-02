@@ -15,7 +15,7 @@
 	<key>PayloadUUID</key>
 	<string>9C1D4A77-0B62-4E58-9A31-6F2D8C05B4E1</string>
 	<key>PayloadVersion</key>
-	<string>1</string>
+	<integer>1</integer>
 	<key>PayloadContent</key>
 	<array>
 		<!--
@@ -62,7 +62,7 @@
 			<key>PayloadUUID</key>
 			<string>3F82B5C1-7A64-4D19-8E02-5C97A1D4B6F3</string>
 			<key>PayloadVersion</key>
-			<string>1</string>
+			<integer>1</integer>
 			<key>PayloadDisplayName</key>
 			<string>MINHDUC DNS - Block</string>
 			<key>PayloadDescription</key>
