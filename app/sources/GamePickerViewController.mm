@@ -85,8 +85,9 @@
 
     // A live session is bound to the old process and offset table, so offer
     // the one action that makes the switch real instead of silently doing
-    // nothing until the user notices.
-    if (IsHUDEnabled()) {
+    // nothing until the user notices. IsESPSessionRunning, not IsHUDEnabled:
+    // the pid file does not cover the session that actually draws.
+    if (IsESPSessionRunning()) {
         UIAlertController *alert =
             [UIAlertController alertControllerWithTitle:@"Restart session?"
                                                 message:@"ESP đang chạy với game cũ. Bật lại session để dùng game vừa chọn."

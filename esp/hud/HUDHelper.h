@@ -1,6 +1,10 @@
 
 #import <Foundation/Foundation.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 BOOL IsHUDEnabled(void);
 void SetHUDEnabled(BOOL isEnabled);
 
@@ -21,3 +25,7 @@ void RequestExitHUD(void);
 //   App_LocalHUDState     the user's last tap in this app, for the window
 //                         between a tap and the host appearing
 BOOL IsESPSessionRunning(void);
+
+#ifdef __cplusplus
+}
+#endif

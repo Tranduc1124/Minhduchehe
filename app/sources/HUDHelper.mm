@@ -7,6 +7,14 @@
 
 #import "HUDHelper.h"
 
+// Real headers, not forward declarations. This is a .mm, so anything declared
+// here without extern "C" gets C++ linkage and the symbol does not match the
+// one the linker found in DirectOverlay.mm / SpringBoardOverlay.m. All three
+// headers already wrap their declarations.
+#import "ESPPrefs.h"
+#import "DirectOverlay.h"
+#import "SpringBoardOverlay.h"
+
 extern "C" char **environ;
 
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
@@ -66,10 +74,6 @@ void RequestExitHUD(void)
 
 BOOL IsESPSessionRunning(void)
 {
-    extern int ESPHostIsRunning(void);
-    extern int SBoardOverlayIsOn(void);
-    extern BOOL ESPPrefsBool(NSString *key, BOOL defaultValue);
-
     if (ESPHostIsRunning()) return YES;
     if (SBoardOverlayIsOn()) return YES;
     if (IsHUDEnabled()) return YES;
