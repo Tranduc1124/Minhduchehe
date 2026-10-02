@@ -125,7 +125,7 @@ int ds_attach(void) {
             NSLog(@"[DS] KERNEL READ DEAD — self proc readback invalid (0x%llx). Re-run the exploit.", selfCheck);
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
-                NSString *line = @"[diag] kernel DEAD — bấm Bắt đầu lại";
+                NSString *line = @"[diag] kernel DEAD - run the exploit again";
                 dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
             }
         }
@@ -149,7 +149,7 @@ int ds_attach(void) {
             NSLog(@"[DS] FF proc not found (kernel alive)");
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
-                NSString *line = @"[diag] không thấy Free Fire — mở game rồi chờ";
+                NSString *line = @"[diag] Free Fire not found - open the game and wait";
                 dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
             }
         }
@@ -226,7 +226,7 @@ int ds_attach(void) {
             NSLog(@"[DS] module base not found (nentries walk failed)");
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
-                NSString *line = @"[diag] thấy FF nhưng không đọc được memory (vm_map walk fail)";
+                NSString *line = @"[diag] found FF but memory is unreadable (vm_map walk failed)";
                 dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
             }
         }

@@ -268,7 +268,7 @@ NSString* WeaponNameForPlayerNS(uint64_t PawnObject) {
 
     switch(wid) {
         case 0:
-        case 1:   return @"Tay không";
+        case 1:   return @"Bare Hands";
         case 2:   return @"M4A1";
         case 4:   return @"AWM";
         case 5:   return @"M1014";
@@ -277,7 +277,7 @@ NSString* WeaponNameForPlayerNS(uint64_t PawnObject) {
         case 8:   return @"MP5";
         case 9:   return @"Desert Eagle";
         case 15:  return @"MP40";
-        case 16:  return @"Chảo";
+        case 16:  return @"Pan";
         case 21:  return @"Kar98k";
         case 28:  return @"XM8";
         case 30:  return @"M60";
@@ -285,8 +285,8 @@ NSString* WeaponNameForPlayerNS(uint64_t PawnObject) {
         case 45:  return @"M82B";
         case 48:  return @"Woodpecker";
         case 50:  return @"MAG-7";
-        case 1204:return @"Bom Keo";
-        default:  return [NSString stringWithFormat:@"Súng %d", wid];
+        case 1204:return @"Grenade";
+        default:  return [NSString stringWithFormat:@"Gun %d", wid];
     }
 }
 

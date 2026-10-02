@@ -234,7 +234,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                                             handler:nil]];
 
     __weak __typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Tắt ESP"
+    [alert addAction:[UIAlertAction actionWithTitle:@"Stop ESP"
                                               style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *action) {
         [weakSelf stopESP];
