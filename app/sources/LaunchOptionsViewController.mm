@@ -5,11 +5,17 @@
 
 // title, pref key, default. Each of these does something today; none of them is
 // a placeholder.
+//
+// The first row used to read "Start ESP automatically on launch", which is not
+// what it does. It calls kernelBootStartKernelOnly, which runs the exploit, the
+// sandbox and KeepAlive and stops before the overlay and the ESP host, so no
+// ESP appears by itself. The label now says what the key actually does rather
+// than what it used to do.
 static NSArray<NSArray *> *LORows(void) {
     return @[
-        @[ @"Start ESP automatically on launch", @"AutoBootOnLaunch", @NO ],
-        @[ @"SandboxEscapeOn",                   @"SandboxEscapeOn", @YES ],
-        @[ @"Keep app alive in background",       @"KeepAliveOn",      @YES ],
+        @[ @"Run the exploit on launch",     @"AutoBootOnLaunch", @NO ],
+        @[ @"SandboxEscapeOn",               @"SandboxEscapeOn",  @YES ],
+        @[ @"Keep app alive in background",   @"KeepAliveOn",      @YES ],
     ];
 }
 
@@ -47,7 +53,7 @@ static NSArray<NSArray *> *LORows(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return @"Keeping the app alive in the background is what lets ESP keep working while you play. Turning it off may let iOS close the app.";
+    return @"Run the exploit on launch prepares the kernel at startup. It does not start the ESP: that still takes a tap on Activate. Keeping the app alive in the background is what lets ESP keep working while you play, and turning it off may let iOS close the app.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView

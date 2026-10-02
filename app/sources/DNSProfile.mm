@@ -148,7 +148,14 @@ static BOOL MDDNGSelfPlatformize(void) {
     uint64_t sp = proc_self();
     int r = platformize_self(sp);
     [MDLog appendLine:[NSString stringWithFormat:@"[dns] platformize_self=%d", r]];
-    if (r != 0) return NO;
+    if (r != 0) {
+        // The bare -1 is what hid a wrong call order behind a silent fallback
+        // for a whole build. Say which of the six steps inside platformize
+        // stopped, and say whether the boot already ran it.
+        [MDLog appendLine:[NSString stringWithFormat:@"[dns] platformize failed: %s",
+                         platformize_last_error()]];
+        return NO;
+    }
     g_platformized = YES;
     return YES;
 }
@@ -403,34 +410,55 @@ void MDDNSOpenProfile(NSString *url, void (^_Nullable done)(BOOL accepted)) {
 NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut) {
     if (errorOut) *errorOut = nil;
 
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *missing = nil;
+
     for (int i = 0; kMDDNSProfileDirs[i] != NULL; i++) {
         NSString *dir = [NSString stringWithUTF8String:kMDDNSProfileDirs[i]];
+
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
+            // Not an error: these are candidate locations and most of them do
+            // not exist on any given install. Recording it as one is what put
+            // "The folder Profiles doesn't exist" in front of the user in red,
+            // which reads like a broken feature rather than a path that was
+            // never going to be there.
+            if (!missing) missing = dir;
+            continue;
+        }
+
         NSError *listErr = nil;
-        NSArray *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir
-                                                                                error:&listErr];
+        NSArray *entries = [fm contentsOfDirectoryAtPath:dir error:&listErr];
         if (!entries) {
             if (errorOut) {
-                *errorOut = [NSString stringWithFormat:@"cannot read %@: %@", dir.lastPathComponent,
-                             listErr.localizedDescription];
+                *errorOut = [NSString stringWithFormat:@"cannot read %@: %@",
+                             dir.lastPathComponent, listErr.localizedDescription];
             }
-            continue;
+            return @"Unknown";
         }
 
         for (NSString *name in entries) {
             if (![name.pathExtension.lowercaseString isEqualToString:@"mobileconfig"]) continue;
             NSString *path = [dir stringByAppendingPathComponent:name];
             NSString *body = [NSString stringWithContentsOfFile:path
-                                                      encoding:NSUTF8StringEncoding
-                                                         error:NULL];
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:NULL];
             if (!body) continue;
             if ([body rangeOfString:kMDDNSPayloadID].location == NSNotFound) continue;
 
             [MDLog appendLine:[NSString stringWithFormat:@"[dns] found installed profile %@", name]];
             return @"Installed";
         }
+        // The directory exists and holds no profile of ours. That is a real
+        // answer, so stop rather than going on to a path that does not exist
+        // and overwriting it with an error.
         return @"Not installed";
     }
 
+    if (errorOut) {
+        *errorOut = [NSString stringWithFormat:@"no profile store yet (%@)",
+                     missing.lastPathComponent ?: @"unknown path"];
+    }
     return @"Unknown";
 }
 

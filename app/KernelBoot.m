@@ -13,6 +13,7 @@
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
 #import "../sandbox_escape.h"
+#import "../platformize.h"
 #import "../esp/DSMemory.h"
 #import "../remote/SpringBoardOverlay.h"
 #import "../remote/RemoteCall.h"
@@ -113,6 +114,24 @@ static void kernelBootStartEx(BOOL kernelOnly) {
         L(@"OK Kernel memory r/w acquired.");
 
         uint64_t self_proc = proc_self();
+
+        // Platformize BEFORE sandbox_escape, the order HUDMainApplicationDelegate
+        // uses and the order platformize.h asks for. platformize copies launchd's
+        // AMFI slot into our cred label, and sandbox_escape rewrites the sandbox
+        // extension chain of that same cred; escaping first leaves platformize
+        // looking at a cred the escape has already rotated.
+        //
+        // This was wrong the other way round until a device log caught it:
+        // platformize_self returned -1 and every DNS install fell back to the
+        // loopback handoff without saying why. Same code, same offsets, same
+        // order that works in the HUD process.
+        int pret = platformize_self(self_proc);
+        if (pret == 0) {
+            L(@"OK Platformized (AMFI treats this proc as a system app).");
+        } else {
+            L(@"WARN platformize_self returned %d", pret);
+        }
+
         int sret;
         // Off by default would be wrong: the overlay needs the filesystem write
         // that sandbox_escape sets up, so leaving it on is the default and the

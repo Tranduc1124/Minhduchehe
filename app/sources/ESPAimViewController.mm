@@ -141,6 +141,7 @@
 // whole Hz, and a slider across 30 values has no precision worth having.
 @interface MDStepperCell : UITableViewCell
 @property (nonatomic, strong) UIStepper *stepper;
+@property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *valueLabel;
 - (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max;
 @end
@@ -153,17 +154,31 @@
     self.backgroundColor = MDThemePanel();
     self.selectionStyle = UITableViewCellSelectionStyleNone;
 
-    // Title and value are stacked on the left, under each other, and the
-    // stepper sits on the right. A UITableViewCell detailTextLabel would put
-    // the value beside the control instead, which is not what this row is.
-    self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
-    self.textLabel.textColor = MDThemeText();
-    self.textLabel.numberOfLines = 1;
+    // Title and value stack on the left and the stepper sits on the right.
+    //
+    // Both labels are this cell's own views rather than textLabel and
+    // detailTextLabel. The earlier version used those two and nudged textLabel
+    // up by hand in layoutSubviews to make room for the value underneath, which
+    // does not work: UITableViewCell positions textLabel itself on every pass,
+    // so the nudge was undone and the title ended up above the top edge, out of
+    // sight. The screenshot showed the value where the title should have been
+    // and no title at all. Owning both labels is the only way to get a real
+    // two-line row without fighting the cell.
+    self.textLabel.text = nil;
     self.detailTextLabel.text = nil;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
+    title.font = MDThemeFont(17.0f, UIFontWeightRegular);
+    title.textColor = MDThemeText();
+    title.numberOfLines = 1;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:title];
+    _titleLabel = title;
 
     _valueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _valueLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
     _valueLabel.textColor = MDThemeMuted();
+    _valueLabel.numberOfLines = 1;
     _valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_valueLabel];
 
@@ -177,29 +192,27 @@
     [NSLayoutConstraint activateConstraints:@[
         [_stepper.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
         [_stepper.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
-        [_stepper.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
-                                                          .leadingAnchor constant:12.0f],
 
-        [_valueLabel.leadingAnchor constraintEqualToAnchor:self.textLabel.leadingAnchor],
-        [_valueLabel.topAnchor constraintEqualToAnchor:self.textLabel.bottomAnchor constant:-1.0f],
+        // The stack is centred as a unit, so the pair stays balanced whichever
+        // of the two lines is taller.
+        [_titleLabel.topAnchor constraintGreaterThanOrEqualToAnchor:self.contentView.topAnchor constant:8.0f],
+        [_titleLabel.bottomAnchor constraintLessThanOrEqualToAnchor:self.contentView.bottomAnchor constant:-8.0f],
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16.0f],
+        [_titleLabel.topAnchor constraintEqualToAnchor:_valueLabel.bottomAnchor constant:2.0f],
+        [_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor
+                                                            constant:-12.0f],
+        [_valueLabel.leadingAnchor constraintEqualToAnchor:_titleLabel.leadingAnchor],
         [_valueLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor
-                                                             constant:-10.0f],
+                                                            constant:-12.0f],
+        [_valueLabel.bottomAnchor constraintLessThanOrEqualToAnchor:self.contentView.bottomAnchor
+                                                           constant:-8.0f],
+        [_valueLabel.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor constant:9.0f],
     ]];
     return self;
 }
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    // The label's own Auto Layout does not give it a height, and the row height
-    // is fixed, so place it under the title by hand once the title has one.
-    CGFloat labelH = self.textLabel.bounds.size.height > 0 ? self.textLabel.bounds.size.height : 21.0f;
-    CGRect want = self.textLabel.frame;
-    want.origin.y -= labelH - 4.0f;
-    self.textLabel.frame = want;
-}
-
 - (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max {
-    self.textLabel.text = title;
+    _titleLabel.text = title;
     _valueLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)value];
     _stepper.minimumValue = min;
     _stepper.maximumValue = max;
@@ -466,6 +479,11 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     NSString *kind = [self rowAtIndexPath:indexPath][0];
     if ([kind isEqualToString:@"l"]) return 76.0f;
     if ([kind isEqualToString:@"g"]) return 58.0f;
+    // The stepper row is the only one with two lines of its own, a 17pt title
+    // over a 13pt value. At the 52pt every switch row uses the pair is cramped
+    // against the top and bottom edges, which is what made the title look
+    // clipped when it was actually squeezed.
+    if ([kind isEqualToString:@"n"]) return 68.0f;
     return 52.0f;
 }
 

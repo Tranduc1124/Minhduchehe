@@ -48,22 +48,41 @@ static int pz_find_ucred(uint64_t proc, uint64_t *out) {
     return 0;
 }
 
+// Why the last call failed, for callers that log. A bare -1 sent the DNS
+// install down its fallback path with nothing in the Log tab to explain it,
+// which is how a wrong call order went unnoticed for a whole build.
+//
+// Set on every non-zero return. Not a parameter: every existing caller takes
+// only self_proc and there are four of them across two processes, and adding
+// an out-param means touching all of them for a diagnostic.
+static const char *g_platformize_last_error = NULL;
+
+const char *platformize_last_error(void) {
+    return g_platformize_last_error ? g_platformize_last_error : "unknown";
+}
+
 int platformize_self(uint64_t self_proc) {
-    if (!self_proc) { NSLog(@"[PLT] self_proc NULL"); return -1; }
+    g_platformize_last_error = NULL;
+
+    if (!self_proc) { g_platformize_last_error = "self_proc is NULL";
+                      NSLog(@"[PLT] self_proc NULL"); return -1; }
 
     uint64_t launchd = proc_find_by_name("launchd");
     if (!launchd || launchd == (uint64_t)-1) launchd = proc_find(1);
     if (!launchd || launchd == (uint64_t)-1) {
+        g_platformize_last_error = "launchd not found in the process list";
         NSLog(@"[PLT] launchd not found");
         return -1;
     }
 
     uint64_t my_ucred = 0, ld_ucred = 0;
     if (pz_find_ucred(self_proc, &my_ucred) != 0) {
+        g_platformize_last_error = "our ucred not found under proc_ro";
         NSLog(@"[PLT] our ucred not found");
         return -1;
     }
     if (pz_find_ucred(launchd, &ld_ucred) != 0) {
+        g_platformize_last_error = "launchd ucred not found under proc_ro";
         NSLog(@"[PLT] launchd ucred not found");
         return -1;
     }
@@ -80,6 +99,7 @@ int platformize_self(uint64_t self_proc) {
     uint64_t my_label  = S(early_kread64(my_ucred + OFF_UCRED_CR_LABEL));
     uint64_t ld_label  = S(early_kread64(ld_ucred + OFF_UCRED_CR_LABEL));
     if (!K(my_label) || !K(ld_label)) {
+        g_platformize_last_error = "a cr_label pointer was not a kernel address";
         NSLog(@"[PLT] label invalid my=0x%llx ld=0x%llx", my_label, ld_label);
         return -1;
     }
@@ -116,6 +136,7 @@ int platformize_self(uint64_t self_proc) {
 
     uint64_t check = early_kread64(my_amfi_slot);
     if (check != ld_val) {
+        g_platformize_last_error = "the AMFI slot read back with a different value";
         NSLog(@"[PLT] write verify failed");
         return -1;
     }
