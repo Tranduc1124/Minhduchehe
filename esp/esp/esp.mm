@@ -2735,6 +2735,9 @@ void ESPSyncFromPrefs(void) {
 @interface ESP_View ()
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, strong) dispatch_source_t frameTimer;
+
+// Implementation lives in the @implementation below. Declared here because
+// DirectOverlay.mm calls it across translation units.
 @property (nonatomic, strong) HTHESPSecureWrapper *secureTextField; 
 @property (nonatomic, strong) UIView *secureCanvas;                  
 
@@ -2783,6 +2786,29 @@ void ESPSyncFromPrefs(void) {
 @end
 
 @implementation ESP_View
+
+// Added so the app's Stop button has something to call. Before this the only
+// stop in the tree was SetHUDEnabled(NO), which kills the separate -hud
+// process; the session that actually draws lives in this process, so the
+// button reported success while ESP kept drawing.
+//
+// Cancelling the timer is what makes the stop stick: it is the 60fps loop that
+// keeps mirroring frames into SpringBoard. A dispatch source has to be
+// cancelled before it is released, otherwise the cancel is a no-op.
+//
+// Main thread: the timer was created on the main queue.
+- (void)stopRendering {
+    if (_frameTimer) {
+        dispatch_source_cancel(_frameTimer);
+        _frameTimer = nil;
+    }
+    if (_displayLink) {
+        [_displayLink invalidate];
+        _displayLink = nil;
+    }
+    [self clearAllContent];
+    [self hideMenu];
+}
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { return NO; }

@@ -24,7 +24,7 @@
     [card addSubview:icon];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
-    title.text = @"Chưa có DNS";
+    title.text = @"No DNS yet";
     title.font = MDThemeFont(17.0f, UIFontWeightSemibold);
     title.textColor = MDThemeText();
     title.textAlignment = NSTextAlignmentCenter;
@@ -32,7 +32,7 @@
     [card addSubview:title];
 
     UILabel *body = [[UILabel alloc] initWithFrame:CGRectZero];
-    body.text = @"Tính năng DNS chưa được thêm. Màn này sẽ cài hoặc cập nhật cấu hình DNS khi có.";
+    body.text = @"The DNS feature has not been added yet. This screen will install or update the DNS configuration when it is.";
     body.font = MDThemeFont(14.0f, UIFontWeightRegular);
     body.textColor = MDThemeMuted();
     body.textAlignment = NSTextAlignmentCenter;

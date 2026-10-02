@@ -17,6 +17,12 @@ int StartESPHost(void);
 // what the UI's status card has to ask. 1 = up, 0 = not started.
 int ESPHostIsRunning(void);
 
+// Tears down what StartESPHost built: the ESP_View's render timer, the
+// MenuView's display link, and the hidden window. Without this the only stop
+// in the tree was killing the -hud process, which is a different session.
+// Safe to call when nothing is running. Must be called on the main thread.
+void StopESPHost(void);
+
 // Deprecated alias — maps to StartESPHost. Do not use for "direct overlay".
 int StartDirectOverlay(void);
 

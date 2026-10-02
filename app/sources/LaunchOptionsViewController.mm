@@ -75,7 +75,7 @@
         cell.accessoryView = _varCleanSwitch;
         cell.detailTextLabel.text = nil;
     } else {
-        cell.textLabel.text = @"Chưa có tuỳ chọn";
+        cell.textLabel.text = @"No options yet";
         cell.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
         cell.textLabel.textColor = MDThemeMuted();
         cell.accessoryView = nil;

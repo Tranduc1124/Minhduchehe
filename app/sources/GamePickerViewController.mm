@@ -4,6 +4,7 @@
 #import "GameOffsets.h"
 #import "MDLog.h"
 #import "HUDHelper.h"
+#import "ESPPrefs.h"
 
 @interface GamePickerViewController ()
 @property (nonatomic, copy) NSArray<NSString *> *ids;
@@ -90,15 +91,17 @@
     if (IsESPSessionRunning()) {
         UIAlertController *alert =
             [UIAlertController alertControllerWithTitle:@"Restart session?"
-                                                message:@"ESP đang chạy với game cũ. Bật lại session để dùng game vừa chọn."
+                                                message:@"ESP is running against the previous game. Restart the session to use the one you just picked."
                                          preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Huỷ"
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                                   style:UIAlertActionStyleCancel
                                                 handler:nil]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Tắt rồi bật lại"
+        [alert addAction:[UIAlertAction actionWithTitle:@"Stop and Restart"
                                                   style:UIAlertActionStyleDestructive
                                                 handler:^(UIAlertAction *action) {
-            SetHUDEnabled(NO);
+            StopESPSession();
+            ESPPrefsSetBool(@"App_LocalHUDState", NO);
+            ESPPrefsSync();
             [self.navigationController popViewControllerAnimated:YES];
         }]];
         [self presentViewController:alert animated:YES completion:nil];

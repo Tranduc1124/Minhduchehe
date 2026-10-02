@@ -119,7 +119,7 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Giao diện";
+    self.title = @"Appearance";
     self.view.backgroundColor = MDThemeBg();
     MDThemeLoadFromPrefs();
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
@@ -131,7 +131,7 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
     _modeRow.layer.cornerRadius = 14.0f;
     [self.view addSubview:_modeRow];
 
-    _modeSeg = [[UISegmentedControl alloc] initWithItems:@[ @"Mặc định", @"Tùy chỉnh" ]];
+    _modeSeg = [[UISegmentedControl alloc] initWithItems:@[ @"Default", @"Custom" ]];
     _modeSeg.selectedSegmentIndex = MDThemeAccentMode() == 1 ? 1 : 0;
     [_modeSeg addTarget:self action:@selector(modeChanged) forControlEvents:UIControlEventValueChanged];
     [_modeRow addSubview:_modeSeg];
@@ -139,7 +139,7 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
     _modeLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _modeLabel.font = MDThemeFont(16.0f, UIFontWeightMedium);
     _modeLabel.textColor = MDThemeText();
-    _modeLabel.text = @"Màu chủ đạo";
+    _modeLabel.text = @"Accent Colour";
     [_modeRow addSubview:_modeLabel];
 
     _swatch = [[UIView alloc] initWithFrame:CGRectZero];
@@ -149,7 +149,7 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
     [_modeRow addSubview:_swatch];
 
     _hint = [[UILabel alloc] initWithFrame:CGRectZero];
-    _hint.text = @"Dùng cho nút kích hoạt, slider và thanh tab.";
+    _hint.text = @"Used by the start button, sliders and the tab bar.";
     _hint.font = MDThemeFont(13.0f, UIFontWeightRegular);
     _hint.textColor = MDThemeMuted();
     _hint.numberOfLines = 0;
@@ -181,14 +181,81 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
     [_spectrumView addGestureRecognizer:pan];
     [_spectrumView addGestureRecognizer:tap];
 
-    _cursorView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 18, 18)];
+    _cursorView = [[UIView alloc] initWithFrame:CGRectZero];
     _cursorView.layer.cornerRadius = 9.0f;
     _cursorView.layer.borderWidth = 2.0f;
     _cursorView.layer.borderColor = [UIColor whiteColor].CGColor;
     _cursorView.userInteractionEnabled = NO;
+    _cursorView.translatesAutoresizingMaskIntoConstraints = NO;
     [_spectrumView addSubview:_cursorView];
 
+    [self buildConstraints];
     [self applyMode];
+}
+
+// One constraint set, built once, instead of frames assigned in
+// viewDidLayoutSubviews. The old version positioned the row, the hint and the
+// card by arithmetic against the view height, so the card landed off-screen on
+// a short device and the cursor was placed from a zero-sized spectrum the first
+// time through.
+- (void)buildConstraints {
+    for (UIView *v in @[ _modeRow, _hint, _customCard, _spectrumView, _rgbLabel, _cursorView ]) {
+        v.translatesAutoresizingMaskIntoConstraints = NO;
+    }
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [_modeRow setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                             forAxis:UILayoutConstraintAxisVertical];
+    [_customCard setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                                forAxis:UILayoutConstraintAxisVertical];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_modeRow.topAnchor constraintEqualToAnchor:safe.topAnchor constant:20.0f],
+        [_modeRow.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16.0f],
+        [_modeRow.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16.0f],
+        [_modeRow.heightAnchor constraintEqualToConstant:54.0f],
+
+        [_modeLabel.leadingAnchor constraintEqualToAnchor:_modeRow.leadingAnchor constant:16.0f],
+        [_modeLabel.centerYAnchor constraintEqualToAnchor:_modeRow.centerYAnchor],
+        [_swatch.leadingAnchor constraintEqualToAnchor:_modeLabel.trailingAnchor constant:10.0f],
+        [_swatch.centerYAnchor constraintEqualToAnchor:_modeRow.centerYAnchor],
+        [_swatch.widthAnchor constraintEqualToConstant:24.0f],
+        [_swatch.heightAnchor constraintEqualToConstant:24.0f],
+
+        [_modeSeg.leadingAnchor constraintGreaterThanOrEqualToAnchor:_swatch.trailingAnchor
+                                                            constant:12.0f],
+        [_modeSeg.trailingAnchor constraintEqualToAnchor:_modeRow.trailingAnchor constant:-16.0f],
+        [_modeSeg.centerYAnchor constraintEqualToAnchor:_modeRow.centerYAnchor],
+        [_modeSeg.widthAnchor constraintEqualToConstant:190.0f],
+        [_modeSeg.heightAnchor constraintEqualToConstant:34.0f],
+
+        [_hint.topAnchor constraintEqualToAnchor:_modeRow.bottomAnchor constant:10.0f],
+        [_hint.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20.0f],
+        [_hint.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20.0f],
+
+        [_customCard.topAnchor constraintEqualToAnchor:_hint.bottomAnchor constant:18.0f],
+        [_customCard.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16.0f],
+        [_customCard.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16.0f],
+        // Grows into whatever the device has left, capped so it does not turn
+        // into a wall of colour on an iPad.
+        [_customCard.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor
+                                                constant:-20.0f],
+        [_customCard.heightAnchor constraintLessThanOrEqualToConstant:320.0f],
+
+        [_rgbLabel.topAnchor constraintEqualToAnchor:_customCard.topAnchor constant:12.0f],
+        [_rgbLabel.leadingAnchor constraintEqualToAnchor:_customCard.leadingAnchor constant:14.0f],
+        [_rgbLabel.trailingAnchor constraintEqualToAnchor:_customCard.trailingAnchor constant:-14.0f],
+
+        [_spectrumView.topAnchor constraintEqualToAnchor:_rgbLabel.bottomAnchor constant:8.0f],
+        [_spectrumView.leadingAnchor constraintEqualToAnchor:_customCard.leadingAnchor constant:14.0f],
+        [_spectrumView.trailingAnchor constraintEqualToAnchor:_customCard.trailingAnchor constant:-14.0f],
+        [_spectrumView.bottomAnchor constraintEqualToAnchor:_customCard.bottomAnchor constant:-14.0f],
+
+        [_cursorView.centerXAnchor constraintEqualToAnchor:_spectrumView.centerXAnchor],
+        [_cursorView.centerYAnchor constraintEqualToAnchor:_spectrumView.centerYAnchor],
+        [_cursorView.widthAnchor constraintEqualToConstant:18.0f],
+        [_cursorView.heightAnchor constraintEqualToConstant:18.0f],
+    ]];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -201,32 +268,9 @@ static void MDUVFromRGB(float r, float g, float b, float *outU, float *outV) {
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    UIEdgeInsets insets = self.view.safeAreaInsets;
-    CGFloat top = insets.top > 0 ? insets.top : 44.0f;
-    CGFloat bottom = insets.bottom > 0 ? insets.bottom : 20.0f;
-    CGFloat w = CGRectGetWidth(self.view.bounds);
-    CGFloat pad = 16.0f;
-    CGFloat cardW = w - pad * 2.0f;
-
-    CGFloat rowH = 54.0f;
-    CGFloat y = top + 20.0f;
-    _modeRow.frame = CGRectMake(pad, y, cardW, rowH);
-    _modeLabel.frame = CGRectMake(pad + 16.0f, y + 14.0f, cardW * 0.42f, 26.0f);
-    _modeSeg.frame = CGRectMake(CGRectGetMinX(_modeRow.frame) + cardW - 16.0f - 216.0f,
-                                y + 10.0f, 216.0f, 34.0f);
-    y += rowH + 10.0f;
-    _hint.frame = CGRectMake(pad + 4.0f, y, cardW - 8.0f, 34.0f);
-    y += 44.0f;
-
-    if (!_customCard.hidden) {
-        CGFloat cardH = MIN(320.0f, CGRectGetHeight(self.view.bounds) - bottom - y);
-        _customCard.frame = CGRectMake(pad, y, cardW, cardH);
-        _rgbLabel.frame = CGRectMake(14.0f, 12.0f, cardW - 28.0f, 18.0f);
-        _spectrumView.frame = CGRectMake(14.0f, 38.0f, cardW - 28.0f, cardH - 52.0f);
-        [self updateCursor];
-    } else {
-        _customCard.frame = CGRectZero;
-    }
+    // The spectrum's frame is what the UV mapping is computed against, so the
+    // cursor can only be placed once there is a real size to divide by.
+    [self updateCursor];
 }
 
 #pragma mark - Accent

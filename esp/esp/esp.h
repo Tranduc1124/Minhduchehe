@@ -267,6 +267,10 @@ Vector3 ResolveHeadWorldPosForESP(uint64_t pawn);
 - (void)handlePan:(UIPanGestureRecognizer *)gesture;
 - (void)layoutSubviews;
 - (void)centerMenu;
+// Cancels the 60fps render timer and drops the layers. The app's Stop button
+// needs this: nothing else in the tree can stop the loop that draws the ESP.
+// Main thread.
+- (void)stopRendering;
 @end
 
 @interface ESPOverlayView : UIView

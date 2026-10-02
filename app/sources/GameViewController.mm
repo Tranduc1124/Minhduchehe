@@ -180,20 +180,20 @@
 
     if (hudOn) {
         [cell applyIconNamed:@"stop.fill" color:MDThemeRed()];
-        [cell applyTitle:@"Tắt ESP"
-                 subtitle:@"Dừng phiên ESP và lớp phủ."
+        [cell applyTitle:@"Stop ESP"
+                 subtitle:@"Stops the ESP session and the overlay."
                     value:nil showsChevron:YES tappable:YES];
         cell.titleLabel.textColor = MDThemeRed();
     } else if (pending) {
         [cell applyIconNamed:@"hourglass" color:MDThemeMuted()];
-        [cell applyTitle:@"Đang bật…"
-                 subtitle:@"Đang khởi tạo kernel và lớp phủ SpringBoard."
+        [cell applyTitle:@"Starting…"
+                 subtitle:@"Bringing up the kernel and the SpringBoard overlay."
                     value:nil showsChevron:NO tappable:NO];
         cell.titleLabel.textColor = MDThemeMuted();
     } else {
         [cell applyIconNamed:@"play.fill" color:MDThemeAccent()];
         [cell applyTitle:@"Activate"
-                 subtitle:@"Kiểm tra quyền và mở phiên mới."
+                 subtitle:@"Rechecks access and starts a fresh session."
                     value:nil showsChevron:YES tappable:YES];
         cell.titleLabel.textColor = MDThemeAccent();
     }
@@ -216,13 +216,13 @@
     [self presentBootLogAndStart];
 }
 
-// Stopping is a kill: the HUD process is SIGKILLed, so there is nothing to ask
-// the user about and no state to unwind.
+// Stopping is a kill, so there is nothing to confirm on this row: the Game
+// tab is the screen the user is already looking at.
 - (void)stopSession {
     ++_hudRequestSerial;
     _pendingHUDEnableUntil = 0;
     [MDLog appendLine:@"— Stopping session."];
-    SetHUDEnabled(NO);
+    StopESPSession();
     [self markSessionRunning:NO];
     [MDLog appendLine:@"OK Session stopped."];
     [self refreshStatus];

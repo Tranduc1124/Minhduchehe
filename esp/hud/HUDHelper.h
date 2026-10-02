@@ -26,6 +26,12 @@ void RequestExitHUD(void);
 //                         between a tap and the host appearing
 BOOL IsESPSessionRunning(void);
 
+// Actually stops the session, whichever parts are up. SetHUDEnabled(NO) only
+// kills the -hud process; the parts that draw live in this process and in
+// SpringBoard, so a stop that does not call this leaves ESP on screen while
+// the UI reports it stopped. Main thread.
+void StopESPSession(void);
+
 #ifdef __cplusplus
 }
 #endif

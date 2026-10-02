@@ -87,3 +87,28 @@ int StartDirectOverlay(void) {
 int ESPHostIsRunning(void) {
     return g_espHostWindow != nil ? 1 : 0;
 }
+
+void StopESPHost(void) {
+    // Same queue StartESPHost uses, so this cannot run halfway through it.
+    void (^teardown)(void) = ^{
+        if (!g_espHostWindow) return;
+        // The two subviews are typed, not filtered by respondsToSelector:
+        // ESP_View's render timer and MenuView's display link are what keep
+        // the session alive, and a string-typed selector on a UIView is a
+        // silent no-op if either class is renamed.
+        for (UIView *v in g_espHostWindow.rootViewController.view.subviews) {
+            if ([v isKindOfClass:[ESP_View class]]) [(ESP_View *)v stopRendering];
+            if ([v isKindOfClass:[MenuView class]]) [(MenuView *)v hideMenu];
+        }
+        g_espHostWindow.hidden = YES;
+        g_espHostWindow.rootViewController = nil;
+        g_espHostWindow = nil;
+        NSLog(@"[ESPHost] host torn down");
+    };
+
+    if ([NSThread isMainThread]) {
+        teardown();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), teardown);
+    }
+}

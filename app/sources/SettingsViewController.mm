@@ -9,6 +9,11 @@
 #import "MDLog.h"
 #import "GameOffsets.h"
 #import "HUDHelper.h"
+#import "ESPPrefs.h"
+
+// App's own record of the user's last tap, mirrored from the Game tab so the
+// two screens cannot disagree after a stop.
+static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 
 #import <SafariServices/SafariServices.h>
 
@@ -101,8 +106,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     switch (indexPath.section) {
         case SectionGame:
             [cell applyIconNamed:@"gamecontroller.fill" color:MDThemeAccent()];
-            [cell applyTitle:@"Chọn game"
-                     subtitle:@"Đích ESP và bảng offset"
+            [cell applyTitle:@"Select Game"
+                     subtitle:@"ESP target and offset table"
                         value:GameTargetIsMax() ? @"Free Fire MAX" : @"Free Fire THG"
                  showsChevron:YES
                      tappable:YES];
@@ -115,8 +120,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                 BOOL hudOn = IsESPSessionRunning();
                 [cell applyIconNamed:(hudOn ? @"stop.fill" : @"trash.fill")
                                color:(hudOn ? MDThemeRed() : MDThemeMuted())];
-                [cell applyTitle:@"Tắt ESP"
-                         subtitle:(hudOn ? @"ESP đang chạy." : @"ESP không chạy.")
+                [cell applyTitle:@"Stop ESP"
+                         subtitle:(hudOn ? @"ESP is running." : @"ESP is not running.")
                             value:nil showsChevron:YES tappable:YES];
             } else {
                 [cell applyIconNamed:@"paperplane.fill" color:MDThemeBlue()];
@@ -137,8 +142,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                             value:nil showsChevron:YES tappable:YES];
             } else {
                 [cell applyIconNamed:@"paintbrush.fill" color:MDThemePurple()];
-                [cell applyTitle:@"Giao diện"
-                         subtitle:@"Màu chủ đạo của app."
+                [cell applyTitle:@"Appearance"
+                         subtitle:@"Accent colour for the app."
                             value:nil showsChevron:YES tappable:YES];
             }
             break;
@@ -146,7 +151,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionDNS:
             [cell applyIconNamed:@"globe" color:MDThemeBlue()];
             [cell applyTitle:@"DNS"
-                     subtitle:@"Cài hoặc cập nhật cấu hình DNS."
+                     subtitle:@"Install or update the DNS configuration."
                         value:nil showsChevron:YES tappable:YES];
             break;
 
@@ -228,11 +233,11 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     }
 
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Tắt ESP?"
-                                            message:@"ESP đang chạy. Dừng phiên và đóng lớp phủ?"
+        [UIAlertController alertControllerWithTitle:@"Stop ESP?"
+                                            message:@"ESP is running. Stop the session and close the overlay?"
                                      preferredStyle:UIAlertControllerStyleAlert];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy"
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
@@ -248,7 +253,9 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
 
 - (void)stopESP {
     [MDLog appendLine:@"— Stopping session (from Settings)."];
-    SetHUDEnabled(NO);
+    StopESPSession();
+    ESPPrefsSetBool(kMDGameSessionKey, NO);
+    ESPPrefsSync();
     [MDLog appendLine:@"OK Session stopped."];
     [_tableView reloadData];
 }

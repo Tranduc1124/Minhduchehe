@@ -14,6 +14,7 @@
 #import "ESPPrefs.h"
 #import "DirectOverlay.h"
 #import "SpringBoardOverlay.h"
+#import "../esp/menu.h"
 
 extern "C" char **environ;
 
@@ -81,4 +82,15 @@ BOOL IsESPSessionRunning(void)
     // the user last asked for, not what is running. It is what makes the row
     // turn into a stop button the moment it is tapped rather than a poll later.
     return ESPPrefsBool(@"App_LocalHUDState", NO);
+}
+
+void StopESPSession(void)
+{
+    // Three separate sessions have to be told, in this order: the local host
+    // first so nothing republishes a frame, then the SpringBoard view that
+    // was mirroring it, then the -hud process. Skipping the first two is what
+    // left the overlay on screen after the user pressed Stop.
+    StopESPHost();
+    SBoardStopOverlay();
+    SetHUDEnabled(NO);
 }
