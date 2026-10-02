@@ -14,6 +14,12 @@ extern "C" {
 // Call AFTER kexploit_opa334(). Returns 0 on success.
 int SBoardStartOverlay(void);
 void SBoardStopOverlay(void);
+
+// Read-only view of whether the SpringBoard-hosted DrawView is currently up.
+// The app UI needs a real answer for its status card: IsHUDEnabled() only
+// knows about the separate -hud process and stays false while the session in
+// this process is live and drawing.
+int SBoardOverlayIsOn(void);
 // Mirror the local ESP_View into the SB-hosted view (called every frame
 // from updateFrame; no-op when the overlay isn't up).
 void SBRemotePushESPFrame(UIView *espView);

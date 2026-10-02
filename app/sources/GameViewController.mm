@@ -37,7 +37,19 @@
     _tableView.rowHeight = UITableViewAutomaticDimension;
     _tableView.estimatedRowHeight = 64.0f;
     [_tableView registerClass:[MDIconRowCell class] forCellReuseIdentifier:@"row"];
+    // Pinned to the safe area rather than to a frame worked out from
+    // safeAreaInsets. That inset is the status bar alone and stops short of
+    // the navigation bar, so the table started underneath it and the top of
+    // the first card was hidden.
+    _tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_tableView];
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_tableView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_tableView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [_tableView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [_tableView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
+    ]];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appBecameActive)
@@ -67,16 +79,6 @@
 - (void)appBecameActive {
     GameOffsetsReload();
     [_tableView reloadData];
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UIEdgeInsets insets = self.view.safeAreaInsets;
-    CGFloat top = insets.top > 0 ? insets.top : 44.0f;
-    CGFloat bottom = self.tabBarController ? CGRectGetMinY(self.tabBarController.tabBar.frame)
-                                           : CGRectGetHeight(self.view.bounds);
-    _tableView.frame = CGRectMake(0.0f, top, CGRectGetWidth(self.view.bounds),
-                                  MAX(0.0f, bottom - top));
 }
 
 #pragma mark - Polling
@@ -156,7 +158,7 @@
     MDIconRowCell *cell = [tableView dequeueReusableCellWithIdentifier:@"row"
                                                         forIndexPath:indexPath];
 
-    BOOL hudOn = IsHUDEnabled();
+    BOOL hudOn = IsESPSessionRunning();
     if (indexPath.section == 0) {
         [cell applyIconNamed:@"waveform.path.ecg"
                         color:hudOn ? MDThemeGreen() : MDThemeRed()];
@@ -207,7 +209,7 @@
 #pragma mark - Action
 
 - (void)actionTapped {
-    if (IsHUDEnabled()) {
+    if (IsESPSessionRunning()) {
         [self stopSession];
         return;
     }
@@ -221,8 +223,21 @@
     _pendingHUDEnableUntil = 0;
     [MDLog appendLine:@"— Stopping session."];
     SetHUDEnabled(NO);
+    [self markSessionRunning:NO];
     [MDLog appendLine:@"OK Session stopped."];
     [self refreshStatus];
+}
+
+// The session lives in this process (StartESPHost's window, mirrored into
+// SpringBoard), so the pid file of the -hud process is not the answer to
+// whether ESP is drawing. IsESPSessionRunning() asks the things that actually
+// know. App_LocalHUDState is the app's own record of the user's last tap, and
+// it is persisted because the session outlives the process that started it.
+static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
+
+- (void)markSessionRunning:(BOOL)running {
+    ESPPrefsSetBool(kMDGameSessionKey, running);
+    ESPPrefsSync();
 }
 
 // Fresh buffer, console on top, boot kicked off behind it. Order matters: the
@@ -255,6 +270,8 @@
     [MDLog appendLine:@"RUN Requesting a fresh session…"];
 
     if (!ESPPrefsBool(@"AutoVarCleanBeforeHUD", NO)) {
+        [self markSessionRunning:YES];
+        SetHUDEnabled(YES);
         kernelBootStart();
         [self refreshStatus];
         return;
@@ -271,6 +288,8 @@
                     return;
                 }
                 [MDLog appendLine:@"OK VarClean done."];
+                [self markSessionRunning:YES];
+                SetHUDEnabled(YES);
                 kernelBootStart();
                 [self refreshStatus];
             });

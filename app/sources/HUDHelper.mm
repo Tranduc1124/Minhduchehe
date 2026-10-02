@@ -63,3 +63,18 @@ void RequestExitHUD(void)
     if (path) unlink(path);
     exit(0);
 }
+
+BOOL IsESPSessionRunning(void)
+{
+    extern int ESPHostIsRunning(void);
+    extern int SBoardOverlayIsOn(void);
+    extern BOOL ESPPrefsBool(NSString *key, BOOL defaultValue);
+
+    if (ESPHostIsRunning()) return YES;
+    if (SBoardOverlayIsOn()) return YES;
+    if (IsHUDEnabled()) return YES;
+    // Last, because it is the only signal that can be stale: it records what
+    // the user last asked for, not what is running. It is what makes the row
+    // turn into a stop button the moment it is tapped rather than a poll later.
+    return ESPPrefsBool(@"App_LocalHUDState", NO);
+}

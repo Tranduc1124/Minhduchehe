@@ -45,23 +45,25 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     _tableView.rowHeight = UITableViewAutomaticDimension;
     _tableView.estimatedRowHeight = 64.0f;
     [_tableView registerClass:[MDIconRowCell class] forCellReuseIdentifier:@"row"];
+    // Pinned to the safe area, not to a frame derived from safeAreaInsets.
+    // That inset covers the status bar and stops short of the navigation bar,
+    // so the table started underneath it and the last section could not be
+    // scrolled clear of it.
+    _tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_tableView];
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_tableView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_tableView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [_tableView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [_tableView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
+    ]];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
     [_tableView reloadData];
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UIEdgeInsets insets = self.view.safeAreaInsets;
-    CGFloat top = insets.top > 0 ? insets.top : 44.0f;
-    CGFloat bottom = self.tabBarController ? CGRectGetMinY(self.tabBarController.tabBar.frame)
-                                           : CGRectGetHeight(self.view.bounds);
-    _tableView.frame = CGRectMake(0.0f, top, CGRectGetWidth(self.view.bounds),
-                                  MAX(0.0f, bottom - top));
 }
 
 #pragma mark - Table shape
@@ -110,7 +112,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
             if (row == 0) {
                 // Same job as the Game tab's action row when a session is
                 // live, so the icon and the colour follow that state.
-                BOOL hudOn = IsHUDEnabled();
+                BOOL hudOn = IsESPSessionRunning();
                 [cell applyIconNamed:(hudOn ? @"stop.fill" : @"trash.fill")
                                color:(hudOn ? MDThemeRed() : MDThemeMuted())];
                 [cell applyTitle:@"Tắt ESP"
@@ -219,8 +221,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
 // button order and the cancel semantics right on its own, and it handles the
 // outside-tap dismissal without code.
 - (void)confirmStopESP {
-    if (!IsHUDEnabled()) {
-        [MDLog appendLine:@"— Stop requested but no session is running."];
+    if (!IsESPSessionRunning()) {
+        [MDLog appendLine:@"— Nothing to stop, no session is running."];
         [_tableView reloadData];
         return;
     }

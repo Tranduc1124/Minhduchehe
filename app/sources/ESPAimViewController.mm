@@ -217,6 +217,10 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         case ESPSectionScreen:
             return @[ @[ @"Hide Screenshot/Recording", @"StreamerMode", @NO ] ];
         case ESPSectionDraw:
+            // SbCountText used to have a row of its own, directly under this
+            // one. Both drive the same counter and read as the same control, so
+            // the mirror is left to the in-game menu and the ESP tab carries a
+            // single switch.
             return @[
                 @[ @"Enable ESP",   @"EnableESP", @NO ],
                 @[ @"Line",         @"Line",      @NO ],
@@ -226,7 +230,6 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"Name",         @"Name",      @YES ],
                 @[ @"Distance",     @"Distance",  @YES ],
                 @[ @"Player Count", @"Count",     @YES ],
-                @[ @"Count on SpringBoard", @"SbCountText", @NO ],
             ];
         case ESPSectionView:
             return @[

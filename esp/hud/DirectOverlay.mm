@@ -81,3 +81,9 @@ int StartESPHost(void) {
 int StartDirectOverlay(void) {
     return StartESPHost();
 }
+
+// g_espHostWindow is only ever written on the main queue inside
+// StartESPHost's block, so reading it from the main thread needs no lock.
+int ESPHostIsRunning(void) {
+    return g_espHostWindow != nil ? 1 : 0;
+}

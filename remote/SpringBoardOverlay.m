@@ -3188,6 +3188,12 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 
+// Plain read, no lock. g_sbOverlayOn is a single byte written under g_sbLock
+// and read here once a second from the app's status card; a torn read of one
+// byte is not possible on arm64, and taking the lock from the UI thread would
+// put the status poll behind a build that can take milliseconds.
+int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
+
 void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }

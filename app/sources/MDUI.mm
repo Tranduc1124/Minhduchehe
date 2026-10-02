@@ -99,6 +99,9 @@ static const CGFloat kMinRowHeight = 54.0f;
     _iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
     _iconView.contentMode = UIViewContentModeScaleAspectFit;
     _iconView.userInteractionEnabled = NO;
+    // Without this the view keeps a zero frame and its Auto Layout constraints
+    // are inert, which shows up as a blank coloured tile with no glyph on it.
+    _iconView.translatesAutoresizingMaskIntoConstraints = NO;
     [_iconTile addSubview:_iconView];
 
     _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];

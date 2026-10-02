@@ -12,6 +12,11 @@ extern "C" {
 // Does NOT register SBSAccessibility. Does NOT show over other apps itself.
 int StartESPHost(void);
 
+// Read-only view of whether the host window from StartESPHost() is up. This is
+// the session that actually renders, and it lives in the app process, so it is
+// what the UI's status card has to ask. 1 = up, 0 = not started.
+int ESPHostIsRunning(void);
+
 // Deprecated alias — maps to StartESPHost. Do not use for "direct overlay".
 int StartDirectOverlay(void);
 
