@@ -6,11 +6,16 @@
 #
 # The warning set matters. Theos builds with -Werror and without
 # -Wno-everything, so a plain -Wno-everything here would pass files that CI then
-# rejects. The flags below keep the project's own suppressions (Makefile.app
-# CFLAGS) and add -Wno-nullability-completeness, which is the one the new UI
-# headers trip over. Deliberately not -Wextra: the real build does not use it,
-# and it flags untouched code such as ModMenuViewController.mm, so it would
-# only send you chasing warnings CI never reports.
+# rejects. The flags below are exactly Makefile.app's own suppressions, with
+# nothing added: a suppression here that CI does not have makes this gate
+# weaker than the build it stands in for, which is how DNSProfile.h once
+# reached CI with five -Wnullability-completeness errors and failed there
+# while this script called it ok. Every new suppression here has to be one
+# Makefile.app also carries.
+#
+# Deliberately not -Wextra: the real build does not use it, and it flags
+# untouched code such as ModMenuViewController.mm, so it would only send you
+# chasing warnings CI never reports.
 #
 # This checks declarations, not symbols. A missing extern "C" still compiles
 # here and only fails at the link step, so read a green run as "this file is
@@ -40,7 +45,7 @@ for f in "$@"; do
       -Wno-incompatible-pointer-types-discards-qualifiers \
       -Wno-incompatible-pointer-types -Wno-format \
       -Wno-unused-but-set-variable -Wno-delete-incomplete \
-      -Wno-nullability-completeness -Werror \
+      -Werror \
       "$f" 2>&1)
   if [ -n "$out" ]; then
     echo "=== $f"

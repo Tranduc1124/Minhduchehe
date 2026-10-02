@@ -18,10 +18,20 @@
 // iOS also refuses to deep link into General > VPN & Device Management, so
 // after the install prompt the user walks there themselves. The screen says
 // so rather than pretending otherwise.
+//
+// Two paths, and the second is a fallback rather than a second choice.
+// MDDNSInstall tries installd through the private MobileInstallation
+// framework, which needs no URL and no prompt. That is the path that can work
+// in one tap, and it is only reachable because this tree already
+// platformizes the process, which is what makes mach-lookup to a system
+// daemon pass. When any gate on it is closed the profile is served over
+// loopback instead, which works anywhere but costs a Safari hand-off.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, MDDNSInstallOutcome) {
     MDDNSInstallOutcomeFailed = 0,
@@ -41,19 +51,28 @@ NSString *MDDNSProfileXML(void);
 
 // Writes the profile into the app container and starts a loopback listener for
 // it. Returns the URL to open, or nil with a reason in errOut.
-NSString *_Nullable MDDNSStartProfileServer(NSString *__autoreleasing *_Nullable errOut);
+// Spaced out on purpose. Written as NSString *__autoreleasing *_Nullable clang
+// reads the two stars as one pointer and then complains the pointer has no
+// nullability, which -Werror turns into a build failure.
+NSString * _Nullable MDDNSStartProfileServer(NSString * _Nullable * _Nullable errOut);
 
 // Opens the URL handed back by MDDNSStartProfileServer. Reports through the
 // completion whether iOS accepted the URL; passing nil skips the report.
 void MDDNSOpenProfile(NSString *url,
                       void (^_Nullable done)(BOOL accepted));
 
-// Reads the installed iOS configuration through NEVPNManager. Returns what it
-// found and, on failure, the reason in errorOut. Without the
-// networkextension entitlement this always fails with
-// NEConfigurationErrorDomain code 10, which is why the screen shows it rather
-// than hiding it: the failure is real and the user should see it.
-NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut);
+// What iOS is actually holding, read from the profiles directory rather than
+// from NEVPNManager. This build has no networking.networkextension
+// entitlement, so NEVPNManager cannot work: loadFromPreferences fails with
+// NEConfigurationErrorDomain code 10 every time. Grepping
+// /var/mobile/Library/ConfigurationProfiles for the payload identifier we
+// install answers the same question with evidence, and needs no entitlement
+// the binary does not have.
+//
+// Returns "Installed" or "Not installed". errorOut carries the reason when
+// the directory could not be read at all, which is the state before the
+// exploit has escaped the sandbox.
+NSString *MDDNSProbeConfiguration(NSString * _Nullable * _Nullable errorOut);
 
 // The whole thing. Tries installd through the private MobileInstallation
 // framework first, which needs no URL and no prompt; when any gate on that
@@ -67,6 +86,8 @@ typedef void (^MDDNSInstallCompletion)(MDDNSInstallOutcome outcome,
                                       NSString *_Nullable failure,
                                       NSString *_Nullable url);
 void MDDNSInstall(MDDNSInstallCompletion completion);
+
+NS_ASSUME_NONNULL_END
 
 #ifdef __cplusplus
 }
