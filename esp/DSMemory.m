@@ -358,7 +358,15 @@ static struct {
     uint64_t localAddr;
     uint64_t port;     // memory_entry — MUST mach_port_deallocate on eviction
     uint64_t lastUse;  // Fl0rk lastUse clock
-    uint64_t bornMs;   // wall clock at insert — drives DS_PAGE_TTL_MS
+    uint64_t bornMs;   // wall clock at insert
+    // Wall clock of the most recent read that hit this slot. The TTL is
+    // measured against this, not against bornMs. bornMs made a page the game
+    // is reading every single frame expire anyway, once every two seconds, and
+    // get remapped on the next frame: a periodic hitch whose size is the whole
+    // working set, on a timer. Measuring age since last use keeps what the TTL
+    // is actually for, which is a VA the game has stopped touching, and leaves
+    // the pages that are demonstrably alive alone.
+    uint64_t lastUseMs;
     uint64_t gen;      // match generation this mapping was taken under
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
@@ -425,6 +433,7 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].port = 0;
     g_pageCache[i].lastUse = 0;
     g_pageCache[i].bornMs = 0;
+    g_pageCache[i].lastUseMs = 0;
     g_pageCache[i].gen = 0;
     g_pageCache[i].useCount = 0;
 }
@@ -453,11 +462,20 @@ void ds_end_read_transaction(void) {
             if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
         }
 
-        // Expire mappings that have outlived DS_PAGE_TTL_MS. The reference
+        // Expire mappings the game has stopped reading. The reference
         // implementation carries a per-slot clock (shmemClock[256]) plus an
         // eviction counter (shmemEvictions); this is the same shape. Without it
         // a recycled VA is served from the same mapping forever, which is the
         // "boxes are pinned to one direction" symptom.
+        //
+        // The clock is per-slot-last-use, not per-slot-insert. It used to be
+        // bornMs, which meant a mapping the game touched every single frame was
+        // still dropped the moment it reached two seconds old, and the next read
+        // of it went back through vm_map_remote_page. With a working set of any
+        // size that is the whole working set being remapped, and it happens on
+        // a two second timer, which reads as a hitch that arrives on its own
+        // schedule rather than as a cost. The VA the TTL actually needs to catch
+        // is one nothing has read for a while, and lastUseMs is that test.
         //
         // Only DS_MAX_EVICT_PER_TXN are dropped per transaction. The total per
         // second is still ample — the render loop runs at ~60 Hz, so 4 per
@@ -468,7 +486,7 @@ void ds_end_read_transaction(void) {
         int evicted = 0;
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS && evicted < DS_MAX_EVICT_PER_TXN; i++) {
             if (!g_pageCache[i].localAddr) continue;
-            if (nowMs - g_pageCache[i].bornMs < DS_PAGE_TTL_MS) continue;
+            if (nowMs - g_pageCache[i].lastUseMs < DS_PAGE_TTL_MS) continue;
             ds_release_page_slot_locked(i);
             evicted++;
         }
@@ -515,6 +533,9 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
             if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
             g_pageCache[i].lastUse = g_pageUseCounter++;
+            // Stamped on every hit. This is what the TTL is measured against,
+            // so a page the game is reading every frame never ages out.
+            g_pageCache[i].lastUseMs = ds_now_ms();
             ds_note_recent_locked(i);
             uint64_t a = g_pageCache[i].localAddr;
             ds_unlock();
@@ -571,6 +592,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     g_pageCache[victim].bornMs = ds_now_ms();
+    g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;
     g_dsRemapCount++;
     ds_note_recent_locked(victim);
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
