@@ -24,22 +24,16 @@ static UIColor *MDHex(uint32_t rgb, CGFloat alpha) {
                            alpha:alpha];
 }
 
+// The custom accent is gone: the picker screen is deleted and the app is
+// fixed to the default mint. MDTheme deliberately does not read AppAccentMode
+// or AppAccentColor* any more, because an install that picked a colour earlier
+// still has those keys on disk and would otherwise keep showing it with no way
+// to change it back.
 void MDThemeLoadFromPrefs(void) {
-    g_accentMode = (int)ESPPrefsFloat(@"AppAccentMode", 0.0f);
-    if (g_accentMode < 0) g_accentMode = 0;
-    if (g_accentMode > 1) g_accentMode = 1;
-    if (g_accentMode == 0) {
-        g_ar = kMDThemeDefaultAccentR;
-        g_ag = kMDThemeDefaultAccentG;
-        g_ab = kMDThemeDefaultAccentB;
-    } else {
-        g_ar = ESPPrefsFloat(@"AppAccentColorR", kMDThemeDefaultAccentR);
-        g_ag = ESPPrefsFloat(@"AppAccentColorG", kMDThemeDefaultAccentG);
-        g_ab = ESPPrefsFloat(@"AppAccentColorB", kMDThemeDefaultAccentB);
-        if (g_ar < 0) g_ar = 0; if (g_ar > 1) g_ar = 1;
-        if (g_ag < 0) g_ag = 0; if (g_ag > 1) g_ag = 1;
-        if (g_ab < 0) g_ab = 0; if (g_ab > 1) g_ab = 1;
-    }
+    g_accentMode = 0;
+    g_ar = kMDThemeDefaultAccentR;
+    g_ag = kMDThemeDefaultAccentG;
+    g_ab = kMDThemeDefaultAccentB;
 }
 
 void MDThemeNotifyChanged(void) {

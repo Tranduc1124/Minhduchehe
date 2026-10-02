@@ -21,7 +21,12 @@ extern NSString * const MDLogDidAppendNotification;
 // Points KernelBoot's kernelBootLog at this buffer. Idempotent.
 + (void)attachKernelBoot;
 
+// Lines tagged [verify] or [diag] are dropped here: raw addresses from the
+// exploit, and per-frame state lines that repeat every frame and otherwise
+// push the boot steps off the screen. The emitters are untouched and still
+// reach the device log through NSLog.
 + (void)appendLine:(NSString *)line;
+
 + (NSString *)text;
 + (void)clear;
 

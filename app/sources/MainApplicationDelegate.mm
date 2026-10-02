@@ -10,6 +10,25 @@
 #import "KeepAlive.h"
 #import "SpringBoardOverlay.h"
 
+// The custom accent picker is gone, but an install that used it has
+// AppAccentMode=1 and an RGB triple on disk. The app's own MDTheme ignores
+// them now; ModMenuViewController.mm has its own copy of those tokens and is
+// frozen, so it would still pick the old colour up. Clearing the keys once
+// here puts both halves back on mint.
+static void MDResetAccentPrefs(void) {
+    if (ESPPrefsFloat(@"AppAccentMode", 0.0f) == 0.0f &&
+        ESPPrefsFloat(@"AppAccentColorR", -1.0f) < 0.0f &&
+        ESPPrefsFloat(@"AppAccentColorG", -1.0f) < 0.0f &&
+        ESPPrefsFloat(@"AppAccentColorB", -1.0f) < 0.0f) {
+        return;
+    }
+    ESPPrefsSetFloat(@"AppAccentMode", 0.0f);
+    ESPPrefsSetFloat(@"AppAccentColorR", kMDThemeDefaultAccentR);
+    ESPPrefsSetFloat(@"AppAccentColorG", kMDThemeDefaultAccentG);
+    ESPPrefsSetFloat(@"AppAccentColorB", kMDThemeDefaultAccentB);
+    ESPPrefsSync();
+}
+
 @implementation MainApplicationDelegate {
     UITabBarController *_tabController;
 }
@@ -24,6 +43,7 @@
 }
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey,id> *)launchOptions {
+    MDResetAccentPrefs();
     MDThemeLoadFromPrefs();
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];

@@ -7,6 +7,21 @@ NSString * const MDLogDidAppendNotification = @"MDLogDidAppendNotification";
 // retries around it, and it is the same cap the old Home log card used.
 static const NSUInteger kMDLogMaxChars = 8000;
 
+// Debug tags to keep out of the console. The emitters are left alone on
+// purpose: they live in esp.mm and DSMemory.m, are per-frame, and are useful
+// in the device log via NSLog.
+//
+//   [verify] raw addresses from KernelBoot after the exploit
+//   [diag]   per-frame state lines. "stop: no-base" alone repeats every frame
+//            while no session is up, which filled the buffer and pushed the
+//            boot steps off the top of the screen.
+//
+// This costs nothing to filter here and cannot be done downstream: the buffer
+// is the only thing the two log screens read.
+static BOOL MDLogIsFiltered(NSString *line) {
+    return [line hasPrefix:@"[verify]"] || [line hasPrefix:@"[diag]"];
+}
+
 static NSMutableString *g_text = nil;
 
 static void MDEnsureBuffer(void) {
@@ -28,6 +43,7 @@ static void MDLogSink(NSString *line) {
 
 + (void)appendLine:(NSString *)line {
     if (line.length == 0) return;
+    if (MDLogIsFiltered(line)) return;
     MDEnsureBuffer();
     @synchronized (g_text) {
         [g_text appendFormat:@"%@\n", line];

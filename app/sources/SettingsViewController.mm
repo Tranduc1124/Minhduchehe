@@ -3,7 +3,6 @@
 #import "ESPAimViewController.h"
 #import "LaunchOptionsViewController.h"
 #import "DNSViewController.h"
-#import "AppearanceViewController.h"
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "MDLog.h"
@@ -79,7 +78,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     switch (section) {
         case SectionGame:        return 1;
         case SectionQuickActions:return 2;
-        case SectionTweaks:      return 3;
+        case SectionTweaks:      return 2;
         case SectionDNS:         return 1;
         case SectionAbout:       return 3;
         default: return 0;
@@ -135,15 +134,10 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                 [cell applyTitle:@"Launch Options"
                          subtitle:@"Startup and background behavior."
                             value:nil showsChevron:YES tappable:YES];
-            } else if (row == 1) {
+            } else {
                 [cell applyIconNamed:@"waveform.path.ecg" color:MDThemeTeal()];
                 [cell applyTitle:@"ESP/AIM"
                          subtitle:@"Count overlay read and publish behavior."
-                            value:nil showsChevron:YES tappable:YES];
-            } else {
-                [cell applyIconNamed:@"paintbrush.fill" color:MDThemePurple()];
-                [cell applyTitle:@"Appearance"
-                         subtitle:@"Accent colour for the app."
                             value:nil showsChevron:YES tappable:YES];
             }
             break;
@@ -201,10 +195,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionTweaks:
             if (indexPath.row == 0) {
                 [self push:[[LaunchOptionsViewController alloc] init]];
-            } else if (indexPath.row == 1) {
-                [self push:[[ESPAimViewController alloc] init]];
             } else {
-                [self push:[[AppearanceViewController alloc] init]];
+                [self push:[[ESPAimViewController alloc] init]];
             }
             break;
         case SectionDNS:

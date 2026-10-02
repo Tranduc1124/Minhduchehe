@@ -4,14 +4,17 @@
 //
 // The app is light-only: MainApplicationDelegate forces
 // UIUserInterfaceStyleLight on the window, so there is no second palette to
-// keep in sync and MDThemeIsLight() always answers YES. The accent stays
-// user-selectable (prefs: AppAccentMode, AppAccentColorR/G/B) because the
-// accent is used for the tab bar, the Activate row and the accent picker.
+// keep in sync and MDThemeIsLight() always answers YES.
+//
+// The accent is fixed at the default mint. The custom picker was deleted, and
+// MDTheme no longer reads AppAccentMode or AppAccentColor*, so an install that
+// chose a colour earlier cannot get stuck showing it with no way back.
 //
 // The in-game menu has its own copy of these tokens inside
 // ModMenuViewController.mm and reads AppThemeMode/AppAccent* straight from
 // prefs. Nothing here writes AppThemeMode, so switching the app to light can
-// never move the in-game menu's theme.
+// never move the in-game menu's theme. MainApplicationDelegate clears the
+// accent keys once at launch so that menu also falls back to mint.
 //
 // ModMenuViewController.mm is frozen. Only the app process uses this header.
 
@@ -25,7 +28,7 @@ void MDThemeLoadFromPrefs(void);
 void MDThemeNotifyChanged(void);
 
 BOOL MDThemeIsLight(void);
-int MDThemeAccentMode(void); // 0 default mint, 1 custom
+int MDThemeAccentMode(void); // always 0: the custom accent is gone
 
 UIColor *MDThemeBg(void);
 UIColor *MDThemePanel(void);
