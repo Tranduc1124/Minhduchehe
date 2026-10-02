@@ -1085,13 +1085,62 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     return res;
 }
 
+// dlsym(RTLD_DEFAULT, name) used to run on every single crossing, on both the
+// stable and the temp path. It takes dyld's global lock and walks the export
+// trie of every loaded image, and a publish makes 8 to 18 crossings, so it was
+// paid eight to eighteen times a frame to look up the same four or five names
+// over and over. The overlay only ever calls CGPathCreateMutable,
+// CGPathAddRects, CGPathAddLines, CGPathRelease, malloc and free.
+//
+// [SB-CALL] is what makes the size of that visible. Its w1, pac and w2 timers
+// start after this line, so dlsym was never inside them; it fell into rest,
+// which read 2.2ms per call against 0.33ms of measured transport.
+//
+// The selector and class caches in remote_objc.m are keyed by target pid,
+// because a selector value is a property of the target. A C symbol is a
+// property of this process, so this one needs no pid and no invalidation: the
+// address dlsym returns is valid for the life of the process. Like those
+// caches, it is a flat array with a rolling index and no eviction policy, at 48
+// entries, which is more than twice what the whole drawing path needs.
+#define RC_LSYM_SLOTS 48
+#define RC_LSYM_NAMELEN 64
+static struct { char name[RC_LSYM_NAMELEN]; uint64_t addr; } g_lsymCache[RC_LSYM_SLOTS];
+static int g_lsymNext = 0;
+static pthread_mutex_t g_lsymLock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t rc_local_sym(const char *name) {
+    if (!name) return 0;
+    pthread_mutex_lock(&g_lsymLock);
+    for (int i = 0; i < RC_LSYM_SLOTS; i++) {
+        if (g_lsymCache[i].addr && strcmp(g_lsymCache[i].name, name) == 0) {
+            uint64_t a = g_lsymCache[i].addr;
+            pthread_mutex_unlock(&g_lsymLock);
+            return a;
+        }
+    }
+    pthread_mutex_unlock(&g_lsymLock);
+
+    // Missed, so resolve outside the lock. dlsym can be slow and holding the
+    // lock across it would serialise every crossing behind it.
+    const uint64_t addr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
+    if (addr) {
+        pthread_mutex_lock(&g_lsymLock);
+        strncpy(g_lsymCache[g_lsymNext].name, name, RC_LSYM_NAMELEN - 1);
+        g_lsymCache[g_lsymNext].name[RC_LSYM_NAMELEN - 1] = '\0';
+        g_lsymCache[g_lsymNext].addr = addr;
+        g_lsymNext = (g_lsymNext + 1) % RC_LSYM_SLOTS;
+        pthread_mutex_unlock(&g_lsymLock);
+    }
+    return addr;
+}
+
 uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
-    uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
+    uint64_t pcAddr = rc_local_sym(name);
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
@@ -1181,7 +1230,7 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     // target thread. Leaving a locally-signed pointer here makes remote_pac
     // produce a bad LR/PC; SpringBoard then RET to raw FAKE_LR 0x401 without
     // our exception port catching it → SIGBUS 0x401 (seen in IPS).
-    uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
+    uint64_t pcAddr = rc_local_sym(name);
     if (!pcAddr) {
         printf("[%s:%d] Unable to find symbol: %s\n", __FUNCTION__, __LINE__, name);
         g_RC_success = false;
