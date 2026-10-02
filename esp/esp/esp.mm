@@ -3870,15 +3870,13 @@ static int      s_espCountN = 0;
     // Simple dump-backed player dict walk (no multi-layout probe every frame).
     // Dictionary<BHGGAEEHJCO,Player> @ match+kMatchPlayerDict
     // Entry: hash+next+key(0x18)+value* => stride 0x28, value @ 0x20
+    // Only the main dict @ kMatchPlayerDict (0x128). No probing of 0x130/0x138/0x140/
+    // 0x150 as a fallback: those are the lobby and social dictionaries, and picking
+    // one of them while the match dict is momentarily unreadable puts a non-match
+    // pawn into the player loop, which then draws it and counts it. The symptom is a
+    // count one higher than the enemies on screen that does not move when enemies
+    // die, because that pawn is not an enemy and never disappears.
     uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
-    if (!isVaildPtr(playerDict)) {
-        // Fallback other known dict slots if primary empty.
-        // NOTE: 0x148 is Dictionary<byte,Player> — WRONG for ESP (GameOffsets comment).
-        const uint64_t alts[] = { 0x130, 0x138, 0x140, 0x150, 0x120, 0x118 };
-        for (size_t ai = 0; ai < sizeof(alts)/sizeof(alts[0]) && !isVaildPtr(playerDict); ai++) {
-            playerDict = ReadAddr<uint64_t>(match + alts[ai]);
-        }
-    }
     if (!isVaildPtr(playerDict)) {
         return stats;
     }
@@ -3896,10 +3894,17 @@ static int      s_espCountN = 0;
     }
 
     int slotCap = ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength);
-    if (slotCap <= 0 || slotCap > 2048) {
+    if (slotCap <= 0 || slotCap > 256) {
         return stats;
     }
-    // dictCount can be 0 briefly; still allow walk if array exists.
+    // dictCount is the number of live entries. When it is zero the backing array is
+    // still allocated and full of freed slots, and a freed entry keeps its old hash
+    // code, so walking by slotCap alone walks the free list and counts pawns that
+    // left the match. Guard here rather than clamp the loop, because the loop is
+    // also what finds the players that are live.
+    if (dictCount <= 0) {
+        return stats;
+    }
 
     // View-projection is sampled AFTER world collect (see below). Reading it here
     // made boxes lag behind cam while the player loop did heavy memory I/O.
@@ -3957,7 +3962,7 @@ static int      s_espCountN = 0;
     const uint64_t entryStride = kDictEntryStrideBytePlayer ? kDictEntryStrideBytePlayer : 0x28;
     const uint64_t entryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
     int loopCount = slotCap;
-    if (loopCount > 512) loopCount = 512;
+    if (loopCount > 128) loopCount = 128;
 
     for (int i = 0; i < loopCount; i++) {
         uint64_t ent = entriesBase + entryStride * (uint64_t)i;
@@ -4064,8 +4069,12 @@ static int      s_espCountN = 0;
         Vector3 liveHip  = getPositionExt(getHip(PawnObject));
         const bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
 
-        // Fallback HP if DataPool reads fail/delay but 3D bones exist
-        if (hasLiveBone) {
+        // Fallback HP if DataPool reads fail/delay but 3D bones exist. Only for a pawn
+        // that is knocked or otherwise still in the round. A body left in the world
+        // after death keeps readable bones, so inventing 200 HP here is what turned
+        // every kill into a permanent extra box and a permanently higher counter.
+        // A real dead body has HP 0 and must stay 0; the tests below drop it.
+        if (hasLiveBone && !isKnocked) {
             if (CurHP <= 0 && MaxHP <= 0) {
                 CurHP = 200;
                 MaxHP = 200;
@@ -4079,9 +4088,18 @@ static int      s_espCountN = 0;
         const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
                                 (MaxHP > 0 && CurHP > MaxHP + 50));
-        const bool fullyDead = (!hasLiveBone && !hpUnreadable && CurHP <= 0);
-        if (!hasLiveBone && (hpGarbage || hpUnreadable || fullyDead || MaxHP <= 0)) {
-            markGhostDead((fullyDead || hpUnreadable || MaxHP <= 0) ? 120 : 45); // longer hold for death
+        // A dead body keeps readable bones for as long as it lies in the world, so
+        // hasLiveBone cannot decide this. It is HP that decides, and only after the
+        // knocked test: a knocked player is alive on HP 0 and must survive, a body
+        // on HP 0 must not. Checking knocked first is the whole point, the other way
+        // round the knocked players disappear instead of the dead ones.
+        const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
+        if (fullyDead) {
+            markGhostDead(120); // longer hold for death
+            continue;
+        }
+        if (!hasLiveBone && (hpGarbage || hpUnreadable || MaxHP <= 0)) {
+            markGhostDead((hpUnreadable || MaxHP <= 0) ? 120 : 45);
             continue;
         }
         // Despawned/spectator shells often keep a free-list pointer with no identity.
