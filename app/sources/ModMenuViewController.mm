@@ -833,6 +833,32 @@ typedef NS_ENUM(NSInteger, MenuTab) {
     sw.transform = CGAffineTransformMakeScale(0.8, 0.8); 
 }
 
+// Tapping a row in the preview card flips the pref it names. The card is the
+// fastest place to reach these because it is already on screen with all of them
+// listed, and a switch that only exists in a sub-tab is a switch nobody finds.
+//
+// The pref key travels on the row's accessibilityIdentifier rather than in a
+// tag, because tags are integers and the keys are strings, and because the row
+// is the only view that needs to remember which key it stands for.
+- (void)mdCardRowTapped:(UITapGestureRecognizer *)tap {
+    UIView *row = tap.view;
+    NSString *key = row.accessibilityIdentifier;
+    if (!key.length) return;
+    const BOOL next = !ESPPrefsBool(key, NO);
+    ESPPrefsSetBool(key, next);
+
+    for (UIView *sub in row.subviews) {
+        if (sub.tag == 9001) {                 // the check box
+            UILabel *ck = (UILabel *)sub;
+            ck.backgroundColor = next ? MDAccent()
+                                      : [UIColor colorWithRed:0.09f green:0.14f blue:0.22f alpha:1];
+            ck.layer.borderColor = next ? MDAccentSoft(0.35f).CGColor : MDLine().CGColor;
+            break;
+        }
+    }
+    row.backgroundColor = [UIColor colorWithWhite:1 alpha:(next ? 0.06f : 0.025f)];
+}
+
 - (void)loadTabContent:(MenuTab)tab {
     for (UIView *v in _contentContainer.subviews) { [v removeFromSuperview]; }
     CGFloat contentWidth = _contentContainer.bounds.size.width;
@@ -889,7 +915,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP"))], @(oxorany("EnableESP")), NO);
             addSwitchRow([self localized:@(oxorany("Line Esp")) viText:@(oxorany("Đường kẻ"))], @(oxorany("Line")), NO);
             addSwitchRow([self localized:@(oxorany("Box Esp")) viText:@(oxorany("Khung ESP"))], @(oxorany("Box")), YES);
-            addSwitchRow([self localized:@(oxorany("Name Esp")) viText:@(oxorany("Tên NPC"))], @(oxorany("Name")), YES);
+            addSwitchRow([self localized:@(oxorany("Name Esp")) viText:@(oxorany("Tên"))], @(oxorany("Name")), YES);
             addSwitchRow([self localized:@(oxorany("Bone Esp")) viText:@(oxorany("Xương ESP"))], @(oxorany("Bone")), NO);
             addSwitchRow([self localized:@(oxorany("Health Esp")) viText:@(oxorany("Thanh Máu"))], @(oxorany("Health")), NO);
             addSwitchRow([self localized:@(oxorany("Distance Esp")) viText:@(oxorany("Cự ly"))], @(oxorany("Distance")), YES);
@@ -977,18 +1003,25 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             CGFloat rightW = (contentWidth - 48) - leftW - 12;
             CGFloat listY = 50;
             NSArray *rows = @[
-                @[ @"Box", @(showBox) ],
-                @[ @"Name", @(showName) ],
-                @[ @"Distance", @(showDist) ],
-                @[ @"Health", @(showHealth) ],
-                @[ @"Bone", @(showBone) ],
-                @[ @"Line", @(showLine) ],
+                @[ @"Box",     @(showBox),    @(oxorany("Box")) ],
+                @[ @"Tên",     @(showName),   @(oxorany("Name")) ],
+                @[ @"Cự ly",   @(showDist),   @(oxorany("Distance")) ],
+                @[ @"Máu",     @(showHealth), @(oxorany("Health")) ],
+                @[ @"Xương",   @(showBone),   @(oxorany("Bone")) ],
+                @[ @"Đường kẻ",@(showLine),   @(oxorany("Line")) ],
             ];
             for (NSArray *row in rows) {
                 BOOL on = [row[1] boolValue];
                 UIView *r = [[UIView alloc] initWithFrame:CGRectMake(14, listY, leftW, 24)];
                 r.backgroundColor = [UIColor colorWithWhite:1 alpha:0.025f];
                 r.layer.cornerRadius = 8.0f;
+                // The row carries the pref key it toggles and reacts to a tap, so
+                // the card is not a read-only mirror of the real switches.
+                r.accessibilityIdentifier = (NSString *)row[2];
+                UITapGestureRecognizer *rowTap =
+                    [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                            action:@selector(mdCardRowTapped:)];
+                [r addGestureRecognizer:rowTap];
                 [previewCard addSubview:r];
                 UILabel *ck = MDFALabel(@"check", 9, on ? [UIColor colorWithRed:0.02f green:0.07f blue:0.05f alpha:1] : [UIColor clearColor]);
                 ck.frame = CGRectMake(6, 3, 18, 18);
@@ -997,6 +1030,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 ck.layer.borderWidth = 1.0f;
                 ck.layer.borderColor = on ? MDAccentSoft(0.35f).CGColor : MDLine().CGColor;
                 ck.clipsToBounds = YES;
+                ck.tag = 9001;
                 [r addSubview:ck];
                 UILabel *tx = [[UILabel alloc] initWithFrame:CGRectMake(30, 0, leftW - 36, 24)];
                 tx.text = row[0];
