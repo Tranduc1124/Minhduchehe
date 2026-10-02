@@ -319,6 +319,24 @@ static uint64_t g_sbRearmAfterUS = 0;
 // discarded at the very first gate, not rate limited. The previous self-heal
 // keyed off g_sbOverlayOn, which is still 1 in that state, so it never fired.
 static int g_sbSessionDead = 0;
+// A build is in flight. SBoardStartOverlay runs off the game's main queue and
+// takes on the order of a second: about two dozen r_msg2_main calls, each of
+// which settles nine times at 3ms. Two things must not happen during that
+// window, and neither can be expressed through g_sbOverlayOn alone, because that
+// flag has to be up for the publish side and the rearm side reads it as "not up".
+//
+// Publishing must wait, or the plate and the glyphs reach the decoder before
+// their layers exist and are dropped, which is a second of empty space between
+// the boxes appearing and the names appearing.
+//
+// Rearming must not fire. The no-overlay branch below dispatches a second
+// SBoardStartOverlay whenever g_sbEverOn is set and the cooldown has passed, and
+// that second call passes this function's own g_sbOverlayOn guard while the
+// first is still running, because the flag is still down. It then builds a
+// second UIWindow, and nothing ever hides the loser: the only setHidden:1 is in
+// SBoardStopOverlay, which no rearm path calls. The orphan keeps whatever path it
+// was last handed, which is a second copy of every box at the old position.
+static int g_sbBuilding = 0;
 
 // Wall clock of the last publish that actually completed. Recovery is driven
 // off this rather than off a run of consecutive dead frames, because the
@@ -1411,7 +1429,10 @@ static void sb_cost_probe(void) {
 
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
-    if (g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return 0; }
+    if (g_sbOverlayOn || g_sbBuilding) { pthread_mutex_unlock(&g_sbLock); return 0; }
+    // Claimed before the lock is dropped, and cleared at the very end below, so
+    // a rearm arriving mid-build sees it and leaves the frame alone.
+    g_sbBuilding = 1;
     pthread_mutex_unlock(&g_sbLock);
 
     if (!g_kexploit_ready) return -1;
@@ -1792,7 +1813,6 @@ int SBoardStartOverlay(void) {
     // Dropped here as well as in the teardown, because a rearm builds a fresh
     // window while the old pointers are still live in these globals.
     sb_text_forget();
-    g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
     // Arm the recovery clock here rather than waiting for a publish that may
@@ -1892,6 +1912,21 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    // Publishes only start now, at the end, once the name layers exist. This flag
+    // used to be set about a hundred lines earlier, immediately after
+    // sb_text_forget, which is what left the boxes on screen for a second before
+    // the names could exist: the name layers are created at the two assignments
+    // near the [SB-NAME] log further down, and everything between here and there
+    // is r_msg2_main, which settles nine times at 3ms each, so the gap is a
+    // second and not the hundred and fifty milliseconds the comments assume.
+    //
+    // g_sbBuilding is what makes moving this safe. The rearm branch reads
+    // g_sbOverlayOn as "not up" and would otherwise start a second build that
+    // passes this function's own guard, and the loser of that race is never
+    // hidden. Cleared immediately after, so the rearm can fire again on a later
+    // frame but not during this one.
+    g_sbOverlayOn = YES;
+    g_sbBuilding = 0;
     // The cost probe, the colour probe and the lineWidth read-back are all behind
     // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
     // between them they were about a hundred and fifteen remote calls of
@@ -1987,7 +2022,7 @@ void SBRemotePushESPFrame(UIView *espView) {
         // g_sbOverlayOn on a single failure and had no path back, so the one
         // frame that did land stayed on screen for the rest of the session no
         // matter what happened in the match.
-        if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
+        if (!g_sbBuilding && g_sbEverOn && now_us() > g_sbRearmAfterUS) {
             g_sbRearmAfterUS = now_us() + 3000000ULL;   // 3s between attempts
             g_sbConsecFail = 0;
             // Off this thread, which is the game's main queue.
