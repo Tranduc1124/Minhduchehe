@@ -425,28 +425,21 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 // FOV circle, its size and the FOV/180/360 sphere describe a value the engine
 // is not using, and a slider that looks adjustable but does nothing is worse
 // than one that is visibly not applicable.
-// Rows that only mean something with Aimbot on.
+// FOV and Aim Type are two prefs describing one pipeline, and the engine
+// refuses to resolve a conflict between them. esp.mm computes
+// useAssistOnly as "isAimAssist && !isAimbot" and then tests assistRadiusSq
+// without consulting aimFov at all, so an FOV left on while Aim Assist is
+// selected describes a radius that is never used.
 //
-// esp.mm reads aimSphereMode as "isAimbot ? mode : 0" and picks the radius
-// differently per pipeline: Aimbot tests the FOV square, Aim Assist solo tests
-// assistRadiusSq and never looks at aimFov. So with Aim Type on Aim Assist the
-// FOV circle, its size and the FOV/180/360 sphere describe a value the engine
-// is not using at all.
-- (BOOL)rowNeedsAimbot:(NSArray *)row {
-    NSString *key = row[2];
-    return [key isEqualToString:@"ShowFovCircle"]
-        || [key isEqualToString:@"FovSize"]
-        || [key isEqualToString:@"AimSphereMode"];
-}
-
-- (BOOL)aimTypeIsAimbot {
-    return (int)ESPPrefsFloat(@"AimTypeMode", 0.0f) == 0;
-}
-
-// Reload the whole AIM section rather than named rows. The section's row count
-// now depends on Aim Type, so any index computed before the change is wrong
-// after it, and reloadRowsAtIndexPaths with a stale index is how that turns
-// into a crash rather than a redraw.
+// Settled in both directions here, where the user can see it happen:
+//
+//   Aimbot -> Aim Assist   switches the FOV off
+//   FOV switched on        switches Aim Type back to Aimbot
+//
+// Reload the whole AIM section rather than named rows. One tap here changes
+// AimTypeMode, AimMaster, Aimbot, AimAssist and ShowFovCircle together, which
+// spans several rows, and reloadRowsAtIndexPaths with an index computed before
+// the change is how that turns into a crash rather than a redraw.
 - (void)reloadAimSection {
     NSMutableIndexSet *sections = [NSMutableIndexSet indexSet];
     [sections addIndex:ESPSectionAim];
@@ -454,38 +447,42 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                   withRowAnimation:UITableViewRowAnimationNone];
 }
 
-// Rows gone entirely, not greyed. A disabled control still reads as a setting
-// that could be on, and the user asked for these to be off rather than dimmed:
-// FOV is a hard LookAt radius for Aimbot and does not exist on the Aim Assist
-// path, so leaving a dead switch on screen only invites setting it.
-- (NSInteger)visibleRowCountInSection:(NSInteger)section {
-    NSArray<NSArray *> *rows = [self rowsInSection:section];
-    BOOL aimbot = [self aimTypeIsAimbot];
-    NSInteger count = 0;
-    for (NSArray *row in rows) {
-        if (!aimbot && [self rowNeedsAimbot:row]) continue;
-        ++count;
-    }
-    return count;
+// Turning the FOV off does not touch Aim Type: Aimbot without an FOV ring is
+// a legitimate combination and forcing a type change on it would take the
+// choice away for no reason.
+- (void)applyFovRequiresAimbot:(BOOL)fovJustTurnedOn {
+    if (!fovJustTurnedOn) return;
+    int type = (int)ESPPrefsFloat(@"AimTypeMode", 0.0f);
+    if (type == 0) return;                        // already Aimbot
+    if (!ESPPrefsBool(@"AimMaster", NO)) return;  // aim is off entirely
+
+    ESPPrefsSetFloat(@"AimTypeMode", 0.0f);
+    ESPPrefsSetBool(@"Aimbot", YES);
+    ESPPrefsSetBool(@"AimAssist", NO);
+    ESPPrefsSetBool(@"AimLegit", NO);
+    ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
+    ESPPrefsSync();
+    ESPSyncFromPrefs();
+    [self reloadAimSection];
 }
 
-// Maps a visible row back to its index in the full table.
-- (NSArray *)rowAtVisibleIndexPath:(NSIndexPath *)indexPath {
-    NSArray<NSArray *> *rows = [self rowsInSection:indexPath.section];
-    BOOL aimbot = [self aimTypeIsAimbot];
-    NSInteger visible = (NSInteger)indexPath.row;
-    for (NSUInteger i = 0; i < rows.count; i++) {
-        if (!aimbot && [self rowNeedsAimbot:rows[i]]) continue;
-        if (visible == 0) return rows[i];
-        --visible;
-    }
-    return nil;
+// The other direction: leaving Aimbot for Aim Assist while the FOV is on.
+// ShowFovCircle is written off rather than restored on return, because the
+// user turned it off here on purpose and silently switching it back later is
+// the sort of thing that makes a switch untrustworthy.
+- (void)applyAssistTurnsOffFov:(BOOL)assistJustSelected {
+    if (!assistJustSelected) return;
+    if (!ESPPrefsBool(@"ShowFovCircle", NO)) return;
+
+    ESPPrefsSetBool(@"ShowFovCircle", NO);
+    ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
+    ESPPrefsSetBool(@"Aim360", NO);
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return ESPSectionCount; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return [self visibleRowCountInSection:section];
+    return (NSInteger)[self rowsInSection:section].count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -699,6 +696,14 @@ static float ESPRowClamp(float v, float lo, float hi) {
         return;
     }
 
+    // Turning the FOV on while Aim Assist is selected means the user wants the
+    // FOV path, and that path is Aimbot's. Switching back here rather than
+    // leaving a ring the engine will not draw is the difference between the
+    // switch doing what it says and doing nothing.
+    if ([key isEqualToString:@"ShowFovCircle"] && isOn) {
+        [self applyFovRequiresAimbot:YES];
+    }
+
     ESPSyncFromPrefs();
 }
 
@@ -724,6 +729,9 @@ static float ESPRowClamp(float v, float lo, float hi) {
             ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
             ESPPrefsSetBool(@"Aim360", NO);
         }
+        // Aim Assist never reads aimFov, so an FOV left on would describe a
+        // radius the engine ignores. It goes off with the type change.
+        [self applyAssistTurnsOffFov:idx == 1];
     } else if ([key isEqualToString:@"AimPos"]) {
         // MenuView listens for this to relabel its floating HEAD/NECK/BODY
         // button, and that menu lives in this same process, so the post lands.
