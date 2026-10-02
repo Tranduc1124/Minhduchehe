@@ -1792,6 +1792,7 @@ int SBoardStartOverlay(void) {
     // Dropped here as well as in the teardown, because a rearm builds a fresh
     // window while the old pointers are still live in these globals.
     sb_text_forget();
+    g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
     // Arm the recovery clock here rather than waiting for a publish that may
@@ -1891,25 +1892,6 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
-    // g_sbOverlayOn is set here, at the end, not where it used to sit just after
-    // sb_text_forget near the top.
-    //
-    // SBRemotePushESPFrame returns immediately unless g_sbOverlayOn is set, so
-    // that assignment is the moment the game's frame timer is allowed to start
-    // publishing. It used to happen about ninety lines before the name layers
-    // were created, and every one of those lines is an r_msg2_main with a 3ms
-    // settle, so there was roughly a hundred and fifty milliseconds in which the
-    // overlay was live, the game was pushing frames, and the name layers did not
-    // exist yet. Those frames found g_sbNameBgShape and g_sbNameTextShape zero
-    // and routed the plate and the glyphs into the geometry path, which is
-    // stroked white with no fill. The first frame after the layers existed drew
-    // correctly, and the pair reads on screen as a flicker at startup and after
-    // every rearm.
-    //
-    // Nothing between the old and new positions reads this flag, so moving it is
-    // otherwise inert, and a build that fails part way through now leaves the
-    // overlay off rather than half-built and on screen.
-    g_sbOverlayOn = YES;
     // The cost probe, the colour probe and the lineWidth read-back are all behind
     // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
     // between them they were about a hundred and fifteen remote calls of
@@ -2633,7 +2615,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                             } else {
                                 dstPath = rp;
                             }
-                            if (dstPath == rpT && tCount < 64) {
+                            if (dstPath && dstPath == rpT && tCount < 64) {
                                 // Which run went to the text path, so a wrong
                                 // destination is readable off the device instead
                                 // of guessed at. The FOV arriving here is a 73
@@ -2671,18 +2653,24 @@ void SBRemotePushESPFrame(UIView *espView) {
                 subpaths++;
 
                 const int np = rn / 2;
-                // No destination, so there is nothing to add this run to. The
-                // snapline branch further down hardcodes rp rather than reading
-                // dstPath, so this has to be checked before it is reached.
-                if (!dstPath) continue;
-                // The text path may only ever receive layer 16. This is now a
-                // backstop rather than the fix, because the fix is at the marker
-                // above, but it is kept and it is keyed on runLayer rather than
-                // curLayer so that it can actually fire. The previous version
-                // tested curLayer, which a marker had already overwritten to 16,
-                // so the condition could never be true and the FOV walked through
-                // it on every frame while the log insisted the routing was correct.
-                if (dstPath == rpT && runLayer != SB_TEXT_LAYER_INDEX) {
+                // This backstop is only about a misrouted run, and it reads dstPath
+                // as an identity against rpT. dstPath can now legitimately be 0,
+                // for a layer that needs a fill whose path does not exist yet, and
+                // with rpT also 0 the comparison below became 0 == 0 and turned
+                // true: every name plate and every glyph run was then redirected
+                // into rp, the stroked geometry path, which is exactly the
+                // opposite of what the 0 was for. So the null test has to be
+                // here too.
+                //
+                // Nothing is skipped when dstPath is 0. The CoreGraphics calls
+                // below take a null path and draw nothing, which is the intended
+                // outcome, and drawn still increments, so the present at the end
+                // of the publish still runs. An earlier version of this used
+                // continue, which swallowed every drawn++ on that path and left
+                // the geometry layer holding the previous frame's path whenever a
+                // frame had nothing else to draw. The empty outline appearing
+                // where a plate should be, offset up and left, is that.
+                if (dstPath && dstPath == rpT && runLayer != SB_TEXT_LAYER_INDEX) {
                     dstPath = rp;
                     dstLayer = runLayer;
                 }
