@@ -11,20 +11,22 @@
 extern "C" {
 #endif
 
-// Template SF Symbol, nil on iOS < 13 or for an unknown name.
-UIImage *MDUISymbol(NSString *symbolName, CGFloat pointSize, UIFontWeight weight);
+NS_ASSUME_NONNULL_BEGIN
+
+// Template SF Symbol. Null on iOS < 13 or for an unknown name, which is why
+// every call site falls back rather than asserting.
+UIImage *_Nullable MDUISymbol(NSString *symbolName, CGFloat pointSize, UIFontWeight weight);
 
 // Bundle image, falling back to a path lookup because the bundled game icons
-// are .webp and UIImage's imageNamed: does not always decode those.
-UIImage *MDUIImageNamed(NSString *baseName);
+// are .webp and UIImage's imageNamed: does not always decode those. Null when
+// the name resolves to neither.
+UIImage *_Nullable MDUIImageNamed(NSString *baseName);
 
 UIFont *MDUIMonoFont(CGFloat size, UIFontWeight weight);
 
 // Standard navigation bar: opaque card background, hairline bottom, centred
 // title, no large title.
 void MDUIApplyNavigationBarStyle(UINavigationBar *navBar);
-
-NS_ASSUME_NONNULL_BEGIN
 
 // Tile + title + optional subtitle + optional value + optional chevron.
 @interface MDIconRowCell : UITableViewCell
