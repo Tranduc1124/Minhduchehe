@@ -2405,13 +2405,30 @@ static UIFont *LoadCountFont(CGFloat size) {
 #ifdef __cplusplus
 extern "C" {
 #endif
-NSString *ESPNameTextFontName(void) {
-    static NSString *s_name = nil;
-    if (!s_name) {
-        s_name = LoadCountFont(10).fontName;
-        if (!s_name.length) s_name = @"Arial-BoldMT";
+CTFontRef ESPNameTextCTFont(CGFloat size) {
+    if (size <= 0.0f) size = 10.0f;
+    // System faces, in order of preference. Every one of these is in the iOS font
+    // registry on every device, which is the whole point.
+    //
+    // The first version of this asked UIFont for its fontName and handed that to
+    // CTFontCreateWithName. UIFont can resolve a face that CoreText's registry
+    // has never heard of, and when the lookup misses, CTFontCreateWithName does
+    // not fail: it returns a fallback whose glyphs are all 0. The advance sum
+    // then comes back 0, the caller concludes there is nothing to draw, and the
+    // path comes out empty. That is what was on screen: a plate, no glyphs.
+    //
+    // Menlo-Bold is first because it is heavy, monospaced and very legible at the
+    // small sizes a distant player needs, which is exactly what a name over a dark
+    // plate wants. The rest are fallbacks in descending weight.
+    static const CFStringRef faces[] = {
+        CFSTR("Menlo-Bold"), CFSTR("HelveticaNeue-Bold"),
+        CFSTR("Helvetica-Bold"), CFSTR("Arial-BoldMT")
+    };
+    for (size_t i = 0; i < sizeof(faces) / sizeof(faces[0]); i++) {
+        CTFontRef f = CTFontCreateWithName(faces[i], size, NULL);
+        if (f) return f;
     }
-    return s_name;
+    return NULL;
 }
 #ifdef __cplusplus
 }   // extern "C"

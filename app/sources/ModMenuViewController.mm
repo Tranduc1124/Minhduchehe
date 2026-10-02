@@ -889,7 +889,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP"))], @(oxorany("EnableESP")), NO);
             addSwitchRow([self localized:@(oxorany("Line Esp")) viText:@(oxorany("Đường kẻ"))], @(oxorany("Line")), NO);
             addSwitchRow([self localized:@(oxorany("Box Esp")) viText:@(oxorany("Khung ESP"))], @(oxorany("Box")), YES);
-            addSwitchRow([self localized:@(oxorany("Info Esp")) viText:@(oxorany("Thông tin"))], @(oxorany("Name")), YES);
+            addSwitchRow([self localized:@(oxorany("Name Esp")) viText:@(oxorany("Tên NPC"))], @(oxorany("Name")), YES);
             addSwitchRow([self localized:@(oxorany("Bone Esp")) viText:@(oxorany("Xương ESP"))], @(oxorany("Bone")), NO);
             addSwitchRow([self localized:@(oxorany("Health Esp")) viText:@(oxorany("Thanh Máu"))], @(oxorany("Health")), NO);
             addSwitchRow([self localized:@(oxorany("Distance Esp")) viText:@(oxorany("Cự ly"))], @(oxorany("Distance")), YES);

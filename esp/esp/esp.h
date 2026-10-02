@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreText/CoreText.h>
 #import <stdint.h>
 
 #import "GameLogic.h"
@@ -212,7 +213,17 @@ UIFont *GetCustomFont(CGFloat size);
 // espdraw.mm, so a name is the only thing worth handing across: the loader stays
 // in one file and each side keeps the CFType it works in, which is the one it
 // has to hand to CoreText anyway.
-NSString *ESPNameTextFontName(void);
+// Returns a +1 CTFontRef built from the UIFont the counter uses, so the caller
+// must CFRelease it. Passing the size matters: UIFont's CGFont is already
+// rasterised at one size and reusing it at another produces metrics that do not
+// match the point size.
+#ifdef __cplusplus
+extern "C" {
+#endif
+CTFontRef ESPNameTextCTFont(CGFloat size);
+#ifdef __cplusplus
+}
+#endif
 
 bool RenderFOVCirclePath(CGMutablePathRef path, float viewWidth, float viewHeight, bool aimbotEnabled, float fovRadius);
 

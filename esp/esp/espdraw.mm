@@ -98,10 +98,7 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     if (!dst || !s.length || size <= 0.5f) return;
     if (frame.size.width <= 0.0 || frame.size.height <= 0.0) return;
 
-    NSString *fontName = ESPNameTextFontName();
-    if (!fontName.length) return;
-
-    CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)fontName, size, NULL);
+    CTFontRef font = ESPNameTextCTFont(size);
     if (!font) return;
 
     // Sized for a plate line: a 16 character nickname plus the "[123M]" tag, with
@@ -469,43 +466,62 @@ static void ESPRenderPawnCore(
 
     if (plateName || plateDis) {
         const CGFloat lineH = dynFontSize + 4.0f;
-        const CGFloat plateH = lineH * (CGFloat)((plateName ? 1 : 0) + (plateDis ? 1 : 0));
 
-        // Đáy plate nằm đúng trên mép trên của thanh máu, tức y - barGap - barH.
-        // Đó là câu trả lời cho "đặt ngay trên mép trên khung box mà không đè
-        // lên thanh máu": barGap + barH là đúng phần đã bị thanh chiếm, chừa
-        // hơn là hở, chừa ít hơn là đè. Hai khối dùng chung barGap và barH để
-        // con số này không thể trôi khỏi thanh máu.
+        // The plate covers the NAME only. The distance is not on it and does not
+        // have a background at all, because the distance belongs under the feet
+        // and the feet are below the box, so a plate that held both would either
+        // have to stretch across the box or sit nowhere useful.
+        const CGFloat plateH = plateName ? lineH : 0.0f;
+
+        // The name plate's bottom edge is exactly the top edge of the health bar,
+        // which is y - barGap - barH. That is the answer to "sit on the top edge
+        // of the box without covering the health bar": barGap + barH is precisely
+        // the part the bar already occupies, so leaving it clear is not a gap and
+        // not an overlap. Both places read the same barGap and barH, so the
+        // number cannot drift away from the bar.
         const CGFloat plateBottom = y - barGap - barH;
-        const CGRect plate = CGRectMake(x, plateBottom - plateH, boxWidth, plateH);
 
-        // Bề rộng plate là boxWidth, không phải bề rộng theo máu.
+        // Width is boxWidth so the plate does not shrink when the health drops,
+        // with a floor on top of that, because boxWidth itself shrinks with range
+        // and at the far end it is about four points wide. A plate four points
+        // wide cannot hold a name at any point size, so the name was being drawn
+        // outside its own background. The floor is estimated from the character
+        // count rather than a measured advance, because measuring means laying the
+        // string out first and the plate has to exist before the glyphs go in.
+        // 0.62em per character plus a four point gutter either side, never below
+        // boxWidth, so the health-scaling rule still holds.
+        const CGFloat charsW = (CGFloat)plateName.length * dynFontSize * 0.62f + 8.0f;
+        const CGFloat plateW = (boxWidth > charsW) ? boxWidth : charsW;
+        const CGRect plate = CGRectMake(x - (plateW - boxWidth) * 0.5f,
+                                        plateBottom - plateH, plateW, plateH);
+
+        // CGPathAddRect, not CGPathAddEllipseInRect: four distinct corners is
+        // what the SpringBoard decoder batches into the shared CGPathAddRects,
+        // so every plate in a frame is still one call.
         //
-        // Đây là yêu cầu của người dùng và nó đúng: plate bám boxWidth nên
-        // đứng yên khi máu giảm. Plate bám theo barW, tức boxWidth *
-        // healthRatio, là bản rẻ hơn và trông như một lỗi: plate co lại
-        // từng khung theo HP và tên bị cắt chỉ vì một con số đổi, trong khi
-        // cái đang co lại là thanh máu chứ không phải cái giữ nó đứng yên.
-        //
-        // CGPathAddRect chứ không phải CGPathAddEllipseInRect: hình chữ nhật
-        // bốn góc được decoder ở SpringBoard gom vào CGPathAddRects chung,
-        // nên plate của cả khung hình vẫn là một lệnh.
-        if (buffers->nameBgPath) {
+        // Only when there is a name. The plate is the name's background, so
+        // switching the name pref off has to take the background with it, and a
+        // plate drawn for a player who has no name would be a grey bar over
+        // nothing.
+        if (plateName && buffers->nameBgPath) {
             CGPathAddRect(buffers->nameBgPath, NULL, plate);
         }
 
-        // Mỗi dòng chiếm đúng một lineH, tên ở trên, quãng cách ở dưới. Cùng
-        // font, cùng cỡ chữ và cùng cách canh giữa với addText: ở trên, nên
-        // chỗ text đứng không nhảy khi CATextLayer bị bỏ đi.
-        CGFloat lineY = plate.origin.y;
+        // The name sits inside its plate. The distance does not: it goes under
+        // the feet, y + boxHeight, clear of the box outline, and it has no
+        // background because there is no plate there. Same font, same size and
+        // the same centring as the CATextLayer path above, so neither line jumps
+        // position when the other is switched off.
         if (plateName) {
             ESPAppendTextPath(buffers->nameTextPath, plateName,
-                              CGRectMake(plate.origin.x, lineY, plate.size.width, lineH), dynFontSize);
-            lineY += lineH;
+                              CGRectMake(plate.origin.x, plate.origin.y,
+                                         plate.size.width, lineH), dynFontSize);
         }
         if (plateDis) {
+            const CGFloat disW = (CGFloat)plateDis.length * dynFontSize * 0.62f + 8.0f;
             ESPAppendTextPath(buffers->nameTextPath, plateDis,
-                              CGRectMake(plate.origin.x, lineY, plate.size.width, lineH), dynFontSize);
+                              CGRectMake(centerX - disW * 0.5f, y + boxHeight + 2.0f,
+                                         disW, lineH), dynFontSize);
         }
         buffers->nameTextDirty = true;
     }
