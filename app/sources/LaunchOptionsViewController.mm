@@ -1,16 +1,14 @@
 #import "LaunchOptionsViewController.h"
 #import "MDUI.h"
 #import "MDTheme.h"
-#import "MDLog.h"
 #import "ESPPrefs.h"
-#import "KeepAlive.h"
 
 // title, pref key, default. Each of these does something today; none of them is
 // a placeholder.
 static NSArray<NSArray *> *LORows(void) {
     return @[
         @[ @"Start ESP automatically on launch", @"AutoBootOnLaunch", @NO ],
-        @[ @"Unlock files",                       @"SandboxEscapeOn", @YES ],
+        @[ @"SandboxEscapeOn",                   @"SandboxEscapeOn", @YES ],
         @[ @"Keep app alive in background",       @"KeepAliveOn",      @YES ],
     ];
 }
@@ -84,13 +82,14 @@ static NSArray<NSArray *> *LORows(void) {
     return cell;
 }
 
+// No log line. Every switch here writes a pref the user just set and can
+// confirm by looking at the switch; a line per flip buried the boot steps
+// that are the reason the Log tab exists.
 - (void)switchChanged:(UISwitch *)sender {
     NSString *key = sender.accessibilityIdentifier;
     if (key.length == 0) return;
     ESPPrefsSetBool(key, sender.isOn);
     ESPPrefsSync();
-    [MDLog appendLine:[NSString stringWithFormat:@"OK %@ = %@",
-                       key, sender.isOn ? @"ON" : @"OFF"]];
 }
 
 @end

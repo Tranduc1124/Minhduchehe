@@ -192,17 +192,20 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                          subtitle:@"iPhone: iOS 17.0–18.7.1 and 26.0–26.0.1"
                             value:nil showsChevron:NO tappable:NO];
             } else {
-                // Measured, not claimed: this one is computed from the running
-                // OS against the same bounds kexploit_opa334.m accepts, so a
-                // device that would fail to boot never reads as supported.
+                // Measured, not claimed: computed from the running OS against
+                // the same bounds kexploit_opa334.m accepts, so a device the
+                // exploit would fail on never reads as supported.
+                //
+                // The verdict is the subtitle, not the value. A row carrying
+                // both put the value beside the control while the subtitle
+                // wrapped under the title, and the two did not line up.
                 BOOL ok = MDCurrentDeviceIsSupported();
                 [cell applyIconNamed:@"iphone" color:ok ? MDThemeGreen() : MDThemeRed()];
                 [cell applyTitle:@"Current Device"
-                         subtitle:[NSString stringWithFormat:@"iOS %@",
+                         subtitle:[NSString stringWithFormat:@"%@ · iOS %@",
+                                   (ok ? @"Supported" : @"Not supported"),
                                    [[UIDevice currentDevice] systemVersion]]
-                            value:(ok ? @"Supported" : @"Not supported")
-                     showsChevron:NO
-                         tappable:NO];
+                            value:nil showsChevron:NO tappable:NO];
             }
             break;
         }

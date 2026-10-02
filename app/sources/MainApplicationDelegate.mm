@@ -104,17 +104,13 @@ static void MDResetAccentPrefs(void) {
                                                  name:MDThemeDidChangeNotification
                                                object:nil];
 
-    [MDLog appendLine:@"OK MINHDUC ready."];
-
-    // Opt-in only. The exploit stays behind the Activate button unless the user
-    // asked for it here, because this runs before anything on screen exists and
-    // a failure would be invisible.
+    // Kernel only. This runs the exploit, the sandbox and KeepAlive and stops
+    // there: no overlay, no ESP host, and App_LocalHUDState untouched, so the
+    // Game tab still reads Inactive and the box does not appear by itself.
+    // Turning the ESP on stays a deliberate tap on Activate.
     if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
-        [MDLog appendLine:@"RUN Starting ESP automatically."];
-        ESPPrefsSetBool(@"App_LocalHUDState", YES);
-        ESPPrefsSync();
-        SetHUDEnabled(YES);
-        kernelBootStart();
+        [MDLog appendLine:@"RUN Preparing the exploit at launch."];
+        kernelBootStartKernelOnly();
     }
     return YES;
 }

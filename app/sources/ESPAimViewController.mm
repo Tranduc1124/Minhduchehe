@@ -141,6 +141,7 @@
 // whole Hz, and a slider across 30 values has no precision worth having.
 @interface MDStepperCell : UITableViewCell
 @property (nonatomic, strong) UIStepper *stepper;
+@property (nonatomic, strong) UILabel *valueLabel;
 - (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max;
 @end
 
@@ -151,10 +152,20 @@
     if (!self) return nil;
     self.backgroundColor = MDThemePanel();
     self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    // Title and value are stacked on the left, under each other, and the
+    // stepper sits on the right. A UITableViewCell detailTextLabel would put
+    // the value beside the control instead, which is not what this row is.
     self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
     self.textLabel.textColor = MDThemeText();
-    self.detailTextLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
-    self.detailTextLabel.textColor = MDThemeMuted();
+    self.textLabel.numberOfLines = 1;
+    self.detailTextLabel.text = nil;
+
+    _valueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _valueLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
+    _valueLabel.textColor = MDThemeMuted();
+    _valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:_valueLabel];
 
     _stepper = [[UIStepper alloc] initWithFrame:CGRectZero];
     _stepper.translatesAutoresizingMaskIntoConstraints = NO;
@@ -168,20 +179,35 @@
         [_stepper.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
         [_stepper.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
                                                           .leadingAnchor constant:12.0f],
+
+        [_valueLabel.leadingAnchor constraintEqualToAnchor:self.textLabel.leadingAnchor],
+        [_valueLabel.topAnchor constraintEqualToAnchor:self.textLabel.bottomAnchor constant:-1.0f],
+        [_valueLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor
+                                                             constant:-10.0f],
     ]];
     return self;
 }
 
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    // The label's own Auto Layout does not give it a height, and the row height
+    // is fixed, so place it under the title by hand once the title has one.
+    CGFloat labelH = self.textLabel.bounds.size.height > 0 ? self.textLabel.bounds.size.height : 21.0f;
+    CGRect want = self.textLabel.frame;
+    want.origin.y -= labelH - 4.0f;
+    self.textLabel.frame = want;
+}
+
 - (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max {
     self.textLabel.text = title;
-    self.detailTextLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)value];
+    _valueLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)value];
     _stepper.minimumValue = min;
     _stepper.maximumValue = max;
     _stepper.value = value;
 }
 
 - (void)stepperChanged:(UIStepper *)sender {
-    self.detailTextLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)sender.value];
+    _valueLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)sender.value];
     NSString *key = sender.accessibilityIdentifier;
     if (key.length == 0) return;
     ESPPrefsSetFloat(key, (float)sender.value);
@@ -369,7 +395,6 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                    @[ @"Crosshair", @"Low HP", @"Closest" ] ],
                 @[ @"g", @"Trigger",           @"TriggerMode",   @(0.0f),
                    @[ @"Auto", @"Fire", @"Scope", @"Both" ] ],
-                @[ @"s", @"Aim Assist (Head)", @"AimAssist",     @NO ],
                 @[ @"l", @"Aim Distance",      @"AimDistance",   @(1.0f),  @(400.0f), @(200.0f) ],
                 @[ @"l", @"Aim Speed",         @"AimSpeed",      @(1.0f),  @(100.0f),  @(100.0f) ],
             ];

@@ -2,7 +2,6 @@
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "GameOffsets.h"
-#import "MDLog.h"
 #import "HUDHelper.h"
 #import "ESPPrefs.h"
 
@@ -81,7 +80,6 @@
     if (wasMax == [id isEqualToString:@"ffmax"]) return;
 
     GameTargetSetSelectedId(id);
-    [MDLog appendLine:[NSString stringWithFormat:@"OK Target set to %@.", _titles[indexPath.row]]];
     [tableView reloadData];
 
     // A live session is bound to the old process and offset table, so offer

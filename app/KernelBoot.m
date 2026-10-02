@@ -67,11 +67,16 @@ static void boot_start_sb_overlay(void) {
     });
 }
 
-void kernelBootStart(void) {
+static void kernelBootStartEx(BOOL kernelOnly) {
     if (g_booting) return;
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
         [[KeepAlive shared] start];
+        // A kernel-only boot after the fact must not drag the overlay back up.
+        if (kernelOnly) {
+            L(@"OK Kernel already ready — nothing else to do.");
+            return;
+        }
         boot_start_sb_overlay();
         boot_start_esp_host();
         return;
@@ -129,6 +134,16 @@ void kernelBootStart(void) {
         [[KeepAlive shared] start];
         L(@"OK KeepAlive started.");
 
+        // Everything below this point is what puts the box on screen. A
+        // kernel-only boot stops here: the exploit, the sandbox and KeepAlive
+        // are ready, and nothing is drawn until the user asks for it.
+        if (kernelOnly) {
+            L(@"OK Kernel ready — not starting ESP.");
+            g_ready = YES;
+            g_booting = NO;
+            return;
+        }
+
         L(@"RUN 5/6 Opening SpringBoard dedicated overlay (staged)");
         boot_start_sb_overlay();
         L(@"OK SpringBoard session pending (background).");
@@ -140,5 +155,8 @@ void kernelBootStart(void) {
         g_booting = NO;
     });
 }
+
+void kernelBootStart(void) { kernelBootStartEx(NO); }
+void kernelBootStartKernelOnly(void) { kernelBootStartEx(YES); }
 
 BOOL kernelBootReady(void) { return g_ready; }
