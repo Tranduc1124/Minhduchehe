@@ -118,7 +118,10 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
         static CGFloat s_size[24] = {0};
         const int slot = (int)(size * 2.0f) - 8;   // 4.0 -> 0, 11.5 -> 15
         if (slot >= 0 && slot < 24) {
-            if (s_font[slot] && fabsf(s_size[slot] - size) < 0.25f) {
+            // fabs and not fabsf: CGFloat is a double on arm64, so the float
+            // overload would truncate the argument. The build turns that into an
+            // error under -Werror.
+            if (s_font[slot] && fabs(s_size[slot] - size) < 0.25) {
                 font = s_font[slot];
             } else {
                 CTFontRef made = ESPNameTextCTFont(size);
