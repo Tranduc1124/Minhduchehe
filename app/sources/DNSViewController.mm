@@ -32,7 +32,7 @@
     [card addSubview:title];
 
     UILabel *body = [[UILabel alloc] initWithFrame:CGRectZero];
-    body.text = @"The DNS feature has not been added yet. This screen will install or update the DNS configuration when it is.";
+    body.text = @"This is not ready yet. It will let you change which DNS your device uses when it is.";
     body.font = MDThemeFont(14.0f, UIFontWeightRegular);
     body.textColor = MDThemeMuted();
     body.textAlignment = NSTextAlignmentCenter;

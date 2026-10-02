@@ -1,12 +1,19 @@
 #import "LaunchOptionsViewController.h"
 #import "MDUI.h"
 #import "MDTheme.h"
-#import "ESPPrefs.h"
 #import "MDLog.h"
+#import "ESPPrefs.h"
+#import "KeepAlive.h"
 
-@interface LaunchOptionsViewController ()
-@property (nonatomic, strong) UISwitch *varCleanSwitch;
-@end
+// title, pref key, default. Each of these does something today; none of them is
+// a placeholder.
+static NSArray<NSArray *> *LORows(void) {
+    return @[
+        @[ @"Start ESP automatically on launch", @"AutoBootOnLaunch", @NO ],
+        @[ @"Unlock files",                       @"SandboxEscapeOn", @YES ],
+        @[ @"Keep app alive in background",       @"KeepAliveOn",      @YES ],
+    ];
+}
 
 @implementation LaunchOptionsViewController
 
@@ -21,32 +28,28 @@
     self.view.backgroundColor = MDThemeBg();
     self.tableView.backgroundColor = MDThemeBg();
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
-    self.tableView.rowHeight = 52.0f;
+    self.tableView.rowHeight = 56.0f;
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
-    _varCleanSwitch.on = ESPPrefsBool(@"AutoVarCleanBeforeHUD", NO);
     [self.tableView reloadData];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return 1;
+    return (NSInteger)LORows().count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"PREPARE" : @"COMING";
+    return @"LAUNCH OPTIONS";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) {
-        return @"Runs VarClean before the kernel boot when activating ESP.";
-    }
-    return @"More launch options will be added here.";
+    return @"Keeping the app alive in the background is what lets ESP keep working while you play. Turning it off may let iOS close the app.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView
@@ -57,38 +60,37 @@
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
                                       reuseIdentifier:ident];
         cell.backgroundColor = MDThemePanel();
-    }
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
 
-    if (indexPath.section == 0) {
-        cell.textLabel.text = @"VarClean Before ESP";
-        cell.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
-        cell.textLabel.textColor = MDThemeText();
-        if (!_varCleanSwitch) {
-            _varCleanSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
-            _varCleanSwitch.onTintColor = MDThemeAccent();
-            [_varCleanSwitch addTarget:self
-                                 action:@selector(varCleanChanged:)
-                       forControlEvents:UIControlEventValueChanged];
-        }
-        _varCleanSwitch.on = ESPPrefsBool(@"AutoVarCleanBeforeHUD", NO);
-        cell.accessoryView = _varCleanSwitch;
-        cell.detailTextLabel.text = nil;
-    } else {
-        cell.textLabel.text = @"No options yet";
-        cell.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
-        cell.textLabel.textColor = MDThemeMuted();
-        cell.accessoryView = nil;
-        cell.detailTextLabel.text = nil;
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
+        sw.onTintColor = MDThemeAccent();
+        [sw addTarget:self
+                action:@selector(switchChanged:)
+      forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
     }
+
+    NSArray *row = LORows()[indexPath.row];
+    cell.textLabel.text = row[0];
+    cell.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
+    cell.textLabel.textColor = MDThemeText();
+    cell.detailTextLabel.text = nil;
+
+    // The pref key rides on the switch: the handler never has to look the row
+    // up, so a row added later cannot be wired to the wrong pref.
+    UISwitch *sw = (UISwitch *)cell.accessoryView;
+    sw.accessibilityIdentifier = row[1];
+    sw.on = ESPPrefsBool(row[1], [row[2] boolValue]);
     return cell;
 }
 
-- (void)varCleanChanged:(UISwitch *)sender {
-    ESPPrefsSetBool(@"AutoVarCleanBeforeHUD", sender.isOn);
+- (void)switchChanged:(UISwitch *)sender {
+    NSString *key = sender.accessibilityIdentifier;
+    if (key.length == 0) return;
+    ESPPrefsSetBool(key, sender.isOn);
     ESPPrefsSync();
-    [MDLog appendLine:[NSString stringWithFormat:@"OK AutoVarCleanBeforeHUD = %@",
-                       sender.isOn ? @"ON" : @"OFF"]];
+    [MDLog appendLine:[NSString stringWithFormat:@"OK %@ = %@",
+                       key, sender.isOn ? @"ON" : @"OFF"]];
 }
 
 @end

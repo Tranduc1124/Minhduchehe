@@ -8,7 +8,9 @@
 #import "MDLog.h"
 #import "ESPPrefs.h"
 #import "KeepAlive.h"
+#import "HUDHelper.h"
 #import "SpringBoardOverlay.h"
+#import "../KernelBoot.h"
 
 // The custom accent picker is gone, but an install that used it has
 // AppAccentMode=1 and an RGB triple on disk. The app's own MDTheme ignores
@@ -103,6 +105,17 @@ static void MDResetAccentPrefs(void) {
                                                object:nil];
 
     [MDLog appendLine:@"OK MINHDUC ready."];
+
+    // Opt-in only. The exploit stays behind the Activate button unless the user
+    // asked for it here, because this runs before anything on screen exists and
+    // a failure would be invisible.
+    if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
+        [MDLog appendLine:@"RUN Starting ESP automatically."];
+        ESPPrefsSetBool(@"App_LocalHUDState", YES);
+        ESPPrefsSync();
+        SetHUDEnabled(YES);
+        kernelBootStart();
+    }
     return YES;
 }
 

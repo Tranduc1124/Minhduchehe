@@ -56,7 +56,7 @@
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return @"Changing the game reloads the offset table. Start a new session for it to take effect.";
+    return @"Changing the game needs a new session before it applies.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView
@@ -91,7 +91,7 @@
     if (IsESPSessionRunning()) {
         UIAlertController *alert =
             [UIAlertController alertControllerWithTitle:@"Restart session?"
-                                                message:@"ESP is running against the previous game. Restart the session to use the one you just picked."
+                                                message:@"ESP is on for the other game. Turn it off and on again to switch."
                                          preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                                   style:UIAlertActionStyleCancel

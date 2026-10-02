@@ -4,9 +4,10 @@
 extern "C" {
 #endif
 
-// Placeholder for the launch options the user has not defined yet.
-// The one switch that already exists in prefs (AutoVarCleanBeforeHUD) lives
-// here so it is in the right place when the rest arrives.
+// Three switches, each backed by something that already exists:
+//   AutoBootOnLaunch  runs the boot from application:didFinishLaunching
+//   SandboxEscapeOn   gates sandbox_escape in KernelBoot stage 3
+//   KeepAliveOn       gates KeepAlive.start, which every caller goes through
 @interface LaunchOptionsViewController : UITableViewController
 @end
 

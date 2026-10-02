@@ -17,6 +17,7 @@
 #import "../remote/SpringBoardOverlay.h"
 #import "../remote/RemoteCall.h"
 #import "KeepAlive.h"
+#import "../esp/esp/ESPPrefs.h"
 
 kernel_boot_log_fn kernelBootLog = NULL;
 
@@ -107,9 +108,22 @@ void kernelBootStart(void) {
         L(@"OK Kernel memory r/w acquired.");
 
         uint64_t self_proc = proc_self();
-        int sret = sandbox_escape(self_proc);
-        L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
-                    : @"WARN sandbox_escape returned %d", sret);
+        int sret;
+        // Off by default would be wrong: the overlay needs the filesystem write
+        // that sandbox_escape sets up, so leaving it on is the default and the
+        // switch is there to skip the step when someone wants it off.
+        if (ESPPrefsBool(@"SandboxEscapeOn", YES)) {
+            sret = sandbox_escape(self_proc);
+        } else {
+            sret = -1;
+        }
+        if (sret == 0) {
+            L(@"OK Sandbox escaped (R+W filesystem).");
+        } else if (ESPPrefsBool(@"SandboxEscapeOn", YES)) {
+            L(@"WARN sandbox_escape returned %d", sret);
+        } else {
+            L(@"SKIP Sandbox escape turned off.");
+        }
 
         L(@"RUN 4/6 Initializing Background KeepAlive");
         [[KeepAlive shared] start];

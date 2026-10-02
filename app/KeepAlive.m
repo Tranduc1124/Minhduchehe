@@ -154,6 +154,13 @@
 }
 
 - (void)start {
+    // Gated here rather than at the call sites. There are four callers — the
+    // app delegate on foreground and on background, KernelBoot stage 4, and
+    // StartESPHost — and gating each one means a new caller quietly gets a
+    // KeepAlive the user turned off.
+    extern BOOL ESPPrefsBool(NSString *key, BOOL defaultValue);
+    if (!ESPPrefsBool(@"KeepAliveOn", YES)) return;
+
     if (_running) {
         // Already marked running — still ensure player alive (idempotent).
         dispatch_async(dispatch_get_main_queue(), ^{

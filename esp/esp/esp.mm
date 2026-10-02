@@ -67,6 +67,57 @@ extern int GetGameProcesspid(char *name);
 void ClearProBoxScreenForPawn(uint64_t pawn);
 
 
+// Render tick. Clamped to 30-60 Hz: below 30 the FOV ring and the snapline
+// fan visibly step, and above 60 there is nothing left to win because each
+// publish already costs about a millisecond of CoreGraphics in SpringBoard.
+//
+// The interval used to be a literal 16 ms. It is now read from EspTickHz so the
+// app can offer it, and dispatch_source_set_timer can be called again on a
+// running source, so changing it does not mean rebuilding the view.
+#define ESP_TICK_MIN_HZ 30.0f
+#define ESP_TICK_MAX_HZ 60.0f
+#define ESP_TICK_DEFAULT_HZ 60.0f
+
+// frameTimer is private to the class extension further down, and this code
+// sits above it. Redeclaring the one property here is what lets the file-scope
+// helpers reach it without moving the extension.
+@interface ESP_View (TickAccess)
+@property (nonatomic, strong) dispatch_source_t frameTimer;
+@end
+
+static float ESPTickHzFromPrefs(void) {
+    float hz = ESPPrefsFloat(@"EspTickHz", ESP_TICK_DEFAULT_HZ);
+    if (hz < ESP_TICK_MIN_HZ) hz = ESP_TICK_MIN_HZ;
+    if (hz > ESP_TICK_MAX_HZ) hz = ESP_TICK_MAX_HZ;
+    return hz;
+}
+
+static uint64_t ESPTickIntervalNS(void) {
+    return (uint64_t)(1e9f / ESPTickHzFromPrefs());
+}
+
+// Weak, so recording the view here cannot keep it alive past its window. Only
+// one host exists at a time; StartESPHost refuses a second.
+static __weak ESP_View *s_espViewInstance = nil;
+static float s_espTickAppliedHz = 0.0f;
+
+// Called from ESPSyncFromPrefs, which runs on a poll rather than every frame,
+// and touches the timer only when the pref actually moved.
+static void ESPSyncTickRate(void) {
+    float hz = ESPTickHzFromPrefs();
+    if (hz == s_espTickAppliedHz) return;
+    ESP_View *view = s_espViewInstance;
+    if (!view) return;
+    s_espTickAppliedHz = hz;
+    dispatch_source_t timer = view.frameTimer;
+    if (!timer) return;
+    uint64_t intervalNS = (uint64_t)(1e9f / hz);
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNS),
+                              intervalNS,
+                              2 * NSEC_PER_MSEC);
+}
+
 // Forward decls used by aim helpers (defined later in this file).
 static inline bool IsZeroVec(const Vector3 &v);
 Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance);
@@ -2635,10 +2686,15 @@ void ESPSyncFromPrefs(void) {
     // Legacy: force-off removed InstantHeal / Fast Weapon Switch prefs.
     ESPPrefsSetBool(@"InstantHeal", NO);
     ESPPrefsSetBool(@"FastWeaponSwitch", NO);
+    // CamPC was pulled from the UI. The engine keeps honouring the pref so a
+    // user who had it on does not silently lose a working feature; what
+    // changed is that nothing in the app sets it any more.
     isCamPC    = ESPPrefsBool(@"CamPC", NO);
     camPCValue = ESPPrefsFloat(@"CamPCValue", 30.0f);
     if (camPCValue < 0.0f) camPCValue = 0.0f;
     if (camPCValue > 150.0f) camPCValue = 150.0f;
+
+    ESPSyncTickRate();
 
     aimMode = (int)ESPPrefsFloat(@"AimMode", 1.0f);
     triggerMode = (int)ESPPrefsFloat(@"TriggerMode", 0.0f);
@@ -3013,22 +3069,29 @@ static void ESPDiagHeartbeat(void) {
         
         [self configureRenderingLayers];
 
-        // 60fps GCD timer — NOT CADisplayLink. CADisplayLink is paused by
+        // GCD timer — NOT CADisplayLink. CADisplayLink is paused by
         // iOS when the app is backgrounded (game in foreground), so ESP froze.
         // A dispatch_source timer on the main queue keeps firing while the
         // process is alive (audio KeepAlive), so the overlay keeps rendering
         // over the game.
+        //
+        // The interval comes from the EspTickHz pref, clamped to 30-60 Hz.
+        // dispatch_source_set_timer can be called again on a running source,
+        // so changing it does not need the view rebuilt.
         self.frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         if (self.frameTimer) {
+            uint64_t intervalNS = ESPTickIntervalNS();
             dispatch_source_set_timer(self.frameTimer,
-                                      dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
-                                      16 * NSEC_PER_MSEC,
+                                      dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNS),
+                                      intervalNS,
                                       2 * NSEC_PER_MSEC);
             __weak ESP_View *wself = self;
             dispatch_source_set_event_handler(self.frameTimer, ^{
                 [wself updateFrame];
             });
             dispatch_resume(self.frameTimer);
+            s_espViewInstance = self;
+            s_espTickAppliedHz = 0; // force the first sync to apply
         }
     }
     return self;

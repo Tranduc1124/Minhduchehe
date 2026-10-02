@@ -16,6 +16,18 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 
 #import <SafariServices/SafariServices.h>
 
+// The bounds kexploit_opa334.m actually gates on: 16.0 <= v < 19.0, or 26.0
+// and above. Parsed from the running OS rather than hardcoded to a yes, so
+// this row can disagree with the "Supported" line above it and be the one that
+// is right.
+static BOOL MDCurrentDeviceIsSupported(void) {
+    NSString *version = [[UIDevice currentDevice] systemVersion] ?: @"0";
+    NSArray<NSString *> *parts = [version componentsSeparatedByString:@"."];
+    if (parts.count == 0) return NO;
+    NSInteger major = [parts.firstObject integerValue];
+    return (major >= 16 && major < 19) || (major >= 26);
+}
+
 typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionGame = 0,
     SectionQuickActions,
@@ -80,7 +92,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionQuickActions:return 2;
         case SectionTweaks:      return 2;
         case SectionDNS:         return 1;
-        case SectionAbout:       return 3;
+        case SectionAbout:       return 5;
         default: return 0;
     }
 }
@@ -106,7 +118,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionGame:
             [cell applyIconNamed:@"gamecontroller.fill" color:MDThemeAccent()];
             [cell applyTitle:@"Select Game"
-                     subtitle:@"ESP target and offset table"
+                     subtitle:@"Which game ESP attaches to"
                         value:GameTargetIsMax() ? @"Free Fire MAX" : @"Free Fire THG"
                  showsChevron:YES
                      tappable:YES];
@@ -120,7 +132,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                 [cell applyIconNamed:(hudOn ? @"stop.fill" : @"trash.fill")
                                color:(hudOn ? MDThemeRed() : MDThemeMuted())];
                 [cell applyTitle:@"Stop ESP"
-                         subtitle:(hudOn ? @"ESP is running." : @"ESP is not running.")
+                         subtitle:(hudOn ? @"ESP is on right now." : @"ESP is off.")
                             value:nil showsChevron:YES tappable:YES];
             } else {
                 [cell applyIconNamed:@"paperplane.fill" color:MDThemeBlue()];
@@ -132,12 +144,12 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
             if (row == 0) {
                 [cell applyIconNamed:@"bolt.fill" color:MDThemeOrange()];
                 [cell applyTitle:@"Launch Options"
-                         subtitle:@"Startup and background behavior."
+                         subtitle:@"How the app starts and keeps running."
                             value:nil showsChevron:YES tappable:YES];
             } else {
                 [cell applyIconNamed:@"waveform.path.ecg" color:MDThemeTeal()];
                 [cell applyTitle:@"ESP/AIM"
-                         subtitle:@"Count overlay read and publish behavior."
+                         subtitle:@"What the ESP box, lines and names draw."
                             value:nil showsChevron:YES tappable:YES];
             }
             break;
@@ -145,7 +157,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionDNS:
             [cell applyIconNamed:@"globe" color:MDThemeBlue()];
             [cell applyTitle:@"DNS"
-                     subtitle:@"Install or update the DNS configuration."
+                     subtitle:@"Change which DNS your device uses."
                         value:nil showsChevron:YES tappable:YES];
             break;
 
@@ -165,11 +177,30 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                             value:(info[@"CFBundleVersion"] ?: @"—")
                      showsChevron:NO
                          tappable:NO];
-            } else {
+            } else if (row == 2) {
                 [cell applyIconNamed:@"shippingbox.fill" color:MDThemeMuted()];
                 [cell applyTitle:@"Bundle"
                          subtitle:nil
                             value:(info[@"CFBundleIdentifier"] ?: @"—")
+                     showsChevron:NO
+                         tappable:NO];
+            } else if (row == 3) {
+                // The advertised range. Static text, and the only line on this
+                // screen that is a claim rather than a measurement.
+                [cell applyIconNamed:@"checkmark.seal.fill" color:MDThemeGreen()];
+                [cell applyTitle:@"Supported"
+                         subtitle:@"iPhone: iOS 17.0–18.7.1 and 26.0–26.0.1"
+                            value:nil showsChevron:NO tappable:NO];
+            } else {
+                // Measured, not claimed: this one is computed from the running
+                // OS against the same bounds kexploit_opa334.m accepts, so a
+                // device that would fail to boot never reads as supported.
+                BOOL ok = MDCurrentDeviceIsSupported();
+                [cell applyIconNamed:@"iphone" color:ok ? MDThemeGreen() : MDThemeRed()];
+                [cell applyTitle:@"Current Device"
+                         subtitle:[NSString stringWithFormat:@"iOS %@",
+                                   [[UIDevice currentDevice] systemVersion]]
+                            value:(ok ? @"Supported" : @"Not supported")
                      showsChevron:NO
                          tappable:NO];
             }
@@ -226,7 +257,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
 
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:@"Stop ESP?"
-                                            message:@"ESP is running. Stop the session and close the overlay?"
+                                            message:@"ESP is running. Stop it?"
                                      preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"

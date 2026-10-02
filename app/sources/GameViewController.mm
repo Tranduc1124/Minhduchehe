@@ -126,9 +126,9 @@
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSString *text = nil;
     if (section == 0) {
-        text = @"Keeps the ESP session active and updates DrawView.";
+        text = @"Keeps the ESP session alive while you play.";
     } else {
-        text = @"Starts the kernel session and the SpringBoard overlay.";
+        text = @"Starts a new ESP session.";
     }
     if (!text) return nil;
 
@@ -181,19 +181,19 @@
     if (hudOn) {
         [cell applyIconNamed:@"stop.fill" color:MDThemeRed()];
         [cell applyTitle:@"Stop ESP"
-                 subtitle:@"Stops the ESP session and the overlay."
+                 subtitle:@"Stops ESP and hides the box."
                     value:nil showsChevron:YES tappable:YES];
         cell.titleLabel.textColor = MDThemeRed();
     } else if (pending) {
         [cell applyIconNamed:@"hourglass" color:MDThemeMuted()];
         [cell applyTitle:@"Starting…"
-                 subtitle:@"Bringing up the kernel and the SpringBoard overlay."
+                 subtitle:@"Getting everything ready. This takes a moment."
                     value:nil showsChevron:NO tappable:NO];
         cell.titleLabel.textColor = MDThemeMuted();
     } else {
         [cell applyIconNamed:@"play.fill" color:MDThemeAccent()];
         [cell applyTitle:@"Activate"
-                 subtitle:@"Rechecks access and starts a fresh session."
+                 subtitle:@"Starts a fresh ESP session."
                     value:nil showsChevron:YES tappable:YES];
         cell.titleLabel.textColor = MDThemeAccent();
     }
@@ -267,7 +267,7 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 - (void)startHUDForRequest:(NSInteger)requestSerial {
     _pendingHUDEnableUntil = CACurrentMediaTime() + 2.5;
     GameOffsetsReload();
-    [MDLog appendLine:@"RUN Requesting a fresh session…"];
+    [MDLog appendLine:@"RUN Starting a new session…"];
 
     if (!ESPPrefsBool(@"AutoVarCleanBeforeHUD", NO)) {
         [self markSessionRunning:YES];
@@ -277,7 +277,7 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
         return;
     }
 
-    [MDLog appendLine:@"RUN VarClean before HUD (AutoVarCleanBeforeHUD)…"];
+    [MDLog appendLine:@"RUN Clearing leftovers before starting…"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [[varCleanController sharedInstance] runVarCleanNowWithCompletion:^(BOOL authorized) {
             dispatch_async(dispatch_get_main_queue(), ^{

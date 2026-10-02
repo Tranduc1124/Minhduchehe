@@ -135,12 +135,70 @@
 
 @end
 
+#pragma mark - Stepper row
+
+// The rate row is a stepper rather than a slider: the useful range is 30-60 in
+// whole Hz, and a slider across 30 values has no precision worth having.
+@interface MDStepperCell : UITableViewCell
+@property (nonatomic, strong) UIStepper *stepper;
+- (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max;
+@end
+
+@implementation MDStepperCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)ident {
+    self = [super initWithStyle:style reuseIdentifier:ident];
+    if (!self) return nil;
+    self.backgroundColor = MDThemePanel();
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
+    self.textLabel.textColor = MDThemeText();
+    self.detailTextLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
+    self.detailTextLabel.textColor = MDThemeMuted();
+
+    _stepper = [[UIStepper alloc] initWithFrame:CGRectZero];
+    _stepper.translatesAutoresizingMaskIntoConstraints = NO;
+    [_stepper addTarget:self
+                  action:@selector(stepperChanged:)
+        forControlEvents:UIControlEventValueChanged];
+    [self.contentView addSubview:_stepper];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_stepper.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
+        [_stepper.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+        [_stepper.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
+                                                          .leadingAnchor constant:12.0f],
+    ]];
+    return self;
+}
+
+- (void)applyTitle:(NSString *)title value:(NSInteger)value min:(NSInteger)min max:(NSInteger)max {
+    self.textLabel.text = title;
+    self.detailTextLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)value];
+    _stepper.minimumValue = min;
+    _stepper.maximumValue = max;
+    _stepper.value = value;
+}
+
+- (void)stepperChanged:(UIStepper *)sender {
+    self.detailTextLabel.text = [NSString stringWithFormat:@"%ld Hz", (long)sender.value];
+    NSString *key = sender.accessibilityIdentifier;
+    if (key.length == 0) return;
+    ESPPrefsSetFloat(key, (float)sender.value);
+    ESPPrefsSync();
+    // The engine re-reads the pref from ESPSyncFromPrefs and retunes the
+    // dispatch timer on its next pass; nothing else has to happen here.
+    ESPSyncFromPrefs();
+}
+
+@end
+
 #pragma mark - Controller
 
 typedef NS_ENUM(NSInteger, ESPSection) {
-    ESPSectionScreen = 0,
+    ESPSectionRate = 0,
+    ESPSectionScreen,
     ESPSectionDraw,
-    ESPSectionView,
     ESPSectionAim,
     ESPSectionCount
 };
@@ -239,6 +297,7 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     self.tableView.rowHeight = 52.0f;
     [self.tableView registerClass:[MDToggleCell class] forCellReuseIdentifier:@"toggle"];
     [self.tableView registerClass:[MDSliderCell class] forCellReuseIdentifier:@"slider"];
+    [self.tableView registerClass:[MDStepperCell class] forCellReuseIdentifier:@"stepper"];
     [self.tableView registerClass:[MDSegmentCell class] forCellReuseIdentifier:@"segment"];
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
 }
@@ -251,11 +310,23 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 
 #pragma mark - Rows
 
-// title, pref key, default value (BOOL as NSNumber, float as NSNumber).
+// Row shape: leading kind, then the fields that kind needs.
+//   "s" kind, title, key, defaultBool
+//   "g" kind, title, key, defaultIndex, items
+//   "l" kind, title, key, min, max, default
+//   "n" kind, title, key, min, max, default   (stepper, integer steps)
+// Items are last for "g" so the default sits where a slider puts its minimum.
+// Reading these the wrong way round sends floatValue to an NSArray.
 - (NSArray<NSArray *> *)rowsInSection:(NSInteger)section {
     switch (section) {
+        case ESPSectionRate:
+            // Clamped to the same 30-60 the engine clamps to, in
+            // ESPSyncTickRate / ESPTickHzFromPrefs. Step 1 Hz at a time.
+            return @[ @[ @"n", @"ESP/AIM rate tick", @"EspTickHz", @(30.0f), @(60.0f), @(60.0f) ] ];
+
         case ESPSectionScreen:
             return @[ @[ @"s", @"Hide Screenshot/Recording", @"StreamerMode", @NO ] ];
+
         case ESPSectionDraw:
             // SbCountText used to have a row of its own, directly under this
             // one. Both drive the same counter and read as the same control, so
@@ -271,43 +342,36 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"s", @"Distance",     @"Distance",  @YES ],
                 @[ @"s", @"Player Count", @"Count",     @YES ],
             ];
-        case ESPSectionView:
-            return @[
-                @[ @"s", @"FOV Circle",  @"ShowFovCircle", @YES ],
-                @[ @"l", @"FOV Size",    @"FovSize",       @(10.0f), @(190.0f), @(120.0f) ],
-                @[ @"s", @"Camera Xa",   @"CamPC",         @NO ],
-                @[ @"l", @"Camera Dist", @"CamPCValue",    @(0.0f),  @(150.0f), @(30.0f) ],
-            ];
         case ESPSectionAim:
             // Everything here already exists in esp.mm. None of it is new
             // behaviour: every row writes a pref that the renderer and the aim
-            // loop already read, which is why this is a UI change and not a
-            // port.
+            // loop already read.
             //
-            // AimSphereMode and AimBehindWall used to be reachable only from the
-            // in-game menu, so 180/360 and wall aim were invisible from the app.
-            // AimRange is the segmented control for the former; Behind Wall is a
-            // switch for the latter and goes through the live setter so the
-            // renderer drops its sticky lock on the same turn.
+            // The FOV ring moved in from the old VIEW section. It belongs with
+            // the aim controls rather than beside the ESP switches — the ring
+            // exists to show the aim's reach. CamPC went with it; the engine
+            // still honours the pref, nothing in the app sets it now.
             return @[
-                @[ @"s", @"Enable Aim",       @"AimMaster",    @NO ],
-                @[ @"g", @"Aim Range",        @"AimSphereMode", @(0.0f),
+                @[ @"s", @"FOV Circle",        @"ShowFovCircle", @YES ],
+                @[ @"l", @"FOV Size",          @"FovSize",       @(10.0f), @(190.0f), @(120.0f) ],
+                @[ @"s", @"Enable Aim",        @"AimMaster",     @NO ],
+                @[ @"g", @"Aim Range",         @"AimSphereMode", @(0.0f),
                    @[ @"FOV", @"180°", @"360°" ] ],
-                @[ @"s", @"Aim Behind Wall",  @"AimBehindWall", @NO ],
-                @[ @"g", @"Aim Mode",         @"AimMode",       @(1.0f),
+                @[ @"s", @"Aim Behind Wall",   @"AimBehindWall", @NO ],
+                @[ @"g", @"Aim Mode",          @"AimMode",       @(1.0f),
                    @[ @"Safe (PC)", @"Normal", @"Rage" ] ],
-                @[ @"g", @"Aim Type",         @"AimTypeMode",   @(0.0f),
-                   @[ @"Aimbot", @"Aim Silent" ] ],
-                @[ @"s", @"Aim Silent",       @"AimSilent",     @NO ],
-                @[ @"g", @"Aim Position",     @"AimPos",        @(0.0f),
+                @[ @"g", @"Aim Type",          @"AimTypeMode",   @(0.0f),
+                   @[ @"Aimbot", @"Aim Assist" ] ],
+                @[ @"s", @"Aim Silent",        @"AimSilent",     @NO ],
+                @[ @"g", @"Aim Position",      @"AimPos",        @(0.0f),
                    @[ @"Head", @"Neck", @"Chest" ] ],
-                @[ @"g", @"Target",           @"AimTargetMode", @(0.0f),
+                @[ @"g", @"Target",            @"AimTargetMode", @(0.0f),
                    @[ @"Crosshair", @"Low HP", @"Closest" ] ],
-                @[ @"g", @"Trigger",          @"TriggerMode",   @(0.0f),
+                @[ @"g", @"Trigger",           @"TriggerMode",   @(0.0f),
                    @[ @"Auto", @"Fire", @"Scope", @"Both" ] ],
-                @[ @"s", @"Aim Assist (Head)", @"AimAssist",    @NO ],
-                @[ @"l", @"Aim Distance",     @"AimDistance",   @(1.0f), @(400.0f), @(200.0f) ],
-                @[ @"l", @"Aim Speed",        @"AimSpeed",      @(1.0f),  @(100.0f), @(100.0f) ],
+                @[ @"s", @"Aim Assist (Head)", @"AimAssist",     @NO ],
+                @[ @"l", @"Aim Distance",      @"AimDistance",   @(1.0f),  @(400.0f), @(200.0f) ],
+                @[ @"l", @"Aim Speed",         @"AimSpeed",      @(1.0f),  @(100.0f),  @(100.0f) ],
             ];
     }
     return @[];
@@ -325,18 +389,25 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
+        case ESPSectionRate:   return @"ESP/AIM";
         case ESPSectionScreen: return @"SCREEN";
         case ESPSectionDraw:   return @"DRAW";
-        case ESPSectionView:   return @"VIEW";
         case ESPSectionAim:    return @"AIM";
     }
     return nil;
 }
 
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
-    if (section != ESPSectionScreen) return nil;
+    NSString *text = nil;
+    if (section == ESPSectionRate) {
+        text = @"How often the ESP redraws. Lower it if it stutters.";
+    } else if (section == ESPSectionScreen) {
+        text = @"Hides overlay views from screenshots and screen recordings.";
+    }
+    if (!text) return nil;
+
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
-    l.text = @"Hides overlay views from screenshots and screen recordings.";
+    l.text = text;
     l.font = MDThemeFont(13.0f, UIFontWeightRegular);
     l.textColor = MDThemeMuted();
     l.numberOfLines = 0;
@@ -352,14 +423,14 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     return footer;
 }
 
-// Only the section that has a footer implements viewForFooterInSection, and
-// only that section implements this. Returning CGFLOAT_MIN here is what iOS
+// Only the sections that have a footer implement viewForFooterInSection, and
+// only those sections implement this. Returning CGFLOAT_MIN here is what iOS
 // Settings does to mean "none", but mixing it with the automatic value on a
 // different section in the same table is not worth the risk — a section that
 // returns a footer view and no height gets measured against the view, and one
 // that returns neither is asked for a height anyway.
 - (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
-    if (section != ESPSectionScreen) return 0.0f;
+    if (section != ESPSectionScreen && section != ESPSectionRate) return 0.0f;
     return UITableViewAutomaticDimension;
 }
 
@@ -373,6 +444,14 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     return 52.0f;
 }
 
+// Stepper rows read and write an integer in the same shape as the slider rows,
+// so the clamp lives next to the pref rather than in two places.
+static float ESPRowClamp(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView
          cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSArray *row = [self rowAtIndexPath:indexPath];
@@ -380,6 +459,21 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     NSString *title = row[1];
     NSString *key = row[2];
     __weak __typeof(self) weakSelf = self;
+
+    if ([kind isEqualToString:@"n"]) {
+        float lo = [row[3] floatValue];
+        float hi = [row[4] floatValue];
+        float cur = ESPRowClamp(ESPPrefsFloat(key, [row[5] floatValue]), lo, hi);
+
+        MDStepperCell *cell = [tableView dequeueReusableCellWithIdentifier:@"stepper"
+                                                             forIndexPath:indexPath];
+        [cell applyTitle:title
+                   value:(NSInteger)lroundf(cur)
+                    min:(NSInteger)lroundf(lo)
+                    max:(NSInteger)lroundf(hi)];
+        cell.stepper.accessibilityIdentifier = key;
+        return cell;
+    }
 
     if ([kind isEqualToString:@"l"]) {
         MDSliderCell *cell = [tableView dequeueReusableCellWithIdentifier:@"slider"
@@ -473,10 +567,9 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         if (type < 0) type = 0;
         if (type > 1) type = 1;
         ESPPrefsSetBool(@"Aimbot", isOn && type == 0);
-        ESPPrefsSetBool(@"AimAssist", NO);
-        // Only the camera modes reset. The range and wall switches stand on
-        // their own, so a user who set 360 does not lose it every time they
-        // flick the master.
+        ESPPrefsSetBool(@"AimAssist", isOn && type == 1);
+        ESPPrefsSetBool(@"AimLegit", NO);
+        ESPPrefsSetBool(@"AimSilent", NO);
         ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
         ESPPrefsSync();
         ESPSyncFromPrefs();
@@ -501,12 +594,17 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     ESPPrefsSetFloat(key, (float)idx);
 
     if ([key isEqualToString:@"AimTypeMode"]) {
+        // Aimbot or Aim Assist. Silent is deliberately not an option here:
+        // esp.mm treats it as an independent pipeline that works on its own or
+        // on top of either, so it is a switch below rather than a third choice.
         ESPPrefsSetBool(@"AimMaster", YES);
         ESPPrefsSetBool(@"Aimbot", idx == 0);
-        ESPPrefsSetBool(@"AimSilent", idx == 1);
-        ESPPrefsSetBool(@"AimAssist", NO);
-        // Legacy mirror the in-game menu still reads.
-        if (idx == 2) ESPPrefsSetBool(@"Aim360", YES); else ESPPrefsSetBool(@"Aim360", NO);
+        ESPPrefsSetBool(@"AimAssist", idx == 1);
+        ESPPrefsSetBool(@"AimLegit", NO);
+        if (idx != 0) {
+            ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
+            ESPPrefsSetBool(@"Aim360", NO);
+        }
     } else if ([key isEqualToString:@"AimPos"]) {
         // MenuView listens for this to relabel its floating HEAD/NECK/BODY
         // button, and that menu lives in this same process, so the post lands.
