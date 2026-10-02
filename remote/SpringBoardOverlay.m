@@ -1909,15 +1909,12 @@ int SBoardStartOverlay(void) {
               (unsigned long long)g_sbNameBgShape,
               (unsigned long long)g_sbNameTextShape);
     }
-    (void)persistentPath();
-    (void)ptsBuffer();
-    (void)sb_ensure_setpath_invocation();
     // Publishes only start now, at the end, once the name layers exist. This flag
     // used to be set about a hundred lines earlier, immediately after
     // sb_text_forget, which is what left the boxes on screen for a second before
     // the names could exist: the name layers are created at the two assignments
     // near the [SB-NAME] log further down, and everything between here and there
-    // is r_msg2_main, which settles nine times at 3ms each, so the gap is a
+    // is r_msg2_main, which settles nine times at 3ms each, so the gap is about a
     // second and not the hundred and fifty milliseconds the comments assume.
     //
     // g_sbBuilding is what makes moving this safe. The rearm branch reads
@@ -1927,6 +1924,15 @@ int SBoardStartOverlay(void) {
     // frame but not during this one.
     g_sbOverlayOn = YES;
     g_sbBuilding = 0;
+    // Warm-up, deliberately after the overlay goes live. None of these three are
+    // needed to paint a frame: persistentPath and ptsBuffer are both cached and
+    // would be built by the first publish that needed them, and the geometry
+    // invocation is only reached by sb_invoke_cached_main_raw. Leaving them in
+    // front put about a quarter of a second of settles ahead of the first
+    // painted frame for no gain, since the first publish builds them anyway.
+    (void)persistentPath();
+    (void)ptsBuffer();
+    (void)sb_ensure_setpath_invocation();
     // The cost probe, the colour probe and the lineWidth read-back are all behind
     // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
     // between them they were about a hundred and fifteen remote calls of
