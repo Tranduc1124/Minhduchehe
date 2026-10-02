@@ -1283,7 +1283,24 @@ static int sb_open_session(void) {
         if (remote_call_current_success()) return 0;
         abandon_remote_call();
     }
-    r_settle_us(3000);
+    // 800, not 3000.
+    //
+    // SBoardStartOverlay issues about ninety r_msg2_main calls and each of those
+    // settles around nine times inside r_msg_main_raw, so the three millisecond
+    // sleep was paid roughly seven hundred and sixty five times, which is about
+    // two and a quarter seconds of the overlay sitting there doing nothing. The
+    // comment on the geometry present has been saying for a while that the sleep
+    // is pacing rather than correctness, and the code agrees: every crossing is
+    // serialised behind g_universal_ipc_mutex inside do_remote_call_stable, and
+    // this build path performs with waitUntilDone 1, so the perform is the
+    // barrier and there is nothing for a sleep to provide. The file's own
+    // estimate of ninety to a hundred and fifty milliseconds for this function
+    // counted one settle per call and understated it by seven to fifteen times.
+    //
+    // Not zero. A non-zero value still gives a failing perform somewhere to be
+    // caught, and 800 leaves a few hundred microseconds of margin on a path that
+    // already waits hundreds of milliseconds per timeout.
+    r_settle_us(800);
     // Fl0rk: EXTRA trojan thread only. Never originalThreadOnly on SpringBoard —
     // that parks com.apple.main-thread at FAKE_PC 0x101 between calls → WATCHDOG
     // (seen IPS: main unresponsive, PC=0x101, 60s checkin timeout).
@@ -1482,16 +1499,15 @@ int SBoardStartOverlay(void) {
     // describing itself as 1.5, and setLineWidth: read straight back out of the
     // CALayer as 1.50. So four doubles in one call is not the open question it
     // was three rounds ago.
-    double greenRGBA[4] = { 0.0, 1.0, 0.0, 1.0 };
-    uint64_t greenColor = r_is_objc_ptr(clsCol)
-                        ? r_msg2_main_raw(clsCol, "colorWithRed:green:blue:alpha:",
-                                          &greenRGBA[0], 8, &greenRGBA[1], 8,
-                                          &greenRGBA[2], 8, &greenRGBA[3], 8)
-                        : 0;
-    uint64_t greenCGColor = r_is_objc_ptr(greenColor)
-                          ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
-    if (!r_is_objc_ptr(greenCGColor)) greenCGColor = whiteCGColor;
-
+    //
+    // The green colour that was built here is gone. greenCGColor was only ever
+    // read by the three lines that assigned it, so the UIColor plus its CGColor
+    // was a four double r_msg2_main_raw and a nine settle r_msg2_main paid on
+    // every build for nothing.
+    // The green colour that used to be built here was dead: grep found
+    // greenCGColor only on its own three lines and nowhere after, so a four
+    // double r_msg2_main_raw and a nine settle r_msg2_main were paid on every
+    // build for a value nothing read. About sixty six milliseconds, gone.
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
