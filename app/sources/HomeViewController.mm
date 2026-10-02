@@ -49,6 +49,10 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *boxSwitch;
 @property (nonatomic, strong) UILabel *lineLabel;
 @property (nonatomic, strong) UISwitch *lineSwitch;
+@property (nonatomic, strong) UILabel *nameLabel;
+@property (nonatomic, strong) UISwitch *nameSwitch;
+@property (nonatomic, strong) UILabel *distanceLabel;
+@property (nonatomic, strong) UISwitch *distanceSwitch;
 @property (nonatomic, strong) UILabel *hpLabel;
 @property (nonatomic, strong) UISwitch *hpSwitch;
 @property (nonatomic, strong) UILabel *sbTextLabel;
@@ -488,6 +492,40 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_lineSwitch addTarget:self action:@selector(lineSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [_togglesCard addSubview:_lineSwitch];
 
+    // Name and Distance are the two text parts of the ESP, and until now the only
+    // way to reach them was the menu tab that most people never open. They are
+    // built here exactly like the Box and Line rows above, because the renderer
+    // already gates them the same way: isName and isDis are read in
+    // ESPSyncFromPrefs and are the only thing standing between a pawn and the
+    // name and the distance appended to its label in espdraw.mm. Same key, same
+    // live write, so flipping either here and flipping it there are the same
+    // switch.
+    _nameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _nameLabel.text = @"Tên";
+    _nameLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _nameLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_nameLabel];
+
+    _nameSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _nameSwitch.onTintColor = [self accentGreen];
+    _nameSwitch.on = ESPPrefsBool(@"Name", YES);
+    [_nameSwitch addTarget:self action:@selector(nameSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_nameSwitch];
+
+    // "Distance" is the ESP distance text, not the aimbot throw: AimDistance is
+    // a separate pref and a separate slider, so this switch cannot move the aim.
+    _distanceLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _distanceLabel.text = @"Cự ly";
+    _distanceLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _distanceLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_distanceLabel];
+
+    _distanceSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _distanceSwitch.onTintColor = [self accentGreen];
+    _distanceSwitch.on = ESPPrefsBool(@"Distance", YES);
+    [_distanceSwitch addTarget:self action:@selector(distanceSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_distanceSwitch];
+
     _hpLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _hpLabel.text = @"Thanh máu (HP)";
     _hpLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
@@ -706,10 +744,16 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
-    // Quick toggles card (Aimbot / ESP / CamPC / FOV + slider, Box / Line / HP, counter)
-    // 176 + 3 rows of 40 for the FOV block, 4 rows of 40 for the three shapes,
-    // and one more row of 40 for the counter.
-    CGFloat togglesH = 416.0f;
+    // Quick toggles card (Aimbot / ESP / CamPC + slider / FOV + slider,
+    // Box / Line / Name / Distance / HP, counter)
+    //
+    // Every switch row is on a flat 40pt pitch: the switch sits at the row top
+    // (31 tall) and the label 4pt below it (24 tall), so a switch bottom clears
+    // the next switch top by 9. The card has to cover the last row's switch,
+    // which ends at 469, and this keeps the same 27pt at the bottom that 416 used
+    // to leave when that switch ended at 389. Name and Distance are the reason
+    // 416 is no longer enough: two more rows of 40.
+    CGFloat togglesH = 496.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
     _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
@@ -727,10 +771,14 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _boxSwitch.frame = CGRectMake(cardW - 68, 238, 51, 31);
     _lineLabel.frame = CGRectMake(16, 282, 200, 24);
     _lineSwitch.frame = CGRectMake(cardW - 68, 278, 51, 31);
-    _hpLabel.frame = CGRectMake(16, 322, 200, 24);
-    _hpSwitch.frame = CGRectMake(cardW - 68, 318, 51, 31);
-    _sbTextLabel.frame = CGRectMake(16, 362, 220, 24);
-    _sbTextSwitch.frame = CGRectMake(cardW - 68, 358, 51, 31);
+    _nameLabel.frame = CGRectMake(16, 322, 200, 24);
+    _nameSwitch.frame = CGRectMake(cardW - 68, 318, 51, 31);
+    _distanceLabel.frame = CGRectMake(16, 362, 200, 24);
+    _distanceSwitch.frame = CGRectMake(cardW - 68, 358, 51, 31);
+    _hpLabel.frame = CGRectMake(16, 402, 200, 24);
+    _hpSwitch.frame = CGRectMake(cardW - 68, 398, 51, 31);
+    _sbTextLabel.frame = CGRectMake(16, 442, 220, 24);
+    _sbTextSwitch.frame = CGRectMake(cardW - 68, 438, 51, 31);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -909,6 +957,22 @@ static const CGFloat kMenuButtonSize = 56.0f;
 
 - (void)lineSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"Line", sender.on);
+    ESPSyncFromPrefs();
+}
+
+// Name and Distance. Same shape as the switches above: the key already exists and
+// the renderer already gates on it, so the live write plus the sync is all this
+// needs. Live rather than the throttled setter so the next frame stops appending
+// the name and the distance to the pawn's text label instead of waiting out the
+// reader's poll. The writer is one NSUserDefaults key, which is what the live
+// setter exists for.
+- (void)nameSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Name", sender.on);
+    ESPSyncFromPrefs();
+}
+
+- (void)distanceSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Distance", sender.on);
     ESPSyncFromPrefs();
 }
 

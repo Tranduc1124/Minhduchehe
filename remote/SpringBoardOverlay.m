@@ -1830,7 +1830,11 @@ int SBoardStartOverlay(void) {
     // to read white text on and light enough to be a plate rather than a hole.
     uint64_t cLayer2 = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer2)) {
-        double nc[4] = { 0.42, 0.42, 0.42, 0.55 };
+        // Darker and more opaque than the first pass. 0.42 grey at 0.55 alpha
+        // read as a translucent haze over the game, which is not what a plate is
+        // for: it is the solid ground the letters sit on. 0.16 at 0.82 is still
+        // grey rather than black, so it does not punch a hole in the scene.
+        double nc[4] = { 0.16, 0.16, 0.16, 0.82 };
         uint64_t nCol = r_msg2_main_raw(r_class("UIColor"),
                                         "colorWithRed:green:blue:alpha:",
                                         &nc[0], 8, &nc[1], 8, &nc[2], 8, &nc[3], 8);
@@ -2915,6 +2919,35 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                     g_sbNameTextPath = eTx;
                 }
             }
+            // The name plate and the name glyphs, handed over here rather than
+            // beside the counter below.
+            //
+            // They were inside the counter's if (textPathReady ...), which is a
+            // copy and paste mistake: the counter's own condition has nothing to
+            // do with names. With SbCountText off, textPathReady stayed 0, the
+            // whole block was skipped, and the plate and the glyphs were decoded
+            // correctly and then never given to their layers. Switching the
+            // counter off would have turned the names off with it.
+            //
+            // Four crossings, no sleep, same as the counter. The paths are handed
+            // over and kept, so the marker block above releases the previous one
+            // instead of leaking it.
+            if (nameBgReady && r_is_objc_ptr(rpNameBg) && r_is_objc_ptr(g_sbNameBgShape)) {
+                if (!sb_invoke_name_cached(0, g_sbNameBgShape, rpNameBg)) {
+                    r_msg2_main(g_sbNameBgShape, "setPath:", rpNameBg, 0,0,0);
+                }
+                calls++;
+                g_sbNameBgPath = rpNameBg;
+                s_sbNameBgLive = 1;
+            }
+            if (nameTextReady && r_is_objc_ptr(rpNameText) && r_is_objc_ptr(g_sbNameTextShape)) {
+                if (!sb_invoke_name_cached(1, g_sbNameTextShape, rpNameText)) {
+                    r_msg2_main(g_sbNameTextShape, "setPath:", rpNameText, 0,0,0);
+                }
+                calls++;
+                g_sbNameTextPath = rpNameText;
+                s_sbNameTextLive = 1;
+            }
             if (textPathReady && r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
                 // Two crossings instead of thirteen, and none of them sleep.
                 // This was the single largest cost in a publish: r_msg2_main
@@ -2927,27 +2960,6 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
                 s_sbTextLive = 1;
-                // The name plate and the name glyphs. Four crossings, no sleep,
-                // the same as the counter gets. The paths are handed over and
-                // kept, so the marker block above releases the previous one
-                // instead of leaking it, and the layer and this pointer never
-                // disagree about who owns what.
-                if (nameBgReady && r_is_objc_ptr(rpNameBg) && r_is_objc_ptr(g_sbNameBgShape)) {
-                    if (!sb_invoke_name_cached(0, g_sbNameBgShape, rpNameBg)) {
-                        r_msg2_main(g_sbNameBgShape, "setPath:", rpNameBg, 0,0,0);
-                    }
-                    calls++;
-                    g_sbNameBgPath = rpNameBg;
-                    s_sbNameBgLive = 1;
-                }
-                if (nameTextReady && r_is_objc_ptr(rpNameText) && r_is_objc_ptr(g_sbNameTextShape)) {
-                    if (!sb_invoke_name_cached(1, g_sbNameTextShape, rpNameText)) {
-                        r_msg2_main(g_sbNameTextShape, "setPath:", rpNameText, 0,0,0);
-                    }
-                    calls++;
-                    g_sbNameTextPath = rpNameText;
-                    s_sbNameTextLive = 1;
-                }
                 // What actually went on the text layer. The FOV ring came out as a
                 // solid red disc, which is what a filled closed circle looks like,
                 // so either a geometry run reached this path or the glyphs did. The

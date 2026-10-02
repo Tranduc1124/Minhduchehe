@@ -465,7 +465,14 @@ static void ESPRenderPawnCore(
     }
 
     if (plateName || plateDis) {
-        const CGFloat lineH = dynFontSize + 4.0f;
+        // The name and the distance are set a little under the ESP's own type
+        // size. dynFontSize also sizes the health bar and the box, so changing
+        // it there would move everything for a request that was only about the
+        // text. 0.86 is small enough to read as secondary and large enough to
+        // stay legible at the far end where dynFontSize is already at its 4.5
+        // floor and the whole tag is three characters.
+        const CGFloat nameSize = dynFontSize * 0.86f;
+        const CGFloat lineH = nameSize + 4.0f;
 
         // The plate covers the NAME only. The distance is not on it and does not
         // have a background at all, because the distance belongs under the feet
@@ -490,7 +497,7 @@ static void ESPRenderPawnCore(
         // string out first and the plate has to exist before the glyphs go in.
         // 0.62em per character plus a four point gutter either side, never below
         // boxWidth, so the health-scaling rule still holds.
-        const CGFloat charsW = (CGFloat)plateName.length * dynFontSize * 0.62f + 8.0f;
+        const CGFloat charsW = (CGFloat)plateName.length * nameSize * 0.62f + 8.0f;
         const CGFloat plateW = (boxWidth > charsW) ? boxWidth : charsW;
         const CGRect plate = CGRectMake(x - (plateW - boxWidth) * 0.5f,
                                         plateBottom - plateH, plateW, plateH);
@@ -515,13 +522,13 @@ static void ESPRenderPawnCore(
         if (plateName) {
             ESPAppendTextPath(buffers->nameTextPath, plateName,
                               CGRectMake(plate.origin.x, plate.origin.y,
-                                         plate.size.width, lineH), dynFontSize);
+                                         plate.size.width, lineH), nameSize);
         }
         if (plateDis) {
-            const CGFloat disW = (CGFloat)plateDis.length * dynFontSize * 0.62f + 8.0f;
+            const CGFloat disW = (CGFloat)plateDis.length * nameSize * 0.62f + 8.0f;
             ESPAppendTextPath(buffers->nameTextPath, plateDis,
                               CGRectMake(centerX - disW * 0.5f, y + boxHeight + 2.0f,
-                                         disW, lineH), dynFontSize);
+                                         disW, lineH), nameSize);
         }
         buffers->nameTextDirty = true;
     }
