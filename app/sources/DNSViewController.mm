@@ -103,7 +103,6 @@ static UIView *MDDNSHairline(void) {
     UIView *errorRow = MDDNSRow(@"Error", &errorLabel);
     _errorRow = errorRow;
     _errorValue = errorLabel;
-    _errorValue.textColor = MDThemeRed();
 
     UILabel *note = MDDNSNote(@"Selected reflects the iOS DNS preference; it does not "
                              @"confirm routing for every connection.", UIFontWeightRegular);
@@ -193,6 +192,12 @@ static UIView *MDDNSHairline(void) {
     if (why.length) {
         _errorRow.hidden = NO;
         _errorValue.text = why;
+        // Not a red failure. "no profile store yet" is the state before the
+        // exploit has escaped the sandbox, and the directory being absent on
+        // an install that never held profiles is not a problem either. Red
+        // reserved itself for a directory that exists but cannot be read.
+        _errorValue.textColor = ([why rangeOfString:@"cannot read"].location != NSNotFound)
+            ? MDThemeRed() : MDThemeMuted();
     } else {
         _errorRow.hidden = YES;
         _errorValue.text = @"none";
