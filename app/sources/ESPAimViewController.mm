@@ -151,8 +151,12 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 // Reusing one shared UISegmentedControl across reloads leaves UIKit holding a
 // view it has already been asked to lay out again, and the toggle underneath
 // stays on screen because nothing hid it.
+//
+// The items are set per row in cellForRowAtIndexPath, so one class covers Aim
+// Range, Aim Mode, Aim Position, Target and Trigger.
 @interface MDSegmentCell : UITableViewCell
 @property (nonatomic, strong) UISegmentedControl *segment;
+- (void)applyTitle:(NSString *)title items:(NSArray<NSString *> *)items selected:(NSInteger)selected;
 @end
 
 @implementation MDSegmentCell
@@ -165,18 +169,43 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
     self.textLabel.textColor = MDThemeText();
 
-    _segment = [[UISegmentedControl alloc] initWithItems:@[ @"Aimbot", @"Aim Silent" ]];
+    _segment = [[UISegmentedControl alloc] initWithItems:@[ @"A", @"B" ]];
     _segment.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_segment];
 
     [NSLayoutConstraint activateConstraints:@[
         [_segment.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
         [_segment.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
-        [_segment.widthAnchor constraintEqualToConstant:180.0f],
+        // Four-option rows (Trigger) do not fit 180pt at 17pt titles, so the
+        // control is allowed to shrink and the label gives way instead.
+        [_segment.widthAnchor constraintLessThanOrEqualToConstant:230.0f],
         [_segment.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
                                                            .leadingAnchor constant:8.0f],
     ]];
     return self;
+}
+
+- (void)applyTitle:(NSString *)title items:(NSArray<NSString *> *)items selected:(NSInteger)selected {
+    self.textLabel.text = title;
+    _segment.selectedSegmentIndex = selected;
+    // Rebuild only when the item count or the labels changed, otherwise every
+    // reload would throw away the selection the user just made.
+    if (_segment.numberOfSegments != (NSInteger)items.count) {
+        [_segment removeAllSegments];
+        for (NSString *item in items) [_segment insertSegmentWithTitle:item atIndex:_segment.numberOfSegments animated:NO];
+    }
+    for (NSUInteger i = 0; i < items.count && i < (NSUInteger)_segment.numberOfSegments; i++) {
+        [_segment setTitle:items[i] forSegmentAtIndex:i];
+    }
+    // Fewer options get a narrower control rather than three stretched labels.
+    CGFloat target = items.count >= 4 ? 230.0f : items.count == 3 ? 190.0f : 140.0f;
+    for (NSLayoutConstraint *c in _segment.constraints) {
+        if (c.firstAttribute == NSLayoutAttributeWidth && c.relation == NSLayoutRelationLessThanOrEqual) {
+            c.constant = target;
+        }
+    }
+    [_segment setTitleTextAttributes:@{ NSFontAttributeName: MDThemeFont(13.0f, UIFontWeightMedium) }
+                           forState:UIControlStateNormal];
 }
 
 @end
@@ -215,34 +244,59 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 - (NSArray<NSArray *> *)rowsInSection:(NSInteger)section {
     switch (section) {
         case ESPSectionScreen:
-            return @[ @[ @"Hide Screenshot/Recording", @"StreamerMode", @NO ] ];
+            return @[ @[ @"s", @"Hide Screenshot/Recording", @"StreamerMode", @NO ] ];
         case ESPSectionDraw:
             // SbCountText used to have a row of its own, directly under this
             // one. Both drive the same counter and read as the same control, so
             // the mirror is left to the in-game menu and the ESP tab carries a
             // single switch.
             return @[
-                @[ @"Enable ESP",   @"EnableESP", @NO ],
-                @[ @"Line",         @"Line",      @NO ],
-                @[ @"Box",          @"Box",       @YES ],
-                @[ @"Bone",         @"Bone",      @NO ],
-                @[ @"Health",       @"Health",    @YES ],
-                @[ @"Name",         @"Name",      @YES ],
-                @[ @"Distance",     @"Distance",  @YES ],
-                @[ @"Player Count", @"Count",     @YES ],
+                @[ @"s", @"Enable ESP",   @"EnableESP", @NO ],
+                @[ @"s", @"Line",         @"Line",      @NO ],
+                @[ @"s", @"Box",          @"Box",       @YES ],
+                @[ @"s", @"Bone",         @"Bone",      @NO ],
+                @[ @"s", @"Health",       @"Health",    @YES ],
+                @[ @"s", @"Name",         @"Name",      @YES ],
+                @[ @"s", @"Distance",     @"Distance",  @YES ],
+                @[ @"s", @"Player Count", @"Count",     @YES ],
             ];
         case ESPSectionView:
             return @[
-                @[ @"FOV Circle",  @"ShowFovCircle", @YES ],
-                @[ @"FOV Size",    @"FovSize",       @(120.0f) ],
-                @[ @"Camera Xa",   @"CamPC",         @NO ],
-                @[ @"Camera Dist", @"CamPCValue",    @(30.0f) ],
+                @[ @"s", @"FOV Circle",  @"ShowFovCircle", @YES ],
+                @[ @"l", @"FOV Size",    @"FovSize",       @(10.0f), @(190.0f), @(120.0f) ],
+                @[ @"s", @"Camera Xa",   @"CamPC",         @NO ],
+                @[ @"l", @"Camera Dist", @"CamPCValue",    @(0.0f),  @(150.0f), @(30.0f) ],
             ];
         case ESPSectionAim:
+            // Everything here already exists in esp.mm. None of it is new
+            // behaviour: every row writes a pref that the renderer and the aim
+            // loop already read, which is why this is a UI change and not a
+            // port.
+            //
+            // AimSphereMode and AimBehindWall used to be reachable only from the
+            // in-game menu, so 180/360 and wall aim were invisible from the app.
+            // AimRange is the segmented control for the former; Behind Wall is a
+            // switch for the latter and goes through the live setter so the
+            // renderer drops its sticky lock on the same turn.
             return @[
-                @[ @"Enable Aim", @"AimMaster", @NO ],
-                @[ @"Aim Type",   @"AimTypeMode", @(0.0f) ],
-                @[ @"Enable Aim Assist (Head)", @"AimAssist", @NO ],
+                @[ @"s", @"Enable Aim",       @"AimMaster",    @NO ],
+                @[ @"g", @"Aim Range",        @"AimSphereMode", @(0.0f),
+                   @[ @"FOV", @"180°", @"360°" ] ],
+                @[ @"s", @"Aim Behind Wall",  @"AimBehindWall", @NO ],
+                @[ @"g", @"Aim Mode",         @"AimMode",       @(1.0f),
+                   @[ @"Safe (PC)", @"Normal", @"Rage" ] ],
+                @[ @"g", @"Aim Type",         @"AimTypeMode",   @(0.0f),
+                   @[ @"Aimbot", @"Aim Silent" ] ],
+                @[ @"s", @"Aim Silent",       @"AimSilent",     @NO ],
+                @[ @"g", @"Aim Position",     @"AimPos",        @(0.0f),
+                   @[ @"Head", @"Neck", @"Chest" ] ],
+                @[ @"g", @"Target",           @"AimTargetMode", @(0.0f),
+                   @[ @"Crosshair", @"Low HP", @"Closest" ] ],
+                @[ @"g", @"Trigger",          @"TriggerMode",   @(0.0f),
+                   @[ @"Auto", @"Fire", @"Scope", @"Both" ] ],
+                @[ @"s", @"Aim Assist (Head)", @"AimAssist",    @NO ],
+                @[ @"l", @"Aim Distance",     @"AimDistance",   @(1.0f), @(400.0f), @(200.0f) ],
+                @[ @"l", @"Aim Speed",        @"AimSpeed",      @(1.0f),  @(100.0f), @(100.0f) ],
             ];
     }
     return @[];
@@ -298,28 +352,33 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     return UITableViewAutomaticDimension;
 }
 
+// Row shape is driven by the leading element: "s" switch, "g" segmented
+// control, "l" slider. One table describes all three kinds, so adding a row is
+// a line rather than a new branch in three places.
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSArray *row = [self rowAtIndexPath:indexPath];
-    NSString *key = row[1];
-    if ([key isEqualToString:@"FovSize"] || [key isEqualToString:@"CamPCValue"]) return 76.0f;
-    if ([key isEqualToString:@"AimTypeMode"]) return 58.0f;
+    NSString *kind = [self rowAtIndexPath:indexPath][0];
+    if ([kind isEqualToString:@"l"]) return 76.0f;
+    if ([kind isEqualToString:@"g"]) return 58.0f;
     return 52.0f;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView
          cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSArray *row = [self rowAtIndexPath:indexPath];
-    NSString *title = row[0];
-    NSString *key = row[1];
+    NSString *kind = row[0];
+    NSString *title = row[1];
+    NSString *key = row[2];
+    __weak __typeof(self) weakSelf = self;
 
-    if ([key isEqualToString:@"FovSize"] || [key isEqualToString:@"CamPCValue"]) {
+    if ([kind isEqualToString:@"l"]) {
         MDSliderCell *cell = [tableView dequeueReusableCellWithIdentifier:@"slider"
                                                             forIndexPath:indexPath];
-        BOOL isFov = [key isEqualToString:@"FovSize"];
+        float min = [row[3] floatValue];
+        float max = [row[4] floatValue];
         cell.nameLabel.text = title;
-        cell.slider.minimumValue = isFov ? 10.0f : 0.0f;
-        cell.slider.maximumValue = isFov ? 190.0f : 150.0f;
-        cell.slider.value = ESPPrefsFloat(key, [row[2] floatValue]);
+        cell.slider.minimumValue = min;
+        cell.slider.maximumValue = max;
+        cell.slider.value = ESPPrefsFloat(key, [row[5] floatValue]);
         cell.valueLabel.text = [NSString stringWithFormat:@"%.0f", cell.slider.value];
 
         __weak MDSliderCell *weakCell = cell;
@@ -338,24 +397,28 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         return cell;
     }
 
-    if ([key isEqualToString:@"AimTypeMode"]) {
+    if ([kind isEqualToString:@"g"]) {
+        NSArray<NSString *> *items = row[3];
+        int sel = (int)ESPPrefsFloat(key, [row[4] floatValue]);
+        if (sel < 0) sel = 0;
+        if (sel >= (int)items.count) sel = (int)items.count - 1;
+
         MDSegmentCell *cell = [tableView dequeueReusableCellWithIdentifier:@"segment"
                                                              forIndexPath:indexPath];
-        cell.textLabel.text = title;
-        cell.segment.selectedSegmentIndex = (NSInteger)ESPPrefsFloat(key, 0.0f);
+        [cell applyTitle:title items:items selected:sel];
+        // One action for every segmented row; the pref key rides on the
+        // control so nothing has to look the row up again.
+        cell.segment.accessibilityIdentifier = key;
         [cell.segment removeTarget:self action:NULL forControlEvents:UIControlEventValueChanged];
         [cell.segment addTarget:self
-                         action:@selector(aimTypeChanged:)
+                         action:@selector(segmentChanged:)
                forControlEvents:UIControlEventValueChanged];
         return cell;
     }
 
     MDToggleCell *cell = [tableView dequeueReusableCellWithIdentifier:@"toggle"
                                                         forIndexPath:indexPath];
-    BOOL def = [row[2] boolValue];
-    [cell applyTitle:title key:key on:ESPPrefsBool(key, def)];
-
-    __weak __typeof(self) weakSelf = self;
+    [cell applyTitle:title key:key on:ESPPrefsBool(key, [row[3] boolValue])];
     cell.onToggle = ^(BOOL isOn) {
         [weakSelf toggleChangedForKey:key isOn:isOn];
     };
@@ -370,7 +433,14 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     if (key.length == 0) return;
 
     ESPPrefsSetBoolLive(key, isOn);
-    ESPSyncFromPrefs();
+
+    // Behind Wall has a live setter as well as the pref. esp.mm's
+    // ESPSetAimBehindWallLive drops the sticky aim lock on the same call, and
+    // writing only the pref would leave the renderer still locked on a target
+    // it should have let go of.
+    if ([key isEqualToString:@"AimBehindWall"]) {
+        ESPSetAimBehindWallLive(isOn);
+    }
 
     // Enable Aim is the master: on arms the selected type, off kills every
     // camera aim mode. Same rule the in-game menu applies, kept here so the
@@ -380,31 +450,56 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         if (type < 0) type = 0;
         if (type > 1) type = 1;
         ESPPrefsSetBool(@"Aimbot", isOn && type == 0);
-        ESPPrefsSetBool(@"AimSilent", isOn && type == 1);
         ESPPrefsSetBool(@"AimAssist", NO);
+        // Only the camera modes reset. The range and wall switches stand on
+        // their own, so a user who set 360 does not lose it every time they
+        // flick the master.
         ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
         ESPPrefsSync();
         ESPSyncFromPrefs();
-        // The segment shows the type, so it has to come back into step when
-        // the master kills the type.
-        [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:1 inSection:ESPSectionAim] ]
-                              withRowAnimation:UITableViewRowAnimationNone];
+        [self.tableView reloadRowsAtIndexPaths:@[
+            [NSIndexPath indexPathForRow:1 inSection:ESPSectionAim],
+            [NSIndexPath indexPathForRow:2 inSection:ESPSectionAim],
+        ] withRowAnimation:UITableViewRowAnimationNone];
+        return;
     }
+
+    ESPSyncFromPrefs();
 }
 
-- (void)aimTypeChanged:(UISegmentedControl *)sender {
+// Every segmented row lands here. Only two of them need a side effect; the
+// rest are a straight pref write, and treating them all the same is what keeps
+// a new row from needing its own handler.
+- (void)segmentChanged:(UISegmentedControl *)sender {
+    NSString *key = sender.accessibilityIdentifier;
+    if (key.length == 0) return;
+
     int idx = (int)sender.selectedSegmentIndex;
-    ESPPrefsSetFloat(@"AimTypeMode", (float)idx);
-    ESPPrefsSetBool(@"AimMaster", YES);
-    ESPPrefsSetBool(@"Aimbot", idx == 0);
-    ESPPrefsSetBool(@"AimSilent", idx == 1);
-    ESPPrefsSetBool(@"AimAssist", NO);
+    ESPPrefsSetFloat(key, (float)idx);
+
+    if ([key isEqualToString:@"AimTypeMode"]) {
+        ESPPrefsSetBool(@"AimMaster", YES);
+        ESPPrefsSetBool(@"Aimbot", idx == 0);
+        ESPPrefsSetBool(@"AimSilent", idx == 1);
+        ESPPrefsSetBool(@"AimAssist", NO);
+        // Legacy mirror the in-game menu still reads.
+        if (idx == 2) ESPPrefsSetBool(@"Aim360", YES); else ESPPrefsSetBool(@"Aim360", NO);
+    } else if ([key isEqualToString:@"AimPos"]) {
+        // MenuView listens for this to relabel its floating HEAD/NECK/BODY
+        // button, and that menu lives in this same process, so the post lands.
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"AimPosChangedNotification" object:nil];
+    } else if ([key isEqualToString:@"AimSphereMode"]) {
+        ESPPrefsSetBool(@"Aim360", idx == 2);
+    }
+
     ESPPrefsSync();
     ESPSyncFromPrefs();
-    // The master switch in this same section has to follow, and the view no
-    // longer reloads itself on appear if the user never taps it.
-    [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:0 inSection:ESPSectionAim] ]
-                          withRowAnimation:UITableViewRowAnimationNone];
+
+    if ([key isEqualToString:@"AimTypeMode"]) {
+        [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:0 inSection:ESPSectionAim] ]
+                              withRowAnimation:UITableViewRowAnimationNone];
+    }
 }
 
 @end
