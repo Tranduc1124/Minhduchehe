@@ -1776,6 +1776,44 @@ int SBoardStartOverlay(void) {
         if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
     }
 
+
+    r_msg2_main(win, "setHidden:", 0, 0,0,0);
+
+    uint64_t key = r_sel("fl0rkffESPMenuWindow");
+    if (r_is_objc_ptr(key)) {
+        dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
+    }
+
+    pthread_mutex_lock(&g_sbLock);
+    g_sbWin = win;
+    g_sbShape = shape;
+    g_sbCanvas = container;
+    // A new session means every text slot and the alignment string are dangling.
+    // Dropped here as well as in the teardown, because a rearm builds a fresh
+    // window while the old pointers are still live in these globals.
+    sb_text_forget();
+    g_sbOverlayOn = YES;
+    g_sbEverOn = 1;
+    g_sbConsecFail = 0;
+    // Arm the recovery clock here rather than waiting for a publish that may
+    // never come, so a session that starts already broken still recovers.
+    g_sbLastPublishUS = now_us();
+    g_sbRearmAfterUS = 0;
+    pthread_mutex_unlock(&g_sbLock);
+
+    sb_forget_local_paint_state();
+
+    // The name layers are built after sb_forget_local_paint_state, not before.
+    // That call zeroes every one of the handles this block assigns, and when the
+    // block ran first the two layer pointers were dead again the moment the
+    // function returned. The decoder then failed both of its
+    // r_is_objc_ptr(g_sbNameBgShape) guards, left rpNameBg and rpNameText at 0,
+    // and sent the plate and the glyphs into rp, which is stroked white at 0.75.
+    // That is all three of the reported symptoms at once: a white outline, no
+    // grey plate, and letters that are outlines with nothing in them.
+    //
+    // g_sbTextShape is deliberately absent from that call's list, which is why
+    // the counter kept working and made the asymmetry hard to see.
     // The two name layers: a dark plate behind, white glyphs in front.
     //
     // Both are filled, which is what a name has to be, and a filled layer is the
@@ -1847,32 +1885,6 @@ int SBoardStartOverlay(void) {
               (unsigned long long)g_sbNameBgShape,
               (unsigned long long)g_sbNameTextShape);
     }
-
-    r_msg2_main(win, "setHidden:", 0, 0,0,0);
-
-    uint64_t key = r_sel("fl0rkffESPMenuWindow");
-    if (r_is_objc_ptr(key)) {
-        dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
-    }
-
-    pthread_mutex_lock(&g_sbLock);
-    g_sbWin = win;
-    g_sbShape = shape;
-    g_sbCanvas = container;
-    // A new session means every text slot and the alignment string are dangling.
-    // Dropped here as well as in the teardown, because a rearm builds a fresh
-    // window while the old pointers are still live in these globals.
-    sb_text_forget();
-    g_sbOverlayOn = YES;
-    g_sbEverOn = 1;
-    g_sbConsecFail = 0;
-    // Arm the recovery clock here rather than waiting for a publish that may
-    // never come, so a session that starts already broken still recovers.
-    g_sbLastPublishUS = now_us();
-    g_sbRearmAfterUS = 0;
-    pthread_mutex_unlock(&g_sbLock);
-
-    sb_forget_local_paint_state();
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
