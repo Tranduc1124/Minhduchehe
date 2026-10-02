@@ -73,14 +73,25 @@ void RequestExitHUD(void)
     exit(0);
 }
 
+BOOL ESPRealSessionRunning(void)
+{
+    // Only the three signals that report something that is actually running.
+    // No pref: a pref survives the process that wrote it, so it describes the
+    // last launch rather than this one.
+    return ESPHostIsRunning() || SBoardOverlayIsOn() || IsHUDEnabled();
+}
+
 BOOL IsESPSessionRunning(void)
 {
-    if (ESPHostIsRunning()) return YES;
-    if (SBoardOverlayIsOn()) return YES;
-    if (IsHUDEnabled()) return YES;
-    // Last, because it is the only signal that can be stale: it records what
-    // the user last asked for, not what is running. It is what makes the row
-    // turn into a stop button the moment it is tapped rather than a poll later.
+    if (ESPRealSessionRunning()) return YES;
+    // The pref is a deliberate optimistic flag so the row turns into a stop
+    // button the instant it is tapped instead of waiting for a poll. It is
+    // also the one thing here that can be left over from a previous launch,
+    // which is why MainApplicationDelegate clears it at start when nothing is
+    // running, and why StopESPSession clears it too. Reading it without that
+    // pair made the Game tab show "Active" after a kernel-only boot, so the
+    // first tap killed a session that did not exist and the second one started
+    // the real one.
     return ESPPrefsBool(@"App_LocalHUDState", NO);
 }
 
@@ -93,4 +104,9 @@ void StopESPSession(void)
     StopESPHost();
     SBoardStopOverlay();
     SetHUDEnabled(NO);
+    // The optimistic flag, cleared with the real session. Left set, it made the
+    // next launch open on a Stop button for a session that had ended a
+    // hundred launches earlier.
+    ESPPrefsSetBool(@"App_LocalHUDState", NO);
+    ESPPrefsSync();
 }

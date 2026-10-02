@@ -147,20 +147,18 @@ static UIView *MDDNSHairline(void) {
     // the difference between "a profile is installed" and "these domains now
     // resolve and those do not".
     UILabel *effect = MDDNSNote([NSString stringWithFormat:
-                                 @"FF Fix Ban ID (DNS iOS) sends %@ to Cloudflare over "
-                                 @"DoH and points %lu other domain(s) at an address "
-                                 @"that does not exist, so they do not resolve.",
-                                 [MDDNSServerList().firstObject ?: @"its resolver"
-                                     stringByReplacingOccurrencesOfString:@"https://"
-                                                                   withString:@""],
+                                 @"FF Fix Ban ID (DNS iOS) points %lu Free Fire domain(s) "
+                                 @"at an address that does not exist, so they stop "
+                                 @"resolving. Everything else, including login, keeps "
+                                 @"using the normal DNS.",
                                  (unsigned long)MDDNSBlockedDomainCount()],
                                 UIFontWeightRegular);
     effect.textAlignment = NSTextAlignmentCenter;
 
-    UILabel *footnote = MDDNSNote(@"After installation, open iOS Settings > General > "
-                                  @"VPN & Device Management > FF Fix Ban ID (DNS iOS) "
-                                  @"and switch it on. iOS does not let this app open "
-                                  @"that page for you.",
+    UILabel *footnote = MDDNSNote(@"Then open iOS Settings > General > VPN & Device "
+                                  @"Management > DNS and switch MINHDUC DNS - Block on. "
+                                  @"Only one DNS entry can be active at a time, so any "
+                                  @"other DNS profile has to be off.",
                                   UIFontWeightRegular);
     footnote.textAlignment = NSTextAlignmentCenter;
 
@@ -231,14 +229,11 @@ static UIView *MDDNSHairline(void) {
         [self.installButton setTitle:@"Install DNS" forState:UIControlStateNormal];
 
         switch (outcome) {
-            case MDDNSInstallOutcomeInstalled:
-                self.outcome.text = @"Installed. Switch it on in iOS Settings.";
-                break;
             case MDDNSInstallOutcomeHandedOff:
                 self.outcome.text = @"iOS is asking to install it — tap Install.";
                 break;
             case MDDNSInstallOutcomeFailed:
-                self.outcome.text = @"Could not install. The Log tab has why.";
+                self.outcome.text = @"iOS would not take the profile.";
                 break;
         }
         [self reload];

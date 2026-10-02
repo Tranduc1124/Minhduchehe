@@ -171,16 +171,25 @@
     title.font = MDThemeFont(17.0f, UIFontWeightRegular);
     title.textColor = MDThemeText();
     title.numberOfLines = 1;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.contentView addSubview:title];
     _titleLabel = title;
 
     _valueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _valueLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
     _valueLabel.textColor = MDThemeMuted();
     _valueLabel.numberOfLines = 1;
-    _valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.contentView addSubview:_valueLabel];
+
+    // A stack, so the order is the insertion order and the pair is centred as
+    // one block. Hand-written anchors got this wrong twice: once the labels
+    // were nudged by hand in layoutSubviews, which UITableViewCell undoes, and
+    // then title.top = value.bottom + 2, which is not "title above value" at
+    // all. In the screenshot the value came out above the title and the title
+    // was clipped by the bottom edge. A stack removes the arithmetic.
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, _valueLabel ]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 1.0f;
+    stack.alignment = UIStackViewAlignmentLeading;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:stack];
 
     _stepper = [[UIStepper alloc] initWithFrame:CGRectZero];
     _stepper.translatesAutoresizingMaskIntoConstraints = NO;
@@ -193,20 +202,9 @@
         [_stepper.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
         [_stepper.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
 
-        // The stack is centred as a unit, so the pair stays balanced whichever
-        // of the two lines is taller.
-        [_titleLabel.topAnchor constraintGreaterThanOrEqualToAnchor:self.contentView.topAnchor constant:8.0f],
-        [_titleLabel.bottomAnchor constraintLessThanOrEqualToAnchor:self.contentView.bottomAnchor constant:-8.0f],
-        [_titleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16.0f],
-        [_titleLabel.topAnchor constraintEqualToAnchor:_valueLabel.bottomAnchor constant:2.0f],
-        [_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor
-                                                            constant:-12.0f],
-        [_valueLabel.leadingAnchor constraintEqualToAnchor:_titleLabel.leadingAnchor],
-        [_valueLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor
-                                                            constant:-12.0f],
-        [_valueLabel.bottomAnchor constraintLessThanOrEqualToAnchor:self.contentView.bottomAnchor
-                                                           constant:-8.0f],
-        [_valueLabel.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor constant:9.0f],
+        [stack.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16.0f],
+        [stack.trailingAnchor constraintLessThanOrEqualToAnchor:_stepper.leadingAnchor constant:-12.0f],
+        [stack.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
     ]];
     return self;
 }
@@ -419,10 +417,75 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     return [self rowsInSection:indexPath.section][indexPath.row];
 }
 
+// Rows that only mean something with Aimbot on.
+//
+// esp.mm reads aimSphereMode as "isAimbot ? mode : 0" and picks the radius
+// differently per pipeline: Aimbot tests the FOV square, Aim Assist solo tests
+// assistRadiusSq and never looks at aimFov. So with Aim Type on Aim Assist the
+// FOV circle, its size and the FOV/180/360 sphere describe a value the engine
+// is not using, and a slider that looks adjustable but does nothing is worse
+// than one that is visibly not applicable.
+// Rows that only mean something with Aimbot on.
+//
+// esp.mm reads aimSphereMode as "isAimbot ? mode : 0" and picks the radius
+// differently per pipeline: Aimbot tests the FOV square, Aim Assist solo tests
+// assistRadiusSq and never looks at aimFov. So with Aim Type on Aim Assist the
+// FOV circle, its size and the FOV/180/360 sphere describe a value the engine
+// is not using at all.
+- (BOOL)rowNeedsAimbot:(NSArray *)row {
+    NSString *key = row[2];
+    return [key isEqualToString:@"ShowFovCircle"]
+        || [key isEqualToString:@"FovSize"]
+        || [key isEqualToString:@"AimSphereMode"];
+}
+
+- (BOOL)aimTypeIsAimbot {
+    return (int)ESPPrefsFloat(@"AimTypeMode", 0.0f) == 0;
+}
+
+// Reload the whole AIM section rather than named rows. The section's row count
+// now depends on Aim Type, so any index computed before the change is wrong
+// after it, and reloadRowsAtIndexPaths with a stale index is how that turns
+// into a crash rather than a redraw.
+- (void)reloadAimSection {
+    NSMutableIndexSet *sections = [NSMutableIndexSet indexSet];
+    [sections addIndex:ESPSectionAim];
+    [self.tableView reloadSections:sections
+                  withRowAnimation:UITableViewRowAnimationNone];
+}
+
+// Rows gone entirely, not greyed. A disabled control still reads as a setting
+// that could be on, and the user asked for these to be off rather than dimmed:
+// FOV is a hard LookAt radius for Aimbot and does not exist on the Aim Assist
+// path, so leaving a dead switch on screen only invites setting it.
+- (NSInteger)visibleRowCountInSection:(NSInteger)section {
+    NSArray<NSArray *> *rows = [self rowsInSection:section];
+    BOOL aimbot = [self aimTypeIsAimbot];
+    NSInteger count = 0;
+    for (NSArray *row in rows) {
+        if (!aimbot && [self rowNeedsAimbot:row]) continue;
+        ++count;
+    }
+    return count;
+}
+
+// Maps a visible row back to its index in the full table.
+- (NSArray *)rowAtVisibleIndexPath:(NSIndexPath *)indexPath {
+    NSArray<NSArray *> *rows = [self rowsInSection:indexPath.section];
+    BOOL aimbot = [self aimTypeIsAimbot];
+    NSInteger visible = (NSInteger)indexPath.row;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        if (!aimbot && [self rowNeedsAimbot:rows[i]]) continue;
+        if (visible == 0) return rows[i];
+        --visible;
+    }
+    return nil;
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return ESPSectionCount; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (NSInteger)[self rowsInSection:section].count;
+    return [self visibleRowCountInSection:section];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -503,6 +566,11 @@ static float ESPRowClamp(float v, float lo, float hi) {
     NSString *key = row[2];
     __weak __typeof(self) weakSelf = self;
 
+    // Aimbot-only rows go dead when Aim Type is Aim Assist. Applied before the
+    // kind branches so it covers every control shape, and reapplied after as
+    // well because each branch sets its own tint.
+
+
     if ([kind isEqualToString:@"n"]) {
         float lo = [row[3] floatValue];
         float hi = [row[4] floatValue];
@@ -515,6 +583,8 @@ static float ESPRowClamp(float v, float lo, float hi) {
                     min:(NSInteger)lroundf(lo)
                     max:(NSInteger)lroundf(hi)];
         cell.stepper.accessibilityIdentifier = key;
+        // removed with the row
+
         return cell;
     }
 
@@ -542,6 +612,8 @@ static float ESPRowClamp(float v, float lo, float hi) {
             ESPPrefsSync();
             ESPSyncFromPrefs();
         };
+        // removed with the row
+
         return cell;
     }
 
@@ -558,6 +630,8 @@ static float ESPRowClamp(float v, float lo, float hi) {
                                                                  forIndexPath:indexPath];
             [cell applyTitle:title items:@[ @"-" ] selected:0];
             cell.segment.enabled = NO;
+
+            cell.userInteractionEnabled = NO;
             return cell;
         }
         if (sel < 0) sel = 0;
@@ -573,6 +647,9 @@ static float ESPRowClamp(float v, float lo, float hi) {
         [cell.segment addTarget:self
                          action:@selector(segmentChanged:)
                forControlEvents:UIControlEventValueChanged];
+
+        // removed with the row
+
         return cell;
     }
 
@@ -582,6 +659,8 @@ static float ESPRowClamp(float v, float lo, float hi) {
     cell.onToggle = ^(BOOL isOn) {
         [weakSelf toggleChangedForKey:key isOn:isOn];
     };
+    // removed with the row
+
     return cell;
 }
 
@@ -616,10 +695,7 @@ static float ESPRowClamp(float v, float lo, float hi) {
         ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
         ESPPrefsSync();
         ESPSyncFromPrefs();
-        [self.tableView reloadRowsAtIndexPaths:@[
-            [NSIndexPath indexPathForRow:1 inSection:ESPSectionAim],
-            [NSIndexPath indexPathForRow:2 inSection:ESPSectionAim],
-        ] withRowAnimation:UITableViewRowAnimationNone];
+        [self reloadAimSection];
         return;
     }
 
@@ -661,8 +737,7 @@ static float ESPRowClamp(float v, float lo, float hi) {
     ESPSyncFromPrefs();
 
     if ([key isEqualToString:@"AimTypeMode"]) {
-        [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:0 inSection:ESPSectionAim] ]
-                              withRowAnimation:UITableViewRowAnimationNone];
+        [self reloadAimSection];
     }
 }
 

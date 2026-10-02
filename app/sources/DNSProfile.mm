@@ -1,58 +1,55 @@
 #import "DNSProfile.h"
 #import "MDLog.h"
-#import "KernelBoot.h"
 
-#import "platformize.h"
-#import "kexploit/kutils.h"
-
-#import <dlfcn.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <sys/time.h>
 #import <unistd.h>
 #import <UIKit/UIKit.h>
 
-// The bundled profile is used verbatim; nothing here generates one. That is a
-// correction, not a preference.
+// Installs the bundled iOS DNS profile the ordinary way: serve it over loopback
+// and let Safari hand it to iOS.
 //
-// This file used to emit com.apple.dnsproxy.managed itself and I claimed in
-// the header that no iOS profile can block a domain. Checked against Apple's
-// DNSSettings documentation, that claim was about the wrong payload type.
-// com.apple.dnsSettings.managed, which the bundled profile uses, carries
-// SupplementalMatchDomains and ServerURL, and blocking falls out of them with
-// no blocking primitive anywhere: assign the domains to be blocked to a DoH
-// URL that does not resolve (192.0.2.1, TEST-NET-1 per RFC 5737), iOS queries
-// it, nothing answers, the app never gets an IP. Same observable effect as the
-// "action": "reject" the profile replaces, and it survives into an app that
-// pins its own IP or uses a pinned DoH resolver.
+// This used to try installd first, through MobileInstallation.framework and
+// MCInstallationCopyProfile, which would install silently and then deep link
+// into Settings. Both halves are gone, on the evidence rather than on taste:
 //
-// AllowFailover is deliberately absent from the payload and must stay absent.
-// Apple documents it as defaulting to false, and false is the only value that
-// makes the block stick: true would let every failed DoH query fall back to
-// the system resolver, and the blocked domains would resolve normally.
+// The silent path never ran. platformize_self fails on device with "our ucred
+// not found under proc_ro", so the process never became platform-application,
+// so mach-lookup to installd was never available and every install fell to the
+// loopback path below. The code that was supposed to save it kept claiming the
+// one-tap flow in the UI while doing the opposite.
 //
-// The payload carries XML comments. iOS parses those, but they are stripped
-// before the dictionary reaches installd rather than assuming installd's
-// parser is as tolerant as the plist one.
+// The deep link was not reachable either. It needs the same platformize, and
+// on a process that is not platformized iOS rejects App-prefs: outright.
+//
+// So the honest version of this screen is the one that always worked: write
+// the profile, serve it, open Safari, iOS asks, the user taps Install. One tap
+// more than the silent path, and it works on any device.
+//
+// What the profile does is unchanged. It is the bundled
+// ff-fixbanid-dns.mobileconfig, byte for byte, and its two
+// com.apple.dnsSettings.managed payloads assign the domains to be blocked to a
+// DoH URL that does not resolve, so they do not resolve. That is the whole
+// trick and it needs nothing from this file.
 
-static NSString *const kMDDNSPayloadID = @"com.tserver.ff.fixbanid.dns";
+static NSString *const kMDDNSPayloadID = @"com.minhduc.ff.fixbanid.dns";
 static NSString *const kMDDNSResource   = @"ff-fixbanid-dns";
 static NSString *const kMDDNSFileName   = @"ff-fixbanid-dns.mobileconfig";
 
-// iOS keeps every installed profile here, and the copy it made of what we
-// handed installd is one of these files. Reading the directory back is how the
-// screen answers "iOS configuration" without a private API and without
-// NetworkExtension, which this build cannot load a config through anyway
-// (no entitlement, so NEVPNManager fails with NEConfigurationErrorDomain 10).
+// iOS keeps installed profiles here. Reading the directory back is how the
+// screen answers "iOS configuration" without an entitlement this build does
+// not have: NEVPNManager would fail with NEConfigurationErrorDomain code 10
+// every time, which is the error the reference app shows on its own screen.
 static const char *const kMDDNSProfileDirs[] = {
     "/var/mobile/Library/ConfigurationProfiles",
     "/var/mobile/Library/ConfigurationProfiles/Profiles",
     NULL,
 };
 
+// The DoH endpoints the payload names, read out of the file rather than kept
+// in step with it by hand.
 NSArray<NSString *> *MDDNSServerList(void) {
-    // Read out of the payload rather than kept in step with it by hand, so the
-    // log cannot claim a server the file does not carry.
     NSString *xml = MDDNSProfileXML();
     NSMutableArray *out = [NSMutableArray array];
     NSRegularExpression *server =
@@ -69,10 +66,8 @@ NSArray<NSString *> *MDDNSServerList(void) {
     return out.count ? out : @[ @"none" ];
 }
 
-// How many domains the payload names at all, counted from the file rather than
-// kept in step with it by hand. This is the total across both payloads, so the
-// screen labels it that way and does not claim all of them are blocked; the
-// split is what the two payload names in the log are for.
+// Domains the payload sends to the address that does not exist. Counted from
+// the file so the screen cannot claim a number the payload does not carry.
 NSUInteger MDDNSBlockedDomainCount(void) {
     NSString *xml = MDDNSProfileXML();
     NSRegularExpression *domains =
@@ -80,8 +75,8 @@ NSUInteger MDDNSBlockedDomainCount(void) {
                                                  options:0
                                                    error:NULL];
     return [domains numberOfMatchesInString:xml
-                                   options:0
-                                     range:NSMakeRange(0, xml.length)];
+                                    options:0
+                                      range:NSMakeRange(0, xml.length)];
 }
 
 NSString *MDDNSProfileXML(void) {
@@ -102,180 +97,8 @@ NSString *MDDNSProfileXML(void) {
             @"<integer>1</integer></dict></plist>";
 }
 
-// Comments have to go before installd sees the plist. A scanner rather than a
-// regex, so a comment containing an angle bracket cannot end the removal early
-// and truncate the profile into something that parses but means less than it
-// did.
-static NSString *MDDNSStripComments(NSString *xml) {
-    NSMutableString *out = [NSMutableString stringWithCapacity:xml.length];
-    NSUInteger i = 0;
-    NSUInteger len = xml.length;
-    while (i < len) {
-        NSRange open = [xml rangeOfString:@"<!--"
-                                  options:0
-                                    range:NSMakeRange(i, len - i)];
-        if (open.location == NSNotFound) {
-            [out appendString:[xml substringFromIndex:i]];
-            break;
-        }
-        [out appendString:[xml substringWithRange:NSMakeRange(i, open.location - i)]];
-        NSUInteger after = NSMaxRange(open);
-        NSRange close = [xml rangeOfString:@"-->"
-                                  options:0
-                                    range:NSMakeRange(after, len - after)];
-        // Unterminated comment: drop the remainder rather than hand installd a
-        // document whose opening <!-- never closed.
-        if (close.location == NSNotFound) break;
-        i = NSMaxRange(close);
-    }
-    return out;
-}
 // ---------------------------------------------------------------------------
-// installd, through the private MobileInstallation framework
-// ---------------------------------------------------------------------------
-
-typedef void (^MDInstallationCopyProfileBlock)(CFErrorRef error);
-typedef Boolean (*MDInstallationCopyProfileFn)(CFAllocatorRef,
-                                               CFDictionaryRef,
-                                               uint32_t,
-                                               MDInstallationCopyProfileBlock);
-
-static void *g_miLib = NULL;
-static BOOL g_platformized = NO;
-
-static BOOL MDDNGSelfPlatformize(void) {
-    if (g_platformized) return YES;
-    uint64_t sp = proc_self();
-    int r = platformize_self(sp);
-    [MDLog appendLine:[NSString stringWithFormat:@"[dns] platformize_self=%d", r]];
-    if (r != 0) {
-        // The bare -1 is what hid a wrong call order behind a silent fallback
-        // for a whole build. Say which of the six steps inside platformize
-        // stopped, and say whether the boot already ran it.
-        [MDLog appendLine:[NSString stringWithFormat:@"[dns] platformize failed: %s",
-                         platformize_last_error()]];
-        return NO;
-    }
-    g_platformized = YES;
-    return YES;
-}
-
-static MDInstallationCopyProfileFn MDDNGLocateCopyProfile(void) {
-    if (g_miLib) {
-        return (MDInstallationCopyProfileFn)dlsym(g_miLib, "MCInstallationCopyProfile");
-    }
-    const char *path =
-        "/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation";
-    g_miLib = dlopen(path, RTLD_LAZY);
-    if (!g_miLib) {
-        [MDLog appendLine:[NSString stringWithFormat:@"[dns] dlopen failed: %s",
-                         dlerror() ? dlerror() : "unknown"]];
-        return NULL;
-    }
-    const char *names[] = { "MCInstallationCopyProfile",
-                            "MCInstallationCopyProfileWithResult",
-                            "MCInstallationCMD" };
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        void *sym = dlsym(g_miLib, names[i]);
-        [MDLog appendLine:[NSString stringWithFormat:@"[dns] dlsym %s -> %@", names[i],
-                         sym ? @"found" : @"missing"]];
-        if (sym && i == 0) return (MDInstallationCopyProfileFn)sym;
-    }
-    return NULL;
-}
-
-static NSString *MDDNSDescribeCFError(CFErrorRef err) {
-    if (!err) return @"none";
-    // There is no CFErrorCopyDomain: CFError is toll-free bridged to NSError,
-    // and going through NSError is also what gets the localized description.
-    NSError *error = (__bridge NSError *)err;
-    CFStringRef desc = CFErrorCopyDescription(err);
-    return [NSString stringWithFormat:@"%@ (%@, %ld)",
-            (__bridge NSString *)desc ?: error.localizedDescription ?: @"?",
-            error.domain ?: @"?",
-            (long)error.code];
-}
-
-// Returns YES only when installd accepted the profile. Every step logs, so a
-// failure says which of the four gates closed: no exploit, no mach-lookup, no
-// symbol, or installd refusing.
-static BOOL MDDNSInstallViaInstalld(NSString *xml, NSString **why) {
-    if (!kernelBootReady()) {
-        if (why) *why = @"the exploit has not run yet";
-        return NO;
-    }
-    if (!MDDNGSelfPlatformize()) {
-        if (why) *why = @"platformize_self failed, no mach-lookup for installd";
-        return NO;
-    }
-
-    MDInstallationCopyProfileFn copyProfile = MDDNGLocateCopyProfile();
-    if (!copyProfile) {
-        if (why) *why = @"MobileInstallation has no MCInstallationCopyProfile";
-        return NO;
-    }
-
-    // Comments go before installd, and the log says so, because "the profile
-    // parsed" would otherwise be indistinguishable from "the whole profile
-    // reached installd".
-    NSString *clean = MDDNSStripComments(xml);
-    NSData *data = [clean dataUsingEncoding:NSUTF8StringEncoding];
-    // CFPropertyListCreateFromXMLData is deprecated and on this SDK its
-    // four-argument form is the only one declared, which is why the extra NULL
-    // in the docs is not here.
-    CFPropertyListRef plist = CFPropertyListCreateFromXMLData(kCFAllocatorDefault,
-                                                              (__bridge CFDataRef)data,
-                                                              kCFPropertyListImmutable,
-                                                              NULL);
-    if (!plist || CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
-        if (plist) CFRelease(plist);
-        if (why) *why = @"the profile XML did not parse";
-        return NO;
-    }
-
-    [MDLog appendLine:@"[dns] handing the profile to installd."];
-    __block CFErrorRef blockErr = NULL;
-    __block BOOL answered = NO;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-
-    Boolean queued = copyProfile(kCFAllocatorDefault,
-                                 (CFDictionaryRef)plist,
-                                 0,
-                                 ^(CFErrorRef e) {
-        answered = YES;
-        if (e) blockErr = e;
-        dispatch_semaphore_signal(sem);
-    });
-    CFRelease(plist);
-
-    if (!queued) {
-        if (why) *why = @"MCInstallationCopyProfile refused to queue the profile";
-        return NO;
-    }
-
-    // installd answers over XPC. No answer means the call went out and was
-    // dropped, which is a different fault from installd saying no.
-    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                                                  20 * NSEC_PER_SEC)) != 0) {
-        if (why) *why = @"installd did not answer within 20s";
-        [MDLog appendLine:@"[dns] timed out waiting for installd."];
-        return NO;
-    }
-    if (!answered) {
-        if (why) *why = @"installd returned no completion";
-        return NO;
-    }
-    if (blockErr) {
-        if (why) *why = [NSString stringWithFormat:@"installd: %@", MDDNSDescribeCFError(blockErr)];
-        return NO;
-    }
-
-    [MDLog appendLine:@"[dns] installd accepted the profile."];
-    return YES;
-}
-
-// ---------------------------------------------------------------------------
-// Loopback fallback: serve the profile and let iOS ask to install it
+// Loopback listener
 // ---------------------------------------------------------------------------
 
 static void MDDNSServeLoopback(int listenFD, NSData *body) {
@@ -291,11 +114,11 @@ static void MDDNSServeLoopback(int listenFD, NSData *body) {
     [response appendData:body];
 
     struct timeval tv;
-    tv.tv_sec = 3;
+    tv.tv_sec = 8;
     tv.tv_usec = 0;
     setsockopt(listenFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // Bounded: at most ten requests, and accept gives up after three idle
+    // Bounded: at most ten requests, and accept gives up after eight idle
     // seconds, so the descriptor cannot outlive the tap by much.
     for (int served = 0; served < 10; served++) {
         int fd = accept(listenFD, NULL, NULL);
@@ -315,12 +138,12 @@ static void MDDNSServeLoopback(int listenFD, NSData *body) {
     close(listenFD);
 }
 
-NSString *_Nullable MDDNSStartProfileServer(NSString *__autoreleasing *_Nullable errOut) {
+NSString * _Nullable MDDNSStartProfileServer(NSString * _Nullable * _Nullable errOut) {
     NSString *xml = MDDNSProfileXML();
     NSData *body = [xml dataUsingEncoding:NSUTF8StringEncoding];
 
-    // Keep the file in the container either way. If installd refuses, this is
-    // the copy the user can still hand to something else.
+    // Keep the file in the container as well. The user can pull it out of the
+    // Files app if Safari ever refuses to install it.
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                         NSUserDomainMask, YES).firstObject;
     if (docs) {
@@ -403,75 +226,11 @@ void MDDNSOpenProfile(NSString *url, void (^_Nullable done)(BOOL accepted)) {
     }];
 }
 
-// Deep link into the Settings page that holds DNS profiles.
-//
-// This cannot be done with public API. App-prefs: was patched in iOS 10.3 and
-// iOS 17 rejects it, and UIApplicationOpenSettingsURLString only ever opens
-// this app's own page. The route that works is a private URL scheme, and the
-// reason it can work from here at all is that this process platformizes: that
-// copies launchd's AMFI slot into our cred label, so AMFI treats the app as a
-// system app and stops rejecting the scheme. That is the same reason a
-// Fl0rk-class app can do it and a normal app cannot.
-//
-// canOpenURL is useless for this and is deliberately not called. It answers
-// false for any scheme not listed in LSApplicationQueriesSchemes, and a
-// private scheme cannot be listed without the entitlement that gets it
-// rejected for other reasons. openURL's completion is the only honest answer,
-// so the result is what gets logged.
-//
-// Ordered by how likely each is to be honoured. App-prefs: is the oldest and
-// the most patched; the App-prefs:General&path= form is what survives on newer
-// builds for nested pages; prefs:root= is the pre-10.3 spelling.
-static NSArray<NSString *> *MDDNSSettingsURLs(void) {
-    return @[
-        @"App-prefs:root=VPN",
-        @"App-prefs:General&path=VPN",
-        @"prefs:root=VPN",
-        @"App-prefs:root=General",
-    ];
-}
-
-void MDDNSTryOpenSettings(void (^_Nullable done)(BOOL opened, NSString *_Nullable which)) {
-    NSArray<NSString *> *candidates = MDDNSSettingsURLs();
-    __block BOOL triedAny = NO;
-
-    // Sequentially, not all at once: firing four openURL calls back to back
-    // would leave iOS showing whichever one landed last, and the log would not
-    // say which of them actually navigated.
-    void (^_Nullable attempt)(NSUInteger) = nil;
-    attempt = ^(NSUInteger index) {
-        if (index >= candidates.count) {
-            [MDLog appendLine:@"[dns] iOS would not open a Settings page for DNS."];
-            if (done) done(NO, nil);
-            return;
-        }
-        NSString *raw = candidates[index];
-        NSURL *url = [NSURL URLWithString:raw];
-        if (!url) {
-            attempt(index + 1);
-            return;
-        }
-        triedAny = YES;
-        [MDLog appendLine:[NSString stringWithFormat:@"[dns] trying %@", raw]];
-        [[UIApplication sharedApplication] openURL:url options:@{}
-                                 completionHandler:^(BOOL ok) {
-            if (ok) {
-                [MDLog appendLine:[NSString stringWithFormat:@"ok=%d %@ opened Settings.",
-                                 (int)ok, raw]];
-                if (done) done(YES, raw);
-                return;
-            }
-            attempt(index + 1);
-        }];
-    };
-    attempt(0);
-}
-
 // ---------------------------------------------------------------------------
 // What iOS actually holds
 // ---------------------------------------------------------------------------
 
-NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut) {
+NSString *MDDNSProbeConfiguration(NSString * _Nullable * _Nullable errorOut) {
     if (errorOut) *errorOut = nil;
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -483,7 +242,7 @@ NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut)
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
             // Not an error: these are candidate locations and most of them do
-            // not exist on any given install. Recording it as one is what put
+            // not exist on any given install. Reporting it as one is what put
             // "The folder Profiles doesn't exist" in front of the user in red,
             // which reads like a broken feature rather than a path that was
             // never going to be there.
@@ -513,9 +272,6 @@ NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut)
             [MDLog appendLine:[NSString stringWithFormat:@"[dns] found installed profile %@", name]];
             return @"Installed";
         }
-        // The directory exists and holds no profile of ours. That is a real
-        // answer, so stop rather than going on to a path that does not exist
-        // and overwriting it with an error.
         return @"Not installed";
     }
 
@@ -527,13 +283,10 @@ NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut)
 }
 
 // ---------------------------------------------------------------------------
-// Entry point used by the screen
+// Install
 // ---------------------------------------------------------------------------
 
-// The installd half only. The loopback half is left to the main thread,
-// because UIApplication will not take beginBackgroundTask from anywhere else.
-static MDDNSInstallOutcome MDDNSInstallViaInstalldStep(NSString *__autoreleasing *whyOut) {
-    NSString *xml = MDDNSProfileXML();
+void MDDNSInstall(MDDNSInstallCompletion completion) {
     [MDLog appendLine:[NSString stringWithFormat:
                        @"[dns] %lu server(s): %@",
                        (unsigned long)MDDNSServerList().count,
@@ -542,50 +295,19 @@ static MDDNSInstallOutcome MDDNSInstallViaInstalldStep(NSString *__autoreleasing
                        @"[dns] payload names %lu domain(s) across the allow and block groups.",
                        (unsigned long)MDDNSBlockedDomainCount()]];
 
-    if (MDDNSInstallViaInstalld(xml, whyOut)) return MDDNSInstallOutcomeInstalled;
+    NSString *serverErr = nil;
+    NSString *url = MDDNSStartProfileServer(&serverErr);
+    if (!url) {
+        [MDLog appendLine:@"[dns] ERR could not serve the profile."];
+        if (completion) completion(MDDNSInstallOutcomeFailed, serverErr, nil);
+        return;
+    }
 
-    [MDLog appendLine:[NSString stringWithFormat:@"[dns] installd path unavailable: %@",
-                     whyOut && *whyOut ? *whyOut : @"unknown"]];
-    return MDDNSInstallOutcomeFailed;
-}
-
-void MDDNSInstall(MDDNSInstallCompletion completion) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *why = nil;
-        MDDNSInstallOutcome outcome = MDDNSInstallViaInstalldStep(&why);
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *failure = nil;
-            NSString *url = nil;
-            MDDNSInstallOutcome result = outcome;
-
-            if (outcome != MDDNSInstallOutcomeInstalled) {
-                NSString *serverErr = nil;
-                url = MDDNSStartProfileServer(&serverErr);
-                if (url) {
-                    [MDLog appendLine:[NSString stringWithFormat:@"[dns] serving on %@", url]];
-                    MDDNSOpenProfile(url, nil);
-                    result = MDDNSInstallOutcomeHandedOff;
-                } else {
-                    failure = [NSString stringWithFormat:@"%@; and the fallback failed: %@",
-                               why ?: @"installd unavailable", serverErr];
-                    result = MDDNSInstallOutcomeFailed;
-                }
-            }
-
-            // Only when installd already took the profile. On the loopback
-            // path Safari is the one holding the install prompt, and jumping
-            // to Settings underneath it would race the user to a profile that
-            // is not there yet.
-            if (result == MDDNSInstallOutcomeInstalled) {
-                MDDNSTryOpenSettings(^(BOOL opened, NSString *which) {
-                    if (opened) {
-                        [MDLog appendLine:@"[dns] Settings opened; the profile still needs switching on."];
-                    }
-                });
-            }
-
-            if (completion) completion(result, failure, url);
-        });
+    [MDLog appendLine:[NSString stringWithFormat:@"[dns] serving on %@", url]];
+    MDDNSOpenProfile(url, ^(BOOL accepted) {
+        if (completion) {
+            completion(accepted ? MDDNSInstallOutcomeHandedOff : MDDNSInstallOutcomeFailed,
+                       accepted ? nil : @"iOS refused the profile URL", url);
+        }
     });
 }

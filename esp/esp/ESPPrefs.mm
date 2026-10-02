@@ -13,6 +13,16 @@ static NSString *gPrimaryPath = nil;
 static NSString *gBackupPath = nil;
 static dispatch_once_t gLoadOnce;
 
+// Modification date of the file gCache was last filled from. A value of nil
+// means "never loaded", which is also what makes the first reload attempt do
+// nothing rather than throw away writes made since the load.
+static NSDate *gLoadedMtime = nil;
+
+// Set while this process has writes that have not reached disk yet. A reload
+// from disk during that window would discard them, because the cache is the
+// authority until the file catches up.
+static BOOL gHasUnflushedWrites = NO;
+
 static NSArray<NSString *> *ESPPrefsCandidatePaths(void) {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
 
@@ -384,8 +394,48 @@ static void ESPPrefsSetValueEx(NSString *key, id value, BOOL schedulePersist) {
 
     if (schedulePersist) {
         // Debounced disk write — UI / ESP flags update from cache immediately.
+        gHasUnflushedWrites = YES;
         ESPPrefsPersistAsync(NO);
     }
+}
+
+// The ESP no longer runs in the app process. The UI writes prefs here and the
+// engine that reads them lives in SpringBoard, which has its own copy of this
+// cache and its own dispatch_once, so a key it read once stayed at that value
+// for the lifetime of the process. That is why every mode control in the app
+// looked like it did nothing: the change reached the file and never came back.
+//
+// So this re-reads the file when another process has touched it. The guard is
+// the modification date, and a stat is cheap enough to sit on the one-second
+// tick ESPSyncFromPrefs already runs on.
+//
+// Flushes first, so a process that writes then reads cannot have its own
+// unwritten changes pulled back out from under it by its own flush.
+void ESPPrefsReloadIfChanged(void)
+{
+    ESPPrefsLoadIfNeeded();
+    if (!gPrimaryPath) return;
+
+    if (gHasUnflushedWrites) {
+        ESPPrefsSync();
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDate *mtime = [[fm attributesOfItemAtPath:gPrimaryPath error:NULL]
+                        objectForKey:NSFileModificationDate];
+    if (!mtime) return;
+    if (gLoadedMtime && [mtime isEqualToDate:gLoadedMtime]) return;
+
+    // Another process wrote. Clear the cache first and repopulate while
+    // holding it, so a concurrent reader sees neither the stale keys nor a
+    // half-filled dictionary.
+    NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:gPrimaryPath];
+    @synchronized (gCache) {
+        [gCache removeAllObjects];
+        if (disk.count) [gCache addEntriesFromDictionary:disk];
+    }
+    gLoadedMtime = mtime;
+    gHasUnflushedWrites = NO;
 }
 
 static void ESPPrefsSetValue(NSString *key, id value) {

@@ -2563,6 +2563,10 @@ static bool s_setNameEnabledGlobal = false;
 static NSString *s_customNameGlobal = nil;
 
 void ESPSyncFromPrefs(void) {
+    // Pick up writes from another process first. The engine runs in
+    // SpringBoard now, so this is the only thing standing between a tap in the
+    // app and the setting actually taking effect there.
+    ESPPrefsReloadIfChanged();
     // Throttle full reload: menu drag/slider used to call this every tick → lag.
     // Still fast enough for toggles (callers also invoke on switch/segment release).
     static CFTimeInterval s_lastFullSync = 0;
@@ -5324,25 +5328,12 @@ static int      s_espCountN = 0;
         s_lockScore = rawBestScore;
     }
 
-    // AIM DIAG: surfaces the whole aim pipeline state — attach, roster size,
-    // picked target. If aimbot "does nothing", this line says which stage is
-    // empty (0 snaps = attach/match fail; snaps>0 target=0 = filter kills all).
-    {
-        static CFTimeInterval s_lastAimDiag = 0;
-        CFTimeInterval nowAd = CACurrentMediaTime();
-        if (nowAd - s_lastAimDiag > 5.0) {
-            s_lastAimDiag = nowAd;
-            kernel_boot_log_fn logFnA = kernelBootLog;
-            if (logFnA) {
-                NSString *lineA = [NSString stringWithFormat:
-                    @"[aim] snaps=%d pick=%llu dis=%.0f trig=%d aimbot=%d",
-                    snapN, (unsigned long long)bestTarget,
-                    bestDistance < FLT_MAX ? bestDistance : 0.f,
-                    triggerMode, (int)isAimbot];
-                dispatch_async(dispatch_get_main_queue(), ^{ logFnA(lineA); });
-            }
-        }
-    }
+    // The AIM DIAG block that used to sit here is gone. It wrote an [aim] line
+    // into the Log tab every five seconds, and that tab is where the user reads
+    // session start and stop. Every value it printed is readable somewhere that
+    // matters now: the engine runs in another process, and the reason settings
+    // appeared to do nothing was that they were never reaching it. That was
+    // fixed by reloading the prefs file, not by watching it not arrive.
 
     // Live target validity: kill / despawn / invalid bone must hard-stop aim immediately.
     // Ghost: MaxHP must be live; bone must be live (no sticky-track invent).

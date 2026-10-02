@@ -26,6 +26,13 @@ void RequestExitHUD(void);
 //                         between a tap and the host appearing
 BOOL IsESPSessionRunning(void);
 
+// The three signals that report something actually running, with no pref in
+// the answer. IsESPSessionRunning falls back to App_LocalHUDState so the Game
+// tab flips to a stop button the moment it is tapped; that flag outlives the
+// process that wrote it, so anything that needs to know what is true right now
+// rather than what was last asked for has to ask this instead.
+BOOL ESPRealSessionRunning(void);
+
 // Actually stops the session, whichever parts are up. SetHUDEnabled(NO) only
 // kills the -hud process; the parts that draw live in this process and in
 // SpringBoard, so a stop that does not call this leaves ESP on screen while

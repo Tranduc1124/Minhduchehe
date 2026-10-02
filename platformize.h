@@ -14,18 +14,12 @@ extern "C" {
 #endif
 
 // Returns 0 on success. Call AFTER sandbox_elevate_to_root() succeeded
-// (we need to write launchd's slot into ours), and BEFORE sandbox_escape():
-// sandbox_escape rewrites the sandbox extension chain of the same cred that
-// this copies launchd's AMFI slot into, and escaping first leaves the copy
-// reading a cred the escape has already rotated. That order was wrong until a
-// device log showed platformize_self returning -1 with no reason given.
+// (we need to write launchd's slot into ours).
+//
+// Only the HUD process calls this, and it needs to: platformize is what makes
+// AMFI treat that process as a system app, which is what puts its window above
+// every other app. The main app process does not, because it draws nothing.
 int platformize_self(uint64_t self_proc);
-
-// Why the last platformize_self returned non-zero, in words. Empty-string safe
-// and never NULL; "unknown" before the first call or after a success. Set for
-// logging, not for control flow: a bare -1 is what sent a failed DNS install
-// silently down its fallback path.
-const char *platformize_last_error(void);
 
 #ifdef __cplusplus
 }

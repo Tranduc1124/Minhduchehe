@@ -104,10 +104,21 @@ static void MDResetAccentPrefs(void) {
                                                  name:MDThemeDidChangeNotification
                                                object:nil];
 
+    // Drop the optimistic flag when nothing is actually running. App_LocalHUDState
+    // is written the moment the user taps Activate and is what makes the Game
+    // tab turn into a Stop button without waiting for a poll. It also survives
+    // the process that wrote it, so a kernel-only launch used to open on a Stop
+    // button for a session that had ended long ago: the first tap killed
+    // nothing and the second one started the real thing.
+    if (!ESPRealSessionRunning() && ESPPrefsBool(@"App_LocalHUDState", NO)) {
+        ESPPrefsSetBool(@"App_LocalHUDState", NO);
+        ESPPrefsSync();
+    }
+
     // Kernel only. This runs the exploit, the sandbox and KeepAlive and stops
-    // there: no overlay, no ESP host, and App_LocalHUDState untouched, so the
-    // Game tab still reads Inactive and the box does not appear by itself.
-    // Turning the ESP on stays a deliberate tap on Activate.
+    // there: no overlay, no ESP host, so the Game tab reads Inactive and the
+    // box does not appear by itself. Turning the ESP on stays a deliberate tap
+    // on Activate.
     if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
         [MDLog appendLine:@"RUN Preparing the exploit at launch."];
         kernelBootStartKernelOnly();
