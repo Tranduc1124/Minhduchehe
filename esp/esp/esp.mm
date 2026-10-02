@@ -5378,8 +5378,26 @@ static int      s_espCountN = 0;
 
     static int s_aimDiagLog = 0;
     if ((isAimbot || useAssist) && (++s_aimDiagLog % 120 == 1)) {
-        NSLog(@"[AIM-DIAG] isAimbot=%d useAssist=%d trig=%d isFiring=%d isScoping=%d act=%d target=0x%llx",
-              (int)isAimbot, (int)useAssist, trig, (int)isFiring, (int)isScoping, (int)shouldActivate, (unsigned long long)bestTarget);
+        // aimFov, aimSphereMode and stickFighting are here because the FOV slider
+        // was reported as having no effect, and there are three ways it can be
+        // ignored without any of them being visible from outside:
+        //
+        //   aimFov read as 0, because the pref is Fov and the Home card writes
+        //     FovSize, so the two sliders were editing different variables;
+        //   aimSphereMode nonzero, which zeroes aimFovSq at the top of the
+        //     frame and every radius then falls back to a hardcoded 150px, and
+        //     the menu only hides the slider once the mode is already changed;
+        //   stickFighting, which is IsFiring, and the lock gate below skips the
+        //     FOV test entirely while it is set. The line already reported
+        //     isFiring, and in the sample log it was 1, so this one was live.
+        //
+        // None of the three can be told apart from the fields that were already
+        // printed, so they are printed.
+        NSLog(@"[AIM-DIAG] isAimbot=%d useAssist=%d trig=%d isFiring=%d isScoping=%d act=%d target=0x%llx "
+              @"aimFov=%.1f aimFovSq=%.0f sphere=%d firing=%d",
+              (int)isAimbot, (int)useAssist, trig, (int)isFiring, (int)isScoping, (int)shouldActivate,
+              (unsigned long long)bestTarget,
+              (double)aimFov, (double)aimFovSq, (int)aimSphereMode, (int)isFiring);
     }
 
     // Hard-stop camera path the instant trigger is off or no aim mode.
