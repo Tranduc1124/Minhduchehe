@@ -116,12 +116,23 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     {
         static CTFontRef s_font[24] = {NULL};
         static CGFloat s_size[24] = {0};
-        const int slot = (int)(size * 2.0f) - 8;   // 4.0 -> 0, 11.5 -> 15
+        // Quarter-point buckets, offset by 15 so the smallest size that actually
+        // occurs lands on slot 0.
+        //
+        // The first version used half-point steps offset by 8, and that offset
+        // came from dynFontSize's 4.5 floor rather than from nameSize's. The
+        // names are set at 0.86 of dynFontSize, so the real floor is
+        // 4.5 * 0.86 = 3.87, and (int)(3.87 * 2) - 8 is -1. Every target at
+        // range, which is exactly where dynFontSize sits at its floor, fell out
+        // of the table and back to calling CTFontCreateWithName for every string
+        // on every frame. The cache did nothing at range, which is the range it
+        // was written for.
+        const int slot = (int)(size * 4.0) - 15;   // 3.75 -> 0, 8.75 -> 20
         if (slot >= 0 && slot < 24) {
             // fabs and not fabsf: CGFloat is a double on arm64, so the float
             // overload would truncate the argument. The build turns that into an
             // error under -Werror.
-            if (s_font[slot] && fabs(s_size[slot] - size) < 0.25) {
+            if (s_font[slot] && fabs(s_size[slot] - size) < 0.2) {
                 font = s_font[slot];
             } else {
                 CTFontRef made = ESPNameTextCTFont(size);
