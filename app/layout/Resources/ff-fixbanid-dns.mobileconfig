@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadDisplayName</key>
+    <string>FF Fix Ban ID (DNS iOS)</string>
+    <key>PayloadDescription</key>
+    <string>Chuyen doi 2 config sing-box (Bypassfix_output.json + DNS FIX BAN ID_output.json) sang profile DNS cua iOS. Giu nguyen chuc nang: 8 domain login/Google duoc resolve binh thuong, ~30 domain Free Fire bi chan, phan con lai dung DNS mac dinh cua he thong (Strategy ipv4_only).</string>
+    <key>PayloadOrganization</key>
+    <string>Tserver</string>
+    <key>PayloadIdentifier</key>
+    <string>com.tserver.ff.fixbanid.dns.2026</string>
+    <key>PayloadUUID</key>
+    <string>F2D8F0AC-7CD9-1BF3-CB18-3BD6005C3AE2</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadContent</key>
+    <array>
+        <!-- ============ SCOPE 1: ALLOW (whitelist) ============ -->
+        <!-- Domain login/Google cua Free Fire: KHONG duoc chan, resolve qua DoH Cloudflare. -->
+        <!-- Dat TRUOC scope chan de duoc uu tien. -->
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadIdentifier</key>
+            <string>com.tserver.ff.fixbanid.dns.allow</string>
+            <key>PayloadUUID</key>
+            <string>375901D2-B999-7117-1AA8-640983ADB361</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadDisplayName</key>
+            <string>FF Fix Ban ID - Allow</string>
+            <key>PayloadDescription</key>
+            <string>8 domain duoc whitelist trong config goc.</string>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>HTTPS</string>
+                <key>ServerURL</key>
+                <string>https://cloudflare-dns.com/dns-query</string>
+                <key>SupplementalMatchDomains</key>
+                <array>
+                    <string>login.common.freefiremobile.com</string>
+                    <string>client.common.freefiremobile.com</string>
+                    <string>version.common.freefiremobile.com</string>
+                    <string>auth.garena.com</string>
+                    <string>accounts.google.com</string>
+                    <string>accounts.youtube.com</string>
+                    <string>oauth2.googleapis.com</string>
+                    <string>oauthaccountmanager.googleapis.com</string>
+                </array>
+            </dict>
+        </dict>
+
+        <!-- ============ SCOPE 2: BLOCK (chan domain) ============ -->
+        <!-- DoH tro toi 192.0.2.1 (TEST-NET-1, RFC 5737 - dia chi khong ton tai, khong the route). -->
+        <!-- => iOS khong doi chieu ten domain nay => app khong lay duoc IP => hoat dong giong "action": "reject". -->
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadIdentifier</key>
+            <string>com.tserver.ff.fixbanid.dns.block</string>
+            <key>PayloadUUID</key>
+            <string>4A563C34-C8F0-EA6F-803B-29BE79E447CD</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadDisplayName</key>
+            <string>FF Fix Ban ID - Block</string>
+            <key>PayloadDescription</key>
+            <string>Chan cac domain Free Fire bi khoa ID.</string>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>HTTPS</string>
+                <key>ServerURL</key>
+                <string>https://192.0.2.1/dns-query</string>
+                <key>SupplementalMatchDomains</key>
+                <array>
+                    <string>freefiremobile.com</string>
+                    <string>freefireth.com</string>
+                    <string>ff.garena.com</string>
+                    <string>ff.rtc.grtc.garenanow.com</string>
+                    <string>ff.sdk.grtc.garenanow.com</string>
+                    <string>ff.dr.grtc.garenanow.com</string>
+                    <string>cdn.garenanow.com</string>
+                    <string>dl.garenanow.com</string>
+                    <string>cdn.gxx.garenanow.com</string>
+                    <string>dl.hdltw.garenanow.com</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

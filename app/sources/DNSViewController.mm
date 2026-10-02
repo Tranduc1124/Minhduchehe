@@ -143,13 +143,28 @@ static UIView *MDDNSHairline(void) {
     _outcome.textColor = MDThemeText();
     _outcome.textAlignment = NSTextAlignmentCenter;
 
+    // What the payload does, read from the file. Stating it on the screen is
+    // the difference between "a profile is installed" and "these domains now
+    // resolve and those do not".
+    UILabel *effect = MDDNSNote([NSString stringWithFormat:
+                                 @"FF Fix Ban ID (DNS iOS) sends %@ to Cloudflare over "
+                                 @"DoH and points %lu other domain(s) at an address "
+                                 @"that does not exist, so they do not resolve.",
+                                 [MDDNSServerList().firstObject ?: @"its resolver"
+                                     stringByReplacingOccurrencesOfString:@"https://"
+                                                                   withString:@""],
+                                 (unsigned long)MDDNSBlockedDomainCount()],
+                                UIFontWeightRegular);
+    effect.textAlignment = NSTextAlignmentCenter;
+
     UILabel *footnote = MDDNSNote(@"After installation, open iOS Settings > General > "
-                                  @"VPN & Device Management > DNS and switch MINHDUC DNS "
-                                  @"on. iOS does not let this app open that page for you.",
+                                  @"VPN & Device Management > FF Fix Ban ID (DNS iOS) "
+                                  @"and switch it on. iOS does not let this app open "
+                                  @"that page for you.",
                                   UIFontWeightRegular);
     footnote.textAlignment = NSTextAlignmentCenter;
 
-    for (UIView *view in @[ card, _installButton, _outcome, footnote ]) {
+    for (UIView *view in @[ card, _installButton, _outcome, effect, footnote ]) {
         [page addArrangedSubview:view];
         [view setContentHuggingPriority:UILayoutPriorityDefaultLow
                                 forAxis:UILayoutConstraintAxisVertical];
@@ -157,6 +172,7 @@ static UIView *MDDNSHairline(void) {
     [page setCustomSpacing:14.0f afterView:card];
     [page setCustomSpacing:14.0f afterView:_installButton];
     [page setCustomSpacing:6.0f afterView:_outcome];
+    [page setCustomSpacing:14.0f afterView:effect];
 
     [NSLayoutConstraint activateConstraints:@[
         [scroll.topAnchor constraintEqualToAnchor:self.view.topAnchor],

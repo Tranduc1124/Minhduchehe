@@ -12,10 +12,32 @@
 #import <unistd.h>
 #import <UIKit/UIKit.h>
 
-// Payload identifier. The status check greps installed profiles for this, so
-// it has to match the identifier baked into MDDNSProfileXML.
-static NSString *const kMDDNSPayloadID = @"com.minhduc.dnsprofile";
-static NSString *const kMDDNSFileName  = @"MINHDUC-DNS.mobileconfig";
+// The bundled profile is used verbatim; nothing here generates one. That is a
+// correction, not a preference.
+//
+// This file used to emit com.apple.dnsproxy.managed itself and I claimed in
+// the header that no iOS profile can block a domain. Checked against Apple's
+// DNSSettings documentation, that claim was about the wrong payload type.
+// com.apple.dnsSettings.managed, which the bundled profile uses, carries
+// SupplementalMatchDomains and ServerURL, and blocking falls out of them with
+// no blocking primitive anywhere: assign the domains to be blocked to a DoH
+// URL that does not resolve (192.0.2.1, TEST-NET-1 per RFC 5737), iOS queries
+// it, nothing answers, the app never gets an IP. Same observable effect as the
+// "action": "reject" the profile replaces, and it survives into an app that
+// pins its own IP or uses a pinned DoH resolver.
+//
+// AllowFailover is deliberately absent from the payload and must stay absent.
+// Apple documents it as defaulting to false, and false is the only value that
+// makes the block stick: true would let every failed DoH query fall back to
+// the system resolver, and the blocked domains would resolve normally.
+//
+// The payload carries XML comments. iOS parses those, but they are stripped
+// before the dictionary reaches installd rather than assuming installd's
+// parser is as tolerant as the plist one.
+
+static NSString *const kMDDNSPayloadID = @"com.tserver.ff.fixbanid.dns";
+static NSString *const kMDDNSResource   = @"ff-fixbanid-dns";
+static NSString *const kMDDNSFileName   = @"ff-fixbanid-dns.mobileconfig";
 
 // iOS keeps every installed profile here, and the copy it made of what we
 // handed installd is one of these files. Reading the directory back is how the
@@ -29,82 +51,85 @@ static const char *const kMDDNSProfileDirs[] = {
 };
 
 NSArray<NSString *> *MDDNSServerList(void) {
-    // Order matters: iOS tries them in sequence and falls through on timeout.
-    return @[ @"1.1.1.1", @"1.0.0.1", @"8.8.8.8", @"8.8.4.4" ];
+    // Read out of the payload rather than kept in step with it by hand, so the
+    // log cannot claim a server the file does not carry.
+    NSString *xml = MDDNSProfileXML();
+    NSMutableArray *out = [NSMutableArray array];
+    NSRegularExpression *server =
+        [NSRegularExpression regularExpressionWithPattern:@"<key>ServerURL</key>\\s*<string>([^<]+)</string>"
+                                                 options:0
+                                                   error:NULL];
+    for (NSTextCheckingResult *hit in [server matchesInString:xml
+                                                     options:0
+                                                       range:NSMakeRange(0, xml.length)]) {
+        NSRange r = [hit rangeAtIndex:1];
+        if (r.location == NSNotFound) continue;
+        [out addObject:[xml substringWithRange:r]];
+    }
+    return out.count ? out : @[ @"none" ];
 }
 
-static NSString *MDUUID(void) {
-    return [[[NSUUID UUID] UUIDString] uppercaseString];
+// How many domains the payload names at all, counted from the file rather than
+// kept in step with it by hand. This is the total across both payloads, so the
+// screen labels it that way and does not claim all of them are blocked; the
+// split is what the two payload names in the log are for.
+NSUInteger MDDNSBlockedDomainCount(void) {
+    NSString *xml = MDDNSProfileXML();
+    NSRegularExpression *domains =
+        [NSRegularExpression regularExpressionWithPattern:@"<string>[^<]*\\.(?:com|net|co|io|now)</string>"
+                                                 options:0
+                                                   error:NULL];
+    return [domains numberOfMatchesInString:xml
+                                   options:0
+                                     range:NSMakeRange(0, xml.length)];
 }
 
 NSString *MDDNSProfileXML(void) {
-    NSMutableString *proxies = [NSMutableString string];
-    for (NSString *server in MDDNSServerList()) {
-        [proxies appendString:
-            @"\t\t<dict>\n"
-             "\t\t\t<key>Server</key>\n"
-             "\t\t\t<string>"];
-        [proxies appendString:server];
-        [proxies appendString:
-            @"</string>\n"
-             "\t\t\t<key>Type</key>\n"
-             "\t\t\t<string>UDP</string>\n"
-             "\t\t</dict>\n"];
+    NSString *path = [[NSBundle mainBundle] pathForResource:kMDDNSResource
+                                                     ofType:@"mobileconfig"];
+    if (path) {
+        NSString *contents = [NSString stringWithContentsOfFile:path
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:NULL];
+        if (contents.length) return contents;
     }
-
-    return [NSString stringWithFormat:
-        @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-         "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-         "<plist version=\"1.0\">\n"
-         "<dict>\n"
-         "\t<key>PayloadContent</key>\n"
-         "\t<array>\n"
-         "\t\t<dict>\n"
-         "\t\t\t<key>DNSSettings</key>\n"
-         "\t\t\t<dict>\n"
-         "\t\t\t\t<key>DNSProxies</key>\n"
-         "\t\t\t\t<array>\n"
-         "%@"
-         "\t\t\t\t</array>\n"
-         "\t\t\t\t<key>MatchDomains</key>\n"
-         "\t\t\t\t<array/>\n"
-         "\t\t\t</dict>\n"
-         "\t\t\t<key>PayloadDescription</key>\n"
-         "\t\t\t<string>MINHDUC DNS servers</string>\n"
-         "\t\t\t<key>PayloadDisplayName</key>\n"
-         "\t\t\t<string>MINHDUC DNS</string>\n"
-         "\t\t\t<key>PayloadIdentifier</key>\n"
-         "\t\t\t<string>%@</string>\n"
-         "\t\t\t<key>PayloadType</key>\n"
-         "\t\t\t<string>com.apple.dnsproxy.managed</string>\n"
-         "\t\t\t<key>PayloadUUID</key>\n"
-         "\t\t\t<string>%@</string>\n"
-         "\t\t\t<key>PayloadVersion</key>\n"
-         "\t\t\t<integer>1</integer>\n"
-         "\t\t</dict>\n"
-         "\t</array>\n"
-         "\t<key>PayloadDescription</key>\n"
-         "\t<string>Installs the MINHDUC DNS servers.</string>\n"
-         "\t<key>PayloadDisplayName</key>\n"
-         "\t<string>MINHDUC DNS</string>\n"
-         "\t<key>PayloadIdentifier</key>\n"
-         "\t<string>%@</string>\n"
-         "\t<key>PayloadOrganization</key>\n"
-         "\t<string>MINHDUC</string>\n"
-         "\t<key>PayloadRemovalDisallowed</key>\n"
-         "\t<false/>\n"
-         "\t<key>PayloadType</key>\n"
-         "\t<string>Configuration</string>\n"
-         "\t<key>PayloadUUID</key>\n"
-         "\t<string>%@</string>\n"
-         "\t<key>PayloadVersion</key>\n"
-         "\t<integer>1</integer>\n"
-         "</dict>\n"
-         "</plist>\n",
-        proxies, kMDDNSPayloadID, MDUUID(), kMDDNSPayloadID, MDUUID()];
+    // A missing resource must never read as an install that quietly did
+    // nothing. The fallback is a valid plist carrying a payload type iOS will
+    // reject loudly, so the failure shows up instead of passing as success.
+    return @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<plist version=\"1.0\"><dict><key>PayloadType</key>"
+            @"<string>com.minhduc.nosuchprofile</string><key>PayloadVersion</key>"
+            @"<integer>1</integer></dict></plist>";
 }
 
+// Comments have to go before installd sees the plist. A scanner rather than a
+// regex, so a comment containing an angle bracket cannot end the removal early
+// and truncate the profile into something that parses but means less than it
+// did.
+static NSString *MDDNSStripComments(NSString *xml) {
+    NSMutableString *out = [NSMutableString stringWithCapacity:xml.length];
+    NSUInteger i = 0;
+    NSUInteger len = xml.length;
+    while (i < len) {
+        NSRange open = [xml rangeOfString:@"<!--"
+                                  options:0
+                                    range:NSMakeRange(i, len - i)];
+        if (open.location == NSNotFound) {
+            [out appendString:[xml substringFromIndex:i]];
+            break;
+        }
+        [out appendString:[xml substringWithRange:NSMakeRange(i, open.location - i)]];
+        NSUInteger after = NSMaxRange(open);
+        NSRange close = [xml rangeOfString:@"-->"
+                                  options:0
+                                    range:NSMakeRange(after, len - after)];
+        // Unterminated comment: drop the remainder rather than hand installd a
+        // document whose opening <!-- never closed.
+        if (close.location == NSNotFound) break;
+        i = NSMaxRange(close);
+    }
+    return out;
+}
 // ---------------------------------------------------------------------------
 // installd, through the private MobileInstallation framework
 // ---------------------------------------------------------------------------
@@ -183,7 +208,11 @@ static BOOL MDDNSInstallViaInstalld(NSString *xml, NSString **why) {
         return NO;
     }
 
-    NSData *data = [xml dataUsingEncoding:NSUTF8StringEncoding];
+    // Comments go before installd, and the log says so, because "the profile
+    // parsed" would otherwise be indistinguishable from "the whole profile
+    // reached installd".
+    NSString *clean = MDDNSStripComments(xml);
+    NSData *data = [clean dataUsingEncoding:NSUTF8StringEncoding];
     // CFPropertyListCreateFromXMLData is deprecated and on this SDK its
     // four-argument form is the only one declared, which is why the extra NULL
     // in the docs is not here.
@@ -414,9 +443,12 @@ NSString *MDDNSProbeConfiguration(NSString *__autoreleasing *_Nullable errorOut)
 static MDDNSInstallOutcome MDDNSInstallViaInstalldStep(NSString *__autoreleasing *whyOut) {
     NSString *xml = MDDNSProfileXML();
     [MDLog appendLine:[NSString stringWithFormat:
-                       @"[dns] profile carries %lu server(s): %@",
+                       @"[dns] %lu server(s): %@",
                        (unsigned long)MDDNSServerList().count,
                        [MDDNSServerList() componentsJoinedByString:@", "]]];
+    [MDLog appendLine:[NSString stringWithFormat:
+                       @"[dns] payload names %lu domain(s) across the allow and block groups.",
+                       (unsigned long)MDDNSBlockedDomainCount()]];
 
     if (MDDNSInstallViaInstalld(xml, whyOut)) return MDDNSInstallOutcomeInstalled;
 

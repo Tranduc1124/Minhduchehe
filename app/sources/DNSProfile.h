@@ -1,31 +1,27 @@
 #import <Foundation/Foundation.h>
 
-// Installs an iOS DNS profile without a kernel.
+// Installs the bundled iOS DNS profile.
 //
-// How it works. A .mobileconfig is an ordinary file that iOS will install from
-// any HTTPS URL: Safari downloads it, iOS raises "Profile Downloaded", and the
-// user taps Install. No entitlement is involved and nothing in the exploit is
-// used. So the profile is written to disk, served over loopback by a one-shot
-// HTTP listener bound to 127.0.0.1, and the URL is handed to Safari.
+// The profile is app/layout/Resources/ff-fixbanid-dns.mobileconfig, installed
+// byte for byte. Nothing here generates one.
 //
-// What it cannot do. com.apple.dnsproxy.managed is the only DNS payload type
-// iOS accepts, and it holds nothing but DNS server addresses. There is no
-// field for "do not resolve these domains", so the reject rules in a
-// sing-box style config have nowhere to go in a profile. This installs DNS
-// servers and nothing else. MatchDomains scopes which domains use them; it
-// does not block anything.
-//
-// iOS also refuses to deep link into General > VPN & Device Management, so
-// after the install prompt the user walks there themselves. The screen says
-// so rather than pretending otherwise.
-//
-// Two paths, and the second is a fallback rather than a second choice.
+// Two install paths, and the second is a fallback rather than a second choice.
 // MDDNSInstall tries installd through the private MobileInstallation
-// framework, which needs no URL and no prompt. That is the path that can work
-// in one tap, and it is only reachable because this tree already
+// framework, which needs no URL and no prompt. That is the path that can
+// finish in one tap, and it is only reachable because this tree already
 // platformizes the process, which is what makes mach-lookup to a system
 // daemon pass. When any gate on it is closed the profile is served over
-// loopback instead, which works anywhere but costs a Safari hand-off.
+// loopback and handed to Safari instead, which works anywhere but costs a
+// prompt.
+//
+// iOS refuses to deep link into General > VPN & Device Management, so after
+// installing, switching the profile on is the user's tap. The screen says so
+// rather than implying the app did it.
+//
+// One thing not to "fix" in the payload: it has no AllowFailover key. Apple
+// documents that key as defaulting to false, and false is the only value that
+// makes the block group work. Setting it to true lets every failed DoH query
+// fall back to the system resolver, and the blocked domains resolve normally.
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,12 +38,16 @@ typedef NS_ENUM(NSInteger, MDDNSInstallOutcome) {
     MDDNSInstallOutcomeHandedOff,
 };
 
-// DNS servers the profile carries, in the order iOS will try them. One
-// function so the list is editable in one place.
+// The DoH endpoints the payload names, read out of the file. Not editable
+// here on purpose: a list kept by hand next to a file it describes drifts.
 NSArray<NSString *> *MDDNSServerList(void);
 
-// The profile as XML, for the log and for writing to disk.
+// The bundled profile, verbatim.
 NSString *MDDNSProfileXML(void);
+
+// Domains named in the payload, across the allow group and the block group
+// together. Not a blocked count; the two groups split them and this does not.
+NSUInteger MDDNSBlockedDomainCount(void);
 
 // Writes the profile into the app container and starts a loopback listener for
 // it. Returns the URL to open, or nil with a reason in errOut.
