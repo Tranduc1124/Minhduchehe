@@ -143,18 +143,6 @@ static UIView *MDDNSHairline(void) {
     _outcome.textColor = MDThemeText();
     _outcome.textAlignment = NSTextAlignmentCenter;
 
-    // What the payload does, read from the file. Stating it on the screen is
-    // the difference between "a profile is installed" and "these domains now
-    // resolve and those do not".
-    UILabel *effect = MDDNSNote([NSString stringWithFormat:
-                                 @"FF Fix Ban ID (DNS iOS) points %lu Free Fire domain(s) "
-                                 @"at an address that does not exist, so they stop "
-                                 @"resolving. Everything else, including login, keeps "
-                                 @"using the normal DNS.",
-                                 (unsigned long)MDDNSBlockedDomainCount()],
-                                UIFontWeightRegular);
-    effect.textAlignment = NSTextAlignmentCenter;
-
     UILabel *footnote = MDDNSNote(@"Then open iOS Settings > General > VPN & Device "
                                   @"Management > DNS and switch MINHDUC DNS - Block on. "
                                   @"Only one DNS entry can be active at a time, so any "
@@ -162,7 +150,7 @@ static UIView *MDDNSHairline(void) {
                                   UIFontWeightRegular);
     footnote.textAlignment = NSTextAlignmentCenter;
 
-    for (UIView *view in @[ card, _installButton, _outcome, effect, footnote ]) {
+    for (UIView *view in @[ card, _installButton, _outcome, footnote ]) {
         [page addArrangedSubview:view];
         [view setContentHuggingPriority:UILayoutPriorityDefaultLow
                                 forAxis:UILayoutConstraintAxisVertical];
@@ -170,7 +158,6 @@ static UIView *MDDNSHairline(void) {
     [page setCustomSpacing:14.0f afterView:card];
     [page setCustomSpacing:14.0f afterView:_installButton];
     [page setCustomSpacing:6.0f afterView:_outcome];
-    [page setCustomSpacing:14.0f afterView:effect];
 
     [NSLayoutConstraint activateConstraints:@[
         [scroll.topAnchor constraintEqualToAnchor:self.view.topAnchor],
