@@ -4,9 +4,9 @@
 extern "C" {
 #endif
 
-// DNS row target. There is no DNS code anywhere in the repo, so this screen
-// is reachable and honest about being empty rather than pretending to install
-// something.
+// DNS row target. The install itself lives in DNSProfile; this is the screen
+// around it — the two status rows, the button, and the note about what iOS
+// will and will not do on its own.
 @interface DNSViewController : UIViewController
 @end
 
