@@ -2,6 +2,7 @@
 #import "GameLogic.h"
 #import "mahoa.h"
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreText/CoreText.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #include <cmath>
@@ -48,6 +49,118 @@ static inline void ESPAddCircle(CGMutablePathRef path, CGPoint center, CGFloat r
     if (!path) return;
     CGRect rect = CGRectMake(center.x - radius, center.y - radius, radius * 2.0f, radius * 2.0f);
     CGPathAddEllipseInRect(path, NULL, rect);
+}
+
+// ==========================================
+// TÊN NGƯỜI CHƠI → GEOMETRY
+// ==========================================
+// The glyph outlines for a string, appended to dst. Every character becomes its
+// own set of subpaths inside the one path, so the whole frame's worth of nicknames
+// is a single CAShapeLayer filled once.
+//
+// Why not a CATextLayer: the ESP host window is created at alpha 0 and never
+// raised (StartESPHost in esp/hud/DirectOverlay.mm), so nothing drawn inside this
+// process is ever seen. The only thing that reaches the screen is a CGPath handed
+// to SpringBoard by SBRemotePushESPFrame, so the name has to be geometry. See the
+// name plate section in ESPRenderPawnCore for where the strings come from.
+//
+// Two things this gets wrong if they are done the obvious way, both of which look
+// fine until they do not:
+//
+// 1. Y axis. Everything else in this file is UIKit: WorldToScreenLayer returns y
+//    growing downwards (UnityMath.mm subtracts the projected y from the middle of
+//    the viewport), the box's top is the smaller of the head and toe y, and the
+//    health bar is at y - barGap, that is, above. CoreText hands back outlines in
+//    font space, y growing upwards from the baseline. Placing one into the other
+//    unchanged draws every glyph the right way up in a space that runs the other
+//    way, which reads as mirrored along the baseline. So one scale of -1 on y and
+//    then the translation, which is what CGAffineTransformMake(1, 0, 0, -1, x, y)
+//    does. sb_text_glyphs in remote/SpringBoardOverlay.m does the same thing for
+//    the counter, and that one is known to draw right way up on the device.
+//
+// 2. Joining the glyphs. CGPathAddPath per glyph is not tidiness. Each outline is
+//    its own closed subpaths, and dropping the moveTo to run the characters
+//    together as one polyline leaves zero area between one letter and the next.
+//    A filled layer draws zero area as nothing, so on this layer that shortcut
+//    would look perfect; on any stroked layer the same path is a cable strung from
+//    the last point of one character to the first of the next. This layer is
+//    filled, so the bug would sit here looking right until somebody stroked it.
+//
+// The font is the counter's, resolved by name in esp.mm, so the digits in the
+// corner and the nicknames over the boxes are one typeface and not two.
+//
+// Frame semantics match addText:, which passes kCAAlignmentCenter for every ESP
+// label: centred horizontally, and vertically by centring the font's ascent and
+// descent in the frame. That is the baseline sb_text_glyphs derives for the
+// counter, and it is why the text does not jump when the path replaces the
+// CATextLayer it used to be drawn by.
+static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, CGFloat size) {
+    if (!dst || !s.length || size <= 0.5f) return;
+    if (frame.size.width <= 0.0 || frame.size.height <= 0.0) return;
+
+    NSString *fontName = ESPNameTextFontName();
+    if (!fontName.length) return;
+
+    CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)fontName, size, NULL);
+    if (!font) return;
+
+    // Sized for a plate line: a 16 character nickname plus the "[123M]" tag, with
+    // room over. Longer input is clipped rather than grown for, because the stack
+    // arrays here are the reason this costs nothing per character.
+    enum { kMaxGlyphs = 48 };
+    if (s.length > (NSUInteger)kMaxGlyphs) s = [s substringToIndex:(NSUInteger)kMaxGlyphs];
+    const CFIndex n = (CFIndex)s.length;
+    if (n <= 0) { CFRelease(font); return; }
+
+    UniChar ch[kMaxGlyphs];
+    [s getCharacters:ch range:NSMakeRange(0, (NSUInteger)n)];
+
+    CGGlyph glyphs[kMaxGlyphs];
+    CGSize advances[kMaxGlyphs];
+    if (!CTFontGetGlyphsForCharacters(font, ch, glyphs, n)) {
+        // The bulk call is all or nothing: a single character the font has no
+        // glyph for, a CJK nickname or an emoji the icon strip did not catch,
+        // makes it return false and takes the whole line with it. One at a time
+        // leaves the unmapped characters at glyph 0, which is what a missing
+        // character renders as everywhere else, and the ASCII part of the name
+        // still shows.
+        for (CFIndex i = 0; i < n; i++) {
+            CGGlyph g = 0;
+            CTFontGetGlyphsForCharacters(font, ch + i, &g, 1);
+            glyphs[i] = g;
+        }
+    }
+
+    // The advances come back with the summed width, so there is no second pass to
+    // measure the string with. kCTFontOrientationHorizontal is read out of
+    // CTFont.h rather than assumed, the same reason sb_text_glyphs reads it out:
+    // the obvious argument order is not the real one.
+    const double totalW = CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal,
+                                                     glyphs, advances, n);
+    if (totalW <= 0.0) { CFRelease(font); return; }
+
+    const double ascent  = CTFontGetAscent(font);
+    const double descent = CTFontGetDescent(font);
+    const double dx = frame.origin.x + (frame.size.width - totalW) * 0.5;
+    const double dy = frame.origin.y + (frame.size.height + ascent + descent) * 0.5 - descent;
+
+    double penX = dx;
+    for (CFIndex i = 0; i < n; i++) {
+        if (glyphs[i] != 0) {
+            CGAffineTransform m = CGAffineTransformMake(1.0, 0.0, 0.0, -1.0, penX, dy);
+            // CTFontCreatePathForGlyph, not the Get variant. There is no
+            // CTFontGetPathForGlyph in the iOS SDK — CTFont.h only declares the
+            // Create form, and the Get form is a macOS one — so the one named in
+            // the brief does not exist to call and this is the function that
+            // does. It hands back a new path per glyph, hence the release; the
+            // borrowed-and-cached form sb_text_glyphs wanted is simply not there
+            // to have.
+            CGPathRef g = CTFontCreatePathForGlyph(font, glyphs[i], &m);
+            if (g) { CGPathAddPath(dst, NULL, g); CGPathRelease(g); }
+        }
+        penX += advances[i].width;
+    }
+    CFRelease(font);
 }
 
 // drawRing, not aimbotEnabled. The flag used to be the aimbot's, and the
@@ -247,6 +360,14 @@ static void ESPRenderPawnCore(
     CGFloat dynFontSize = fmaxf(4.5f, fminf(10.0f, 350.0f / fmaxf(dis, 1.0f)));
     float centerX = x + boxWidth * 0.5f;
 
+    // The health bar's height and its gap off the top of the box, defined here
+    // rather than inside the health bar block because two things have to agree on
+    // them: the bar itself, and the name plate, which has to sit on exactly the
+    // line the bar's top edge is on so the two do not overlap. A literal written
+    // twice is a value that gets changed once.
+    const CGFloat barH   = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
+    const CGFloat barGap = 3.0f;       // đáy thanh lên khỏi đỉnh box
+
     // ---------------------------------------------------------
     // BONE — bỏ hẳn.
     //
@@ -308,23 +429,85 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // NAME
+    // NAME PLATE — tên + "[Xm]", chữ trắng trên nền xám.
+    //
+    // Một plate cho mỗi người, hai path cho cả khung hình: một path chữ cho
+    // tất cả tên, một path nền cho tất cả plate. Mỗi path đi qua đúng một
+    // lần publish, và số lần đó không nhân với số người — cùng lý do
+    // snapline gộp thành một polyline.
+    //
+    // Vì sao là geometry chứ không phải CATextLayer: cửa sổ host chạy ở
+    // alpha 0 (StartESPHost trong esp/hud/DirectOverlay.mm) nên không thứ gì
+    // vẽ trong process này được nhìn thấy. Thứ duy nhất ra màn hình là
+    // CGPath đưa sang SpringBoard, nên tên phải là path. Cách dựng nét chữ:
+    // ESPAppendTextPath ở trên.
+    //
+    // addText: vẫn được gọi. Nó là lớp trong app nên vô hình, nhưng nó là
+    // lớp mà CATextLayer của app từng dùng, và hai cái không vẽ lên cùng
+    // một bề mặt: path chỉ đi sang SpringBoard. Bỏ đi là một thay đổi hành
+    // vi không ai yêu cầu, nên nó ở lại.
     // ---------------------------------------------------------
-    if (isName && textCallback) {
-        NSString *dispName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
-        if (dispName.length > 0) {
-            // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-            textCallback(callbackContext, dispName, CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f, 200.0f, dynFontSize + 4.0f), [UIColor yellowColor], dynFontSize, NO);
-        }
+    NSString *plateName = nil;
+    if (isName) {
+        plateName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
+        if (plateName.length == 0) plateName = nil;
+    }
+    NSString *plateDis = nil;
+    if (isDis) {
+        plateDis = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
+        if (plateDis.length == 0) plateDis = nil;
     }
 
-    // ---------------------------------------------------------
-    // DISTANCE
-    // ---------------------------------------------------------
-    if (isDis && textCallback) {
-        NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
+    if (plateName && textCallback) {
         // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
-        textCallback(callbackContext, distString, CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f, 200.0f, dynFontSize + 4.0f), [UIColor whiteColor], dynFontSize, NO);
+        textCallback(callbackContext, plateName, CGRectMake(centerX - 100.0f, y - dynFontSize - 6.0f, 200.0f, dynFontSize + 4.0f), [UIColor yellowColor], dynFontSize, NO);
+    }
+    if (plateDis && textCallback) {
+        // [FIX LAG]: Xóa sizeWithAttributes, căn giữa bằng cờ NO
+        textCallback(callbackContext, plateDis, CGRectMake(centerX - 100.0f, y + boxHeight + 2.0f, 200.0f, dynFontSize + 4.0f), [UIColor whiteColor], dynFontSize, NO);
+    }
+
+    if (plateName || plateDis) {
+        const CGFloat lineH = dynFontSize + 4.0f;
+        const CGFloat plateH = lineH * (CGFloat)((plateName ? 1 : 0) + (plateDis ? 1 : 0));
+
+        // Đáy plate nằm đúng trên mép trên của thanh máu, tức y - barGap - barH.
+        // Đó là câu trả lời cho "đặt ngay trên mép trên khung box mà không đè
+        // lên thanh máu": barGap + barH là đúng phần đã bị thanh chiếm, chừa
+        // hơn là hở, chừa ít hơn là đè. Hai khối dùng chung barGap và barH để
+        // con số này không thể trôi khỏi thanh máu.
+        const CGFloat plateBottom = y - barGap - barH;
+        const CGRect plate = CGRectMake(x, plateBottom - plateH, boxWidth, plateH);
+
+        // Bề rộng plate là boxWidth, không phải bề rộng theo máu.
+        //
+        // Đây là yêu cầu của người dùng và nó đúng: plate bám boxWidth nên
+        // đứng yên khi máu giảm. Plate bám theo barW, tức boxWidth *
+        // healthRatio, là bản rẻ hơn và trông như một lỗi: plate co lại
+        // từng khung theo HP và tên bị cắt chỉ vì một con số đổi, trong khi
+        // cái đang co lại là thanh máu chứ không phải cái giữ nó đứng yên.
+        //
+        // CGPathAddRect chứ không phải CGPathAddEllipseInRect: hình chữ nhật
+        // bốn góc được decoder ở SpringBoard gom vào CGPathAddRects chung,
+        // nên plate của cả khung hình vẫn là một lệnh.
+        if (buffers->nameBgPath) {
+            CGPathAddRect(buffers->nameBgPath, NULL, plate);
+        }
+
+        // Mỗi dòng chiếm đúng một lineH, tên ở trên, quãng cách ở dưới. Cùng
+        // font, cùng cỡ chữ và cùng cách canh giữa với addText: ở trên, nên
+        // chỗ text đứng không nhảy khi CATextLayer bị bỏ đi.
+        CGFloat lineY = plate.origin.y;
+        if (plateName) {
+            ESPAppendTextPath(buffers->nameTextPath, plateName,
+                              CGRectMake(plate.origin.x, lineY, plate.size.width, lineH), dynFontSize);
+            lineY += lineH;
+        }
+        if (plateDis) {
+            ESPAppendTextPath(buffers->nameTextPath, plateDis,
+                              CGRectMake(plate.origin.x, lineY, plate.size.width, lineH), dynFontSize);
+        }
+        buffers->nameTextDirty = true;
     }
 
     // ---------------------------------------------------------
@@ -353,13 +536,12 @@ static void ESPRenderPawnCore(
     // đường viền dày thêm chứ không phải một thanh. Đây là khoảng cách trông
     // đẹp nhất trong ba giá trị thử; không phải thanh to thêm, chỉ dời lên.
     //
-    // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung; nền xám
-    // của tên bám theo đúng con số này, xem phần NAME.
+    // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung, và nó là
+    // thứ duy nhất ở đây co lại được: nền xám của tên cố ý dùng boxWidth
+    // chứ không dùng barW, xem phần NAME PLATE.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barH = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
-        const CGFloat barGap = 3.0f;     // đáy thanh lên khỏi đỉnh box
         const CGFloat barW = boxWidth * healthRatio;
         const CGFloat barTop = y - barGap - barH;
 

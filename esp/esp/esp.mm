@@ -2389,6 +2389,34 @@ static UIFont *LoadCountFont(CGFloat size) {
     return font ? font : [UIFont boldSystemFontOfSize:size];
 }
 
+// The font name the counter draws with, cached once.
+//
+// addText: keeps its own static copy of LoadCountFont(10).fontName and so does
+// this, and both go through the same loader, so the digits in the corner and the
+// nicknames over the boxes are one typeface. Rebuilding the UIFont per player per
+// frame just to read a name that never changes is not worth it.
+//
+// extern "C" on the definition, not just on the declaration in esp.h. espdraw.mm
+// calls this, and espdraw.mm is Objective-C++ while this is Objective-C++, so
+// without it the symbol is C++ mangled and the two sides do not meet: the header
+// promises an unmangled _ESPNameTextFontName and the definition supplies a
+// mangled one. That is an undefined symbol at link time, and -fsyntax-only
+// cannot see it, so it is checked here by hand every time.
+#ifdef __cplusplus
+extern "C" {
+#endif
+NSString *ESPNameTextFontName(void) {
+    static NSString *s_name = nil;
+    if (!s_name) {
+        s_name = LoadCountFont(10).fontName;
+        if (!s_name.length) s_name = @"Arial-BoldMT";
+    }
+    return s_name;
+}
+#ifdef __cplusplus
+}   // extern "C"
+#endif
+
 static inline CGMutablePathRef ESPCreateMutablePath(void) { return CGPathCreateMutable(); }
 static inline void ESPReleasePath(CGMutablePathRef path) { if (path) CGPathRelease(path); }
 
@@ -2408,6 +2436,8 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.hpFillRedPath = ESPCreateMutablePath();
     buffers.bgFillBlackPath = ESPCreateMutablePath();
     buffers.alertPath = ESPCreateMutablePath();
+    buffers.nameTextPath = ESPCreateMutablePath();
+    buffers.nameBgPath = ESPCreateMutablePath();
     
     buffers.boxDirty = buffers.boxBotDirty = buffers.boxKnockedDirty = NO;
     buffers.boneDirty = buffers.boneBotDirty = buffers.boneKnockedDirty = NO;
@@ -2428,6 +2458,7 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
     buffers.snaplineFanStarted = buffers.snaplineBotFanStarted = buffers.snaplineKnockedFanStarted = NO;
     buffers.hpFillGreenDirty = buffers.hpFillOrangeDirty = buffers.hpFillRedDirty = NO;
     buffers.bgFillBlackDirty = buffers.alertDirty = NO;
+    buffers.nameTextDirty = NO;
     return buffers;
 }
 
@@ -2450,6 +2481,7 @@ static inline void ESPGeometryBuffersRelease(ESPGeometryBuffers *buffers) {
     ESPReleasePath(buffers->snaplineKnockedPath); ESPReleasePath(buffers->hpFillGreenPath);
     ESPReleasePath(buffers->hpFillOrangePath); ESPReleasePath(buffers->hpFillRedPath); 
     ESPReleasePath(buffers->bgFillBlackPath); ESPReleasePath(buffers->alertPath);
+    ESPReleasePath(buffers->nameTextPath); ESPReleasePath(buffers->nameBgPath);
 }
 
 static inline void MenuViewApplyPath(CAShapeLayer *layer, CGMutablePathRef path, bool dirty) {
@@ -2711,6 +2743,12 @@ void ESPSyncFromPrefs(void) {
 @property (nonatomic, strong) CAShapeLayer *alertNumOrangeLayer;
 @property (nonatomic, strong) CAShapeLayer *alertNumRedLayer;
 
+// The nickname glyphs. Built and filled white in this process and read out of
+// this view over KVC, so this layer is never added to the canvas and never has
+// a path set on the app side: it exists to be asked for. See ESPGeometryBuffers
+// in esp.h for why the plate is geometry and not a CATextLayer.
+@property (nonatomic, strong) CAShapeLayer *nameTextLayer;
+
 @property (nonatomic, strong) NSMutableArray<CATextLayer *> *textLayerPool;
 @property (nonatomic, assign) NSUInteger activeTextLayerCount;
 
@@ -2761,6 +2799,7 @@ static void ESPViewAddImageCallback(void *context, UIImage *image, CGRect frame)
     self.bgFillBlackLayer.path = nil; self.aimAssistLayer.path = nil;
     self.alertNumBGLayer.path = nil; self.alertNumGreenLayer.path = nil;
     self.alertNumOrangeLayer.path = nil; self.alertNumRedLayer.path = nil;
+    self.nameTextLayer.path = nil;
     self.statusLayer.hidden = YES;
     [self resetReusableLayers];
 }
@@ -3000,6 +3039,19 @@ static void ESPDiagHeartbeat(void) {
     self.alertNumGreenLayer = [self buildShapeLayerWithStroke:[UIColor colorWithRed:0 green:1 blue:0 alpha:1.0f] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
     self.alertNumOrangeLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
     self.alertNumRedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:[UIColor clearColor] lineWidth:4.0f zPos:baseZ + 8];
+
+    // Nickname glyphs, white and filled, on top of the dark plate. baseZ + 8 for
+    // the same reason the plate is baseZ + 7: the plate has to cover the box and
+    // the health bar, which are at baseZ + 3 and baseZ + 5, and the glyphs have to
+    // cover the plate.
+    //
+    // Deliberately not in the layers array below. It is a data source for
+    // SpringBoard, not something this process draws: adding it would put a second
+    // copy of the name on the app's own canvas over a canvas nobody can see, and
+    // it would then need clearing in resetReusableLayers and re-attaching on the
+    // streamer-mode toggle for no picture. It stays a bare retained layer whose
+    // path is set by MenuViewApplyPath and read back over KVC.
+    self.nameTextLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor whiteColor] lineWidth:0 zPos:baseZ + 8];
 
     NSArray *layers = @[self.bgFillBlackLayer, self.fovLayer, self.snaplineLayer, self.snaplineBotLayer, self.snaplineKnockedLayer, self.boneLayer, self.boneBotLayer, self.boneKnockedLayer, self.boxLayer, self.boxBotLayer, self.boxKnockedLayer, self.hpFillGreenLayer, self.hpFillOrangeLayer, self.hpFillRedLayer, self.alertLayer, self.aimAssistLayer, self.alertNumBGLayer, self.alertNumGreenLayer, self.alertNumOrangeLayer, self.alertNumRedLayer];
 
@@ -3337,6 +3389,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
         MenuViewApplyPath(self.hpFillOrangeLayer, showVisuals ? buffers.hpFillOrangePath : nil, buffers.hpFillOrangeDirty);
         MenuViewApplyPath(self.hpFillRedLayer, showVisuals ? buffers.hpFillRedPath : nil, buffers.hpFillRedDirty);
         MenuViewApplyPath(self.alertLayer, showVisuals ? buffers.alertPath : nil, buffers.alertDirty);
+        // The nickname glyphs. Gated on the same showVisuals as everything else,
+        // so turning the ESP off stops publishing names as well as boxes, and on
+        // the same dirty flag the others use, so a frame that drew no names costs
+        // nothing and a frame that did replaces the path.
+        MenuViewApplyPath(self.nameTextLayer, showVisuals ? buffers.nameTextPath : nil, buffers.nameTextDirty);
 
         // The dirty flags are read by the [APP-LAYER] diagnostic further down,
         // which runs after ESPGeometryBuffersRelease has freed the paths, so
@@ -5516,6 +5573,16 @@ static int      s_espCountN = 0;
         // Release fire/scope or no target → stop cam override immediately.
         if (!(isFiring || isScoping) || !cameraAimActive || bestTarget == 0)
             AimLockClear();
+    }
+
+    // The name plate's rectangles were built in espdraw.mm, which is where the box
+    // they line up with is computed, and they belong on the plate layer rather than
+    // on a layer of their own: alertNumBGLayer is already the dark fill, already
+    // published at kShapeKeys index 17, and already costs one crossing whatever it
+    // holds. Merging here rather than adding a second layer is also why the plate
+    // does not appear and disappear when the edge counter is switched on.
+    if (buffers && buffers->nameBgPath && !CGPathIsEmpty(buffers->nameBgPath)) {
+        CGPathAddPath(aNumBGPath, NULL, buffers->nameBgPath);
     }
 
     self.alertNumBGLayer.path = CGPathIsEmpty(aNumBGPath) ? nil : aNumBGPath;

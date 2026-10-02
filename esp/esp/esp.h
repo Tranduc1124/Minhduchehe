@@ -65,6 +65,25 @@ typedef struct {
     CGMutablePathRef alertPath;
     CGMutablePathRef bgFillBlackPath;
 
+    // Name plate, the two halves of it.
+    //
+    // The host window runs at alpha 0, so a CATextLayer is never seen and the
+    // nickname has to be geometry: nameTextPath carries the glyph outlines for
+    // every player in the frame, nameBgPath carries one plate rectangle per
+    // player. SpringBoard picks both up over KVC and fills them, white on the
+    // dark plate.
+    //
+    // nameBgPath is here rather than drawn straight into the alert counter's
+    // background because the plate's rectangle is computed in espdraw.mm, by the
+    // same function that computes the box, and that background is a local of the
+    // frame loop in esp.mm. The two halves of the frame meet in this struct.
+    //
+    // One path for all players, not one per player: a layer is published whole,
+    // so thirty players cost the same two crossings as one. See the snapline fan
+    // note above for the same argument about a different shape.
+    CGMutablePathRef nameTextPath;
+    CGMutablePathRef nameBgPath;
+
     bool boxDirty;
     bool boxBotDirty;
     bool boxKnockedDirty;
@@ -97,6 +116,11 @@ typedef struct {
     bool hpFillRedDirty;
     bool alertDirty;
     bool bgFillBlackDirty;
+    // Only the glyphs need one of these. The plate rectangles ride along in
+    // nameBgPath, which is merged into the alert counter's background path and
+    // assigned unconditionally at the end of the frame, so there is no dirty
+    // edge to get wrong there.
+    bool nameTextDirty;
 } ESPGeometryBuffers;
 
 typedef struct { 
@@ -179,6 +203,16 @@ bool get_IsKnockedDown(uint64_t PawnObject);
 bool get_IsBeingRescued(uint64_t PawnObject);
 
 UIFont *GetCustomFont(CGFloat size);
+
+// The PostScript name of the font the counter layer draws with, i.e. the one the
+// name plate has to use too, or the same overlay ends up carrying two typefaces.
+//
+// It is a name and not a UIFont or a CTFont on purpose. LoadCountFont is a file
+// static in esp.mm and the glyph builder that needs it is a file static in
+// espdraw.mm, so a name is the only thing worth handing across: the loader stays
+// in one file and each side keeps the CFType it works in, which is the one it
+// has to hand to CoreText anyway.
+NSString *ESPNameTextFontName(void);
 
 bool RenderFOVCirclePath(CGMutablePathRef path, float viewWidth, float viewHeight, bool aimbotEnabled, float fovRadius);
 

@@ -163,6 +163,25 @@ static SbTextSlot g_sbText[SB_TEXT_SLOTS];
 // nothing it does can reach g_sbShape: a failure here leaves the geometry exactly
 // as it was and the counter simply does not appear.
 static uint64_t g_sbTextShape = 0;      // the CAShapeLayer, filled, in the target
+// The name plate and the name glyphs. Both filled, both clipped at creation, both
+// with their own path hold. Every player's plate is one path and every player's
+// glyphs is another, so this is a fixed cost that does not grow with the roster.
+static uint64_t g_sbNameBgShape = 0;
+static uint64_t g_sbNameTextShape = 0;
+static uint64_t g_sbNameTextFill = 0;
+static uint64_t g_sbNameBgPath = 0;    // the plate's CGMutablePath, in the target
+static uint64_t g_sbNameTextPath = 0;  // the glyphs' CGMutablePath, in the target
+// Whether each name layer is showing something. A CAShapeLayer keeps the last
+// path it was handed for the life of the session, so a layer that stops getting a
+// marker needs one explicit empty path handed over, once, or the names freeze on
+// screen when the pref is switched off.
+static int s_sbNameBgLive = 0;
+static int s_sbNameTextLive = 0;
+// Declared up here rather than next to sb_invoke_name_cached, because
+// sb_forget_local_paint_state tears these down and it is defined earlier in the
+// file than that helper is.
+static uint64_t g_sbNameInv[2] = {0, 0};
+static uint64_t g_sbNameArgBuf[2] = {0, 0};
 static uint64_t g_sbTextPath  = 0;      // its CGMutablePath, in the target
 static uint64_t g_sbTextFill  = 0;      // its CGColor, in the target
 // Whether the counter's layer is currently showing something, which is not the
@@ -323,12 +342,26 @@ static uint64_t g_sbNextPublishUS = 0;
 static uint32_t g_sbLastSubpaths = 0;
 static uint64_t g_sbLastCalls = 0;
 
-static const char *kShapeKeys[16] = {
+// Index 0 to 15 are the geometry layers. 16 is the white filled text layer and is
+// NOT in here: it is sampled straight from the app's statusLayer through sb_text_path
+// rather than through KVC, because it is text and not a shape the app draws.
+//
+// 17 and 18 are the name plate background and the white name glyphs. The app
+// already built both layers and never shipped them, because this list stopped at
+// 16: alertNumBGLayer is the dark plate, and nameTextLayer is the new one. The
+// app merges every player's plate into one path and every player's glyphs into
+// one path, so these two cost the same two crossings the counter does and do not
+// grow with the player count.
+#define SB_NAME_BG_INDEX 17
+#define SB_NAME_TEXT_INDEX 18
+#define SB_SHAPE_KEY_COUNT 19
+static const char *kShapeKeys[SB_SHAPE_KEY_COUNT] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
     "boneLayer", "boneBotLayer", "boneKnockedLayer",
     "snaplineLayer", "snaplineBotLayer", "snaplineKnockedLayer",
     "hpFillGreenLayer", "hpFillOrangeLayer", "hpFillRedLayer",
-    "bgFillBlackLayer", "alertLayer", "fovLayer", "aimAssistLayer"
+    "bgFillBlackLayer", "alertLayer", "fovLayer", "aimAssistLayer",
+    NULL, "alertNumBGLayer", "nameTextLayer"
 };
 
 static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
@@ -862,8 +895,19 @@ static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
     // The marker is what makes the bucket decidable: draw the snapline layers,
     // drop the rest.
     int emitted = 0;
-    for (int i = 0; i < 16; i++) {
-        id val = [espView valueForKey:[NSString stringWithUTF8String:kShapeKeys[i]]];
+    for (int i = 0; i < SB_SHAPE_KEY_COUNT; i++) {
+        // Slot 16 is the counter's text layer, which is sampled through
+        // sb_text_path and not through KVC, so it has no key here.
+        if (!kShapeKeys[i]) continue;
+        NSString *key = [NSString stringWithUTF8String:kShapeKeys[i]];
+        // valueForKey: on a key the view does not declare raises
+        // NSUndefinedKeyException, which would take SpringBoard down. A missing
+        // layer is a cosmetic problem, never a reason to die, so the selector is
+        // checked first. This is not defensive paranoia: the two new keys are
+        // read out of the game's view and the app side of this is a separate
+        // change that can legitimately land later or not at all.
+        if (![espView respondsToSelector:NSSelectorFromString(key)]) continue;
+        id val = [espView valueForKey:key];
         if (![val isKindOfClass:[CAShapeLayer class]]) continue;
         CGPathRef p = ((CAShapeLayer *)val).path;
         if (!p || CGPathIsEmpty(p)) continue;
@@ -939,6 +983,26 @@ static void sb_forget_local_paint_state(void) {
     // to clear a layer from the previous session.
     g_sbTextPath = 0;
     s_sbTextLive = 0;
+    // The name layers die with the session that created them, and so must the
+    // paths they were handed. A new session gets new layers and new paths, so
+    // holding the old ones here would be a dangling pointer into a dead overlay.
+    g_sbNameBgShape = 0;
+    g_sbNameTextShape = 0;
+    g_sbNameTextFill = 0;
+    g_sbNameBgPath = 0;
+    g_sbNameTextPath = 0;
+    s_sbNameBgLive = 0;
+    s_sbNameTextLive = 0;
+    for (int i = 0; i < 2; i++) {
+        if (r_is_objc_ptr(g_sbNameInv[i]) && remote_call_has_local_state()) {
+            r_msg2(g_sbNameInv[i], "release", 0,0,0,0);
+        }
+        if (g_sbNameArgBuf[i] && remote_call_has_local_state()) {
+            dlsym_remote("free", g_sbNameArgBuf[i], 0,0,0,0,0,0,0);
+        }
+        g_sbNameInv[i] = 0;
+        g_sbNameArgBuf[i] = 0;
+    }
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -1148,6 +1212,49 @@ static BOOL sb_invoke_text_cached_main_raw(uint64_t path) {
     if (!r_msg(g_sbTextInv, setArgSel, g_sbTextArgBuf, 2, 0, 0)) return NO;
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbTextInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
+    return YES;
+}
+
+// Slot 0 is the name plate, slot 1 the name glyphs. Same construction and the
+// same no-settle perform as the two invocations above, which is why it is a loop
+// and not a third copy of them. The storage is at the top of the file, next to
+// the live flags, because sb_forget_local_paint_state needs it.
+
+static BOOL sb_invoke_name_cached(int slot, uint64_t target, uint64_t path) {
+    if (slot < 0 || slot > 1) return NO;
+    if (!r_is_objc_ptr(path) || !r_is_objc_ptr(target)) return NO;
+
+    if (!r_is_objc_ptr(g_sbNameInv[slot])) {
+        uint64_t setPathSel = r_sel("setPath:");
+        if (!setPathSel) return NO;
+        uint64_t sig = r_msg(target, r_sel("methodSignatureForSelector:"), setPathSel, 0, 0, 0);
+        if (!r_is_objc_ptr(sig)) return NO;
+        uint64_t NSInv = r_class("NSInvocation");
+        if (!r_is_objc_ptr(NSInv)) return NO;
+        uint64_t inv = r_msg(NSInv, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+        if (!r_is_objc_ptr(inv)) return NO;
+        r_msg2(inv, "retain", 0, 0, 0, 0);
+        r_msg2(inv, "setTarget:", target, 0, 0, 0);
+        r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
+        uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (!argBuf) { r_msg2(inv, "release", 0, 0, 0, 0); return NO; }
+        remote_write64(argBuf, 0);
+        r_msg2(inv, "setArgument:atIndex:", argBuf, 2, 0, 0);
+        r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+        g_sbNameInv[slot] = inv;
+        g_sbNameArgBuf[slot] = argBuf;
+    }
+    remote_write64(g_sbNameArgBuf[slot], path);
+    if (remote_read64(g_sbNameArgBuf[slot]) != path) {
+        g_sbPathArgMisses++;
+        return NO;
+    }
+    uint64_t setArgSel = r_sel("setArgument:atIndex:");
+    if (!setArgSel) return NO;
+    if (!r_msg(g_sbNameInv[slot], setArgSel, g_sbNameArgBuf[slot], 2, 0, 0)) return NO;
+    if (g_sbPerformMainSel && g_sbInvokeSel) {
+        r_msg(g_sbNameInv[slot], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
     return YES;
 }
@@ -1669,6 +1776,78 @@ int SBoardStartOverlay(void) {
         if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
     }
 
+    // The two name layers: a dark plate behind, white glyphs in front.
+    //
+    // Both are filled, which is what a name has to be, and a filled layer is the
+    // one thing that can turn a whole screen white. The counter's layer carries a
+    // clip for exactly that reason, written down above, and these get the same
+    // backstop for the same reason. A wrong coordinate on a stroked layer draws a
+    // meaningless line; a wrong coordinate on a filled layer fills the screen. The
+    // clip bounds that to a rectangle where a name can actually be, so a bad path
+    // shows as a missing name rather than as a white flash.
+    //
+    // The plate is built here rather than mirrored from the app for the same
+    // reason the counter's colour is: a CGColor is an object in the target, and
+    // the app's is in this process. 0.42 grey at 0.55 alpha, which is dark enough
+    // to read white text on and light enough to be a plate rather than a hole.
+    uint64_t cLayer2 = r_msg2_main(container, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(cLayer2)) {
+        double nc[4] = { 0.42, 0.42, 0.42, 0.55 };
+        uint64_t nCol = r_msg2_main_raw(r_class("UIColor"),
+                                        "colorWithRed:green:blue:alpha:",
+                                        &nc[0], 8, &nc[1], 8, &nc[2], 8, &nc[3], 8);
+        uint64_t nCG = r_is_objc_ptr(nCol) ? r_msg2_main(nCol, "CGColor", 0,0,0,0) : 0;
+
+        uint64_t bgShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+        if (r_is_objc_ptr(bgShape)) {
+            r_msg2_main_raw(bgShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+            if (r_is_objc_ptr(nCG)) r_msg2_main(bgShape, "setFillColor:", nCG, 0,0,0);
+            r_msg2_main(bgShape, "setStrokeColor:", 0, 0,0,0);
+            double nzw = 0.0;
+            r_msg2_main_raw(bgShape, "setLineWidth:", &nzw, 8, NULL,0,NULL,0,NULL,0);
+            r_msg2_main(bgShape, "setOpaque:", 0, 0,0,0);
+            double nzb = 101.0;
+            r_msg2_main_raw(bgShape, "setZPosition:", &nzb, 8, NULL,0,NULL,0,NULL,0);
+            double bgClip[4] = { -40.0, -40.0, 460.0, 660.0 };
+            r_msg2_main_raw(bgShape, "setClip:", bgClip, 32, NULL,0,NULL,0,NULL,0);
+            sb_disable_layer_actions(bgShape);
+            g_sbNameBgShape = bgShape;
+            r_msg2_main(cLayer2, "addSublayer:", bgShape, 0,0,0);
+        }
+
+        uint64_t txShape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
+        if (r_is_objc_ptr(txShape)) {
+            r_msg2_main_raw(txShape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+            double wc[4] = { 1.0, 1.0, 1.0, 1.0 };
+            uint64_t wCol = r_msg2_main_raw(r_class("UIColor"),
+                                           "colorWithRed:green:blue:alpha:",
+                                           &wc[0], 8, &wc[1], 8, &wc[2], 8, &wc[3], 8);
+            uint64_t wCG = r_is_objc_ptr(wCol) ? r_msg2_main(wCol, "CGColor", 0,0,0,0) : 0;
+            if (r_is_objc_ptr(wCG)) {
+                r_msg2_main(txShape, "setFillColor:", wCG, 0,0,0);
+                g_sbNameTextFill = wCG;
+            }
+            r_msg2_main(txShape, "setStrokeColor:", 0, 0,0,0);
+            double xzw = 0.0;
+            r_msg2_main_raw(txShape, "setLineWidth:", &xzw, 8, NULL,0,NULL,0,NULL,0);
+            r_msg2_main(txShape, "setOpaque:", 0, 0,0,0);
+            double xz = 102.0;
+            r_msg2_main_raw(txShape, "setZPosition:", &xz, 8, NULL,0,NULL,0,NULL,0);
+            // The backstop. This is a filled white layer, the exact combination
+            // that produced a full-screen white flash when the name work was
+            // reverted. Whatever the path turns out to contain, the damage is
+            // bounded to where a name can be on screen.
+            double txClip[4] = { -40.0, -40.0, 460.0, 660.0 };
+            r_msg2_main_raw(txShape, "setClip:", txClip, 32, NULL,0,NULL,0,NULL,0);
+            sb_disable_layer_actions(txShape);
+            g_sbNameTextShape = txShape;
+            r_msg2_main(cLayer2, "addSublayer:", txShape, 0,0,0);
+        }
+        NSLog(@"[SB-NAME] bg=0x%llx text=0x%llx",
+              (unsigned long long)g_sbNameBgShape,
+              (unsigned long long)g_sbNameTextShape);
+    }
+
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
@@ -2089,6 +2268,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             // while the boxes are stroked; sharing a path would make the digits
             // outlines or the boxes solid, and neither is wanted.
             uint64_t rpT = r_is_objc_ptr(g_sbTextShape) ? sb_text_path() : 0;
+            // The two filled name paths. They cannot go into rp, which is stroked,
+            // and they cannot go into rpT, which is red, so each needs its own.
+            // Each is replaced at its own marker and the one it replaced is
+            // released there, so exactly one of each is alive at a time.
+            uint64_t rpNameBg = 0;
+            uint64_t rpNameText = 0;
             const int okAfterBuf = remote_call_current_success() ? 1 : 0;
             if (!okBefore || !rp || !ptsBuf || !okAfterBuf || !okAfterPath) {
                 static uint64_t s_probeUS = 0;
@@ -2265,6 +2450,8 @@ void SBRemotePushESPFrame(UIView *espView) {
             // flag crosses between threads, so a rebuild cannot be lost and digits
             // cannot be drawn over digits.
             int textPathReady = 0;
+            int nameBgReady = 0;
+            int nameTextReady = 0;
             uint32_t dstCount = 0;                 // runs sent to the text path
             uint32_t tCount = 0;                   // and their shapes
             uint8_t  tPts[64];
@@ -2345,6 +2532,36 @@ void SBRemotePushESPFrame(UIView *espView) {
                                     }
                                 }
                             }
+                            // The two name layers, same shape as the counter's.
+                            // The plate and the glyphs each need their own filled
+                            // path: neither can go into rp, which is stroked, and
+                            // neither can go into rpT, which is red.
+                            if (curLayer == SB_NAME_BG_INDEX && !nameBgReady) {
+                                nameBgReady = 1;
+                                if (r_is_objc_ptr(g_sbNameBgShape)) {
+                                    if (r_is_objc_ptr(g_sbNameBgPath)) {
+                                        dlsym_remote("CGPathRelease", g_sbNameBgPath, 0,0,0,0,0,0,0);
+                                        calls += 1;
+                                    }
+                                    g_sbNameBgPath = 0;
+                                    rpNameBg = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                                    calls += 1;
+                                    if (!r_is_objc_ptr(rpNameBg)) g_sbNameBgPath = 0;
+                                }
+                            }
+                            if (curLayer == SB_NAME_TEXT_INDEX && !nameTextReady) {
+                                nameTextReady = 1;
+                                if (r_is_objc_ptr(g_sbNameTextShape)) {
+                                    if (r_is_objc_ptr(g_sbNameTextPath)) {
+                                        dlsym_remote("CGPathRelease", g_sbNameTextPath, 0,0,0,0,0,0,0);
+                                        calls += 1;
+                                    }
+                                    g_sbNameTextPath = 0;
+                                    rpNameText = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                                    calls += 1;
+                                    if (!r_is_objc_ptr(rpNameText)) g_sbNameTextPath = 0;
+                                }
+                            }
                             // The pending rectangle batch is flushed before the
                             // switch, or a batch begun on one layer would finish
                             // into the next one's path.
@@ -2356,8 +2573,10 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 rectDoubles = 0;
                             }
                             dstLayer = curLayer;
-                            dstPath = (curLayer == SB_TEXT_LAYER_INDEX && r_is_objc_ptr(rpT))
-                                    ? rpT : rp;
+                            dstPath = rp;
+                            if (curLayer == SB_TEXT_LAYER_INDEX && r_is_objc_ptr(rpT)) dstPath = rpT;
+                            else if (curLayer == SB_NAME_BG_INDEX && r_is_objc_ptr(rpNameBg)) dstPath = rpNameBg;
+                            else if (curLayer == SB_NAME_TEXT_INDEX && r_is_objc_ptr(rpNameText)) dstPath = rpNameText;
                             if (dstPath == rpT && tCount < 64) {
                                 // Which run went to the text path, so a wrong
                                 // destination is readable off the device instead
@@ -2647,6 +2866,43 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                     g_sbTextPath = empty;
                 }
             }
+            // The same off edge for the two name layers. Without it, turning the
+            // name pref off leaves the last frame's plate and glyphs sitting on
+            // screen for the rest of the session, because nothing else ever clears
+            // a CAShapeLayer. One empty path each, once, and only when a marker
+            // that used to arrive has stopped.
+            if (!nameBgReady && s_sbNameBgLive && r_is_objc_ptr(g_sbNameBgShape)) {
+                s_sbNameBgLive = 0;
+                uint64_t eBg = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                calls++;
+                if (r_is_objc_ptr(eBg)) {
+                    if (!sb_invoke_name_cached(0, g_sbNameBgShape, eBg)) {
+                        r_msg2_main(g_sbNameBgShape, "setPath:", eBg, 0,0,0);
+                    }
+                    calls++;
+                    if (r_is_objc_ptr(g_sbNameBgPath)) {
+                        dlsym_remote("CGPathRelease", g_sbNameBgPath, 0,0,0,0,0,0,0);
+                        calls++;
+                    }
+                    g_sbNameBgPath = eBg;
+                }
+            }
+            if (!nameTextReady && s_sbNameTextLive && r_is_objc_ptr(g_sbNameTextShape)) {
+                s_sbNameTextLive = 0;
+                uint64_t eTx = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+                calls++;
+                if (r_is_objc_ptr(eTx)) {
+                    if (!sb_invoke_name_cached(1, g_sbNameTextShape, eTx)) {
+                        r_msg2_main(g_sbNameTextShape, "setPath:", eTx, 0,0,0);
+                    }
+                    calls++;
+                    if (r_is_objc_ptr(g_sbNameTextPath)) {
+                        dlsym_remote("CGPathRelease", g_sbNameTextPath, 0,0,0,0,0,0,0);
+                        calls++;
+                    }
+                    g_sbNameTextPath = eTx;
+                }
+            }
             if (textPathReady && r_is_objc_ptr(rpT) && r_is_objc_ptr(g_sbTextShape)) {
                 // Two crossings instead of thirteen, and none of them sleep.
                 // This was the single largest cost in a publish: r_msg2_main
@@ -2659,6 +2915,27 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++;
                 g_sbTextPath = rpT;
                 s_sbTextLive = 1;
+                // The name plate and the name glyphs. Four crossings, no sleep,
+                // the same as the counter gets. The paths are handed over and
+                // kept, so the marker block above releases the previous one
+                // instead of leaking it, and the layer and this pointer never
+                // disagree about who owns what.
+                if (nameBgReady && r_is_objc_ptr(rpNameBg) && r_is_objc_ptr(g_sbNameBgShape)) {
+                    if (!sb_invoke_name_cached(0, g_sbNameBgShape, rpNameBg)) {
+                        r_msg2_main(g_sbNameBgShape, "setPath:", rpNameBg, 0,0,0);
+                    }
+                    calls++;
+                    g_sbNameBgPath = rpNameBg;
+                    s_sbNameBgLive = 1;
+                }
+                if (nameTextReady && r_is_objc_ptr(rpNameText) && r_is_objc_ptr(g_sbNameTextShape)) {
+                    if (!sb_invoke_name_cached(1, g_sbNameTextShape, rpNameText)) {
+                        r_msg2_main(g_sbNameTextShape, "setPath:", rpNameText, 0,0,0);
+                    }
+                    calls++;
+                    g_sbNameTextPath = rpNameText;
+                    s_sbNameTextLive = 1;
+                }
                 // What actually went on the text layer. The FOV ring came out as a
                 // solid red disc, which is what a filled closed circle looks like,
                 // so either a geometry run reached this path or the glyphs did. The
