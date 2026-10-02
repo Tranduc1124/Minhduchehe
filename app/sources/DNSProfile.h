@@ -61,6 +61,19 @@ NSString * _Nullable MDDNSStartProfileServer(NSString * _Nullable * _Nullable er
 void MDDNSOpenProfile(NSString *url,
                       void (^_Nullable done)(BOOL accepted));
 
+// Tries to navigate Settings to the page holding DNS profiles, so installing
+// does not stop at the app.
+//
+// Private API. App-prefs: has been patched since iOS 10.3 and public API
+// cannot reach a Settings subpage at all; this works only because the process
+// platformizes, which makes AMFI treat the app as a system app. Every URL it
+// tries is logged along with whether iOS accepted it, so a device that refuses
+// all four says so instead of doing nothing.
+//
+// Navigation is not the same as enabling. Landing on the page is all this can
+// do; switching the profile on stays the user's tap.
+void MDDNSTryOpenSettings(void (^_Nullable done)(BOOL opened, NSString *_Nullable which));
+
 // What iOS is actually holding, read from the profiles directory rather than
 // from NEVPNManager. This build has no networking.networkextension
 // entitlement, so NEVPNManager cannot work: loadFromPreferences fails with

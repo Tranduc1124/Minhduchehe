@@ -403,6 +403,70 @@ void MDDNSOpenProfile(NSString *url, void (^_Nullable done)(BOOL accepted)) {
     }];
 }
 
+// Deep link into the Settings page that holds DNS profiles.
+//
+// This cannot be done with public API. App-prefs: was patched in iOS 10.3 and
+// iOS 17 rejects it, and UIApplicationOpenSettingsURLString only ever opens
+// this app's own page. The route that works is a private URL scheme, and the
+// reason it can work from here at all is that this process platformizes: that
+// copies launchd's AMFI slot into our cred label, so AMFI treats the app as a
+// system app and stops rejecting the scheme. That is the same reason a
+// Fl0rk-class app can do it and a normal app cannot.
+//
+// canOpenURL is useless for this and is deliberately not called. It answers
+// false for any scheme not listed in LSApplicationQueriesSchemes, and a
+// private scheme cannot be listed without the entitlement that gets it
+// rejected for other reasons. openURL's completion is the only honest answer,
+// so the result is what gets logged.
+//
+// Ordered by how likely each is to be honoured. App-prefs: is the oldest and
+// the most patched; the App-prefs:General&path= form is what survives on newer
+// builds for nested pages; prefs:root= is the pre-10.3 spelling.
+static NSArray<NSString *> *MDDNSSettingsURLs(void) {
+    return @[
+        @"App-prefs:root=VPN",
+        @"App-prefs:General&path=VPN",
+        @"prefs:root=VPN",
+        @"App-prefs:root=General",
+    ];
+}
+
+void MDDNSTryOpenSettings(void (^_Nullable done)(BOOL opened, NSString *_Nullable which)) {
+    NSArray<NSString *> *candidates = MDDNSSettingsURLs();
+    __block BOOL triedAny = NO;
+
+    // Sequentially, not all at once: firing four openURL calls back to back
+    // would leave iOS showing whichever one landed last, and the log would not
+    // say which of them actually navigated.
+    void (^_Nullable attempt)(NSUInteger) = nil;
+    attempt = ^(NSUInteger index) {
+        if (index >= candidates.count) {
+            [MDLog appendLine:@"[dns] iOS would not open a Settings page for DNS."];
+            if (done) done(NO, nil);
+            return;
+        }
+        NSString *raw = candidates[index];
+        NSURL *url = [NSURL URLWithString:raw];
+        if (!url) {
+            attempt(index + 1);
+            return;
+        }
+        triedAny = YES;
+        [MDLog appendLine:[NSString stringWithFormat:@"[dns] trying %@", raw]];
+        [[UIApplication sharedApplication] openURL:url options:@{}
+                                 completionHandler:^(BOOL ok) {
+            if (ok) {
+                [MDLog appendLine:[NSString stringWithFormat:@"ok=%d %@ opened Settings.",
+                                 (int)ok, raw]];
+                if (done) done(YES, raw);
+                return;
+            }
+            attempt(index + 1);
+        }];
+    };
+    attempt(0);
+}
+
 // ---------------------------------------------------------------------------
 // What iOS actually holds
 // ---------------------------------------------------------------------------
@@ -508,6 +572,19 @@ void MDDNSInstall(MDDNSInstallCompletion completion) {
                     result = MDDNSInstallOutcomeFailed;
                 }
             }
+
+            // Only when installd already took the profile. On the loopback
+            // path Safari is the one holding the install prompt, and jumping
+            // to Settings underneath it would race the user to a profile that
+            // is not there yet.
+            if (result == MDDNSInstallOutcomeInstalled) {
+                MDDNSTryOpenSettings(^(BOOL opened, NSString *which) {
+                    if (opened) {
+                        [MDLog appendLine:@"[dns] Settings opened; the profile still needs switching on."];
+                    }
+                });
+            }
+
             if (completion) completion(result, failure, url);
         });
     });
