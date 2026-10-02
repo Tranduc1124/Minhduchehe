@@ -98,7 +98,41 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     if (!dst || !s.length || size <= 0.5f) return;
     if (frame.size.width <= 0.0 || frame.size.height <= 0.0) return;
 
-    CTFontRef font = ESPNameTextCTFont(size);
+    // One CTFont per half-point size, kept for the life of the process.
+    //
+    // This used to call ESPNameTextCTFont on every string, every player, every
+    // frame, and that is CTFontCreateWithName every time: a font database lookup
+    // plus a font object built from scratch, then released again straight after.
+    // At thirty players and two lines each that is three thousand six hundred
+    // creations a second, which is where the two second lag came from. The names
+    // were not stale, they were simply being computed three seconds behind the
+    // boxes, which are the same frame and do not pay this.
+    //
+    // dynFontSize runs from 4.5 to 10, so half-point steps put the whole range in
+    // a dozen entries. Keyed on the rounded value, so a size that lands on the
+    // same half point reuses the font and only the metrics differ by a fraction
+    // of a point, which is not visible at these sizes.
+    CTFontRef font = NULL;
+    {
+        static CTFontRef s_font[24] = {NULL};
+        static CGFloat s_size[24] = {0};
+        const int slot = (int)(size * 2.0f) - 8;   // 4.0 -> 0, 11.5 -> 15
+        if (slot >= 0 && slot < 24) {
+            if (s_font[slot] && fabsf(s_size[slot] - size) < 0.25f) {
+                font = s_font[slot];
+            } else {
+                CTFontRef made = ESPNameTextCTFont(size);
+                if (made) {
+                    if (s_font[slot]) CFRelease(s_font[slot]);
+                    s_font[slot] = made;
+                    s_size[slot] = size;
+                    font = made;
+                }
+            }
+        } else {
+            font = ESPNameTextCTFont(size);
+        }
+    }
     if (!font) return;
 
     // Sized for a plate line: a 16 character nickname plus the "[123M]" tag, with
@@ -107,7 +141,7 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     enum { kMaxGlyphs = 48 };
     if (s.length > (NSUInteger)kMaxGlyphs) s = [s substringToIndex:(NSUInteger)kMaxGlyphs];
     const CFIndex n = (CFIndex)s.length;
-    if (n <= 0) { CFRelease(font); return; }
+    if (n <= 0) return;   // font is cached, not owned here
 
     UniChar ch[kMaxGlyphs];
     [s getCharacters:ch range:NSMakeRange(0, (NSUInteger)n)];
@@ -134,7 +168,7 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     // the obvious argument order is not the real one.
     const double totalW = CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal,
                                                      glyphs, advances, n);
-    if (totalW <= 0.0) { CFRelease(font); return; }
+    if (totalW <= 0.0) return;   // font is cached, not owned here
 
     const double ascent  = CTFontGetAscent(font);
     const double descent = CTFontGetDescent(font);
@@ -157,7 +191,7 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
         }
         penX += advances[i].width;
     }
-    CFRelease(font);
+    // no CFRelease: the font is owned by the cache above and shared across frames
 }
 
 // drawRing, not aimbotEnabled. The flag used to be the aimbot's, and the
