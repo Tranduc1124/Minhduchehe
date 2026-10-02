@@ -159,7 +159,9 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 - (void)applyTitle:(NSString *)title items:(NSArray<NSString *> *)items selected:(NSInteger)selected;
 @end
 
-@implementation MDSegmentCell
+@implementation MDSegmentCell {
+    NSLayoutConstraint *_widthCap;
+}
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)ident {
     self = [super initWithStyle:style reuseIdentifier:ident];
@@ -173,12 +175,16 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     _segment.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_segment];
 
+    // Four-option rows (Trigger) need more room than a two-option row, so the
+    // cap is a constraint that moves rather than a fixed width. Held as a
+    // property because the alternative is walking the constraints array on
+    // every configure.
+    _widthCap = [_segment.widthAnchor constraintLessThanOrEqualToConstant:140.0f];
+
     [NSLayoutConstraint activateConstraints:@[
         [_segment.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
         [_segment.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
-        // Four-option rows (Trigger) do not fit 180pt at 17pt titles, so the
-        // control is allowed to shrink and the label gives way instead.
-        [_segment.widthAnchor constraintLessThanOrEqualToConstant:230.0f],
+        _widthCap,
         [_segment.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
                                                            .leadingAnchor constant:8.0f],
     ]];
@@ -187,23 +193,28 @@ typedef NS_ENUM(NSInteger, ESPSection) {
 
 - (void)applyTitle:(NSString *)title items:(NSArray<NSString *> *)items selected:(NSInteger)selected {
     self.textLabel.text = title;
-    _segment.selectedSegmentIndex = selected;
-    // Rebuild only when the item count or the labels changed, otherwise every
-    // reload would throw away the selection the user just made.
+
+    // Rebuild first, select second. Assigning selectedSegmentIndex on a control
+    // that does not have that many segments yet is a no-op, so the other order
+    // loses the selection on every reuse.
     if (_segment.numberOfSegments != (NSInteger)items.count) {
         [_segment removeAllSegments];
-        for (NSString *item in items) [_segment insertSegmentWithTitle:item atIndex:_segment.numberOfSegments animated:NO];
+        for (NSString *item in items) {
+            [_segment insertSegmentWithTitle:item
+                                     atIndex:_segment.numberOfSegments
+                                   animated:NO];
+        }
+        _widthCap.constant = items.count >= 4 ? 230.0f : (items.count == 3 ? 190.0f : 140.0f);
     }
     for (NSUInteger i = 0; i < items.count && i < (NSUInteger)_segment.numberOfSegments; i++) {
         [_segment setTitle:items[i] forSegmentAtIndex:i];
     }
-    // Fewer options get a narrower control rather than three stretched labels.
-    CGFloat target = items.count >= 4 ? 230.0f : items.count == 3 ? 190.0f : 140.0f;
-    for (NSLayoutConstraint *c in _segment.constraints) {
-        if (c.firstAttribute == NSLayoutAttributeWidth && c.relation == NSLayoutRelationLessThanOrEqual) {
-            c.constant = target;
-        }
-    }
+
+    NSInteger sel = selected;
+    if (sel < 0) sel = 0;
+    if (sel >= _segment.numberOfSegments) sel = _segment.numberOfSegments - 1;
+    _segment.selectedSegmentIndex = sel;
+
     [_segment setTitleTextAttributes:@{ NSFontAttributeName: MDThemeFont(13.0f, UIFontWeightMedium) }
                            forState:UIControlStateNormal];
 }
@@ -398,8 +409,20 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     }
 
     if ([kind isEqualToString:@"g"]) {
-        NSArray<NSString *> *items = row[3];
-        int sel = (int)ESPPrefsFloat(key, [row[4] floatValue]);
+        // Row shape: kind, title, key, defaultIndex, items. Items are last so
+        // the default sits where the slider rows put their minimum and the two
+        // kinds read alike. Getting these two the wrong way round sends
+        // floatValue to an NSArray, which is what the last crash was.
+        NSArray<NSString *> *items = row[4];
+        int sel = (int)ESPPrefsFloat(key, [row[3] floatValue]);
+        if (![items isKindOfClass:[NSArray class]] || items.count == 0) {
+            // A malformed row must not take the app down; show it disabled.
+            MDSegmentCell *cell = [tableView dequeueReusableCellWithIdentifier:@"segment"
+                                                                 forIndexPath:indexPath];
+            [cell applyTitle:title items:@[ @"-" ] selected:0];
+            cell.segment.enabled = NO;
+            return cell;
+        }
         if (sel < 0) sel = 0;
         if (sel >= (int)items.count) sel = (int)items.count - 1;
 
