@@ -9,6 +9,7 @@
 @property (nonatomic, copy) NSArray<NSString *> *ids;
 @property (nonatomic, copy) NSArray<NSString *> *titles;
 @property (nonatomic, copy) NSArray<NSString *> *subtitles;
+@property (nonatomic, copy) NSArray<NSString *> *icons;
 @end
 
 @implementation GamePickerViewController
@@ -18,9 +19,14 @@
     if (self) {
         self.title = @"Game";
         // Same order as the version cards the app used to have on Home.
+        // The icon sits beside the name rather than being chosen from it with a
+        // string comparison: `id == @"ffmax"` compares pointers, which is
+        // undefined behaviour and can pick the wrong branch, and a literal is
+        // not required to be identical across two occurrences.
         _ids = @[ @"ffmax", @"ff" ];
         _titles = @[ @"Free Fire MAX", @"Free Fire THG" ];
         _subtitles = @[ @"com.dts.freefiremax", @"vn.vng.freefireth" ];
+        _icons = @[ @"crown.fill", @"flame.fill" ];
     }
     return self;
 }
@@ -59,8 +65,7 @@
     NSInteger i = indexPath.row;
     BOOL selected = GameTargetIsMax() == ([_ids[i] isEqualToString:@"ffmax"]);
 
-    [cell applyIconNamed:(_ids[i] == @"ffmax" ? @"crown.fill" : @"flame.fill")
-                   color:(selected ? MDThemeAccent() : MDThemePanel2())];
+    [cell applyIconNamed:_icons[i] color:(selected ? MDThemeAccent() : MDThemePanel2())];
     [cell applyTitle:_titles[i] subtitle:_subtitles[i] value:nil showsChevron:NO tappable:YES];
     cell.titleLabel.textColor = selected ? MDThemeText() : MDThemeMuted();
     cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
