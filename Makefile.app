@@ -15,7 +15,6 @@ $(APPLICATION_NAME)_FILES += $(wildcard app/main.m)
 $(APPLICATION_NAME)_FILES += $(wildcard app/sources/*.mm app/sources/*.m app/sources/*.c)
 $(APPLICATION_NAME)_FILES += $(wildcard app/sources/roothide/*.mm app/sources/roothide/*.m)
 $(APPLICATION_NAME)_FILES += $(wildcard app/sources/KIF/*.mm app/sources/KIF/*.m)
-$(APPLICATION_NAME)_FILES += $(wildcard app/sources/HomeViewController/*.mm app/sources/HomeViewController/*.m app/sources/HomeViewController/*.cpp)
 
 $(APPLICATION_NAME)_FILES += $(wildcard app/oxorany/*.cpp)
 

@@ -2,7 +2,7 @@
 //  main.m — MINHDUC app entry (Fl0rk-style dual mode)
 //
 //  argv[1] == "-hud"  → HUD overlay process (SpringBoard-hosted window)
-//  otherwise          → normal config app UI (HomeViewController)
+//  otherwise          → normal config app UI (Game / Log / Settings tabs)
 //
 //  Exploit runs ONLY when user taps "Bắt đầu" — never at launch.
 //

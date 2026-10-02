@@ -1,7 +1,19 @@
 #import <UIKit/UIKit.h>
 
-// Shared app + menu chrome theme (prefs: AppThemeMode, AppAccentMode, AppAccentColorR/G/B).
-// Matches ModMenuViewController tokens so tipa home/settings look like the in-game menu.
+// App chrome theme.
+//
+// The app is light-only: MainApplicationDelegate forces
+// UIUserInterfaceStyleLight on the window, so there is no second palette to
+// keep in sync and MDThemeIsLight() always answers YES. The accent stays
+// user-selectable (prefs: AppAccentMode, AppAccentColorR/G/B) because the
+// accent is used for the tab bar, the Activate row and the accent picker.
+//
+// The in-game menu has its own copy of these tokens inside
+// ModMenuViewController.mm and reads AppThemeMode/AppAccent* straight from
+// prefs. Nothing here writes AppThemeMode, so switching the app to light can
+// never move the in-game menu's theme.
+//
+// ModMenuViewController.mm is frozen. Only the app process uses this header.
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,24 +38,19 @@ UIColor *MDThemeAccentSoft(CGFloat alpha);
 UIColor *MDThemeBlue(void);
 UIColor *MDThemeOrange(void);
 UIColor *MDThemeRed(void);
+UIColor *MDThemeGreen(void);
+UIColor *MDThemeTeal(void);
+UIColor *MDThemePurple(void);
 
 UIFont *MDThemeFont(CGFloat size, UIFontWeight weight);
 
-// Default mint (same as menu).
+// Default mint accent.
 extern const float kMDThemeDefaultAccentR;
 extern const float kMDThemeDefaultAccentG;
 extern const float kMDThemeDefaultAccentB;
 
-// Style a UITabBarController to match MD theme.
+// Tab bar chrome. Call again after MDThemeLoadFromPrefs when the accent moves.
 void MDThemeApplyToTabBar(UITabBar *tabBar);
-
-// Card helper
-UIView *MDThemeMakeCard(void);
-
-// Top-right settings gear (appearance sheet). Caller owns returned button if needed.
-UIButton *MDThemeMakeSettingsButton(id target, SEL action);
-// Top-corner trash (VarClean).
-UIButton *MDThemeMakeTrashButton(id target, SEL action);
 
 #ifdef __cplusplus
 }
