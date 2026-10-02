@@ -55,8 +55,6 @@ void MDUIApplyNavigationBarStyle(UINavigationBar *navBar) {
         @try {
             id normal = [[app valueForKey:@"standardLayoutAppearance"] valueForKey:@"normal"];
             [normal setValue:MDThemeText() forKey:@"titleTextAttributes"];
-            [normal setValue:@{ NSForegroundColorAttributeName: MDThemeText() }
-                      forKey:@"titleTextAttributes"];
         } @catch (__unused NSException *e) {}
         if ([navBar respondsToSelector:@selector(setStandardAppearance:)]) {
             [navBar setValue:app forKey:@"standardAppearance"];
@@ -76,26 +74,26 @@ static const CGFloat kTileSize = 30.0f;
 static const CGFloat kTilePad = 16.0f;
 static const CGFloat kTileGap = 12.0f;
 static const CGFloat kChevronW = 8.0f;
-static const CGFloat kChevronGap = 8.0f;
+static const CGFloat kChevronGap = 10.0f;
+static const CGFloat kMinRowHeight = 54.0f;
 
-// The chevron wants a grey lighter than the label colour, and MDTheme exposes
-// no alpha helper, so tint by scaling the existing colour.
-static UIColor *MDChevronTint(UIColor *c) {
-    CGFloat r = 0, g = 0, b = 0, a = 1;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return c;
-    return [UIColor colorWithRed:r * 0.62f green:g * 0.62f blue:b * 0.62f alpha:a];
+@implementation MDIconRowCell {
+    UIStackView *_textStack;
+    UIView *_spacer;
 }
-
-@implementation MDIconRowCell
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)ident {
     self = [super initWithStyle:style reuseIdentifier:ident];
     if (!self) return nil;
 
+    self.backgroundColor = MDThemePanel();
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+
     _iconTile = [[UIView alloc] initWithFrame:CGRectZero];
     _iconTile.userInteractionEnabled = NO;
     _iconTile.layer.cornerRadius = 8.0f;
     _iconTile.clipsToBounds = YES;
+    _iconTile.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_iconTile];
 
     _iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
@@ -106,33 +104,99 @@ static UIColor *MDChevronTint(UIColor *c) {
     _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _titleLabel.font = MDThemeFont(17.0f, UIFontWeightSemibold);
     _titleLabel.textColor = MDThemeText();
-    [self.contentView addSubview:_titleLabel];
+    _titleLabel.numberOfLines = 1;
 
     _subtitleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _subtitleLabel.font = MDThemeFont(13.0f, UIFontWeightRegular);
     _subtitleLabel.textColor = MDThemeMuted();
-    _subtitleLabel.numberOfLines = 2;
-    [self.contentView addSubview:_subtitleLabel];
+    // Wrapping is the whole point of the subtitle. Two lines was enough for the
+    // English strings and not for the Vietnamese ones, which is where the
+    // truncation came from.
+    _subtitleLabel.numberOfLines = 3;
+
+    _textStack = [[UIStackView alloc] initWithArrangedSubviews:@[ _titleLabel, _subtitleLabel ]];
+    _textStack.axis = UILayoutConstraintAxisVertical;
+    _textStack.spacing = 2.0f;
+    _textStack.alignment = UIStackViewAlignmentFill;
+    _textStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:_textStack];
+
+    // A value label sits on the right, before the chevron. The spacer is what
+    // keeps the value from being pushed off-screen when the title runs long,
+    // because the stack is fill-aligned and the chevron has a fixed width.
+    _spacer = [[UIView alloc] initWithFrame:CGRectZero];
+    _spacer.translatesAutoresizingMaskIntoConstraints = NO;
+    [_textStack addArrangedSubview:_spacer];
+    [_spacer setContentHuggingPriority:UILayoutPriorityDefaultLow - 1
+                      forAxis:UILayoutConstraintAxisHorizontal];
+    [_spacer setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                           forAxis:UILayoutConstraintAxisHorizontal];
 
     _valueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _valueLabel.font = MDThemeFont(15.0f, UIFontWeightRegular);
     _valueLabel.textColor = MDThemeMuted();
     _valueLabel.textAlignment = NSTextAlignmentRight;
+    _valueLabel.numberOfLines = 1;
+    _valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_valueLabel];
 
     _chevronView = [[UIImageView alloc] initWithFrame:CGRectZero];
     _chevronView.image = MDUISymbol(@"chevron.right", 13.0f, UIFontWeightSemibold);
-    _chevronView.tintColor = MDChevronTint(MDThemeMuted());
+    // The chevron wants a grey lighter than the label colour.
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    [MDThemeMuted() getRed:&r green:&g blue:&b alpha:&a];
+    _chevronView.tintColor = [UIColor colorWithRed:r * 0.62f green:g * 0.62f blue:b * 0.62f alpha:a];
     _chevronView.contentMode = UIViewContentModeScaleAspectFit;
     _chevronView.userInteractionEnabled = NO;
+    _chevronView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.contentView addSubview:_chevronView];
 
+    [self buildConstraints];
     return self;
+}
+
+- (void)buildConstraints {
+    UILayoutGuide *guide = self.contentView.layoutMarginsGuide;
+
+    // Margins: 16 on the leading and trailing edge, 10 vertical. The tile
+    // hangs off the left margin and the text starts after its gap.
+    self.contentView.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(10.0f, kTilePad, 10.0f, kTilePad);
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_iconTile.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
+        [_iconTile.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+        [_iconTile.widthAnchor constraintEqualToConstant:kTileSize],
+        [_iconTile.heightAnchor constraintEqualToConstant:kTileSize],
+
+        [_iconView.centerXAnchor constraintEqualToAnchor:_iconTile.centerXAnchor],
+        [_iconView.centerYAnchor constraintEqualToAnchor:_iconTile.centerYAnchor],
+        [_iconView.widthAnchor constraintEqualToConstant:kTileSize - 14.0f],
+        [_iconView.heightAnchor constraintEqualToConstant:kTileSize - 14.0f],
+
+        [_textStack.leadingAnchor constraintEqualToAnchor:_iconTile.trailingAnchor constant:kTileGap],
+        [_textStack.topAnchor constraintEqualToAnchor:guide.topAnchor],
+        [_textStack.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor],
+
+        [_chevronView.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+        [_chevronView.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+        [_chevronView.widthAnchor constraintEqualToConstant:kChevronW],
+        [_chevronView.heightAnchor constraintGreaterThanOrEqualToConstant:12.0f],
+
+        // valueLabel sits left of the chevron, textStack left of valueLabel.
+        [_valueLabel.trailingAnchor constraintEqualToAnchor:_chevronView.leadingAnchor
+                                                  constant:-kChevronGap],
+        [_valueLabel.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+        [_textStack.trailingAnchor constraintLessThanOrEqualToAnchor:_valueLabel.leadingAnchor
+                                                            constant:-8.0f],
+
+        // A single-line row still has to clear the native row height.
+        [self.contentView.heightAnchor constraintGreaterThanOrEqualToConstant:kMinRowHeight],
+    ]];
 }
 
 - (void)applyIconNamed:(NSString *)symbolName color:(UIColor *)color {
     _iconTile.backgroundColor = color ?: MDThemePanel2();
-    _iconView.image = [symbolName length] ? MDUISymbol(symbolName, 15.0f, UIFontWeightSemibold) : nil;
+    _iconView.image = symbolName.length ? MDUISymbol(symbolName, 15.0f, UIFontWeightSemibold) : nil;
     _iconView.tintColor = [UIColor whiteColor];
 }
 
@@ -144,78 +208,22 @@ static UIColor *MDChevronTint(UIColor *c) {
     _titleLabel.text = title;
     _titleLabel.textColor = MDThemeText();
     _subtitleLabel.text = subtitle;
+    // Hiding rather than blanking, so the stack drops the row entirely and the
+    // cell shrinks to one line.
     _subtitleLabel.hidden = (subtitle.length == 0);
     _valueLabel.text = value;
     _valueLabel.hidden = (value.length == 0);
     _chevronView.hidden = !chevron;
+    _spacer.hidden = !chevron;
     self.selectionStyle = tappable ? UITableViewCellSelectionStyleDefault
                                    : UITableViewCellSelectionStyleNone;
     self.userInteractionEnabled = tappable;
     [self setNeedsLayout];
 }
 
-+ (CGFloat)heightForTitle:(NSString *)title subtitle:(NSString *)subtitle {
-    if (subtitle.length == 0) return 54.0f;
-    CGFloat h = 14.0f + 22.0f + 4.0f;
-    h += [self subtitleHeightForWidth:280.0f text:subtitle title:title];
-    return h + 12.0f;
-}
-
-+ (CGFloat)subtitleHeightForWidth:(CGFloat)width text:(NSString *)subtitle title:(NSString *)title {
-    if (subtitle.length == 0) return 0.0f;
-    CGFloat textW = width - (kTilePad + kTileSize + kTileGap) - kTilePad - kChevronW - kChevronGap * 2;
-    if (textW < 80.0f) textW = 80.0f;
-    CGSize bound = CGSizeMake(textW, 100.0f);
-    NSDictionary *attrs = @{ NSFontAttributeName: MDThemeFont(13.0f, UIFontWeightRegular) };
-    CGRect r = [subtitle boundingRectWithSize:bound
-                                      options:(NSStringDrawingUsesLineFragmentOrigin |
-                                               NSStringDrawingUsesFontLeading)
-                                   attributes:attrs
-                                      context:nil];
-    CGFloat titleH = [title boundingRectWithSize:bound
-                                          options:NSStringDrawingUsesLineFragmentOrigin
-                                       attributes:@{ NSFontAttributeName: MDThemeFont(17.0f, UIFontWeightSemibold) }
-                                          context:nil].size.height;
-    return MAX(titleH, ceil(r.size.height));
-}
-
-- (void)layoutSubviews {
-    [super layoutSubviews];
-
-    CGRect content = self.contentView.bounds;
-    CGFloat x = kTilePad;
-    CGFloat w = CGRectGetWidth(content);
-
-    BOOL hasChevron = !_chevronView.hidden;
-    BOOL hasValue = !_valueLabel.hidden;
-    CGFloat trailing = kTilePad;
-    if (hasChevron) {
-        _chevronView.frame = CGRectMake(w - trailing - kChevronW, (CGRectGetHeight(content) - 12.0f) * 0.5f,
-                                        kChevronW, 14.0f);
-        trailing += kChevronW + kChevronGap;
-    }
-    CGFloat textX = x + kTileSize + kTileGap;
-    CGFloat textW = w - textX - trailing;
-
-    CGFloat centerY = CGRectGetHeight(content) * 0.5f;
-    _iconTile.frame = CGRectMake(x, centerY - kTileSize * 0.5f, kTileSize, kTileSize);
-    CGFloat inset = 7.0f;
-    _iconView.frame = CGRectMake(inset, inset, kTileSize - inset * 2, kTileSize - inset * 2);
-
-    if (_subtitleLabel.hidden) {
-        _titleLabel.frame = CGRectMake(textX, 0, hasValue ? textW - 110.0f : textW, CGRectGetHeight(content));
-        _valueLabel.frame = CGRectMake(w - trailing - 104.0f, 0, 104.0f, CGRectGetHeight(content));
-        _valueLabel.textAlignment = NSTextAlignmentRight;
-    } else {
-        CGFloat subH = [MDIconRowCell subtitleHeightForWidth:MAX(80.0f, textW)
-                                                        text:_subtitleLabel.text
-                                                       title:_titleLabel.text];
-        CGFloat blockH = 22.0f + 3.0f + subH;
-        CGFloat top = (CGRectGetHeight(content) - blockH) * 0.5f;
-        _titleLabel.frame = CGRectMake(textX, top, textW, 22.0f);
-        _subtitleLabel.frame = CGRectMake(textX, top + 25.0f, textW, subH);
-        _valueLabel.frame = CGRectZero;
-    }
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    [super setHighlighted:highlighted animated:animated];
+    self.contentView.alpha = highlighted ? 0.62f : 1.0f;
 }
 
 @end

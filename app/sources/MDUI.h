@@ -29,11 +29,14 @@ UIFont *MDUIMonoFont(CGFloat size, UIFontWeight weight);
 void MDUIApplyNavigationBarStyle(UINavigationBar *navBar);
 
 // Tile + title + optional subtitle + optional value + optional chevron.
+//
+// The cell lays itself out with Auto Layout and sizes to its content. An
+// earlier version positioned subviews in layoutSubviews and asked the
+// delegate for a height computed against a hardcoded 280pt width, which
+// clipped long subtitles and overlapped rows at any other width. Callers
+// should now leave rowHeight on UITableViewAutomaticDimension and not
+// implement heightForRowAtIndexPath:.
 @interface MDIconRowCell : UITableViewCell
-
-// Height the subtitle actually needs at this width. Used by the table
-// delegate, so it has to be reachable from outside the implementation.
-+ (CGFloat)subtitleHeightForWidth:(CGFloat)width text:(nullable NSString *)subtitle title:(NSString *)title;
 
 @property (nonatomic, strong) UIView *iconTile;
 @property (nonatomic, strong) UIImageView *iconView;
@@ -44,15 +47,13 @@ void MDUIApplyNavigationBarStyle(UINavigationBar *navBar);
 
 // Shows a rounded square of `color` with a white SF Symbol in it. Passing a
 // nil name leaves the tile as a plain colour block.
-- (void)applyIconNamed:(NSString *)symbolName color:(UIColor *)color;
+- (void)applyIconNamed:(nullable NSString *)symbolName color:(nullable UIColor *)color;
+
 - (void)applyTitle:(NSString *)title
           subtitle:(nullable NSString *)subtitle
              value:(nullable NSString *)value
-        showsChevron:(BOOL)chevron
-            tappable:(BOOL)tappable;
-
-// Row height matching what applyTitle: set: laid out.
-+ (CGFloat)heightForTitle:(NSString *)title subtitle:(nullable NSString *)subtitle;
+       showsChevron:(BOOL)chevron
+           tappable:(BOOL)tappable;
 
 @end
 

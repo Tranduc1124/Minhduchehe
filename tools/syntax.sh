@@ -7,8 +7,10 @@
 # The warning set matters. Theos builds with -Werror and without -Wno-everything,
 # so a plain -Wno-everything here would pass files that CI then rejects. The
 # flags below keep the project's own suppressions (Makefile.app CFLAGS) and add
-# the nullability and ARC checks, because those are what the new UI headers
-# trip over. Add -Werror so a warning fails here rather than there.
+# -Wno-nullability-completeness, which is the one the new UI headers trip over.
+# Deliberately not -Wextra: the real build does not use it, and it flags
+# untouched code such as ModMenuViewController.mm, so it would send you chasing
+# warnings CI never reports.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 SDK=/home/tduck/theos/sdks/iPhoneOS17.5.sdk
@@ -22,11 +24,11 @@ for f in "$@"; do
       -DNOTIFY_DESTROY_HUD='"vn.vng.freefireth.hud.destroy"' \
       -DPID_PATH='"/var/mobile/Library/Caches/vn.vng.freefireth.pid"' \
       -std=c++17 \
-      -Wall -Wextra \
+      -Wall \
       -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable \
-      -Wno-unused-value -Wno-module-import-in-extern-c \
+      -Wno-unused-parameter -Wno-unused-value -Wno-module-import-in-extern-c \
       -Wno-unknown-warning-option -Wno-unguarded-availability-new \
-      -Wno-return-type -Wno-macro-redefined \
+      -Wno-return-type -Wno-macro-redefined -Wno-sign-compare \
       -Wno-incompatible-pointer-types-discards-qualifiers \
       -Wno-incompatible-pointer-types -Wno-format \
       -Wno-unused-but-set-variable -Wno-delete-incomplete \

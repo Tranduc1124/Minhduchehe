@@ -6,8 +6,9 @@
 #import "AppearanceViewController.h"
 #import "MDUI.h"
 #import "MDTheme.h"
+#import "MDLog.h"
 #import "GameOffsets.h"
-#import "roothide/varCleanController.h"
+#import "HUDHelper.h"
 
 #import <SafariServices/SafariServices.h>
 
@@ -37,8 +38,12 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     _tableView.dataSource = self;
     _tableView.delegate = self;
     _tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+    // The cells lay themselves out, so the table must be allowed to ask for a
+    // height. The old version of this screen passed a fixed estimate plus a
+    // delegate height computed against a guessed text width, which clipped the
+    // Vietnamese subtitles and let rows overlap.
     _tableView.rowHeight = UITableViewAutomaticDimension;
-    _tableView.estimatedRowHeight = 74.0f;
+    _tableView.estimatedRowHeight = 64.0f;
     [_tableView registerClass:[MDIconRowCell class] forCellReuseIdentifier:@"row"];
     [self.view addSubview:_tableView];
 }
@@ -103,8 +108,14 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
 
         case SectionQuickActions:
             if (row == 0) {
-                [cell applyIconNamed:@"trash.fill" color:MDThemeRed()];
-                [cell applyTitle:@"Clean Up" subtitle:nil value:nil showsChevron:YES tappable:YES];
+                // Same job as the Game tab's action row when a session is
+                // live, so the icon and the colour follow that state.
+                BOOL hudOn = IsHUDEnabled();
+                [cell applyIconNamed:(hudOn ? @"stop.fill" : @"trash.fill")
+                               color:(hudOn ? MDThemeRed() : MDThemeMuted())];
+                [cell applyTitle:@"Tắt ESP"
+                         subtitle:(hudOn ? @"ESP đang chạy." : @"ESP không chạy.")
+                            value:nil showsChevron:YES tappable:YES];
             } else {
                 [cell applyIconNamed:@"paperplane.fill" color:MDThemeBlue()];
                 [cell applyTitle:@"Contact" subtitle:nil value:nil showsChevron:YES tappable:YES];
@@ -175,10 +186,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
             break;
         case SectionQuickActions:
             if (indexPath.row == 0) {
-                varCleanController *vc = [varCleanController sharedInstance];
-                UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-                nav.modalPresentationStyle = UIModalPresentationFormSheet;
-                [self presentViewController:nav animated:YES completion:nil];
+                [self confirmStopESP];
             } else {
                 [self contact];
             }
@@ -202,6 +210,45 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
 
 - (void)push:(UIViewController *)vc {
     [self.navigationController pushViewController:vc animated:YES];
+}
+
+#pragma mark - Stop ESP
+
+// Two-step because it kills a process. The default alert is the right control
+// here: it is what the system uses for a destructive choice, it gets the
+// button order and the cancel semantics right on its own, and it handles the
+// outside-tap dismissal without code.
+- (void)confirmStopESP {
+    if (!IsHUDEnabled()) {
+        [MDLog appendLine:@"— Stop requested but no session is running."];
+        [_tableView reloadData];
+        return;
+    }
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Tắt ESP?"
+                                            message:@"ESP đang chạy. Dừng phiên và đóng lớp phủ?"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    __weak __typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Tắt ESP"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        [weakSelf stopESP];
+    }]];
+
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)stopESP {
+    [MDLog appendLine:@"— Stopping session (from Settings)."];
+    SetHUDEnabled(NO);
+    [MDLog appendLine:@"OK Session stopped."];
+    [_tableView reloadData];
 }
 
 #pragma mark - Contact

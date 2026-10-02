@@ -7,11 +7,25 @@
 #pragma mark - Switch row
 
 @interface MDToggleCell : UITableViewCell
+
 @property (nonatomic, strong) UISwitch *toggle;
+
+// Called when the switch flips.
+//
+// The cell is its own UIControl target and forwards through here instead of
+// taking the controller's selector. The target of addTarget:action: is always
+// the object it is called on — here, the cell — so passing in a selector the
+// cell does not implement sends the message to a UITableViewCell, which does
+// not recognise it and aborts. That is what the crash log shows: the switch
+// asks for the action, nothing handles it, and UIResponder raises
+// doesNotRecognizeSelector:. Cleared in prepareForReuse so a recycled cell
+// cannot fire the previous row's handler.
+@property (nonatomic, copy, nullable) void (^onToggle)(BOOL isOn);
+
 - (void)applyTitle:(NSString *)title
                key:(NSString *)key
-                on:(BOOL)on
-          selector:(SEL)sel;
+                on:(BOOL)on;
+
 @end
 
 @implementation MDToggleCell
@@ -25,22 +39,31 @@
     // System green, like the reference. MDThemeAccent here would tint every
     // switch mint and the screen stops reading as iOS.
     _toggle.onTintColor = [UIColor colorWithRed:0.20f green:0.78f blue:0.35f alpha:1.0f];
+    [_toggle addTarget:self
+                  action:@selector(switchFlipped:)
+        forControlEvents:UIControlEventValueChanged];
     [self.contentView addSubview:_toggle];
     return self;
 }
 
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    _onToggle = nil;
+}
+
+- (void)switchFlipped:(UISwitch *)sender {
+    if (_onToggle) _onToggle(sender.isOn);
+}
+
 - (void)applyTitle:(NSString *)title
                key:(NSString *)key
-                on:(BOOL)on
-          selector:(SEL)sel {
+                on:(BOOL)on {
     self.textLabel.text = title;
     self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
     self.textLabel.textColor = MDThemeText();
     self.detailTextLabel.text = nil;
     _toggle.accessibilityIdentifier = key;
     _toggle.on = on;
-    [_toggle removeTarget:self action:NULL forControlEvents:UIControlEventValueChanged];
-    [_toggle addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
     self.selectionStyle = UITableViewCellSelectionStyleNone;
 }
 
@@ -122,9 +145,45 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     ESPSectionCount
 };
 
-@implementation ESPAimViewController {
-    UISegmentedControl *_aimTypeSeg;
+#pragma mark - Segment row
+
+// Its own cell, not a toggle cell with a segment bolted on as the accessory.
+// Reusing one shared UISegmentedControl across reloads leaves UIKit holding a
+// view it has already been asked to lay out again, and the toggle underneath
+// stays on screen because nothing hid it.
+@interface MDSegmentCell : UITableViewCell
+@property (nonatomic, strong) UISegmentedControl *segment;
+@end
+
+@implementation MDSegmentCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)ident {
+    self = [super initWithStyle:style reuseIdentifier:ident];
+    if (!self) return nil;
+    self.backgroundColor = MDThemePanel();
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
+    self.textLabel.textColor = MDThemeText();
+
+    _segment = [[UISegmentedControl alloc] initWithItems:@[ @"Aimbot", @"Aim Silent" ]];
+    _segment.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:_segment];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_segment.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16.0f],
+        [_segment.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+        [_segment.widthAnchor constraintEqualToConstant:180.0f],
+        [_segment.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.textLabel
+                                                           .leadingAnchor constant:8.0f],
+    ]];
+    return self;
 }
+
+@end
+
+#pragma mark - Controller
+
+@implementation ESPAimViewController
 
 - (instancetype)init {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
@@ -140,19 +199,14 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     self.tableView.rowHeight = 52.0f;
     [self.tableView registerClass:[MDToggleCell class] forCellReuseIdentifier:@"toggle"];
     [self.tableView registerClass:[MDSliderCell class] forCellReuseIdentifier:@"slider"];
+    [self.tableView registerClass:[MDSegmentCell class] forCellReuseIdentifier:@"segment"];
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     MDUIApplyNavigationBarStyle(self.navigationController.navigationBar);
-    [self reloadSectionRows];
-}
-
-- (void)reloadSectionRows {
-    NSMutableIndexSet *idx = [NSMutableIndexSet indexSet];
-    for (NSInteger s = 0; s < ESPSectionCount; s++) [idx addIndex:s];
-    [self.tableView reloadSections:idx withRowAnimation:UITableViewRowAnimationNone];
+    [self.tableView reloadData];
 }
 
 #pragma mark - Rows
@@ -230,12 +284,20 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     return footer;
 }
 
+// Only the section that has a footer implements viewForFooterInSection, and
+// only that section implements this. Returning CGFLOAT_MIN here is what iOS
+// Settings does to mean "none", but mixing it with the automatic value on a
+// different section in the same table is not worth the risk — a section that
+// returns a footer view and no height gets measured against the view, and one
+// that returns neither is asked for a height anyway.
 - (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
-    return section == ESPSectionScreen ? UITableViewAutomaticDimension : CGFLOAT_MIN;
+    if (section != ESPSectionScreen) return 0.0f;
+    return UITableViewAutomaticDimension;
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSString *key = [self rowAtIndexPath:indexPath][1];
+    NSArray *row = [self rowAtIndexPath:indexPath];
+    NSString *key = row[1];
     if ([key isEqualToString:@"FovSize"] || [key isEqualToString:@"CamPCValue"]) return 76.0f;
     if ([key isEqualToString:@"AimTypeMode"]) return 58.0f;
     return 52.0f;
@@ -273,45 +335,38 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         return cell;
     }
 
-    MDToggleCell *cell = [tableView dequeueReusableCellWithIdentifier:@"toggle"
-                                                        forIndexPath:indexPath];
-
     if ([key isEqualToString:@"AimTypeMode"]) {
-        // One segment control, kept as the cell's accessoryView so a reload
-        // reuses it instead of stacking a new one on the content view.
-        if (!_aimTypeSeg) {
-            _aimTypeSeg = [[UISegmentedControl alloc] initWithItems:@[ @"Aimbot", @"Aim Silent" ]];
-            [_aimTypeSeg addTarget:self
-                             action:@selector(aimTypeChanged:)
-                   forControlEvents:UIControlEventValueChanged];
-        }
-        _aimTypeSeg.selectedSegmentIndex = (NSInteger)ESPPrefsFloat(key, 0.0f);
-        cell.accessoryView = _aimTypeSeg;
+        MDSegmentCell *cell = [tableView dequeueReusableCellWithIdentifier:@"segment"
+                                                             forIndexPath:indexPath];
         cell.textLabel.text = title;
-        cell.textLabel.font = MDThemeFont(17.0f, UIFontWeightRegular);
-        cell.textLabel.textColor = MDThemeText();
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.segment.selectedSegmentIndex = (NSInteger)ESPPrefsFloat(key, 0.0f);
+        [cell.segment removeTarget:self action:NULL forControlEvents:UIControlEventValueChanged];
+        [cell.segment addTarget:self
+                         action:@selector(aimTypeChanged:)
+               forControlEvents:UIControlEventValueChanged];
         return cell;
     }
 
+    MDToggleCell *cell = [tableView dequeueReusableCellWithIdentifier:@"toggle"
+                                                        forIndexPath:indexPath];
     BOOL def = [row[2] boolValue];
-    [cell applyTitle:title
-                 key:key
-                  on:ESPPrefsBool(key, def)
-            selector:@selector(toggleChanged:)];
-    cell.accessoryView = nil;
+    [cell applyTitle:title key:key on:ESPPrefsBool(key, def)];
+
+    __weak __typeof(self) weakSelf = self;
+    cell.onToggle = ^(BOOL isOn) {
+        [weakSelf toggleChangedForKey:key isOn:isOn];
+    };
     return cell;
 }
 
 #pragma mark - Actions
 
-// The row's pref key rides on the switch itself, so there is no index-path
-// lookup here and no way for the handler and the cell to drift apart.
-- (void)toggleChanged:(UISwitch *)sender {
-    NSString *key = sender.accessibilityIdentifier;
+// The row's pref key rides on the cell, so there is no index-path lookup here
+// and no way for the handler and the row it belongs to drift apart.
+- (void)toggleChangedForKey:(NSString *)key isOn:(BOOL)isOn {
     if (key.length == 0) return;
 
-    ESPPrefsSetBoolLive(key, sender.isOn);
+    ESPPrefsSetBoolLive(key, isOn);
     ESPSyncFromPrefs();
 
     // Enable Aim is the master: on arms the selected type, off kills every
@@ -321,12 +376,16 @@ typedef NS_ENUM(NSInteger, ESPSection) {
         int type = (int)ESPPrefsFloat(@"AimTypeMode", 0.0f);
         if (type < 0) type = 0;
         if (type > 1) type = 1;
-        ESPPrefsSetBool(@"Aimbot", sender.isOn && type == 0);
-        ESPPrefsSetBool(@"AimSilent", sender.isOn && type == 1);
+        ESPPrefsSetBool(@"Aimbot", isOn && type == 0);
+        ESPPrefsSetBool(@"AimSilent", isOn && type == 1);
         ESPPrefsSetBool(@"AimAssist", NO);
         ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
         ESPPrefsSync();
         ESPSyncFromPrefs();
+        // The segment shows the type, so it has to come back into step when
+        // the master kills the type.
+        [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:1 inSection:ESPSectionAim] ]
+                              withRowAnimation:UITableViewRowAnimationNone];
     }
 }
 
@@ -339,7 +398,10 @@ typedef NS_ENUM(NSInteger, ESPSection) {
     ESPPrefsSetBool(@"AimAssist", NO);
     ESPPrefsSync();
     ESPSyncFromPrefs();
-    [self reloadSectionRows];
+    // The master switch in this same section has to follow, and the view no
+    // longer reloads itself on appear if the user never taps it.
+    [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:0 inSection:ESPSectionAim] ]
+                          withRowAnimation:UITableViewRowAnimationNone];
 }
 
 @end

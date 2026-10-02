@@ -35,7 +35,7 @@
     _tableView.delegate = self;
     _tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     _tableView.rowHeight = UITableViewAutomaticDimension;
-    _tableView.estimatedRowHeight = 74.0f;
+    _tableView.estimatedRowHeight = 64.0f;
     [_tableView registerClass:[MDIconRowCell class] forCellReuseIdentifier:@"row"];
     [self.view addSubview:_tableView];
 
@@ -167,15 +167,32 @@
             [cell applyTitle:@"Inactive" subtitle:@"ESP is off. Activate it to start."
                        value:nil showsChevron:NO tappable:NO];
         }
+        return cell;
+    }
+
+    // One row, two jobs: start a session, or stop the one already running.
+    // The label has to follow the state, otherwise the button reads "Activate"
+    // while ESP is live and tapping it then kills what the user just started.
+    BOOL pending = (!hudOn && _pendingHUDEnableUntil > 0 &&
+                    CACurrentMediaTime() < _pendingHUDEnableUntil);
+
+    if (hudOn) {
+        [cell applyIconNamed:@"stop.fill" color:MDThemeRed()];
+        [cell applyTitle:@"Tắt ESP"
+                 subtitle:@"Dừng phiên ESP và lớp phủ."
+                    value:nil showsChevron:YES tappable:YES];
+        cell.titleLabel.textColor = MDThemeRed();
+    } else if (pending) {
+        [cell applyIconNamed:@"hourglass" color:MDThemeMuted()];
+        [cell applyTitle:@"Đang bật…"
+                 subtitle:@"Đang khởi tạo kernel và lớp phủ SpringBoard."
+                    value:nil showsChevron:NO tappable:NO];
+        cell.titleLabel.textColor = MDThemeMuted();
     } else {
-        [cell applyIconNamed:(hudOn ? @"stop.fill" : @"play.fill") color:MDThemeAccent()];
-        NSString *title = hudOn ? @"Deactivate" : @"Activate";
-        if (_pendingHUDEnableUntil > 0 && CACurrentMediaTime() < _pendingHUDEnableUntil && !hudOn) {
-            title = @"Activating…";
-        }
-        NSString *subtitle = hudOn ? @"Stops the ESP session and the overlay."
-                                   : @"Revalidates protected access and starts a fresh session.";
-        [cell applyTitle:title subtitle:subtitle value:nil showsChevron:YES tappable:YES];
+        [cell applyIconNamed:@"play.fill" color:MDThemeAccent()];
+        [cell applyTitle:@"Activate"
+                 subtitle:@"Kiểm tra quyền và mở phiên mới."
+                    value:nil showsChevron:YES tappable:YES];
         cell.titleLabel.textColor = MDThemeAccent();
     }
     return cell;
@@ -191,16 +208,21 @@
 
 - (void)actionTapped {
     if (IsHUDEnabled()) {
-        ++_hudRequestSerial;
-        _pendingHUDEnableUntil = 0;
-        [MDLog appendLine:@"— Deactivating session."];
-        SetHUDEnabled(NO);
-        [MDLog appendLine:@"OK Session stopped."];
-        [self refreshStatus];
+        [self stopSession];
         return;
     }
-
     [self presentBootLogAndStart];
+}
+
+// Stopping is a kill: the HUD process is SIGKILLed, so there is nothing to ask
+// the user about and no state to unwind.
+- (void)stopSession {
+    ++_hudRequestSerial;
+    _pendingHUDEnableUntil = 0;
+    [MDLog appendLine:@"— Stopping session."];
+    SetHUDEnabled(NO);
+    [MDLog appendLine:@"OK Session stopped."];
+    [self refreshStatus];
 }
 
 // Fresh buffer, console on top, boot kicked off behind it. Order matters: the

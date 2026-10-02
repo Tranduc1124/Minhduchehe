@@ -27,8 +27,20 @@
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    UIEdgeInsets insets = self.view.safeAreaInsets;
-    CGFloat top = insets.top > 0 ? insets.top : 44.0f;
+
+    // The console runs right up under the navigation bar. Laying it out from
+    // safeAreaInsets.top instead left a band of the app's light background
+    // between the bar and the top of the console, which read as a second bar.
+    // The child view spans the whole screen and the bar is drawn over it, so
+    // the bar's bottom edge is the top of the console.
+    CGFloat top = self.view.safeAreaInsets.top;
+    UIView *barParent = self.navigationController.navigationBar.superview;
+    if (barParent) {
+        CGRect inSelf = [self.view convertRect:self.navigationController.navigationBar.bounds
+                                      fromView:barParent];
+        if (CGRectGetHeight(inSelf) > 0.0f) top = CGRectGetMaxY(inSelf);
+    }
+
     CGFloat bottom = self.tabBarController ? CGRectGetMinY(self.tabBarController.tabBar.frame)
                                            : CGRectGetHeight(self.view.bounds);
     _logView.frame = CGRectMake(0.0f, top, CGRectGetWidth(self.view.bounds),
