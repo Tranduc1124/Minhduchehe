@@ -4463,12 +4463,25 @@ static int      s_countOffScreen = 0;
         }
     }
 
-    // Reached only when both the camera and the match pointer are valid, which
-    // is what the early return above checks. It used to be a literal true, which
-    // made the field useless: the counter needed to tell "no match loaded" apart
-    // from "in a match with nobody in it", and a field that is always true cannot
-    // tell them apart.
-    stats.inMatch = true;
+    // NOTE: stats.inMatch is deliberately NOT set here.
+    //
+    // It used to be committed at this point, on "camera and match are both valid
+    // pointers". That is not the same thing as "there is a match to count", and the
+    // gap between them is the loading screen:
+    //
+    //   esp.mm:4508  playerDict   read; invalid during loading
+    //   esp.mm:4534  dictCount    0 during loading
+    //
+    // Both return early, carrying inMatch = true and a count of 0. The counter
+    // prints "--" only when realCount == 0 && botCount == 0 && !inMatch
+    // (esp.mm:4000), so it fell through to the number and printed 0 on the
+    // loading screen, which is the reported symptom: "0 at loading, -- in the
+    // match", the two swapped from what they should say.
+    //
+    // It is committed further down, once the dictionary has proved it holds live
+    // entries. Loading now returns with inMatch false and prints "--", and a real
+    // match with nobody in it still prints 0, which is the distinction the field
+    // exists for.
 
     // Camera / local origin for ESP distance + min/max cull.
     // Bug history: when MainCameraTransform failed, myLocation stayed (0,0,0) while
@@ -4534,6 +4547,13 @@ static int      s_countOffScreen = 0;
     if (dictCount <= 0) {
         return stats;
     }
+
+    // Everything above has to have worked before the counter is allowed to say
+    // "in a match": valid camera, valid match, usable dictionary, and live entries
+    // in it. This is the first point at which all four are true, so it is where the
+    // commitment belongs. See the note above the camera block for what committing
+    // it earlier did to the loading screen.
+    stats.inMatch = true;
 
     // View-projection is sampled AFTER world collect (see below). Reading it here
     // made boxes lag behind cam while the player loop did heavy memory I/O.
