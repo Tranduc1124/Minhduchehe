@@ -137,12 +137,33 @@ int ds_attach(void) {
     const char *foundName = NULL;
     for (int i = 0; i < 5; i++) {
         p = proc_find_by_name(names[i]);
-        if (p && p != (uint64_t)-1 && K(p)) {
+        // is_kaddr_valid(p + off), not K(p). proc_find_by_name answers "not
+        // found" with (uint64_t)-1, and K() is a plain `>` against
+        // VM_MIN_KERNEL_ADDRESS, so -1 passes it: 0xFFFFFFFFFFFFFFFF is larger
+        // than 0xFFFFFFDC00000000. What actually rejects it is the offset test —
+        // the address that gets read next is p + off_proc_p_pid, and for p = -1
+        // that wraps to 0x5F on 17.x (off_proc_p_pid = 0x60), which is not a
+        // kernel address. RemoteCall.m:1812 already uses this exact test.
+        if (p && p != (uint64_t)-1 && K(p) && is_kaddr_valid(p + off_proc_p_pid)) {
             foundName = names[i];
             break;
         }
+        p = 0;
     }
-    if (!p) {
+    // The post-loop test has to be this and not `if (!p)`. "The game is not
+    // running" is the normal state of this app for most of its life, and it is
+    // answered by -1, not by 0.
+    //
+    // MINHDUC-2026-10-02-234403.ips: SIGSEGV, KERN_INVALID_ADDRESS at 0x1,
+    // early_kread <- early_kread64 <- kread32 <- ds_attach <- GameTargetModuleBase
+    // <- the ESP frame timer, on the main queue. 0x1 is early_kread's own
+    // canary, `*(int *)1 = 0` at kexploit_opa334.m:459, which fires when
+    // is_kaddr_valid rejects the address. The chain above fed it kread32(0x5F):
+    // the loop rejected -1 correctly but left it in p, `if (!p)` is false for -1,
+    // and the next line dereferenced it. It happened on the first ESP tick after
+    // every boot in which the game was not already running, and never when the
+    // game was up, which is exactly the reported symptom.
+    if (!p || p == (uint64_t)-1 || !is_kaddr_valid(p + off_proc_p_pid)) {
         static int s_notFoundLogged = 0;
         if (!s_notFoundLogged) {
             s_notFoundLogged = 1;
@@ -157,11 +178,31 @@ int ds_attach(void) {
     }
     g_ff_proc = p;
     g_ff_pid  = (pid_t)kread32(p + off_proc_p_pid);
+    // A proc named like the game with no pid is one that is on its way out. Its
+    // vm_map is freed as it goes, so the walk below would return a base from a
+    // map that no longer describes the process and every later read would be
+    // noise. The retry picks the real one up within half a second.
+    if (g_ff_pid <= 0) {
+        NSLog(@"[DS] FF proc pid=0 — process is exiting, will retry");
+        return -1;
+    }
     NSLog(@"[DS] attached '%s' pid=%d", foundName ?: "?", g_ff_pid);
 
-    g_ff_task = proc_task(g_ff_proc);
-    if (!K(g_ff_task)) {
-        NSLog(@"[DS] FF task invalid");
+    // proc_task() inlined so the intermediate can be checked. A proc that exists
+    // but is not usable — the game caught mid-launch, or already exiting — has a
+    // proc_ro that is null or not a kernel address, and kread64 of
+    // proc_ro + off_proc_ro_pr_task on it lands in early_kread's canary, the
+    // same SIGSEGV at 0x1 as above. Attaching is retried for as long as the
+    // process lives, so a refusal here is a normal answer, not a failure.
+    uint64_t proc_ro = kread64(g_ff_proc + off_proc_p_proc_ro);
+    if (!K(proc_ro) || !is_kaddr_valid(proc_ro)) {
+        NSLog(@"[DS] FF proc_ro invalid (0x%llx) — game still starting or exiting",
+              (unsigned long long)proc_ro);
+        return -1;
+    }
+    g_ff_task = kread64(proc_ro + off_proc_ro_pr_task);
+    if (!K(g_ff_task) || !is_kaddr_valid(g_ff_task)) {
+        NSLog(@"[DS] FF task invalid (0x%llx)", (unsigned long long)g_ff_task);
         return -1;
     }
 
@@ -171,14 +212,33 @@ int ds_attach(void) {
     // while base pointed at the wrong image (ti=nil downstream). UnityFramework
     // is by far the biggest mapped binary in the FF process.
     uint64_t map = kread_ptr(g_ff_task + off_task_map);
+    // Same reason as proc_ro above, one step further out: a task can be live
+    // while its map is already gone. Every read below is at map + an offset, so
+    // an unchecked map is an unchecked address.
+    if (!K(map) || !is_kaddr_valid(map + off_vm_map_hdr)) {
+        NSLog(@"[DS] FF map invalid (0x%llx)", (unsigned long long)map);
+        return -1;
+    }
     g_ff_map = map; // saved for ds_read/ds_write remap path
     uint64_t hdr = map + off_vm_map_hdr;
     uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
+    // nentries is a count, not a pointer: a wrong offset reads a plausible
+    // 32-bit garbage and the walk below would then follow whatever it finds.
+    if (nentries == 0 || nentries > 100000) {
+        NSLog(@"[DS] FF vm_map header implausible (nentries=%u) — retry later", nentries);
+        return -1;
+    }
     uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
+    if (!K(e) || !is_kaddr_valid(e + E_START)) {
+        NSLog(@"[DS] FF vm_map first entry invalid (0x%llx)", (unsigned long long)e);
+        return -1;
+    }
 
     uint64_t bestStart = 0, bestSize = 0;
     int mappedCount = 0, failCount = 0;
-    for (uint32_t i = 0; i < nentries && K(e); i++) {
+    // K(e) alone is not enough here for the same reason as the name loop: -1
+    // passes `>`. The entry is dereferenced on the next line.
+    for (uint32_t i = 0; i < nentries && K(e) && is_kaddr_valid(e + E_START); i++) {
         uint64_t start = kread64(e + E_START);
         uint64_t end   = kread64(e + E_END);
         uint64_t size  = (end > start) ? (end - start) : 0;

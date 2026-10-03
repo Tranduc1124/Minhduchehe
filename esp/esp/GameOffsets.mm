@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>   // CACurrentMediaTime, the retry log throttle
 #import "GameOffsets.h"
 #import "ESPPrefs.h"
 #import "offsetmax.h"
@@ -477,7 +478,16 @@ bool GameTargetIsRunning(void) {
 
 uintptr_t GameTargetModuleBase(void) {
     if (!ds_attached()) {
-        NSLog(@"[GameOffsets] GameTargetModuleBase: Attaching to '%s' via ds_attach()...", GameTargetProcessName());
+        // Throttled, not removed. The game not running is the normal state of
+        // this app for most of its life, the ESP tick retries every 30 frames,
+        // and an unthrottled NSLog here put two lines a second into the device
+        // log for as long as the game stayed closed.
+        static uint64_t s_lastTryLogUS = 0;
+        uint64_t tUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        if (tUS - s_lastTryLogUS >= 1000000) {
+            s_lastTryLogUS = tUS;
+            NSLog(@"[GameOffsets] GameTargetModuleBase: Attaching to '%s' via ds_attach()...", GameTargetProcessName());
+        }
         int ret = ds_attach();
         if (ret != 0) {
             static int s_failCount = 0;
