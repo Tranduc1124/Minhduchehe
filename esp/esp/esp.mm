@@ -2382,131 +2382,191 @@ extern "C" void ToggleSpeedX50(bool enable) {
 //
 // The fix is the offsets, not a heuristic in front of them.
 
-// Which offset actually holds the game's aim rotation, worked out at runtime
-// instead of assumed.
+// The game's look axis, cached per pawn.
 //
-// What is known from the device, not from reasoning:
+// The rotation fields are not the whole mechanism. The game samples the look
+// stick, and the stick's CurrentAimWriter keeps writing Player.m_CurrentAimRotation
+// from it. A quaternion written into the rotation fields without the stick moving
+// with it gets stomped on the next sample — which is what "the aim does nothing"
+// looks like from here: the field reads back as ours for a frame and then the
+// camera does not move.
 //
-//   e99f61871 removed the three legacy writes (0x5B4, 0x5C4, 0x19A4) and the
-//   game stopped dying. 6b7c9fb29 removed the guard from that commit and the
-//   aim stayed dead. So the aim was coming from one of the legacy offsets, not
-//   from the offsets table, and the crash was coming from one of the others.
-//   The table's 0x614 / 0x628 / 0x1A8C do not drive the camera on this build.
-//
-// So both sets have to stay in play and the choice has to be measured. A field
-// that is a rotation changes while the player is aiming; a field that is a
-// pointer the game owns does not, because nothing about our writing makes the
-// game reallocate its own objects. Requiring both "changed since the last
-// sample" and "both halves are plausible floats" is what separates them.
-//
-// The float test is on the halves, not on the whole 64-bit word. That was the
-// mistake in e99f61871: the second component sits in the high half, so any
-// rotation with a non-zero second component reads as an enormous word, and a
-// magnitude test on the word rejects every rotation there is.
-//
-// Plausible means: zero, or a float whose magnitude is between 1/16 and 4. That
-// covers every component of a real rotation (they are in [-1,1] and rarely near
-// zero while aiming) and excludes pointer halves, which are denormals, huge, or
-// NaN.
-static inline bool AimHalfIsPlausibleFloat(uint32_t bits) {
-    if (bits == 0) return true;                       // +0.0f
-    const uint32_t mag = bits & 0x7FFFFFFFu;
-    if (mag >= 0xBD000000u && mag <= 0xC1000000u) return true;   // 0.0625 .. -4.0
-    if (mag >= 0x3D000000u && mag <= 0x40800000u) return true;   // 0.0625 .. 4.0
-    return false;
-}
-
-#define AIM_FIELD_SLOTS 8
-typedef struct {
-    uint64_t off;
-    uint64_t last;
-    int      seen;        // samples taken
-    int      changed;     // samples where it moved
-    int      live;        // changed AND plausible: a rotation we may write
-} AimFieldProbe;
-
-static AimFieldProbe g_aimFields[AIM_FIELD_SLOTS];
-static int g_aimFieldCount = 0;
-
-static void AimFieldRegister(uint64_t off) {
-    if (!off) return;
-    for (int i = 0; i < g_aimFieldCount; i++) if (g_aimFields[i].off == off) return;
-    if (g_aimFieldCount < AIM_FIELD_SLOTS) {
-        g_aimFields[g_aimFieldCount].off = off;
-        g_aimFieldCount++;
+// Axis type 1 is Right, which is the look axis; the handler holds an array of
+// them and the look one is found by type rather than by index.
+static uint64_t resolve_look_axis(uint64_t handler) {
+    uint64_t arr = ReadAddr<uint64_t>(handler + kUCHandlerAxisData); // 0x68
+    if (!isVaildPtr(arr)) return 0;
+    int32_t len = ReadAddr<int32_t>(arr + kIl2CppArrayMaxLength);
+    if (len < 1 || len > 32) return 0;
+    for (int32_t i = 0; i < len; i++) {
+        uint64_t el = ReadAddr<uint64_t>(arr + kIl2CppArrayItems + (uint64_t)i * 8ull);
+        if (!isVaildPtr(el)) continue;
+        if (ReadAddr<int32_t>(el + kAxisType) == 1) return el;   // Right
     }
+    return 0;
 }
 
-// Sample every candidate once. Returns whether this offset may be written.
-static bool AimFieldIsLiveRotation(uint64_t player, uint64_t off) {
-    const uint64_t v = ReadAddr<uint64_t>(player + off);
-    const uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
-    const uint32_t hi = (uint32_t)(v >> 32);
-    const bool plausible = AimHalfIsPlausibleFloat(lo) && AimHalfIsPlausibleFloat(hi);
-
-    AimFieldProbe *p = nullptr;
-    for (int i = 0; i < g_aimFieldCount; i++) if (g_aimFields[i].off == off) { p = &g_aimFields[i]; break; }
-    if (!p) return false;
-
-    if (p->seen > 0 && p->last != v) p->changed++;
-    p->last = v;
-    if (p->seen < 32) p->seen++;
-    p->live = (p->changed > 0 && plausible);
-    return p->live;
-}
-
-// One line a second, so one log line from the device says which offsets are
-// rotations and which are not, instead of this being guessed again.
-static void AimFieldLog(uint64_t player) {
-    static CFTimeInterval s_last = 0;
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now - s_last < 1.0) return;
-    s_last = now;
-    if (!isVaildPtr(player)) return;
-    NSMutableString *m = [NSMutableString string];
-    for (int i = 0; i < g_aimFieldCount; i++) {
-        AimFieldProbe *p = &g_aimFields[i];
-        const uint64_t v = ReadAddr<uint64_t>(player + p->off);
-        [m appendFormat:@" +0x%llx=%016llx(c%@%@) ",
-              (unsigned long long)p->off, (unsigned long long)v,
-              p->changed ? @"Y" : @"n",
-              p->live ? @"LIVE" : @""];
+static uint64_t look_axis_for(uint64_t player) {
+    static uint64_t s_owner = 0;
+    static uint64_t s_axis  = 0;
+    static int s_reported = 0;
+    if (s_owner != player) {          // pawn change invalidates the cache
+        s_owner = player;
+        s_axis  = 0;
+        s_reported = 0;
     }
-    NSLog(@"[AIM-FIELDS]%@", m);
-}
-
-// Single clean write per call. Double-writes + multi-burst made the camera thrash
-// even when bullets (silent/fire-dir) were already accurate.
-//
-// Every candidate is registered and then only the ones measured to be live
-// rotations are written. The legacy 0x5B4 / 0x5C4 / 0x19A4 are back in the list
-// because the aim demonstrably came from them; what is gone is writing to all
-// five unconditionally, which is what put a quaternion into a pointer field and
-// killed the game at teardown (FreeFire-2026-10-03-082640.ips, faulting address
-// 0x3a3a69ed00000000 = 0.0f and 0.00059f, PAC-stripped into the GPU carveout).
-static void write_aim_rotations(uint64_t player, const Quaternion &out) {
-    if (!isVaildPtr(player)) return;
-    AimFieldRegister(kAimRotation);
-    AimFieldRegister(kAimRotationAux);
-    AimFieldRegister(kCurrentAimRotation);
-    AimFieldRegister(0x5B4);
-    AimFieldRegister(0x5C4);
-    AimFieldRegister(0x19A4);
-    // MAX offsets, so the same build works whichever target is selected.
-    if (GameTargetIsMax()) {
-        AimFieldRegister(0x61C);
-        AimFieldRegister(0x630);
-        AimFieldRegister(0x1AA4);
-    }
-
-    AimFieldLog(player);
-
-    for (int i = 0; i < g_aimFieldCount; i++) {
-        const uint64_t off = g_aimFields[i].off;
-        if (AimFieldIsLiveRotation(player, off)) {
-            WriteAddr<Quaternion>(player + off, out);
+    if (isVaildPtr(s_axis)) return s_axis;
+    uint64_t handler = ReadAddr<uint64_t>(player + kUserControlHandler);
+    if (!isVaildPtr(handler)) return 0;
+    s_axis = resolve_look_axis(handler);
+    if (!s_reported) {
+        s_reported = 1;
+        if (isVaildPtr(s_axis)) {
+            int32_t type = ReadAddr<int32_t>(s_axis + kAxisType);
+            Vector3 p = ReadAddr<Vector3>(s_axis + kAxisCurrentScreenPos);
+            NSLog(@"[MD-AIM] look axis OK  handler=%p axis=%p type=%d screenPos=(%.1f, %.1f)",
+                  (void *)handler, (void *)s_axis, (int)type, p.x, p.y);
+        } else {
+            NSLog(@"[MD-AIM] look axis NOT FOUND (handler=%p) — rotation is moving without input",
+                  (void *)handler);
         }
     }
+    return s_axis;
+}
+
+// Move the stick to the place the rotation says it should be at, in the screen
+// units the game samples.
+//
+// The stick is fed FIRST and the rotation second, because the rotation is what
+// the report correlates against the sample stream: a rotation that moves without
+// a matching stick sample is the aimbot signature, not just a visual glitch.
+//
+// Deliberately NOT touched: m_IsTouched (axis + 0x4B) / m_IsActuallyMoved
+// (axis + 0x4C) and m_IsUserControlChanged (handler + 0x78). Forcing those on
+// would make the game believe the stick is held — floating stick, auto fire.
+// The position alone is what gets sampled.
+static bool drive_look_axis_input(uint64_t player, const Quaternion &prev, const Quaternion &next) {
+    if (!isVaildPtr(player)) return false;
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return false;
+
+    uint64_t handler = ReadAddr<uint64_t>(player + kUserControlHandler);
+    if (!isVaildPtr(handler)) return false;
+    uint64_t axis = look_axis_for(player);
+    if (!isVaildPtr(axis)) return false;
+
+    Vector3 e0 = Quaternion::ToEuler(prev);
+    Vector3 e1 = Quaternion::ToEuler(next);
+    float dYaw = e1.y - e0.y;
+    if (dYaw > 180.f) dYaw -= 360.f;
+    if (dYaw < -180.f) dYaw += 360.f;
+    float dPitch = e1.x - e0.x;
+    if (dPitch > 180.f) dPitch -= 360.f;
+    if (dPitch < -180.f) dPitch += 360.f;
+    if (fabsf(dYaw) < 0.0001f && fabsf(dPitch) < 0.0001f) return false;
+
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    float sw = (float)scr.width, sh = (float)scr.height;
+    if (sw < 1.f || sh < 1.f) { sw = 1080.f; sh = 2340.f; }
+
+    // px-per-degree, from the drag area, calibrated once via the AimPxPerDeg
+    // pref. A flat constant cannot track sensitivity or zoom.
+    float pxPerDeg = ESPPrefsFloat(@"AimPxPerDeg", 0.f);
+    if (!(pxPerDeg > 0.01f) || pxPerDeg > 64.f)
+        pxPerDeg = (sw * 0.22f) * 0.0085f;   // ~2.0 px/deg at 1080 pt width
+
+    Vector3 cur   = ReadAddr<Vector3>(axis + kAxisCurrentScreenPos);
+    Vector3 start = ReadAddr<Vector3>(axis + kAxisStartScreenPos);
+    if (isnan(cur.x) || isnan(cur.y) || isnan(cur.z)) return false;
+    if (isnan(start.x) || isnan(start.y) || isnan(start.z)) start = cur;
+
+    Vector3 to = cur;
+    to.x = cur.x + dYaw * pxPerDeg;
+    to.y = cur.y - dPitch * pxPerDeg;
+    if (to.x < sw * 0.50f) to.x = sw * 0.50f;      // keep it in the right drag area
+    if (to.x > sw * 0.98f) to.x = sw * 0.98f;
+    if (to.y < sh * 0.05f) to.y = sh * 0.05f;
+    if (to.y > sh * 0.95f) to.y = sh * 0.95f;
+
+    Vector3 step(to.x - cur.x, to.y - cur.y, 0.f);
+    Vector3 delta(to.x - start.x, to.y - start.y, 0.f);
+    float moved = sqrtf(step.x * step.x + step.y * step.y);
+
+    WriteAddr<Vector3>(axis + kAxisCurrentScreenPos, to);
+    WriteAddr<Vector3>(axis + kAxisDeltaPos, delta);
+    WriteAddr<Vector3>(axis + kAxisCurrentDeltaValue, step);
+    WriteAddr<Vector3>(axis + kAxisLastDirection, step);
+    WriteAddr<float>(axis + kAxisActuallyMovedDistance, moved);
+    return true;
+}
+
+// The game samples the look stick every GameVarDef.AimInputSampleIntervalTick
+// ticks, and the report pairs one sample with one CallSetAimRotationCount bump.
+// Rotation has to move at the same cadence as the sample stream or the mismatch
+// is the aimbot signal. Read from the server config rather than hardcoded.
+static CFTimeInterval aim_sample_interval(void) {
+    static CFTimeInterval s_gap = 0.0;
+    static CFTimeInterval s_checkedAt = 0.0;
+    const CFTimeInterval now = CACurrentMediaTime();
+    if (s_gap > 0.0 && (now - s_checkedAt) < 2.0) return s_gap;
+
+    s_checkedAt = now;
+    s_gap = 0.0;
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return 0.0;
+    uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + kGameVarDefTypeInfo);
+    if (!isVaildPtr(typeInfo)) return 0.0;
+    uint64_t gvd = ReadAddr<uint64_t>(typeInfo + kTypeInfoStatics);
+    if (!isVaildPtr(gvd)) return 0.0;
+
+    int32_t intervalTick = ReadAddr<int32_t>(gvd + kGvdAimInputSampleIntervalTick);
+    // 0 = pipeline disabled or an unexpected value: leave pacing to the game.
+    if (intervalTick < 1 || intervalTick > 8) return 0.0;
+    s_gap = (double)intervalTick / 60.0;   // ticks are 60 Hz
+    return s_gap;
+}
+
+static void write_aim_rotations(uint64_t player, const Quaternion &out) {
+    if (!isVaildPtr(player)) return;
+    Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
+    float ang = Quaternion::Angle(prev, out);
+    if (isnan(ang)) ang = 0.f;
+    Quaternion prevCur = ReadAddr<Quaternion>(player + kCurrentAimRotation);
+    float angC = Quaternion::Angle(prevCur, out);
+    if (isnan(angC)) angC = 0.f;
+    // Gate on EITHER field: 0x614 can read as "already ours" while the stick's
+    // CurrentAimWriter stomps 0x1A8C. The game's own threshold is ~0.46 degrees.
+    if (ang < 0.4f && angC < 0.4f) return;
+
+    static uint64_t s_lastPlayer = 0;
+    static CFTimeInterval s_lastBump = 0.0;
+    const CFTimeInterval now = CACurrentMediaTime();
+    if (player != s_lastPlayer) {
+        s_lastPlayer = player;
+        s_lastBump = 0.0;
+    }
+    if (s_lastBump != 0.0) {
+        const CFTimeInterval minGap = aim_sample_interval();
+        if (minGap > 0.0 && (now - s_lastBump) < minGap) return;
+    }
+
+    // Input FIRST, then the rotation it explains, then the counter: the report
+    // packs samples and counter together, so both must move in the same frame.
+    const bool fed = drive_look_axis_input(player, prev, out);
+
+    WriteAddr<Quaternion>(player + kAimRotation, out);        // 0x614
+    WriteAddr<Quaternion>(player + kAimRotationAux, out);     // 0x628 ResetAux copy
+    WriteAddr<Quaternion>(player + kCurrentAimRotation, out); // 0x1A8C camera source
+    s_lastBump = now;
+
+    // Counter++ is what the report correlates against the sample list. If the
+    // stick could not be fed this frame, leave the counter alone rather than
+    // emitting the exact "counter advanced, no input" pattern.
+    if (fed) {
+        uint32_t n = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
+        WriteAddr<uint32_t>(player + kCallSetAimRotationCount, n + 1u);
+    }
+    // kCheckBufPending (Player+0x624) is NOT ours to set: MarkGGPVerifyCheckBufPending
+    // owns it and is driven by the weapon fire path. Writing it from aim was both
+    // a constant-true bug and a machine-perfect rhythm signature.
 }
 
 void set_aim(uint64_t player, Quaternion rotation, float speed, int mode, bool forceInstant) {
