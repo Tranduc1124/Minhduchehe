@@ -1735,21 +1735,24 @@ static inline void ESPResolveDrawColor(int mode, float baseR, float baseG, float
 // Wall-ON: keep lock a bit while target strafes. Wall-OFF: never sticky (see maxLost below).
 static const int kAimLockMaxLostFrames = 4;
 
-// How long after acquiring a lock it may sit outside the FOV ring.
+// The FOV gates, and why they are not the ring's radius.
 //
-// The ring is a promise about where the aim will go, and picking already keeps
-// it (esp.mm:4993, inRange = distSq <= aimFovSq). Keeping a lock did not: the
-// sticky re-eval and AimTargetStillValid both tested fovSq * 2.25, that is 1.5
-// times the radius, so a target well outside the circle stayed locked as long as
-// nothing better came along — reported as "small FOV, and it still locks an
-// enemy outside it".
+// 09fbf6da0 made every one of them the ring's own radius after ten frames of
+// lock, on the theory that the circle is a promise. That promise cost the aimbot:
+// the target was acquired and then failed AimTargetStillValid on the following
+// frame, so nothing was ever written. The working reference
+// (/home/tduck/Projects/tipar-normal) keeps slack in all three places and the
+// numbers are now the same here:
 //
-// The slack is still there for the case it was added for: dragging the fire stick
-// moves the crosshair, the target slides out of the circle while the button is
-// still down, and a hard radius dropped the lock every frame ("giật khi kéo nút
-// bắn"). It is bounded by this counter and then the radius is enforced exactly
-// as picking enforces it, so the promise holds from 10 frames after the lock on.
-#define kAimFovSlackFrames 10
+//   pick            aimFovSq            the ring, exactly
+//   lock re-eval    aimFovSq * 2.25     tipar-normal esp.mm:4936
+//   still-valid     aimFovSq * 1.5      tipar-normal esp.mm:5128
+//   lookOk          aimFovSq * 1.5      tipar-normal esp.mm:5311
+//
+// 2.25 held too far across the screen, which is what "it locks an enemy outside
+// the FOV" was. 1.0 dropped it mid-aim, which is "the aim does nothing". 1.5 is
+// the balance the reference settled on, and stickFighting still switches the
+// still-valid gate off entirely while the fire stick is being dragged.
 
 // ===== Player Cache để giảm số lần đọc memory (2-3 frame) =====
 struct PlayerCache {
@@ -5601,12 +5604,13 @@ static int      s_countOffScreen = 0;
                             dsq = dx*dx + dy*dy;
                         }
                         bool inR = false;
-                        // 1.5x the radius only while the lock is young, so the
-                        // fire-stick drag that started it does not throw it away
-                        // on the frame the crosshair moves. See kAimFovSlackFrames.
                         const float baseFovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                        const float keepFovSq = (s_lockHoldFrames < kAimFovSlackFrames)
-                                                ? (baseFovSq * 2.25f) : baseFovSq;
+                        // x2.25 on the square while the lock is held, matching the
+                        // working reference (tipar-normal esp.mm:4936). 09fbf6da0
+                        // made this the ring's own radius after ten frames, which
+                        // is what stopped the aim: the target was acquired and then
+                        // failed this test on the following frame.
+                        const float keepFovSq = baseFovSq * 2.25f;
                         if (!allowThroughWall) {
                             if (isAimbot && useAim180) inR = inF;
                             else if (isAimbot) {
@@ -5806,13 +5810,14 @@ static int      s_countOffScreen = 0;
                 float dx = w2s.x - screenCenter.x;
                 float dy = w2s.y - screenCenter.y;
                 float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                // The stick can pull the crosshair out briefly, so this used to
-                // test 2.25x fovSq — 1.5x the radius — unconditionally, and a
-                // locked target could sit outside a small ring indefinitely. The
-                // slack is now only for the frames right after acquiring (see
-                // kAimFovSlackFrames); after that this is the ring's own radius.
-                const float lim = (s_lockHoldFrames < kAimFovSlackFrames)
-                                 ? (fovSq * 2.25f) : fovSq;
+                // Lock-hold slack x1.5 on the square, matching the working
+                // reference (tipar-normal esp.mm:5128): enough that dragging the
+                // fire stick does not drop the lock every frame, tight enough that
+                // it does not hold a target across the screen. 2.25 was too sticky
+                // there; 1.0 (what 09fbf6da0 tried) drops the lock mid-aim, which
+                // reads as "the aim does nothing" because the target is picked and
+                // then thrown away on the next frame.
+                const float lim = fovSq * 1.5f;
                 if ((dx * dx + dy * dy) > lim) return false;
             }
         }
@@ -6031,7 +6036,11 @@ static int      s_countOffScreen = 0;
                         float dx = w2sLook.x - screenCenter.x;
                         float dy = w2sLook.y - screenCenter.y;
                         float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                        lookOk = (dx * dx + dy * dy) <= fovSq * 1.10f;
+                        // x1.5, matching the sticky pick slack in the working
+                        // reference (tipar-normal esp.mm:5311). This was 1.10,
+                        // which is inside the ring's own radius in the squared
+                        // metric and so rejected targets the lock was holding.
+                        lookOk = (dx * dx + dy * dy) <= fovSq * 1.5f;
                     }
                 } else if (useAssistOnly) {
                     // Assist solo: near crosshair only. Stacked with Aimbot uses FOV/sphere above.
@@ -6041,7 +6050,9 @@ static int      s_countOffScreen = 0;
                     } else {
                         float dx = w2sLook.x - screenCenter.x;
                         float dy = w2sLook.y - screenCenter.y;
-                        lookOk = (dx * dx + dy * dy) <= assistRadiusSq * 1.15f;
+                        // x1.5 to match the sticky gate above (tipar-normal
+                        // esp.mm:5322 — "was x1.15, same toggle issue").
+                        lookOk = (dx * dx + dy * dy) <= assistRadiusSq * 1.5f;
                     }
                 }
 
