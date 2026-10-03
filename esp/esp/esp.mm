@@ -2369,10 +2369,18 @@ extern "C" void ToggleSpeedX50(bool enable) {
 //
 // The crash was on the main thread inside UnityFramework with no ESP frames,
 // because the corrupted field is read by the game long after the write.
-static inline bool AimFieldLooksLikePointer(uint64_t player, uint64_t off) {
-    const uint64_t v = ReadAddr<uint64_t>(player + off);
-    return v >= 0x100000000ULL;
-}
+//
+// There is deliberately NO runtime guard here that refuses to write when the
+// target "looks like a pointer". One was tried and it killed the aimbot, because
+// the test cannot work on this data: the eight bytes of a quaternion are two
+// float32s, and the second one sits in the HIGH half of the 64-bit word, so any
+// quaternion with a non-zero second component reads as something enormous. A
+// guard of the form "value >= 0x100000000 means pointer" therefore rejects
+// essentially every rotation, which is exactly what it did — aim stopped dead
+// while the game stopped crashing, and the crash was already fixed by dropping
+// the stale offsets.
+//
+// The fix is the offsets, not a heuristic in front of them.
 
 // Single clean write per call. Double-writes + multi-burst made the camera thrash
 // even when bullets (silent/fire-dir) were already accurate.
@@ -2397,17 +2405,6 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
         const uint64_t off = targets[i].off;
         if (!off) continue;
-        if (AimFieldLooksLikePointer(player, off)) {
-            static uint32_t s_refused = 0;
-            if (s_refused < 8) {
-                s_refused++;
-                NSLog(@"[AIM-WRITE] refused %s at +0x%llx — field holds 0x%llx, "
-                      @"that is a pointer and not a rotation",
-                      targets[i].name, (unsigned long long)off,
-                      (unsigned long long)ReadAddr<uint64_t>(player + off));
-            }
-            continue;
-        }
         WriteAddr<Quaternion>(player + off, out);
     }
 }
