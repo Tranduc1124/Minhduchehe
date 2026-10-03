@@ -841,7 +841,7 @@ static void sb_text_send(int slot, NSString *text,
 // by string and size, so CoreText runs on a change and not on a frame.
 static CGPathRef sb_text_glyph_path_for_frame(UIView *espView) {
     if (!g_sbTextShape) return NULL;
-    if (!ESPPrefsBool(@"SbCountText", NO)) return NULL;
+    if (!ESPPrefsBool(@"Count", YES)) return NULL;
 
     id sl = [espView valueForKey:@"statusLayer"];
     if (![sl isKindOfClass:[CATextLayer class]]) return NULL;
@@ -2197,7 +2197,7 @@ void SBRemotePushESPFrame(UIView *espView) {
     // thread is woken lives on the signal, not here, because a signal that waits
     // on a timer is a delay rather than a ceiling.
     static int s_textPrev = -1;
-    const int textOn = ESPPrefsBool(@"SbCountText", NO) ? 1 : 0;
+    const int textOn = ESPPrefsBool(@"Count", YES) ? 1 : 0;
     const int textChanged = (s_textPrev != textOn);
     s_textPrev = textOn;
     g_sbTextStageBounds = espView.bounds;
