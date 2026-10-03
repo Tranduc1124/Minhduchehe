@@ -2527,45 +2527,88 @@ static CFTimeInterval aim_sample_interval(void) {
     return s_gap;
 }
 
+// Counters for [AIM-WRITE], so "the aim does nothing" has a number in it instead
+// of a guess. calls / wrote / stuck (the stick axis could not be resolved or fed)
+// / starved (the write was skipped) / lastGap / lastAng.
+static uint32_t g_awCalls = 0, g_awWrote = 0, g_awStuck = 0, g_awStarved = 0;
+static float    g_awGap = 0.f, g_awAng = 0.f;
+static CFTimeInterval g_awLastLog = 0;
+
+// The rotation write is unconditional, and that is the one thing here that is
+// known from the device rather than from the reference.
+//
+// c60f3856b wrote kAimRotation / kAimRotationAux / kCurrentAimRotation on every
+// call with no gate at all, and the camera turned. 207b54703 ported the
+// reference's two gates in front of it —
+//
+//   if (ang < 0.4 && angCur < 0.4) return;      // already there
+//   if (now - lastBump < sampleInterval) return; // too soon
+//
+// — and the camera stopped turning. The two of them close on each other: the
+// first write puts the game's fields at our value, so the next call measures a
+// zero angle and returns, and because the stick was fed the game's own writer
+// keeps 0x1A8C near our value too, so the second condition holds as well. The
+// lock thread then hammers this every 4ms and none of it reaches the game.
+//
+// The reference has the same gates and works, because its rotation comes from a
+// different cadence. Porting a gate is not porting a mechanism: the gate is only
+// safe when something else re-reads the target, and here the only thing that
+// does is the thing being gated.
+//
+// So: the rotation goes in every call, exactly as it did at c60f3856b. The stick
+// feed and the counter bump stay, because those are what make the input stream
+// match the rotation, and they carry their own pacing. What is gone from the
+// rotation path are only the three legacy offsets, which is the crash.
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
-    Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
-    float ang = Quaternion::Angle(prev, out);
-    if (isnan(ang)) ang = 0.f;
-    Quaternion prevCur = ReadAddr<Quaternion>(player + kCurrentAimRotation);
-    float angC = Quaternion::Angle(prevCur, out);
-    if (isnan(angC)) angC = 0.f;
-    // Gate on EITHER field: 0x614 can read as "already ours" while the stick's
-    // CurrentAimWriter stomps 0x1A8C. The game's own threshold is ~0.46 degrees.
-    if (ang < 0.4f && angC < 0.4f) return;
+    g_awCalls++;
 
-    static uint64_t s_lastPlayer = 0;
-    static CFTimeInterval s_lastBump = 0.0;
-    const CFTimeInterval now = CACurrentMediaTime();
-    if (player != s_lastPlayer) {
-        s_lastPlayer = player;
-        s_lastBump = 0.0;
-    }
-    if (s_lastBump != 0.0) {
-        const CFTimeInterval minGap = aim_sample_interval();
-        if (minGap > 0.0 && (now - s_lastBump) < minGap) return;
-    }
-
-    // Input FIRST, then the rotation it explains, then the counter: the report
-    // packs samples and counter together, so both must move in the same frame.
-    const bool fed = drive_look_axis_input(player, prev, out);
-
+    // Rotation FIRST and unconditional: this is the write the camera follows.
     WriteAddr<Quaternion>(player + kAimRotation, out);        // 0x614
     WriteAddr<Quaternion>(player + kAimRotationAux, out);     // 0x628 ResetAux copy
     WriteAddr<Quaternion>(player + kCurrentAimRotation, out); // 0x1A8C camera source
-    s_lastBump = now;
+    g_awWrote++;
 
-    // Counter++ is what the report correlates against the sample list. If the
-    // stick could not be fed this frame, leave the counter alone rather than
-    // emitting the exact "counter advanced, no input" pattern.
-    if (fed) {
-        uint32_t n = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
-        WriteAddr<uint32_t>(player + kCallSetAimRotationCount, n + 1u);
+    // Input second, paced to the server's sample interval so the stick moves at
+    // the rate the report expects a sample stream to move at. Pacing lives here
+    // and not in front of the rotation: the stick is what the game reads to
+    // produce the rotation, so skipping it is what makes the camera lag.
+    const CFTimeInterval now = CACurrentMediaTime();
+    const CFTimeInterval minGap = aim_sample_interval();   // 0 = no pacing
+    static uint64_t s_lastPlayer = 0;
+    static CFTimeInterval s_lastFeed = 0.0;
+    if (player != s_lastPlayer) {
+        s_lastPlayer = player;
+        s_lastFeed = 0.0;
+    }
+    if (minGap > 0.0 && s_lastFeed != 0.0 && (now - s_lastFeed) < minGap) {
+        g_awStarved++;
+    } else {
+        Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
+        g_awAng = Quaternion::Angle(prev, out);
+        if (isnan(g_awAng)) g_awAng = 0.f;
+        const bool fed = drive_look_axis_input(player, prev, out);
+        s_lastFeed = now;
+        g_awGap = (float)minGap;
+        if (fed) {
+            // Counter++ is what the report correlates against the sample list.
+            // Only when the stick actually moved: "counter advanced, no input" is
+            // the exact pattern it looks for.
+            uint32_t n = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
+            WriteAddr<uint32_t>(player + kCallSetAimRotationCount, n + 1u);
+        } else {
+            g_awStuck++;
+        }
+    }
+
+    if (now - g_awLastLog >= 1.0) {
+        g_awLastLog = now;
+        NSLog(@"[AIM-WRITE] calls=%u wrote=%u stuck=%u starved=%u gap=%.3f ang=%.2f "
+              @"axis=%d tick=%u",
+              g_awCalls, g_awWrote, g_awStuck, g_awStarved, (double)g_awGap, (double)g_awAng,
+              isVaildPtr(look_axis_for(player)) ? 1 : 0,
+              (unsigned)(minGap * 60.0));
+        g_awCalls = g_awWrote = g_awStuck = g_awStarved = 0;
     }
     // kCheckBufPending (Player+0x624) is NOT ours to set: MarkGGPVerifyCheckBufPending
     // owns it and is driven by the weapon fire path. Writing it from aim was both
