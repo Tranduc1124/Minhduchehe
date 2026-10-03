@@ -14,9 +14,6 @@
 
 @interface GameViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) UIView *headerView;
-@property (nonatomic, strong) MDStatusChip *statusChip;
-@property (nonatomic, strong) MDPrimaryButton *primaryButton;
 @property (nonatomic, strong) NSTimer *pollTimer;
 @property (nonatomic, assign) NSInteger hudRequestSerial;
 @property (nonatomic, assign) CFTimeInterval pendingHUDEnableUntil;
@@ -47,44 +44,9 @@
     // the first card was hidden.
     _tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_tableView];
-
-    // Header: the state chip above the start button, both pinned out of the
-    // scroll view. They are tableHeaderView-sized by hand rather than assigned to
-    // tableHeaderView, because a tableHeaderView is laid out by UITableView with
-    // its own width bookkeeping and these two need a height that comes from their
-    // own constraints. The rows below stay for the two cards that carry the
-    // detail.
-    _headerView = [[UIView alloc] initWithFrame:CGRectZero];
-    _headerView.backgroundColor = MDThemeBg();
-    _headerView.translatesAutoresizingMaskIntoConstraints = NO;
-
-    _statusChip = [[MDStatusChip alloc] initWithFrame:CGRectZero];
-    [_headerView addSubview:_statusChip];
-
-    _primaryButton = [[MDPrimaryButton alloc] initWithFrame:CGRectZero];
-    [_primaryButton addTarget:self
-                       action:@selector(primaryButtonTapped)
-             forControlEvents:UIControlEventTouchUpInside];
-    [_headerView addSubview:_primaryButton];
-
-    [self.view addSubview:_headerView];
-
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_headerView.topAnchor constraintEqualToAnchor:safe.topAnchor],
-        [_headerView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
-        [_headerView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-
-        [_statusChip.topAnchor constraintEqualToAnchor:_headerView.topAnchor constant:10.0f],
-        [_statusChip.leadingAnchor constraintEqualToAnchor:_headerView.leadingAnchor constant:16.0f],
-        [_statusChip.trailingAnchor constraintEqualToAnchor:_headerView.trailingAnchor constant:-16.0f],
-
-        [_primaryButton.topAnchor constraintEqualToAnchor:_statusChip.bottomAnchor constant:12.0f],
-        [_primaryButton.leadingAnchor constraintEqualToAnchor:_headerView.leadingAnchor constant:16.0f],
-        [_primaryButton.trailingAnchor constraintEqualToAnchor:_headerView.trailingAnchor constant:-16.0f],
-        [_primaryButton.bottomAnchor constraintEqualToAnchor:_headerView.bottomAnchor constant:-12.0f],
-
-        [_tableView.topAnchor constraintEqualToAnchor:_headerView.bottomAnchor],
+        [_tableView.topAnchor constraintEqualToAnchor:safe.topAnchor],
         [_tableView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_tableView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [_tableView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
@@ -138,7 +100,6 @@
 // the button title move. Reload those two cells and nothing else.
 - (void)refreshStatus {
     if (!self.isViewLoaded) return;
-    [self syncHeader];
     NSIndexPath *statusPath = [NSIndexPath indexPathForRow:0 inSection:0];
     NSIndexPath *actionPath = [NSIndexPath indexPathForRow:0 inSection:1];
     if ([_tableView numberOfRowsInSection:0] > 0) {
@@ -151,66 +112,6 @@
     }
 }
 
-// One place that reads the three booleans and decides what the chip and the
-// button say. The rows below compute the same thing independently; they are left
-// alone because they carry the long subtitles, and duplicating the state logic
-// into three places is how the chip and the row start disagreeing.
-//
-// kernelBootReady() is the expensive half of this and it runs on a 1s timer, so
-// the answer is cached here rather than asked per view.
-- (void)syncHeader {
-    BOOL hudOn = IsESPSessionRunning();
-    BOOL kernelOnly = (!hudOn && kernelBootReady());
-    BOOL pending = (!hudOn && _pendingHUDEnableUntil > 0 &&
-                    CACurrentMediaTime() < _pendingHUDEnableUntil);
-
-    if (hudOn) {
-        [_statusChip applyKind:MDStatusChipKindLive
-                          title:@"ESP is live"
-                         detail:@"Drawing on top of the game."];
-        [_primaryButton applyKind:MDPrimaryButtonKindStop
-                            title:@"Stop ESP"
-                         subtitle:@"Ends the session and hides the overlay."
-                             busy:NO
-                          enabled:YES];
-    } else if (pending) {
-        [_statusChip applyKind:MDStatusChipKindReady
-                          title:@"Starting"
-                         detail:@"Bringing the session up. One moment."];
-        [_primaryButton applyKind:MDPrimaryButtonKindBusy
-                            title:@"Starting…"
-                         subtitle:@"Do not close the app."
-                             busy:YES
-                          enabled:NO];
-    } else if (kernelOnly) {
-        [_statusChip applyKind:MDStatusChipKindReady
-                          title:@"Kernel ready"
-                         detail:@"Exploit is up. ESP is not running yet."];
-        [_primaryButton applyKind:MDPrimaryButtonKindAccent
-                            title:@"Start ESP"
-                         subtitle:@"Turns on the overlay and the ESP."
-                             busy:NO
-                          enabled:YES];
-    } else {
-        [_statusChip applyKind:MDStatusChipKindOff
-                          title:@"Not started"
-                         detail:@"The exploit has not run on this launch."];
-        [_primaryButton applyKind:MDPrimaryButtonKindAccent
-                            title:@"Activate"
-                         subtitle:@"Runs the exploit and starts a session."
-                             busy:NO
-                          enabled:YES];
-    }
-}
-
-- (void)primaryButtonTapped {
-    if (IsESPSessionRunning()) {
-        [self stopSession];
-        return;
-    }
-    [self presentBootLogAndStart];
-}
-
 #pragma mark - Table
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
@@ -220,18 +121,15 @@
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    // No section headers any more. The status they labelled is the chip at the
-    // top of the screen, in the accent, with a dot; "STATUS" above it was the
-    // same fact stated twice, and the smaller of the two won.
-    return nil;
+    return section == 0 ? @"STATUS" : @"ACTION";
 }
 
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSString *text = nil;
     if (section == 0) {
-        text = @"The session keeps running while you play. Stop it before closing.";
+        text = @"Keeps the ESP session alive while you play.";
     } else {
-        text = @"Starting runs the kernel exploit once, then brings up the overlay.";
+        text = @"Starts a new ESP session.";
     }
     if (!text) return nil;
 
