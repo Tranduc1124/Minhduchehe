@@ -5025,10 +5025,18 @@ static int      s_countOffScreen = 0;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
 
-        // The tally, here, where isOnScreen is the same test the box is drawn
-        // from. Dedup by UID because the player dictionary can name one pawn
-        // twice; the frame stamp is the 3-frame hold described below.
-        if (isOnScreen) {
+        // The tally. 360 degrees: every live pawn inside the draw limit counts,
+        // the ones behind you and beside you as much as the ones in front. That
+        // is what the counter is for — knowing how many are around you — and the
+        // boxes still draw exactly where they draw, which for an off-screen pawn
+        // means outside the viewport, with the alert arrows being the thing that
+        // shows where.
+        //
+        // 8d06a6a4a made this on-screen only, to make the number match the boxes.
+        // That was the wrong trade: it silently dropped enemies behind the player,
+        // which is the half of a 360 that matters most. The count and the picture
+        // answer different questions and are not required to agree.
+        {
             const uint64_t key = s.uid ? s.uid : s.pawn;
             int slot = -1;
             for (int ci = 0; ci < s_espCountN; ci++) {
@@ -5042,11 +5050,12 @@ static int      s_countOffScreen = 0;
                 s_espCountFrame[slot] = g_cacheFrameCounter;
                 s_espCountBot[slot] = s.isBot ? 1 : 0;
             }
-        } else if (s.dis < espDistanceLimit) {
-            // Live, inside the limit, would have been counted before the tally
-            // moved here, and is not drawn. Printed so "the number is one too
-            // high" either has a cause in the log or provably does not.
-            s_countOffScreen++;
+            if (!isOnScreen && s.dis < espDistanceLimit) {
+                // Counted, inside the limit, not in the viewport. Printed so the
+                // difference between "how many are around me" and "how many are
+                // on screen" is a number rather than an argument.
+                s_countOffScreen++;
+            }
         }
 
         // [PUSH] 1 Hz on the first drawn snap: splits "frozen data" from
