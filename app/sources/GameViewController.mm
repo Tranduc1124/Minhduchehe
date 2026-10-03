@@ -1,6 +1,7 @@
 #import "GameViewController.h"
 #import "BootLogViewController.h"
 #import "MDLog.h"
+#import "KernelBoot.h"
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "HUDHelper.h"
@@ -159,11 +160,20 @@
                                                         forIndexPath:indexPath];
 
     BOOL hudOn = IsESPSessionRunning();
+    // Kernel-only is a third state, not "off". AutoBootOnLaunch brings the exploit
+    // up at launch and deliberately starts nothing that draws, and the row said
+    // "Inactive / ESP is off" for a machine that was in fact ready — so the button
+    // read like a first start rather than the second half of a session already in
+    // progress.
+    BOOL kernelOnly = (!hudOn && kernelBootReady());
     if (indexPath.section == 0) {
         [cell applyIconNamed:@"waveform.path.ecg"
-                        color:hudOn ? MDThemeGreen() : MDThemeRed()];
+                        color:hudOn ? MDThemeGreen() : (kernelOnly ? MDThemeGreen() : MDThemeRed())];
         if (hudOn) {
             [cell applyTitle:@"Active" subtitle:@"ESP is on. Session is live."
+                       value:nil showsChevron:NO tappable:NO];
+        } else if (kernelOnly) {
+            [cell applyTitle:@"Kernel ready" subtitle:@"Kernel only. The ESP is off."
                        value:nil showsChevron:NO tappable:NO];
         } else {
             [cell applyTitle:@"Inactive" subtitle:@"ESP is off. Activate it to start."
@@ -191,10 +201,19 @@
                     value:nil showsChevron:NO tappable:NO];
         cell.titleLabel.textColor = MDThemeMuted();
     } else {
+        // Kernel already up: this is not a fresh boot, it is the second half of
+        // one. kernelBootStart() takes its g_ready path and brings up the
+        // SpringBoard overlay and the ESP host without re-running the exploit.
         [cell applyIconNamed:@"play.fill" color:MDThemeAccent()];
-        [cell applyTitle:@"Activate"
-                 subtitle:@"Starts a fresh ESP session."
-                    value:nil showsChevron:YES tappable:YES];
+        if (kernelOnly) {
+            [cell applyTitle:@"Start ESP"
+                     subtitle:@"Kernel is up. Turns on the overlay and the ESP."
+                        value:nil showsChevron:YES tappable:YES];
+        } else {
+            [cell applyTitle:@"Activate"
+                     subtitle:@"Starts a fresh ESP session."
+                        value:nil showsChevron:YES tappable:YES];
+        }
         cell.titleLabel.textColor = MDThemeAccent();
     }
     return cell;
@@ -265,7 +284,13 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 }
 
 - (void)startHUDForRequest:(NSInteger)requestSerial {
-    _pendingHUDEnableUntil = CACurrentMediaTime() + 2.5;
+    // How long the row stays on "Starting…". A full boot is the exploit, which
+    // either works in a second or does not work at all. Starting from
+    // kernel-ready is only the SpringBoard overlay, and boot_start_sb_overlay
+    // retries at 3s, 5s, 8s and 12s cumulative — so the old fixed 2.5s put the row
+    // back to "Start ESP" while the overlay was still coming up, and the user saw
+    // the button flicker through three states.
+    _pendingHUDEnableUntil = CACurrentMediaTime() + (kernelBootReady() ? 15.0 : 2.5);
     GameOffsetsReload();
     [MDLog appendLine:@"RUN Starting a new session…"];
 

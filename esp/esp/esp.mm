@@ -2382,30 +2382,130 @@ extern "C" void ToggleSpeedX50(bool enable) {
 //
 // The fix is the offsets, not a heuristic in front of them.
 
+// Which offset actually holds the game's aim rotation, worked out at runtime
+// instead of assumed.
+//
+// What is known from the device, not from reasoning:
+//
+//   e99f61871 removed the three legacy writes (0x5B4, 0x5C4, 0x19A4) and the
+//   game stopped dying. 6b7c9fb29 removed the guard from that commit and the
+//   aim stayed dead. So the aim was coming from one of the legacy offsets, not
+//   from the offsets table, and the crash was coming from one of the others.
+//   The table's 0x614 / 0x628 / 0x1A8C do not drive the camera on this build.
+//
+// So both sets have to stay in play and the choice has to be measured. A field
+// that is a rotation changes while the player is aiming; a field that is a
+// pointer the game owns does not, because nothing about our writing makes the
+// game reallocate its own objects. Requiring both "changed since the last
+// sample" and "both halves are plausible floats" is what separates them.
+//
+// The float test is on the halves, not on the whole 64-bit word. That was the
+// mistake in e99f61871: the second component sits in the high half, so any
+// rotation with a non-zero second component reads as an enormous word, and a
+// magnitude test on the word rejects every rotation there is.
+//
+// Plausible means: zero, or a float whose magnitude is between 1/16 and 4. That
+// covers every component of a real rotation (they are in [-1,1] and rarely near
+// zero while aiming) and excludes pointer halves, which are denormals, huge, or
+// NaN.
+static inline bool AimHalfIsPlausibleFloat(uint32_t bits) {
+    if (bits == 0) return true;                       // +0.0f
+    const uint32_t mag = bits & 0x7FFFFFFFu;
+    if (mag >= 0xBD000000u && mag <= 0xC1000000u) return true;   // 0.0625 .. -4.0
+    if (mag >= 0x3D000000u && mag <= 0x40800000u) return true;   // 0.0625 .. 4.0
+    return false;
+}
+
+#define AIM_FIELD_SLOTS 8
+typedef struct {
+    uint64_t off;
+    uint64_t last;
+    int      seen;        // samples taken
+    int      changed;     // samples where it moved
+    int      live;        // changed AND plausible: a rotation we may write
+} AimFieldProbe;
+
+static AimFieldProbe g_aimFields[AIM_FIELD_SLOTS];
+static int g_aimFieldCount = 0;
+
+static void AimFieldRegister(uint64_t off) {
+    if (!off) return;
+    for (int i = 0; i < g_aimFieldCount; i++) if (g_aimFields[i].off == off) return;
+    if (g_aimFieldCount < AIM_FIELD_SLOTS) {
+        g_aimFields[g_aimFieldCount].off = off;
+        g_aimFieldCount++;
+    }
+}
+
+// Sample every candidate once. Returns whether this offset may be written.
+static bool AimFieldIsLiveRotation(uint64_t player, uint64_t off) {
+    const uint64_t v = ReadAddr<uint64_t>(player + off);
+    const uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
+    const uint32_t hi = (uint32_t)(v >> 32);
+    const bool plausible = AimHalfIsPlausibleFloat(lo) && AimHalfIsPlausibleFloat(hi);
+
+    AimFieldProbe *p = nullptr;
+    for (int i = 0; i < g_aimFieldCount; i++) if (g_aimFields[i].off == off) { p = &g_aimFields[i]; break; }
+    if (!p) return false;
+
+    if (p->seen > 0 && p->last != v) p->changed++;
+    p->last = v;
+    if (p->seen < 32) p->seen++;
+    p->live = (p->changed > 0 && plausible);
+    return p->live;
+}
+
+// One line a second, so one log line from the device says which offsets are
+// rotations and which are not, instead of this being guessed again.
+static void AimFieldLog(uint64_t player) {
+    static CFTimeInterval s_last = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - s_last < 1.0) return;
+    s_last = now;
+    if (!isVaildPtr(player)) return;
+    NSMutableString *m = [NSMutableString string];
+    for (int i = 0; i < g_aimFieldCount; i++) {
+        AimFieldProbe *p = &g_aimFields[i];
+        const uint64_t v = ReadAddr<uint64_t>(player + p->off);
+        [m appendFormat:@" +0x%llx=%016llx(c%@%@) ",
+              (unsigned long long)p->off, (unsigned long long)v,
+              p->changed ? @"Y" : @"n",
+              p->live ? @"LIVE" : @""];
+    }
+    NSLog(@"[AIM-FIELDS]%@", m);
+}
+
 // Single clean write per call. Double-writes + multi-burst made the camera thrash
 // even when bullets (silent/fire-dir) were already accurate.
 //
-// Only the three offsets that come from the offsets table. This used to write
-// five: the same quaternion to kAimRotation, kAimRotationAux, kCurrentAimRotation
-// AND to 0x5B4, 0x5C4, 0x19A4, behind `if (kAimRotation != 0x5B4)` guards that
-// only skipped a legacy address when it happened to equal the table's. With the
-// table at 0x614/0x628/0x1A8C (FF) or 0x61C/0x630/0x1AA4 (MAX) every guard was
-// true, so all five writes ran every call. 0x5B4, 0x5C4 and 0x19A4 carry no
-// provenance comment and are from an older layout; in the current build whatever
-// lives there is not a rotation, and a quaternion written over it is the crash
-// above. The aimbot runs this continuously, so the damage is already in the object
-// by the time the match ends and the game reads the field.
+// Every candidate is registered and then only the ones measured to be live
+// rotations are written. The legacy 0x5B4 / 0x5C4 / 0x19A4 are back in the list
+// because the aim demonstrably came from them; what is gone is writing to all
+// five unconditionally, which is what put a quaternion into a pointer field and
+// killed the game at teardown (FreeFire-2026-10-03-082640.ips, faulting address
+// 0x3a3a69ed00000000 = 0.0f and 0.00059f, PAC-stripped into the GPU carveout).
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
-    struct { uint64_t off; const char *name; } targets[] = {
-        { kAimRotation,        "AimRotation" },
-        { kAimRotationAux,     "AimRotationAux" },
-        { kCurrentAimRotation, "CurrentAimRotation" },
-    };
-    for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
-        const uint64_t off = targets[i].off;
-        if (!off) continue;
-        WriteAddr<Quaternion>(player + off, out);
+    AimFieldRegister(kAimRotation);
+    AimFieldRegister(kAimRotationAux);
+    AimFieldRegister(kCurrentAimRotation);
+    AimFieldRegister(0x5B4);
+    AimFieldRegister(0x5C4);
+    AimFieldRegister(0x19A4);
+    // MAX offsets, so the same build works whichever target is selected.
+    if (GameTargetIsMax()) {
+        AimFieldRegister(0x61C);
+        AimFieldRegister(0x630);
+        AimFieldRegister(0x1AA4);
+    }
+
+    AimFieldLog(player);
+
+    for (int i = 0; i < g_aimFieldCount; i++) {
+        const uint64_t off = g_aimFields[i].off;
+        if (AimFieldIsLiveRotation(player, off)) {
+            WriteAddr<Quaternion>(player + off, out);
+        }
     }
 }
 
