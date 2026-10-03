@@ -22,3 +22,6 @@ XPF/external/ChOma/include/choma/
 *.tar.*
 .git/
 *.DS_Store
+# Tserver SDK archive: fetched from the serverhihi sdk-latest release.
+# Committed archives were built on Linux and crash on arm64e.
+vendor/APIClient/libAPIClient.a

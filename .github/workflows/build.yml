@@ -35,6 +35,18 @@ jobs:
       - name: Install ldid
         run: brew install ldid
 
+      - name: Download libAPIClient.a (built on macOS by serverhihi)
+        run: |
+          # The vendored archive is not committed: an archive produced by the
+          # Linux/Theos toolchain links with "incompatible arm64e ABI" on
+          # Apple's linker and crashes the app in a dyld initializer with a
+          # pointer-authentication fault. sdk-latest is produced on macos-14.
+          mkdir -p vendor/APIClient
+          curl -fsSL -o vendor/APIClient/libAPIClient.a \
+            https://github.com/Tranduc1124/serverhihi/releases/download/sdk-latest/libAPIClient.a
+          ls -la vendor/APIClient/libAPIClient.a
+          shasum -a 256 vendor/APIClient/libAPIClient.a
+
       - name: Build
         run: |
           cd "$GITHUB_WORKSPACE"
