@@ -3764,6 +3764,51 @@ static int      s_espCountN = 0;
     }
 
     uint64_t matchGame = getMatchGame(Moudule_Base);
+    uint64_t camera = isVaildPtr(matchGame) ? CameraMain(matchGame) : 0;
+    uint64_t match  = isVaildPtr(matchGame) ? getMatch(matchGame) : 0;
+
+    // The end of a match is the mirror image of the start of one, and it was the
+    // one the cache never saw.
+    //
+    // On the way in there is a flush, further down, keyed on `match` becoming
+    // valid. On the way out the function returns at the lobby check above, before
+    // reaching it, so every page mapping stayed alive across the teardown: the
+    // game destroys the scene's vm_objects and DSMemory keeps handing those
+    // mappings back on a bare VA match, with no re-validation (ds_page_local).
+    // Reading a freed vm_object through a shmem mapping is what gets the process
+    // killed on the way out of a match.
+    //
+    // Once per transition, never per frame — DSMemory.m records that a per-frame
+    // flush caused "Taking non-sleepable RW lock" panics.
+    static uint64_t s_lastLiveMatch = 0;
+    // Declared here rather than inside the flush block below, which runs after
+    // this one and is reset by it when a match ends.
+    static uint64_t s_lastMatchDiag = 0;
+    {
+        const bool live = isVaildPtr(match);
+        if (s_lastLiveMatch != 0 && !live) {
+            const uint64_t left = s_lastLiveMatch;
+            ds_flush_page_cache();
+            ds_cache_bump_generation();
+            // The count is a table of pawn pointers with a frame hold; a pawn from
+            // the match that just ended is not a live enemy in the lobby.
+            s_espCountN = 0;
+            memset(s_espCountFrame, 0, sizeof(s_espCountFrame));
+            memset(s_espCountBot, 0, sizeof(s_espCountBot));
+            gAimLockTarget = 0;
+            gAimLockLostFrames = 0;
+            s_lockHoldFrames = 0;
+            AimLockClear();
+            // Reset so the flush on the way into the next match runs again.
+            s_lastMatchDiag = 0;
+            s_lastLiveMatch = 0;
+            NSLog(@"[PUSH-FLUSH] left match 0x%llx — page cache dropped, locks cleared",
+                  (unsigned long long)left);
+        } else if (live) {
+            s_lastLiveMatch = match;
+        }
+    }
+
     if (!isVaildPtr(matchGame)) {
         static int s_lobbyLog = 0;
         if (++s_lobbyLog % 300 == 1) {
@@ -3773,8 +3818,6 @@ static int      s_espCountN = 0;
         return stats;
     }
 
-    uint64_t camera = CameraMain(matchGame);
-    uint64_t match = getMatch(matchGame);
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
         DIAG_EARLY(@"loading-match");
         return stats;
@@ -3793,7 +3836,8 @@ static int      s_espCountN = 0;
     // pixels every frame because the data behind them is the same freed memory.
     // Report it rather than guess: staleGen > 0 means the cache crossed a match.
     {
-        static uint64_t s_lastMatchDiag = 0;
+        // s_lastMatchDiag is declared above, at the match -> lobby transition,
+        // which resets it so this fires again for the next match.
         if (match != s_lastMatchDiag) {
             // Fire on the FIRST valid match of this attach, not only on a
             // change. The previous attempt hung the flush off `match` changing
@@ -4124,6 +4168,14 @@ static int      s_espCountN = 0;
     const uint64_t entryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
     int loopCount = slotCap;
     if (loopCount > 128) loopCount = 128;
+    // How many dict entries were dropped as "that is me". Printed with the count
+    // below because it is the whole question behind "the counter counts me": the
+    // self filter needs the local pawn, and getLocalPlayer(match) returns 0 when
+    // kMatchLocalPlayer does not resolve, in which case isSamePlayerAsLocal
+    // answers false for everything and the local player is counted as an enemy.
+    // self=0 with local=0 is that case, and self=0 with a valid local is a
+    // different bug entirely. One log line separates them.
+    int selfSkipped = 0;
 
     for (int i = 0; i < loopCount; i++) {
         uint64_t ent = entriesBase + entryStride * (uint64_t)i;
@@ -4144,7 +4196,7 @@ static int      s_espCountN = 0;
         }
         if (!isVaildPtr(PawnObject)) continue;
         // Skip self: pointer, UserID, or PlayerID (local pointer can mismatch after death/rejoin).
-        if (isSamePlayerAsLocal(myPawnObject, PawnObject)) continue;
+        if (isSamePlayerAsLocal(myPawnObject, PawnObject)) { selfSkipped++; continue; }
         // Skip teammates when local is known.
         if (isVaildPtr(myPawnObject) && isLocalTeamMate(myPawnObject, PawnObject)) continue;
 
@@ -4597,8 +4649,11 @@ static int      s_espCountN = 0;
 
     static int s_countDiagLog = 0;
     if (++s_countDiagLog % 180 == 1) {
-        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d)",
-              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN, stats.realCount, stats.botCount);
+        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
+              @"local=0x%llx self=%d",
+              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
+              stats.realCount, stats.botCount,
+              (unsigned long long)myPawnObject, selfSkipped);
     }
 
     // -------------------------------------------------------------------------
