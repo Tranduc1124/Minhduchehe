@@ -111,6 +111,34 @@ int ds_attach(void) {
     if (ds_attached()) return 0;
     if (!g_kexploit_ready) return -1;
 
+    // Drop any half-finished attempt before starting a new one.
+    //
+    // g_ff_task is set at the line that reads proc_ro->pr_task, which is BEFORE
+    // the base walk. Every failure between there and the end of the walk
+    // (proc_ro, task, map, nentries, first entry, no base) returns -1 and leaves
+    // g_ff_task set, and ds_attached() is a bare pointer test on g_ff_task. So
+    // one failed attempt made ds_attached() answer true forever, and the
+    // early-out above meant every later ds_attach() returned 0 without walking
+    // anything -- the retry could never fix itself.
+    //
+    // This is what happened on device 2026-10-03 12:56, one boot after the
+    // bundle id change:
+    //
+    //   [DS] base walk: mapped=7 fail=7 best=0x0 size=0x0
+    //   [DS] module base not found (nentries walk failed)
+    //   [GameOffsets] ds_attach() failed: code -1
+    //   [HB] FLUSH1 base=0x0 pid=519 at=1 ...      <- attached, base zero
+    //
+    // and every [HB] FLUSH1 line after it kept printing base=0x0 at=1 until the
+    // process died. Nothing drew, because every offset is module-relative and
+    // the module base was zero.
+    //
+    // ds_detach() is the right reset because it also drops the page cache and
+    // the degrade state, which were both populated against the failed attempt.
+    if (g_ff_task || g_ff_proc || g_ff_pid || g_ff_base) {
+        ds_detach();
+    }
+
     init_physmap();
 
     // DIAG: kernel read health check — read our own proc. If this returns
