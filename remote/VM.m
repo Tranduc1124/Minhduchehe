@@ -373,6 +373,85 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     struct vm_map_entry entry = {0};
     kreadbuf(nextAddr, &entry, VME_ENTRY_ZONE_BYTES);
 
+    // ---------------------------------------------------------------------
+    // BEFORE WRITING: the entry must be the one we think it is.
+    //
+    // 2026-10-03 10:11, iPhone13,2 / 21F90 / xnu-10063.122.3, incident
+    // EDF36373, from the user's own crash report:
+    //
+    //   panic(cpu 0 caller 0xfffffff025bbb1ac):
+    //   pmap_enter_options_internal: attempt to map illegal VA
+    //   0xffffff5ff8bfc000 in pmap 0xfffffff027a000e8 @pmap.c:8465
+    //   Panicked task ...: 1732 pages, 8 threads: pid 1349: MINHDUC
+    //
+    // That is a dead kernel, not a dead app: the panic is raised inside
+    // vm_map_enter on OUR OWN pmap, and the address is refused because it is
+    // not in any user range at all. The only thing in this project that writes
+    // into a live vm_map_entry is the hijack two blocks below, a 32-byte store
+    // of a packed vm_object pointer into vme_object_or_delta of whatever
+    // nextAddr names. A pmap that hands back an unmappable address is a pmap
+    // whose tree was written to with the wrong entry, so the entry is checked
+    // before it is written to.
+    //
+    // The check needs no guessing about the layout. mach_make_memory_entry_64()
+    // above was given localAddr and PAGE_SIZE, and XNU builds the copy for a
+    // memory entry by copying in exactly that range
+    // (vm_named_entry_associate_vm_object -> vm_map_copyin), so the single
+    // entry of that copy describes [localAddr, localAddr + PAGE_SIZE) and
+    // nothing else. localAddr came back from the kernel microseconds ago and
+    // we still hold it, so it is a fact about this remap rather than an
+    // assumption about the device.
+    //
+    // When nextAddr is not that entry -- stale copy, recycled zone element, a
+    // mislocated backing pointer -- this refuses instead of writing, and the
+    // page cache keeps working off the last good mapping until it ages out.
+    // That is strictly better than the alternative, which is the device.
+    // ---------------------------------------------------------------------
+    {
+        static int s_hijackBadRun = 0;
+        static int s_hijackOff = 0;
+        static int s_hijackReported = 0;
+
+        const uint64_t wantStart = (uint64_t)localAddr;
+        const uint64_t wantEnd   = wantStart + PAGE_SIZE;
+        const uint64_t gotStart  = (uint64_t)entry.links.start;
+        const uint64_t gotEnd    = (uint64_t)entry.links.end;
+
+        // localAddr is from mach_vm_allocate on our own task, so it must be a
+        // plain user address. If even that does not hold, nothing below is
+        // worth trusting.
+        const BOOL addrPlausible = (wantStart != 0 && wantStart < 0x0000000100000000ULL);
+        const BOOL rangeMatches  = (gotStart == wantStart && gotEnd == wantEnd);
+
+        if (!addrPlausible || !rangeMatches) {
+            s_hijackBadRun++;
+            if (!s_hijackOff && s_hijackBadRun >= 8) {
+                s_hijackOff = 1;
+                NSLog(@"[DS] HIJACK DISABLED after %d entries that did not describe our own "
+                      @"page; remap will keep using mappings it already has",
+                      s_hijackBadRun);
+            }
+            if (!s_hijackReported || s_hijackBadRun == 1 || s_hijackBadRun % 8 == 0) {
+                s_hijackReported = 1;
+                NSLog(@"[DS] REFUSE hijack entry=0x%llx start=0x%llx end=0x%llx "
+                      @"want=[0x%llx,0x%llx) run=%d off=%d",
+                      (unsigned long long)nextAddr,
+                      (unsigned long long)gotStart, (unsigned long long)gotEnd,
+                      (unsigned long long)wantStart, (unsigned long long)wantEnd,
+                      s_hijackBadRun, s_hijackOff);
+            }
+            mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
+            if (MACH_PORT_VALID(memoryObject)) {
+                mach_port_deallocate(mach_task_self_, memoryObject);
+            }
+            return shmem;
+        }
+        if (s_hijackBadRun) {
+            // A good one clears the run so the trip-wire needs 8 in a row.
+            s_hijackBadRun = 0;
+        }
+    }
+
     // DIAG via NSLog (3uTools realtime only captures NSLog, not printf):
     // dump the real 72 bytes so the kernel's actual layout is measured on the
     // device instead of inferred.
@@ -479,6 +558,22 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
               (unsigned long)odOff, newOD, check,
               check == newOD ? @"MATCH" : @"MISMATCH");
+
+        // A write that did not land is a live map entry holding whatever it held
+        // before, and the map below goes on to resolve the memory entry through
+        // it. There is nothing to undo -- the store either landed or it did not
+        // -- so the only safe move is to not use the mapping. This used to log
+        // MISMATCH and then mach_vm_map anyway, which is how a wrong object
+        // pointer reaches vm_map_enter and comes back as
+        // "attempt to map illegal VA" on the panic of 2026-10-03 10:11.
+        if (check != newOD) {
+            mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
+            if (MACH_PORT_VALID(memoryObject)) {
+                mach_port_deallocate(mach_task_self_, memoryObject);
+                memoryObject = MACH_PORT_NULL;
+            }
+            return shmem;
+        }
     }
 
     // ---------------------------------------------------------------------
