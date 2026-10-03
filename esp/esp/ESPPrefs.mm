@@ -3,8 +3,18 @@
 
 // Fixed suite + file so settings survive restart / reinstall of tipa better than
 // process-local defaults alone. Legacy path is still read for migration.
-static NSString *const kPrefsSuiteName = @"com.trminhduc.fifai.settings";
-static NSString *const kPrefsFileName  = @"com.trminhduc.fifai.settings.plist";
+static NSString *const kPrefsSuiteName = @"com.tranminhduc.ff.settings";
+static NSString *const kPrefsFileName  = @"com.tranminhduc.ff.settings.plist";
+
+// The bundle id changed, so writes go to the suite above. This is the file the
+// previous id wrote, and it is read as a fallback so a reinstall keeps every
+// setting instead of resetting the user's ESP to defaults without saying so.
+//
+// Read-only. Nothing ever writes here again, and the old suite domain is merged
+// from it for the same reason -- NSUserDefaults keeps the old plist in the
+// defaults database long after the bundle id moves.
+static NSString *const kOldPrefsFileName = @"com.trminhduc.fifai.settings.plist";
+static NSString *const kOldPrefsSuiteName = @"com.trminhduc.fifai.settings";
 static NSString *const kLegacyPrefsPath = @"/var/mobile/Library/Preferences/com.hth.shared.plist";
 
 static NSMutableDictionary *gCache = nil;
@@ -27,6 +37,9 @@ static NSArray<NSString *> *ESPPrefsCandidatePaths(void) {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
 
     [paths addObject:[@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kPrefsFileName]];
+    // The old bundle id's file, right after the new one, so it is only reached
+    // when there is no new file yet. Read-only from here on.
+    [paths addObject:[@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kOldPrefsFileName]];
     [paths addObject:kLegacyPrefsPath];
 
     NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -140,6 +153,21 @@ static void ESPPrefsLoadIfNeeded(void) {
         NSDictionary *suiteDomain = [gSuite persistentDomainForName:kPrefsSuiteName];
         if (suiteDomain.count > 0) {
             [suiteDomain enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+                if (gCache[key] == nil) {
+                    gCache[key] = obj;
+                }
+            }];
+        }
+
+        // 2b) Same for the previous bundle id's suite. Both merges are
+        // first-wins, and the new suite is merged first, so a key that exists in
+        // both keeps the new value and only keys the old id still has are picked
+        // up from it. Without this a bundle id change silently resets every
+        // setting, because the new suite is empty on the first run after it.
+        NSUserDefaults *oldSuite = [[NSUserDefaults alloc] initWithSuiteName:kOldPrefsSuiteName];
+        NSDictionary *oldDomain = oldSuite ? [oldSuite persistentDomainForName:kOldPrefsSuiteName] : nil;
+        if (oldDomain.count > 0) {
+            [oldDomain enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
                 if (gCache[key] == nil) {
                     gCache[key] = obj;
                 }
@@ -283,7 +311,7 @@ static dispatch_queue_t ESPPrefsIOQueue(void) {
     static dispatch_queue_t q = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        q = dispatch_queue_create("com.trminhduc.fifai.espprefs.io", DISPATCH_QUEUE_SERIAL);
+        q = dispatch_queue_create("com.tranminhduc.ff.espprefs.io", DISPATCH_QUEUE_SERIAL);
     });
     return q;
 }
