@@ -389,11 +389,11 @@ typedef NS_ENUM(NSInteger, ESPSection) {
             // still honours the pref, nothing in the app sets it now.
             //
             // Kill Game AA is not an aim mode. It controls the game's own chest
-            // magnet, DisableGameDefaultAimAssist in GameLogic.mm, and the engine
-            // already kills it whenever a custom aim is running. On, it keeps it
-            // dead for the whole match, including the frames no aim is firing,
-            // which is the state this switch exists to reach. Off leaves the
-            // kill exactly where it was: bound to the aim. See esp.mm:4430.
+            // magnet, DisableGameDefaultAimAssist in GameLogic.mm, on its own.
+            // On kills it for the whole match. Off leaves it alone even while
+            // Aimbot or Aim Assist is firing, so the magnet stays live and can
+            // pull against what the custom aim writes. Aimbot and Aim Assist
+            // themselves are not touched either way.
             return @[
                 @[ @"s", @"FOV Circle",        @"ShowFovCircle", @YES ],
                 @[ @"l", @"FOV Size",          @"FovSize",       @(10.0f), @(190.0f), @(120.0f) ],

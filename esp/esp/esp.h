@@ -170,6 +170,10 @@ extern bool isFastReload;
 
 // --- AIMBOT (hard LookAt only; Aim Silent removed) ---
 extern bool isAimbot;
+// Whether the game's own chest magnet gets stomped at all. Read at three call
+// sites of DisableGameDefaultAimAssist, two of which are above the definition in
+// esp.mm, so it has to be visible from here rather than declared locally.
+extern bool isKillGameAA;
 extern int  triggerMode;
 extern int  aimPosition;
 extern int  aimTargetMode;

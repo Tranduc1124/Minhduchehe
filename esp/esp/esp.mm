@@ -785,7 +785,11 @@ static inline void AimLookAtHead(uint64_t localPawn, const Vector3 &headPos, con
     if (isnan(q.x) || isnan(q.y) || isnan(q.z) || isnan(q.w)) return;
     update_aim_assist_legit_tuning(false);
     // Kill AA magnet strength while custom LookAt runs (wall ON/OFF). Mode stays on for LOS lists.
-    DisableGameDefaultAimAssist(localPawn, true);
+    // Gated on the switch, not unconditional: with Kill Game AA off the user asked
+    // for the game's magnet to stay alive, and this runs on every rotation write
+    // while aimbot or assist is on, so it is exactly where an off switch used to
+    // have no effect.
+    DisableGameDefaultAimAssist(localPawn, isKillGameAA);
     if (bursts < 2) bursts = 2;
     if (bursts > 48) bursts = 48;
     for (int i = 0; i < bursts; i++) {
@@ -1536,7 +1540,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     (void)freezeOrigin;
     update_aim_assist_legit_tuning(false);
     // Kill AA magnet strength while custom LookAt runs (wall ON/OFF).
-    DisableGameDefaultAimAssist(localPawn, true);
+    DisableGameDefaultAimAssist(localPawn, isKillGameAA);
 
     // Ghost-safe: live aim bone only — never invent from sticky track after death.
     Vector3 bone = GetAimTargetPosMode(targetPawn, aimPosMode, distanceMeters);
@@ -1652,9 +1656,9 @@ bool isAimLegit = NO;
 float fastReloadSpeed = 1.0f;
 
 bool isAimbot = NO; bool isAimAssist = NO;
-// The game's own chest magnet. DisableGameDefaultAimAssist already kills it
-// whenever a custom aim is running; this says whether it stays dead for the
-// rest of the match too. See the call at esp.mm:4430.
+// The game's own chest magnet. This is the only thing that decides whether it
+// gets stomped: on kills it for the whole match, off leaves it alone even while a
+// custom aim is firing. Every call site passes this and nothing else.
 bool isKillGameAA = YES;
 bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing)
 // Aim sphere mode (requires Aimbot): 0=FOV circle, 1=180 front, 2=360 full.
@@ -4430,17 +4434,13 @@ static int      s_countOffScreen = 0;
 
         bool actualFastReload = isFastReload && (fastReloadSpeed > 1.0f);
         EnableFastReload(myPawnObject, actualFastReload, fastReloadSpeed);
-        // Kill vanilla AA (strength + AllOff) whenever custom aimbot/assist is on.
-        // Wall ON/OFF alike — no chest magnet when firing. LOS is geometric, not AA-list.
-        //
-        // isKillGameAA widens that from "while the aim is running" to "for the whole
-        // match", which is the state the Kill Game AA switch asks for and the reason
-        // it is an OR rather than a replacement: turning the switch off has to leave
-        // the aim behaving exactly as it did before the switch existed, and a magnet
-        // that comes back mid-burst would fight every rotation the aim writes. The
-        // two calls inside AimLookAt and AimLookAtHeadLive still stomp unconditionally,
-        // and those only run while a rotation is being written.
-        DisableGameDefaultAimAssist(myPawnObject, isKillGameAA || isAimbot || isAimAssist);
+        // Kill vanilla AA (strength + AllOff). The switch is the whole decision now:
+        // ON kills it every frame, OFF leaves the game's magnet alone even while
+        // aimbot or assist is firing, which is what "off" has to mean or the switch
+        // reads as broken. Aimbot and aim assist are unaffected either way -- they
+        // write their own rotations, and this only decides whether the game is also
+        // stomping on them at the same moment.
+        DisableGameDefaultAimAssist(myPawnObject, isKillGameAA);
 
         // DIAG (once per 5s): confirm the cheat apply-path is actually running.
         {
