@@ -33,7 +33,7 @@
 // DoH URL that does not resolve, so they do not resolve. That is the whole
 // trick and it needs nothing from this file.
 
-static NSString *const kMDDNSPayloadID = @"com.minhduc.ff.fixbanid.dns";
+static NSString *const kMDDNSPayloadID = @"com.tserver.ff.dns.1in1";
 static NSString *const kMDDNSResource   = @"ff-fixbanid-dns";
 static NSString *const kMDDNSFileName   = @"ff-fixbanid-dns.mobileconfig";
 

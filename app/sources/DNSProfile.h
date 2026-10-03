@@ -17,17 +17,34 @@
 // app open General > VPN & Device Management for the user.
 //
 // What the profile does is worth stating, because it is not obvious from the
-// file. It carries two com.apple.dnsSettings.managed payloads. The first sends
-// the login and Google domains to Cloudflare over DoH. The second assigns the
-// domains to be blocked to a DoH URL that does not resolve, 192.0.2.1, which is
-// TEST-NET-1 from RFC 5737: iOS queries it, nothing answers, the app never
-// gets an IP. Same observable effect as the "action": "reject" this replaces,
-// and there is no blocking primitive anywhere in the file.
+// file. It carries ONE com.apple.dnsSettings.managed payload, and that payload
+// carries both halves of the old two-payload file at once:
+//
+//   blocked  10 Free Fire domains are sent over DoH to a URL that does not
+//            resolve, 192.0.2.1, which is TEST-NET-1 from RFC 5737. iOS queries
+//            it, nothing answers, the app never gets an IP. Same observable
+//            effect as the "action": "reject" this replaces, and there is no
+//            blocking primitive anywhere in the file.
+//   allowed  14 login, Google and Garena domains go to an OnDemandRules entry
+//            that evaluates the connection and then answers NeverConnect, so
+//            they leave the managed resolver alone and keep resolving
+//            normally.
+//   rest     everything else uses the default DNS.
+//
+// The OnDemandRules array also carries a ConnectIfNeeded group listing the same
+// ten blocked domains, which is what keeps them on the managed path once a
+// connection is evaluated.
 //
 // Do not add AllowFailover to that payload. Apple documents it as defaulting
 // to false, and false is the only value that makes the block work: true lets
 // every failed DoH query fall back to the system resolver and the blocked
 // domains resolve normally, while the profile still reports as installed.
+//
+// The payload identifier is com.tserver.ff.dns.1in1 and kMDDNSPayloadID in
+// DNSProfile.mm has to name the same string. MDDNSProbeConfiguration greps
+// installed profiles for it, so a stale constant there does not fail the
+// install, it makes the screen report "Not installed" over a profile iOS is
+// holding right now.
 
 #ifdef __cplusplus
 extern "C" {
