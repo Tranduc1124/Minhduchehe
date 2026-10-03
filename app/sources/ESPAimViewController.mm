@@ -387,10 +387,18 @@ typedef NS_ENUM(NSInteger, ESPSection) {
             // the aim controls rather than beside the ESP switches — the ring
             // exists to show the aim's reach. CamPC went with it; the engine
             // still honours the pref, nothing in the app sets it now.
+            //
+            // Kill Game AA is not an aim mode. It controls the game's own chest
+            // magnet, DisableGameDefaultAimAssist in GameLogic.mm, and the engine
+            // already kills it whenever a custom aim is running. On, it keeps it
+            // dead for the whole match, including the frames no aim is firing,
+            // which is the state this switch exists to reach. Off leaves the
+            // kill exactly where it was: bound to the aim. See esp.mm:4430.
             return @[
                 @[ @"s", @"FOV Circle",        @"ShowFovCircle", @YES ],
                 @[ @"l", @"FOV Size",          @"FovSize",       @(10.0f), @(190.0f), @(120.0f) ],
                 @[ @"s", @"Enable Aim",        @"AimMaster",     @NO ],
+                @[ @"s", @"Kill Game AA",     @"KillGameAA",   @YES ],
                 @[ @"g", @"Aim Range",         @"AimSphereMode", @(0.0f),
                    @[ @"FOV", @"180°", @"360°" ] ],
                 @[ @"s", @"Aim Behind Wall",   @"AimBehindWall", @NO ],

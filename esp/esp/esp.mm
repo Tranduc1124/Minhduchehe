@@ -1652,6 +1652,10 @@ bool isAimLegit = NO;
 float fastReloadSpeed = 1.0f;
 
 bool isAimbot = NO; bool isAimAssist = NO;
+// The game's own chest magnet. DisableGameDefaultAimAssist already kills it
+// whenever a custom aim is running; this says whether it stays dead for the
+// rest of the match too. See the call at esp.mm:4430.
+bool isKillGameAA = YES;
 bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing)
 // Aim sphere mode (requires Aimbot): 0=FOV circle, 1=180 front, 2=360 full.
 int aimSphereMode = 0;
@@ -3053,6 +3057,7 @@ void ESPSyncFromPrefs(void) {
     // Only Legit is exclusive vs hard LookAt (soft Slerp fights Aimbot).
     isAimbot    = ESPPrefsBool(@"Aimbot", NO);
     isAimAssist = ESPPrefsBool(@"AimAssist", NO);
+    isKillGameAA = ESPPrefsBool(@"KillGameAA", YES);
     isAimLegit  = ESPPrefsBool(@"AimLegit", NO);
     if (isAimbot && isAimLegit) {
         ESPPrefsSetBool(@"AimLegit", NO);
@@ -4427,7 +4432,15 @@ static int      s_countOffScreen = 0;
         EnableFastReload(myPawnObject, actualFastReload, fastReloadSpeed);
         // Kill vanilla AA (strength + AllOff) whenever custom aimbot/assist is on.
         // Wall ON/OFF alike — no chest magnet when firing. LOS is geometric, not AA-list.
-        DisableGameDefaultAimAssist(myPawnObject, isAimbot || isAimAssist);
+        //
+        // isKillGameAA widens that from "while the aim is running" to "for the whole
+        // match", which is the state the Kill Game AA switch asks for and the reason
+        // it is an OR rather than a replacement: turning the switch off has to leave
+        // the aim behaving exactly as it did before the switch existed, and a magnet
+        // that comes back mid-burst would fight every rotation the aim writes. The
+        // two calls inside AimLookAt and AimLookAtHeadLive still stomp unconditionally,
+        // and those only run while a rotation is being written.
+        DisableGameDefaultAimAssist(myPawnObject, isKillGameAA || isAimbot || isAimAssist);
 
         // DIAG (once per 5s): confirm the cheat apply-path is actually running.
         {

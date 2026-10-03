@@ -191,7 +191,7 @@ static void ESPPrefsLoadIfNeeded(void) {
             @"EspCheckVisible",
             @"AimIgnoreBot", @"AimOnBot", @"AimIgnoreKnock",
             @"AimBehindWall",
-            @"AimMaster", @"AimTypeMode",
+            @"AimMaster", @"AimTypeMode", @"KillGameAA",
             @"AimRage", @"AimLegit", @"Aimbot", @"AimAssist", @"AimSilent", @"Aim360", @"AimSphereMode",
             @"AimMode", @"TriggerMode", @"AimPos", @"AimTargetMode", @"Fov", @"AimSpeed", @"ShowFovCircle", @"FovSize",
             @"SbCountText",
