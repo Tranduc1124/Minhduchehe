@@ -1,8 +1,13 @@
 name: Build MINHDUC
 
+# PAUSED 2026-10-03: every push was starting a build, and the Tserver client
+# API key is being regenerated. The SDK is compiled against that key, so any
+# build made from the old key would ship an app the server rejects. Uncomment
+# the push trigger below to resume; workflow_dispatch still runs a one-off by
+# hand from the Actions tab either way.
 on:
-  push:
-    branches: [ '**' ]
+  # push:
+  #   branches: [ '**' ]
   workflow_dispatch:
 
 permissions:
