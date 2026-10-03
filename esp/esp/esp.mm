@@ -4167,7 +4167,13 @@ static int      s_countOffScreen = 0;
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
             s_lastLiveMatch = 0;
-            NSLog(@"[PUSH-FLUSH] left match 0x%llx — page cache dropped, locks cleared",
+            // The plate and the names live on CAShapeLayers in SpringBoard that
+            // keep whatever path they were last handed, and the publish that
+            // clears them stops running the moment the ESP goes silent — which is
+            // exactly what a match ending does. Without this the dark plate stays
+            // on screen for the rest of the session.
+            SBClearESPNameLayers();
+            NSLog(@"[PUSH-FLUSH] left match 0x%llx — page cache dropped, locks and names cleared",
                   (unsigned long long)left);
         } else if (live) {
             s_lastLiveMatch = match;
@@ -5042,18 +5048,37 @@ static int      s_countOffScreen = 0;
             for (int ci = 0; ci < s_espCountN; ci++) {
                 if (s_espCountKey[ci] == key) { slot = ci; break; }
             }
-            if (slot < 0 && s_espCountN < (int)(sizeof(s_espCountKey) / sizeof(s_espCountKey[0]))) {
-                slot = s_espCountN++;
-                s_espCountKey[slot] = key;
+            if (slot < 0) {
+                if (s_espCountN < (int)(sizeof(s_espCountKey) / sizeof(s_espCountKey[0]))) {
+                    slot = s_espCountN++;
+                } else {
+                    // Table full: reuse the stalest entry.
+                    //
+                    // It used to drop the pawn instead, and that is what broke the
+                    // counter a while into a session. The table is append-only and
+                    // nothing ever freed a slot, so every pawn that ever appeared
+                    // kept its entry for the life of the process — 192 of them,
+                    // which a few matches fills — and from then on no new pawn
+                    // could get a slot at all, so the number stopped moving while
+                    // the boxes kept drawing. The three-frame hold has long since
+                    // stopped counting those entries, so the stalest one is free to
+                    // take.
+                    int64_t oldest = INT64_MAX;
+                    for (int ci = 0; ci < s_espCountN; ci++) {
+                        if (s_espCountFrame[ci] < oldest) {
+                            oldest = s_espCountFrame[ci];
+                            slot = ci;
+                        }
+                    }
+                    if (slot < 0) slot = 0;
+                }
             }
             if (slot >= 0) {
+                s_espCountKey[slot] = key;
                 s_espCountFrame[slot] = g_cacheFrameCounter;
                 s_espCountBot[slot] = s.isBot ? 1 : 0;
             }
             if (!isOnScreen && s.dis < espDistanceLimit) {
-                // Counted, inside the limit, not in the viewport. Printed so the
-                // difference between "how many are around me" and "how many are
-                // on screen" is a number rather than an argument.
                 s_countOffScreen++;
             }
         }

@@ -1212,8 +1212,13 @@ static BOOL sb_ensure_text_setpath_invocation(void) {
 // must still appear, so the caller keeps one r_msg2_main for that case. That
 // costs 27ms but only once per session, which is what the old code paid on
 // every single publish.
+// path may be 0: setPath: nil is the legal way to clear a CAShapeLayer, and the
+// off edges use it because it is one crossing with nothing left to own, where the
+// empty-path version was three — CGPathCreateMutable, setPath:, CGPathRelease —
+// and put three path-lifetime questions on the edge that runs at the moment the
+// user flips a switch.
 static BOOL sb_invoke_text_cached_main_raw(uint64_t path) {
-    if (!r_is_objc_ptr(path)) return NO;
+    if (path && !r_is_objc_ptr(path)) return NO;
     if (!sb_ensure_text_setpath_invocation()) return NO;
     remote_write64(g_sbTextArgBuf, path);
     // Read the pointer back before handing it over, for the same reason the
@@ -1241,7 +1246,10 @@ static BOOL sb_invoke_text_cached_main_raw(uint64_t path) {
 
 static BOOL sb_invoke_name_cached(int slot, uint64_t target, uint64_t path) {
     if (slot < 0 || slot > 1) return NO;
-    if (!r_is_objc_ptr(path) || !r_is_objc_ptr(target)) return NO;
+    // path 0 is nil, which is how a layer is cleared. See the note on
+    // sb_invoke_text_cached_main_raw above.
+    if (path && !r_is_objc_ptr(path)) return NO;
+    if (!r_is_objc_ptr(target)) return NO;
 
     if (!r_is_objc_ptr(g_sbNameInv[slot])) {
         uint64_t setPathSel = r_sel("setPath:");
@@ -2947,66 +2955,47 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
             // gate. This also covers the other way the marker goes missing, where
             // the app hides its own statusLayer, since both arrive here as the same
             // absence of a marker.
+            // All three off edges hand over nil.
+            //
+            // setPath: nil is how a CAShapeLayer is cleared, and it is one
+            // crossing with nothing left to own. The empty-path version was three
+            // per layer — CGPathCreateMutable, setPath:, CGPathRelease — and it
+            // ran at exactly the moment a switch is flipped, which is when the
+            // publish already has the most work and the transport the least room.
+            // SpringBoard has now died twice with SIGBUS at 0x401, this project's
+            // own FAKE_LR, on the frame after a feature was switched off. A publish
+            // that cleared three layers at once was doing nine extra crossings
+            // there; it does one per layer now.
             if (!textPathReady && s_sbTextLive && r_is_objc_ptr(g_sbTextShape)) {
                 s_sbTextLive = 0;
-                uint64_t empty = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-                calls++;
-                if (r_is_objc_ptr(empty)) {
-                    // Cached path first: two crossings, no sleep. The r_msg2_main
-                    // is only the fallback for a session where the invocation
-                    // could not be built, and it runs on this edge once, not on
-                    // every publish.
-                    if (!sb_invoke_text_cached_main_raw(empty)) {
-                        r_msg2_main(g_sbTextShape, "setPath:", empty, 0,0,0);
-                    }
-                    calls++;
-                    // Handed to the layer and kept, so the next marker releases it
-                    // in the block above instead of leaking it. g_sbTextPath is left
-                    // pointing at what the layer actually holds, so the two never
-                    // disagree about who owns the old path.
-                    if (r_is_objc_ptr(g_sbTextPath)) {
-                        dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
-                        calls++;
-                    }
-                    g_sbTextPath = empty;
+                if (!sb_invoke_text_cached_main_raw(0)) {
+                    r_msg2_main(g_sbTextShape, "setPath:", 0, 0,0,0);
                 }
+                calls++;
+                // The layer dropped its own reference when it took nil, so ours
+                // goes without a crossing.
+                g_sbTextPath = 0;
             }
             // The same off edge for the two name layers. Without it, turning the
             // name pref off leaves the last frame's plate and glyphs sitting on
             // screen for the rest of the session, because nothing else ever clears
-            // a CAShapeLayer. One empty path each, once, and only when a marker
-            // that used to arrive has stopped.
+            // a CAShapeLayer. One nil each, once, and only when a marker that used
+            // to arrive has stopped.
             if (!nameBgReady && s_sbNameBgLive && r_is_objc_ptr(g_sbNameBgShape)) {
                 s_sbNameBgLive = 0;
-                uint64_t eBg = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-                calls++;
-                if (r_is_objc_ptr(eBg)) {
-                    if (!sb_invoke_name_cached(0, g_sbNameBgShape, eBg)) {
-                        r_msg2_main(g_sbNameBgShape, "setPath:", eBg, 0,0,0);
-                    }
-                    calls++;
-                    if (r_is_objc_ptr(g_sbNameBgPath)) {
-                        dlsym_remote("CGPathRelease", g_sbNameBgPath, 0,0,0,0,0,0,0);
-                        calls++;
-                    }
-                    g_sbNameBgPath = eBg;
+                if (!sb_invoke_name_cached(0, g_sbNameBgShape, 0)) {
+                    r_msg2_main(g_sbNameBgShape, "setPath:", 0, 0,0,0);
                 }
+                calls++;
+                g_sbNameBgPath = 0;
             }
             if (!nameTextReady && s_sbNameTextLive && r_is_objc_ptr(g_sbNameTextShape)) {
                 s_sbNameTextLive = 0;
-                uint64_t eTx = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-                calls++;
-                if (r_is_objc_ptr(eTx)) {
-                    if (!sb_invoke_name_cached(1, g_sbNameTextShape, eTx)) {
-                        r_msg2_main(g_sbNameTextShape, "setPath:", eTx, 0,0,0);
-                    }
-                    calls++;
-                    if (r_is_objc_ptr(g_sbNameTextPath)) {
-                        dlsym_remote("CGPathRelease", g_sbNameTextPath, 0,0,0,0,0,0,0);
-                        calls++;
-                    }
-                    g_sbNameTextPath = eTx;
+                if (!sb_invoke_name_cached(1, g_sbNameTextShape, 0)) {
+                    r_msg2_main(g_sbNameTextShape, "setPath:", 0, 0,0,0);
                 }
+                calls++;
+                g_sbNameTextPath = 0;
             }
             // The name plate and the name glyphs, handed over here rather than
             // beside the counter below.
@@ -3193,6 +3182,49 @@ void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 // byte is not possible on arm64, and taking the lock from the UI thread would
 // put the status poll behind a build that can take milliseconds.
 int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
+
+// Clear the two filled name layers, once, from outside a publish.
+//
+// The publish already has this as its off edge, and that is where it belongs —
+// but the off edge only runs if a publish runs. A match ending makes the ESP go
+// silent rather than empty: mergePaths returns NO and SBRemotePushESPFrame drops
+// the frame before the publish body, so nothing reaches SpringBoard and the
+// layers keep the last paths they were handed. Reported as the dark plate staying
+// on screen after the match, with no name on it.
+//
+// Same work as the off edges, and the same live flags cleared so a later publish
+// that does bring names re-arms them instead of thinking they are still up.
+void SBClearESPNameLayers(void) {
+    pthread_mutex_lock(&g_sbLock);
+    const int on = g_sbOverlayOn ? 1 : 0;
+    pthread_mutex_unlock(&g_sbLock);
+    if (!on) return;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+
+    // The transport, same as a publish: one session, one queue, one set of
+    // argument buffers.
+    pthread_mutex_lock(&g_sbIoLock);
+    // Same nil hand-over as the publish's off edges, one crossing per layer.
+    @try {
+        if (s_sbNameTextLive && r_is_objc_ptr(g_sbNameTextShape)) {
+            if (!sb_invoke_name_cached(1, g_sbNameTextShape, 0)) {
+                r_msg2_main(g_sbNameTextShape, "setPath:", 0, 0,0,0);
+            }
+            g_sbNameTextPath = 0;
+        }
+        s_sbNameTextLive = 0;
+
+        if (s_sbNameBgLive && r_is_objc_ptr(g_sbNameBgShape)) {
+            if (!sb_invoke_name_cached(0, g_sbNameBgShape, 0)) {
+                r_msg2_main(g_sbNameBgShape, "setPath:", 0, 0,0,0);
+            }
+            g_sbNameBgPath = 0;
+        }
+        s_sbNameBgLive = 0;
+    } @finally {
+        pthread_mutex_unlock(&g_sbIoLock);
+    }
+}
 
 void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
