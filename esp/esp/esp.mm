@@ -2559,6 +2559,78 @@ static CFTimeInterval g_awLastLog = 0;
 // feed and the counter bump stay, because those are what make the input stream
 // match the rotation, and they carry their own pacing. What is gone from the
 // rotation path are only the three legacy offsets, which is the crash.
+// ---- GameVarDef aim gates, kept in the state the camera path needs ----
+//
+// Two flags decide whether a rotation we write ever reaches the view, and both
+// were sitting in GameOffsets.h with the explanation and no code using them:
+//
+//   EnableInternalSetRotation (statics+0xE4) — CurrentAimWriter reads it and,
+//     when it is not 1, overwrites 0x614 from the look stick. Our rotation is
+//     then discarded on the next sample.
+//   RotationPlan (statics+0x380C) — HFIKAJMBGJG applies Player.m_CurrentAimRotation
+//     (0x1A8C, what we write) to the camera only when the plan is 1. Plans 0 and 2
+//     skip it or source it from a Lerp, and the aim never reaches the view.
+//
+// That is exactly the reported shape: the target is picked, the rotation fields
+// hold our value, and the camera does not move.
+//
+// What is deliberately NOT touched, because it is the ban vector rather than a
+// feature flag:
+//
+//   EnableCheckBuf (statics+0x458C) — forcing it 0 makes the server see a missing
+//     report 0xF0, which is a ban, not a suppression. Report 0xF0/0xF1 flow.
+//   EnableAimInputSample / the sample counters — never forged. The look stick is
+//     moved for real by drive_look_axis_input, so SampleAimInput records a real
+//     position and FillAimInputSamples never has to emit the -1.0f that marks a
+//     missing sample.
+static bool     g_gvdPatched = false;
+static uint8_t  g_gvdSavedIntRot = 0;
+static int32_t  g_gvdSavedRotationPlan = 0;
+
+static uint64_t ResolveGameVarDefStatics(void) {
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return 0;
+    uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + kGameVarDefTypeInfo);
+    if (!isVaildPtr(typeInfo)) return 0;
+    uint64_t statics = ReadAddr<uint64_t>(typeInfo + kTypeInfoStatics);
+    if (!isVaildPtr(statics)) {
+        const uint64_t offs[] = {0xB8, 0xB0, 0xC0, 0xA8};
+        for (size_t i = 0; i < 4 && !isVaildPtr(statics); i++) {
+            statics = ReadAddr<uint64_t>(typeInfo + offs[i]);
+        }
+    }
+    return isVaildPtr(statics) ? statics : 0;
+}
+
+static void PatchAimDetectionFlags(bool enable) {
+    // Read-compare-write, so this costs nothing once the flags are already right.
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return;
+
+    uint64_t statics = ResolveGameVarDefStatics();
+    if (!isVaildPtr(statics)) return;
+
+    if (enable) {
+        if (!g_gvdPatched) {
+            g_gvdSavedIntRot = ReadAddr<uint8_t>(statics + kGvdEnableInternalSetRotation);
+            g_gvdSavedRotationPlan = ReadAddr<int32_t>(statics + kGvdRotationPlan);
+            g_gvdPatched = true;
+        }
+        if (ReadAddr<uint8_t>(statics + kGvdEnableInternalSetRotation) != 1)
+            WriteAddr<uint8_t>(statics + kGvdEnableInternalSetRotation, 1);
+        if (ReadAddr<int32_t>(statics + kGvdRotationPlan) != 1)
+            WriteAddr<int32_t>(statics + kGvdRotationPlan, 1);
+        return;
+    }
+
+    if (!g_gvdPatched) return;
+    uint8_t ir = ReadAddr<uint8_t>(statics + kGvdEnableInternalSetRotation);
+    if (ir != g_gvdSavedIntRot)
+        WriteAddr<uint8_t>(statics + kGvdEnableInternalSetRotation, g_gvdSavedIntRot);
+    int32_t rp = ReadAddr<int32_t>(statics + kGvdRotationPlan);
+    if (rp != g_gvdSavedRotationPlan)
+        WriteAddr<int32_t>(statics + kGvdRotationPlan, g_gvdSavedRotationPlan);
+    g_gvdPatched = false;
+}
+
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
     g_awCalls++;
@@ -5924,6 +5996,13 @@ static int      s_countOffScreen = 0;
     // thread. Camera aim (Aimbot/Assist) stays independent via LookAt.
     const bool cameraAimActive = (isAimbot || useAssist) && shouldActivate;
     const bool silentActive = useSilent && iAmAlive && isVaildPtr(myPawnObject);
+
+    // The two GameVarDef flags that decide whether the rotation we write is
+    // allowed to reach the camera, set while the camera aim is live and put back
+    // when it is not. See PatchAimDetectionFlags above: without them the stick
+    // overwrites 0x614 and the camera never sources 0x1A8C, which is "the aim
+    // picks a target and the camera does not move".
+    PatchAimDetectionFlags(cameraAimActive);
 
     static int s_aimDiagLog = 0;
     if ((isAimbot || useAssist) && (++s_aimDiagLog % 120 == 1)) {
