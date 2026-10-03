@@ -2729,8 +2729,27 @@ void ESPSyncFromPrefs(void) {
     if (aimPosition > 2) aimPosition = 2;
     aimTargetMode = (int)ESPPrefsFloat(@"AimTargetMode", 0.0f);
 
-    aimFov = ESPPrefsFloat(@"Fov", 150.0f);
-    if (aimFov <= 1.0f) aimFov = 150.0f;
+    // The aim radius and the ring radius are one setting, read from one pref.
+    //
+    // They were not. The ring read FovSize, which is what the app's ESP/AIM screen
+    // writes (ESPAimViewController, "FOV Size"), and the aim read Fov, which that
+    // screen never writes. So moving the slider moved the circle and left the aim
+    // exactly where it was — reported as "the aim does not take the FOV size".
+    // Two keys for one number, and the shipped UI wrote the one the engine ignored.
+    //
+    // Fov is only a fallback, never a write: it is the old in-game menu's slider,
+    // so an install that has it and has never touched the app screen keeps working
+    // exactly as before, and nothing here migrates one into the other.
+    id sizeVal = AppSettingsObjectForKey(@"FovSize");
+    if ([sizeVal isKindOfClass:[NSNumber class]]) {
+        aimFov = [(NSNumber *)sizeVal floatValue];
+    } else {
+        aimFov = ESPPrefsFloat(@"Fov", 120.0f);
+    }
+    // The ring's own clamp, spelled the same way (fovSize, a few hundred lines
+    // up), so the two can never disagree about what the number means.
+    if (aimFov < 5.0f)   aimFov = 120.0f;
+    if (aimFov > 190.0f) aimFov = 190.0f;
 
     // Prefer AimDistance. Migrate old builds that stored aim range under "Distance" as a float > 1.
     aimDistance = ESPPrefsFloat(@"AimDistance", -1.0f);
