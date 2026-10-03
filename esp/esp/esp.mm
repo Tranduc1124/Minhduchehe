@@ -4098,6 +4098,39 @@ static uint64_t s_espCountKey[192]  = {0};
 static int64_t  s_espCountFrame[192] = {0};
 static uint8_t  s_espCountBot[192]   = {0};
 static int      s_espCountN = 0;
+
+// Age an entry out of the count on the spot.
+//
+// The tally is stamped in the draw pass BEFORE the drawing branches, because
+// it needs isOnScreen and the frame stamp. Three of those branches can then
+// bail out with continue and draw nothing at all, and everything stamped
+// before that point still counted. That is the whole of "2 enemies, 2 boxes,
+// the counter says 3": the third pawn passes wantDraw, gets stamped, and then
+// hits one of these:
+//
+//   esp.mm, Lite ESP:  head bone unreadable  -> no box at all
+//   esp.mm, Pro ESP:   s.curHP <= 0          -> no box at all
+//
+// and the second one is a permanent +1 rather than a flicker: a knocked player
+// is alive with HP 0, wantDraw lets it through, Pro then refuses to draw it,
+// and the number sits one above the boxes for as long as that player is down.
+//
+// Stamping it and then dropping it is not a workaround for the number, it is
+// what "the counter counts the boxes" means: a pawn that reaches no drawing
+// code has to stop counting the frame it reached none.
+//
+// The frame is set far enough back that the 3-frame hold skips it now, rather
+// than deleting the slot, so the entry is still there to be reused -- and the
+// stalest-slot reuse picks exactly this one first.
+static void esp_count_drop(uint64_t key) {
+    for (int ci = 0; ci < s_espCountN; ci++) {
+        if (s_espCountKey[ci] == key) {
+            s_espCountFrame[ci] = INT64_MIN / 2;
+            return;
+        }
+    }
+}
+
 // Live pawns inside the draw limit whose projection is outside the viewport: not
 // drawn, so not counted. Reset per frame where the draw pass runs.
 static int      s_countOffScreen = 0;
@@ -5031,17 +5064,20 @@ static int      s_countOffScreen = 0;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
 
-        // The tally. 360 degrees: every live pawn inside the draw limit counts,
-        // the ones behind you and beside you as much as the ones in front. That
-        // is what the counter is for — knowing how many are around you — and the
-        // boxes still draw exactly where they draw, which for an off-screen pawn
-        // means outside the viewport, with the alert arrows being the thing that
-        // shows where.
+        // The tally. 360 degrees: every live enemy inside the draw limit counts,
+        // the ones behind you and beside you as much as the ones in front. That is
+        // what the counter is for — knowing how many are around you — and the boxes
+        // still draw exactly where they draw, which for an off-screen pawn means
+        // outside the viewport, with the alert arrows being the thing that shows
+        // where.
         //
         // 8d06a6a4a made this on-screen only, to make the number match the boxes.
-        // That was the wrong trade: it silently dropped enemies behind the player,
-        // which is the half of a 360 that matters most. The count and the picture
-        // answer different questions and are not required to agree.
+        // That was the wrong trade: it silently dropped the enemies behind the
+        // player, which is the half of a 360 that matters most.
+        //
+        // The counter is stamped here, before the drawing branches, and the
+        // branches that end up drawing nothing drop it again -- see
+        // esp_count_drop. That is what keeps the number equal to the boxes.
         {
             const uint64_t key = s.uid ? s.uid : s.pawn;
             int slot = -1;
@@ -5248,7 +5284,12 @@ static int      s_countOffScreen = 0;
         // Lite ESP — body-ratio height (no ankle pump) + screen-space sticky box.
         if (isESP2) {
             Vector3 HeadPos = s.head;
-            if (IsZeroVec(HeadPos) || !looksLikeWorldPos(HeadPos)) continue;
+            if (IsZeroVec(HeadPos) || !looksLikeWorldPos(HeadPos)) {
+                // Stamped by the tally above, and nothing drawn below. See
+                // esp_count_drop.
+                esp_count_drop(s.uid ? s.uid : s.pawn);
+                continue;
+            }
             Vector3 HipPos = s.hip;
             // Reject detached / inverted hips — bad bones make giant boxes.
             {
@@ -5381,7 +5422,14 @@ static int      s_countOffScreen = 0;
             }
         } else if (isESP) {
             // CurHP<=0 is terminal; ignore lagged isKnocked (corpse/transition ghost).
-            if (s.curHP <= 0) continue;
+            if (s.curHP <= 0) {
+                // A knocked player is alive on HP 0: wantDraw keeps it, the tally
+                // stamped it, and this is where Pro gives up and draws nothing.
+                // Stamped-and-dropped, or it is a standing +1 for the whole time
+                // anyone is down. See esp_count_drop.
+                esp_count_drop(s.uid ? s.uid : s.pawn);
+                continue;
+            }
             // Crowded Pro: far off-screen enemies skip full Pro path (still counted/alerted).
             if (crowded && !isOnScreen && s.dis > (veryCrowded ? 80.f : 120.f)) {
                 continue;
