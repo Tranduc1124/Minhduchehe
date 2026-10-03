@@ -5046,6 +5046,11 @@ static int      s_countOffScreen = 0;
     const int crowdN = snapN;
     const bool crowded = crowdN >= 18;
     const bool veryCrowded = crowdN >= 28;
+    // Hoisted out of the alert block below because the counter needs it: an
+    // off-screen pawn is only ever visible as an alert arrow/number at the screen
+    // edge, so this distance is part of the answer to "is this pawn something the
+    // player can actually see". See the tally.
+    const float alertMaxDis = veryCrowded ? 70.f : (crowded ? 95.f : 120.f);
     // Re-sample matrix once more right before project when many targets — collect
     // pass can take several ms and cam has already moved (stick-then-snap feel).
     if (crowded) {
@@ -5064,21 +5069,37 @@ static int      s_countOffScreen = 0;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
 
-        // The tally. 360 degrees: every live enemy inside the draw limit counts,
-        // the ones behind you and beside you as much as the ones in front. That is
-        // what the counter is for — knowing how many are around you — and the boxes
-        // still draw exactly where they draw, which for an off-screen pawn means
-        // outside the viewport, with the alert arrows being the thing that shows
-        // where.
+        // The tally counts what the ESP is actually showing, and that is the whole
+        // bug report: "team of 2, both alive, it says 3"; "only I die, it says
+        // 4". A number that changes when the local player dies is counting
+        // something that is not an enemy, and an enemy that is counted with
+        // nothing on screen to account for it is not a number anyone can check.
         //
-        // 8d06a6a4a made this on-screen only, to make the number match the boxes.
-        // That was the wrong trade: it silently dropped the enemies behind the
-        // player, which is the half of a 360 that matters most.
+        // 8d06a6a4a counted on-screen only. 14eda906c went back to 360, on the
+        // reasoning that knowing how many are behind you is the point. Both were
+        // half right, because the tally never asked whether the pawn was drawn:
         //
-        // The counter is stamped here, before the drawing branches, and the
-        // branches that end up drawing nothing drop it again -- see
-        // esp_count_drop. That is what keeps the number equal to the boxes.
-        {
+        //   esp.mm  the alert block, a few lines below
+        //       if ((isAlert360 || isAlertNum) && !isOnScreen && s.dis < alertMaxDis)
+        //
+        // An off-screen pawn is drawn ONLY by that block, and only when an alert
+        // pref is on. With the alerts off, a 360 tally counted every enemy behind
+        // the player and the player could see none of them -- a permanent +1 with
+        // no box, which is exactly what was reported, every time, for as long as
+        // 360 counting was in.
+        //
+        // So the rule is the one the picture can be checked against: a pawn
+        // counts if its box is in the viewport, or if the alert arrow/number at
+        // the screen edge is standing in for it. Turn the alerts on and the 360
+        // is back, because now those pawns are visible again; turn them off and
+        // they stop being counted, because then they are genuinely not shown.
+        // Nothing is silently dropped either way.
+        //
+        // Stamped here, before the drawing branches, and the branches that end
+        // up drawing nothing drop it again -- see esp_count_drop.
+        const bool shownAsAlert = !isOnScreen && (isAlert360 || isAlertNum) &&
+                                  s.dis < alertMaxDis;
+        if (isOnScreen || shownAsAlert) {
             const uint64_t key = s.uid ? s.uid : s.pawn;
             int slot = -1;
             for (int ci = 0; ci < s_espCountN; ci++) {
@@ -5114,7 +5135,10 @@ static int      s_countOffScreen = 0;
                 s_espCountFrame[slot] = g_cacheFrameCounter;
                 s_espCountBot[slot] = s.isBot ? 1 : 0;
             }
-            if (!isOnScreen && s.dis < espDistanceLimit) {
+            if (shownAsAlert) {
+                // Counted, but standing at the screen edge rather than in the
+                // viewport. Printed so the two kinds of count are two numbers in
+                // the log instead of one number and an argument.
                 s_countOffScreen++;
             }
         }
@@ -5205,7 +5229,6 @@ static int      s_countOffScreen = 0;
         }
 
         // Alert only nearer off-screen threats; throttle harder when crowded.
-        const float alertMaxDis = veryCrowded ? 70.f : (crowded ? 95.f : 120.f);
         if ((isAlert360 || isAlertNum) && !isOnScreen && s.dis < alertMaxDis) {
             float viewX = aimW.x * matrixData[0] + aimW.y * matrixData[4] + aimW.z * matrixData[8] + matrixData[12];
             float viewY = aimW.x * matrixData[1] + aimW.y * matrixData[5] + aimW.z * matrixData[9] + matrixData[13];
@@ -5423,10 +5446,11 @@ static int      s_countOffScreen = 0;
         } else if (isESP) {
             // CurHP<=0 is terminal; ignore lagged isKnocked (corpse/transition ghost).
             if (s.curHP <= 0) {
-                // A knocked player is alive on HP 0: wantDraw keeps it, the tally
-                // stamped it, and this is where Pro gives up and draws nothing.
-                // Stamped-and-dropped, or it is a standing +1 for the whole time
-                // anyone is down. See esp_count_drop.
+                // Unreachable in practice: the collect pass drops CurHP <= 0
+                // before the snapshot is ever built, so no snap can arrive here
+                // with a dead HP. Kept as a belt-and-braces guard, and it still
+                // drops the tally, because if it ever does fire the pawn is
+                // drawn by nothing. See esp_count_drop.
                 esp_count_drop(s.uid ? s.uid : s.pawn);
                 continue;
             }
