@@ -9,6 +9,7 @@
 #import "GameOffsets.h"
 #import "roothide/varCleanController.h"
 #import "../KernelBoot.h"
+#import "../../remote/SpringBoardOverlay.h"
 
 #import <QuartzCore/QuartzCore.h>
 
@@ -154,19 +155,51 @@
     return UITableViewAutomaticDimension;
 }
 
+// Three states, not two, and the third one used to be missing.
+//
+// actionTapped records the session as running before it starts anything:
+// markSessionRunning:YES writes App_LocalHUDState and SetHUDEnabled spawns the
+// -hud process, and both of those are what IsESPSessionRunning() reads. So the
+// instant the row is tapped it answered yes, and the card said "Active" and the
+// button said "Stop ESP" while the kernel was still being exploited and not one
+// frame had been drawn. It was the truth about a flag and a lie about a picture.
+//
+// So "asked for" and "drawing" are separate here. A session is live only once a
+// frame has actually reached SpringBoard; until then it is starting, and says
+// so. That is the whole reason SBoardOverlayHasPublishedFrame exists.
+- (BOOL)isESPDrawing {
+    return IsESPSessionRunning() && SBoardOverlayHasPublishedFrame() != 0;
+}
+
+- (BOOL)isESPStarting {
+    return IsESPSessionRunning() && SBoardOverlayHasPublishedFrame() == 0;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView
          cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     MDIconRowCell *cell = [tableView dequeueReusableCellWithIdentifier:@"row"
                                                         forIndexPath:indexPath];
 
-    BOOL hudOn = IsESPSessionRunning();
+    BOOL hudOn = [self isESPDrawing];
+    // Asked for, not yet drawing. Distinct from both "off" and "live".
+    BOOL starting = [self isESPStarting];
     // Kernel-only is a third state, not "off". AutoBootOnLaunch brings the exploit
     // up at launch and deliberately starts nothing that draws, and the row said
     // "Inactive / ESP is off" for a machine that was in fact ready — so the button
     // read like a first start rather than the second half of a session already in
     // progress.
-    BOOL kernelOnly = (!hudOn && kernelBootReady());
+    BOOL kernelOnly = (!hudOn && !starting && kernelBootReady());
     if (indexPath.section == 0) {
+        if (starting) {
+            // A muted clock rather than the green of a live session: nothing is on
+            // screen yet, and a card that claims otherwise is the whole problem.
+            [cell applyIconNamed:@"clock" color:MDThemeMuted()];
+            [cell applyTitle:@"Starting…"
+                     subtitle:@"Nothing is on screen yet. This stays until the ESP draws."
+                        value:nil showsChevron:NO tappable:NO];
+            cell.titleLabel.textColor = MDThemeMuted();
+            return cell;
+        }
         [cell applyIconNamed:@"waveform.path.ecg"
                         color:hudOn ? MDThemeGreen() : (kernelOnly ? MDThemeGreen() : MDThemeRed())];
         if (hudOn) {
@@ -188,7 +221,16 @@
     BOOL pending = (!hudOn && _pendingHUDEnableUntil > 0 &&
                     CACurrentMediaTime() < _pendingHUDEnableUntil);
 
-    if (hudOn) {
+    if (starting) {
+        // Tappable, and tapping it cancels. A start that never reaches a publish
+        // would otherwise sit on this row for the life of the app with no way out
+        // of it: the row is the only control on the screen.
+        [cell applyIconNamed:@"hourglass" color:MDThemeMuted()];
+        [cell applyTitle:@"Starting ESP…"
+                 subtitle:@"Not on screen yet. Tap to cancel."
+                    value:nil showsChevron:NO tappable:YES];
+        cell.titleLabel.textColor = MDThemeMuted();
+    } else if (hudOn) {
         [cell applyIconNamed:@"stop.fill" color:MDThemeRed()];
         [cell applyTitle:@"Stop ESP"
                  subtitle:@"Stops ESP and hides the box."

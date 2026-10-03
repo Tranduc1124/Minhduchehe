@@ -20,6 +20,13 @@ void SBoardStopOverlay(void);
 // knows about the separate -hud process and stays false while the session in
 // this process is live and drawing.
 int SBoardOverlayIsOn(void);
+// Whether a frame has actually reached SpringBoard and been drawn.
+//
+// SBoardOverlayIsOn answers "the window exists", which is true the moment the
+// build finishes and well before the first geometry is on screen. The app UI
+// needs the other half to tell a session that is starting from one that is
+// live, so it does not report Active while nothing has been painted yet.
+int SBoardOverlayHasPublishedFrame(void);
 // Mirror the local ESP_View into the SB-hosted view (called every frame
 // from updateFrame; no-op when the overlay isn't up).
 void SBRemotePushESPFrame(UIView *espView);

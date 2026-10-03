@@ -3183,6 +3183,22 @@ void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 // put the status poll behind a build that can take milliseconds.
 int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
 
+// Has a frame actually been drawn, as opposed to a window existing.
+//
+// g_sbLastPublishUS is stamped only where a publish completes, and the same file
+// already reads it as the difference between "has drawn before" and never:
+// the [PUSH-HB] line prints since=-1 when it is zero, and the recovery branch
+// below it treats non-zero as "has published at least once". So this is that
+// same question with an answer instead of a log line.
+//
+// Both halves are needed. The overlay can be up while every publish is still
+// being skipped, and the timestamp survives a session that has since gone away,
+// so g_sbOverlayOn is what makes the answer mean "right now" rather than
+// "once".
+int SBoardOverlayHasPublishedFrame(void) {
+    return (g_sbOverlayOn && g_sbLastPublishUS != 0) ? 1 : 0;
+}
+
 // Clear the two filled name layers, once, from outside a publish.
 //
 // The publish already has this as its off edge, and that is where it belongs —
