@@ -11,6 +11,7 @@
 #import "HUDHelper.h"
 #import "SpringBoardOverlay.h"
 #import "MDLicenseGate.h"
+#import "APIClient/APIClient.h"
 #import "../KernelBoot.h"
 
 // The custom accent picker is gone, but an install that used it has
@@ -145,6 +146,16 @@ static void MDResetAccentPrefs(void) {
         [MDLog appendLine:[NSString stringWithFormat:@"LICENSE %@", message]];
     }];
     return YES;
+}
+
+- (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey,id> *)options {
+    // The license gate finishes key activation through a return URL: the web
+    // flow opens minhduc://... and the SDK matches it against its pending
+    // callback. Without this handler the key never confirms and the app stays
+    // on the lock screen.
+    (void)app;
+    (void)options;
+    return APIClientHandleOpenURL(url);
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
