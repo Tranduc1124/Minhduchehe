@@ -7,7 +7,6 @@
 #import "MDUI.h"
 
 static BOOL gMDLicenseAuthorized = NO;
-static __weak MDLicenseLockViewController *gMDLicenseLockController = nil;
 static dispatch_block_t gAuthorizedHandler = nil;
 static void (^gTerminalHandler)(NSString *) = nil;
 
@@ -440,7 +439,7 @@ static NSString *MDLicenseMessageForStatus(TserverStatusCode code) {
     _statusTile.backgroundColor = MDLicenseColorForStatus(status);
     _statusIcon.image = MDUISymbol(MDLicenseSymbolForStatus(status), 24.0, UIFontWeightSemibold);
     _statusLabel.text = message;
-    _detailLabel.text = TserverStatusString(status);
+    _detailLabel.text = TserverStatusCodeString(status);
     _retryButton.hidden = (status == TserverStatusCodeValid ||
                            status == TserverStatusCodeOfflineGraceValid);
 }
@@ -452,6 +451,10 @@ static NSString *MDLicenseMessageForStatus(TserverStatusCode code) {
 @end
 
 #pragma mark - Gate
+
+/// The visible lock screen. Held weakly so the gate never keeps a released
+/// view controller alive.
+static __weak MDLicenseLockViewController *gMDLicenseLockController = nil;
 
 @implementation MDLicenseGate
 
