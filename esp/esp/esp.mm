@@ -5599,11 +5599,28 @@ static int      s_countOffScreen = 0;
 
     static int s_countDiagLog = 0;
     if (++s_countDiagLog % 180 == 1) {
+        // Distance spread of everything in the tally, in metres from the local
+        // player. off= with snapN= says only that nothing landed inside the
+        // viewport, and that is the same number whether the pawns are standing in
+        // a circle at arm's length or spread across a hundred metres of map. The
+        // two need opposite fixes: a tight spread means the world positions are
+        // collapsing onto the camera and getPositionExt is folding the wrong
+        // chain, a wide spread means the positions are fine and the divisor row
+        // of the projection is wrong. s.dis is already on every snapshot for the
+        // distance limit, so this reads what the frame already computed.
+        float dmin = -1.0f, dmax = -1.0f;
+        for (int si = 0; si < snapN; si++) {
+            const float d = snaps[si].dis;
+            if (d < 0.0f) continue;
+            if (dmin < 0.0f || d < dmin) dmin = d;
+            if (dmax < 0.0f || d > dmax) dmax = d;
+        }
         NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
-              @"local=0x%llx self=%d off=%d",
+              @"local=0x%llx self=%d off=%d dmin=%.1f dmax=%.1f",
               (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
               stats.realCount, stats.botCount,
-              (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen);
+              (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen,
+              dmin, dmax);
     }
 
     // Aim target pick on the same fresh matrix as ESP.
