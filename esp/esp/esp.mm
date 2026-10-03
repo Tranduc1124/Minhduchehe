@@ -1699,6 +1699,22 @@ static inline void ESPResolveDrawColor(int mode, float baseR, float baseG, float
 // Wall-ON: keep lock a bit while target strafes. Wall-OFF: never sticky (see maxLost below).
 static const int kAimLockMaxLostFrames = 4;
 
+// How long after acquiring a lock it may sit outside the FOV ring.
+//
+// The ring is a promise about where the aim will go, and picking already keeps
+// it (esp.mm:4993, inRange = distSq <= aimFovSq). Keeping a lock did not: the
+// sticky re-eval and AimTargetStillValid both tested fovSq * 2.25, that is 1.5
+// times the radius, so a target well outside the circle stayed locked as long as
+// nothing better came along — reported as "small FOV, and it still locks an
+// enemy outside it".
+//
+// The slack is still there for the case it was added for: dragging the fire stick
+// moves the crosshair, the target slides out of the circle while the button is
+// still down, and a hard radius dropped the lock every frame ("giật khi kéo nút
+// bắn"). It is bounded by this counter and then the radius is enforced exactly
+// as picking enforces it, so the promise holds from 10 frames after the lock on.
+#define kAimFovSlackFrames 10
+
 // ===== Player Cache để giảm số lần đọc memory (2-3 frame) =====
 struct PlayerCache {
     uint64_t pawn = 0;
@@ -3565,11 +3581,24 @@ static inline uint64_t ESPPhaseNowUS(void) {
         ESPGeometryBuffersRelease(&buffers);
 
         CGMutablePathRef fovPath = CGPathCreateMutable();
-        // The ring is a circle on the screen in its own right, so its visibility
-        // is ShowFovCircle alone and its radius is FovSize. It used to be gated
-        // on isAimbot && aimSphereMode == 0 and sized from aimFov.
+        // Drawn only where the ring is a true statement, which is exactly where
+        // the aim is gated by it: aimFovSq at esp.mm:4067 is (isAimbot &&
+        // !useSphereAim) ? aimFov^2 : 0.
+        //
+        // Everywhere else the circle was a picture of a bound that did not exist,
+        // which is what "the aim does not follow the FOV" looks like from the
+        // ground: Aim Type on Assist alone gates by assistRadius (12% of the
+        // screen height), Aim Range 180 gates by inFront, 360 and silent-sphere
+        // gate by nothing at all. A small ring with a big reach reads as the aim
+        // ignoring the slider, and it was.
+        //
+        // ShowFovCircle is still the user's switch; this only refuses to draw a
+        // circle for a mode that does not use one. The app's ESP/AIM screen
+        // already turns the ring off when Aim Type is switched to Assist, so this
+        // is the same rule enforced on the engine side where it cannot be skipped.
+        const BOOL fovBoundsAim = isShowFovCircle && isAimbot && aimSphereMode == 0;
         BOOL hasFov = RenderFOVCirclePath(fovPath, viewWidth, viewHeight,
-                                          isShowFovCircle, fovSize);
+                                          fovBoundsAim, fovSize);
         self.fovLayer.path = hasFov ? fovPath : nil;
         CGPathRelease(fovPath);
 
@@ -5248,12 +5277,16 @@ static int      s_espCountN = 0;
                             dsq = dx*dx + dy*dy;
                         }
                         bool inR = false;
+                        // 1.5x the radius only while the lock is young, so the
+                        // fire-stick drag that started it does not throw it away
+                        // on the frame the crosshair moves. See kAimFovSlackFrames.
+                        const float baseFovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
+                        const float keepFovSq = (s_lockHoldFrames < kAimFovSlackFrames)
+                                                ? (baseFovSq * 2.25f) : baseFovSq;
                         if (!allowThroughWall) {
                             if (isAimbot && useAim180) inR = inF;
                             else if (isAimbot) {
-                                float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                                // Wide while locked (stick/drag).
-                                inR = inF && (dsq <= fovSq * 2.25f);
+                                inR = inF && (dsq <= keepFovSq);
                             } else {
                                 inR = inF && (dsq <= assistRadiusSq * 1.5f);
                             }
@@ -5262,8 +5295,7 @@ static int      s_espCountN = 0;
                         } else if (isAimbot && useAim180) {
                             inR = inF;
                         } else if (isAimbot) {
-                            float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                            inR = inF && (dsq <= fovSq * 2.25f);
+                            inR = inF && (dsq <= keepFovSq);
                         } else {
                             inR = inF && (dsq <= assistRadiusSq * 1.5f);
                         }
@@ -5450,8 +5482,14 @@ static int      s_espCountN = 0;
                 float dx = w2s.x - screenCenter.x;
                 float dy = w2s.y - screenCenter.y;
                 float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
-                // 50% slack: stick can pull crosshair out briefly without dropping lock.
-                if ((dx * dx + dy * dy) > fovSq * 2.25f) return false;
+                // The stick can pull the crosshair out briefly, so this used to
+                // test 2.25x fovSq — 1.5x the radius — unconditionally, and a
+                // locked target could sit outside a small ring indefinitely. The
+                // slack is now only for the frames right after acquiring (see
+                // kAimFovSlackFrames); after that this is the ring's own radius.
+                const float lim = (s_lockHoldFrames < kAimFovSlackFrames)
+                                 ? (fovSq * 2.25f) : fovSq;
+                if ((dx * dx + dy * dy) > lim) return false;
             }
         }
         if (iAmAlive) {
@@ -5532,12 +5570,19 @@ static int      s_espCountN = 0;
         //
         // None of the three can be told apart from the fields that were already
         // printed, so they are printed.
+        // gateR is the radius the pick actually used, which is the question behind
+        // "the aim does not take the FOV size": it is aimFov only where the FOV
+        // gates (isAimbot && !sphere), assistRadius where Assist runs alone, and
+        // -1 where nothing gates at all. Read with aimFov and sphere, one line
+        // says which of those three the build is in.
+        const float gateR = (isAimbot && !useSphereAim) ? aimFov
+                          : (useAssistOnly ? assistRadius : -1.0f);
         NSLog(@"[AIM-DIAG] isAimbot=%d useAssist=%d trig=%d isFiring=%d isScoping=%d act=%d target=0x%llx "
-              @"aimFov=%.1f aimFovSq=%.0f sphere=%d firing=%d fireSrc=0x%x",
+              @"aimFov=%.1f aimFovSq=%.0f sphere=%d firing=%d fireSrc=0x%x gateR=%.0f lock=%d",
               (int)isAimbot, (int)useAssist, trig, (int)isFiring, (int)isScoping, (int)shouldActivate,
               (unsigned long long)bestTarget,
               (double)aimFov, (double)aimFovSq, (int)aimSphereMode, (int)isFiring,
-              (unsigned)g_fireSrcMask);
+              (unsigned)g_fireSrcMask, (double)gateR, (int)s_lockHoldFrames);
     }
 
     // Hard-stop camera path the instant trigger is off or no aim mode.
