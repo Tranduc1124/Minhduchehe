@@ -393,52 +393,69 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     // whose tree was written to with the wrong entry, so the entry is checked
     // before it is written to.
     //
-    // The check needs no guessing about the layout. mach_make_memory_entry_64()
-    // above was given localAddr and PAGE_SIZE, and XNU builds the copy for a
-    // memory entry by copying in exactly that range
-    // (vm_named_entry_associate_vm_object -> vm_map_copyin), so the single
-    // entry of that copy describes [localAddr, localAddr + PAGE_SIZE) and
-    // nothing else. localAddr came back from the kernel microseconds ago and
-    // we still hold it, so it is a fact about this remap rather than an
-    // assumption about the device.
+    // The check needs no guessing about the layout, but the first version of it
+    // guessed wrong and the device said so immediately. It assumed the entry
+    // described the address we allocated, [localAddr, localAddr + PAGE_SIZE),
+    // because mach_make_memory_entry_64() was handed that range. Every remap was
+    // then refused:
     //
-    // When nextAddr is not that entry -- stale copy, recycled zone element, a
-    // mislocated backing pointer -- this refuses instead of writing, and the
-    // page cache keeps working off the last good mapping until it ages out.
-    // That is strictly better than the alternative, which is the device.
+    //   [DS] REFUSE hijack entry=0xffffffe0147aa7f0 start=0x0 end=0x4000
+    //         want=[0x102fe8000,0x102fec000)
+    //   [DS] HIJACK DISABLED after 8 entries that did not describe our own page
+    //
+    // and nothing drew, because nothing could be read any more. The entry of a
+    // vm_map_copy is not an address range in some map, it is the object's own
+    // extent: start 0, end the object size. That is what the log prints, on two
+    // different entries, both 0x0..0x4000, and it matches how XNU builds it --
+    // the copy describes the object, and the memory entry's own offset says
+    // where in the object the page lives.
+    //
+    // So the entry is compared against the copy's own size field, read from the
+    // same header this file has been documenting since 03ac21b5:
+    //     +0x10 u64 size = 0x4000
+    // start must be 0 and end must be exactly that size. Both numbers come from
+    // the kernel microseconds ago, and a stale copy, a recycled zone element or
+    // a mislocated backing pointer produces anything but that pair.
+    //
+    // There is no permanent cut-out after N refusals. The first version had one
+    // and it cost a whole session of drawing: the wrong guess refused every
+    // remap, the cut-out latched, and the ESP had no way to read memory at all.
+    // Refusing IS the protection -- a refused remap writes nothing -- so a
+    // cut-out on top of it adds no safety and one more way to be wrong. The
+    // counter stays to report how long the run is.
     // ---------------------------------------------------------------------
     {
         static int s_hijackBadRun = 0;
-        static int s_hijackOff = 0;
         static int s_hijackReported = 0;
 
-        const uint64_t wantStart = (uint64_t)localAddr;
-        const uint64_t wantEnd   = wantStart + PAGE_SIZE;
-        const uint64_t gotStart  = (uint64_t)entry.links.start;
-        const uint64_t gotEnd    = (uint64_t)entry.links.end;
+        // vm_map_copy.size, the same field the named-entry offset block below
+        // reads at shmemVMCopyAddr + 0x10 to find the offset word by value.
+        // The entry's end must be exactly it.
+        const uint64_t copySize   = kread64(shmemVMCopyAddr + 0x10);
+        const uint64_t gotStart   = (uint64_t)entry.links.start;
+        const uint64_t gotEnd     = (uint64_t)entry.links.end;
 
-        // localAddr is from mach_vm_allocate on our own task, so it must be a
-        // plain user address. If even that does not hold, nothing below is
-        // worth trusting.
-        const BOOL addrPlausible = (wantStart != 0 && wantStart < 0x0000000100000000ULL);
-        const BOOL rangeMatches  = (gotStart == wantStart && gotEnd == wantEnd);
+        // 0x4000 is what the device reports for this copy, but do not require
+        // that specific number: the check is against the copy's own size, and
+        // the copy's own size is what has to be true for the entry to be the
+        // one belonging to this copy. Anything the kernel reports for the copy
+        // and anything the entry says about itself has to agree, and both are
+        // read a moment apart from the same live objects.
+        const BOOL copySane = (copySize != 0 && (copySize & (PAGE_SIZE - 1)) == 0 &&
+                               copySize <= 0x40000000ULL);
+        const BOOL rangeMatches = (gotStart == 0 && gotEnd == copySize);
 
-        if (!addrPlausible || !rangeMatches) {
+        if (!copySane || !rangeMatches) {
             s_hijackBadRun++;
-            if (!s_hijackOff && s_hijackBadRun >= 8) {
-                s_hijackOff = 1;
-                NSLog(@"[DS] HIJACK DISABLED after %d entries that did not describe our own "
-                      @"page; remap will keep using mappings it already has",
-                      s_hijackBadRun);
-            }
             if (!s_hijackReported || s_hijackBadRun == 1 || s_hijackBadRun % 8 == 0) {
                 s_hijackReported = 1;
                 NSLog(@"[DS] REFUSE hijack entry=0x%llx start=0x%llx end=0x%llx "
-                      @"want=[0x%llx,0x%llx) run=%d off=%d",
+                      @"copy=0x%llx copySize=0x%llx run=%d",
                       (unsigned long long)nextAddr,
                       (unsigned long long)gotStart, (unsigned long long)gotEnd,
-                      (unsigned long long)wantStart, (unsigned long long)wantEnd,
-                      s_hijackBadRun, s_hijackOff);
+                      (unsigned long long)shmemVMCopyAddr,
+                      (unsigned long long)copySize,
+                      s_hijackBadRun);
             }
             mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
             if (MACH_PORT_VALID(memoryObject)) {
@@ -447,7 +464,8 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             return shmem;
         }
         if (s_hijackBadRun) {
-            // A good one clears the run so the trip-wire needs 8 in a row.
+            // A good one clears the run, so the counter only ever measures
+            // consecutive failures.
             s_hijackBadRun = 0;
         }
     }
