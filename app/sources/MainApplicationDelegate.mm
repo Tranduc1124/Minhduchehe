@@ -134,7 +134,8 @@ static void MDResetAccentPrefs(void) {
         strongSelf->_tabController = [strongSelf buildMainTabController];
         MDThemeApplyToTabBar(strongSelf->_tabController.tabBar);
         strongSelf.window.rootViewController = strongSelf->_tabController;
-        [strongSelf->_lockController removeFromParent];
+        // No removeFromParent: the lock screen was never added as a child, and
+        // replacing window.rootViewController is what releases it.
         strongSelf->_lockController = nil;
         if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
             [MDLog appendLine:@"RUN Preparing the exploit at launch."];
