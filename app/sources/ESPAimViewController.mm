@@ -373,7 +373,6 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"s", @"Enable ESP",   @"EnableESP", @NO ],
                 @[ @"s", @"Line",         @"Line",      @NO ],
                 @[ @"s", @"Box",          @"Box",       @YES ],
-                @[ @"s", @"Bone",         @"Bone",      @NO ],
                 @[ @"s", @"Health",       @"Health",    @YES ],
                 @[ @"s", @"Name",         @"Name",      @YES ],
                 @[ @"s", @"Distance",     @"Distance",  @YES ],
