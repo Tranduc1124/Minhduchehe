@@ -28,6 +28,10 @@ kernel_boot_log_fn kernelBootLog = NULL;
 
 static BOOL  g_booting   = NO;
 static BOOL  g_ready     = NO;
+// A Start tapped while a boot already owns the queue. The tap cannot start a
+// second boot, so it arms this and the in-flight boot runs stages 5 and 6 when
+// it gets there. See the g_booting branch in kernelBootStartEx.
+static BOOL  g_startESPAfterBoot = NO;
 static dispatch_queue_t g_bootQueue;
 
 static void L(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -73,7 +77,22 @@ static void boot_start_sb_overlay(void) {
 }
 
 static void kernelBootStartEx(BOOL kernelOnly) {
-    if (g_booting) return;
+    if (g_booting) {
+        // The launch-time boot is already on the queue. Returning here used to
+        // drop the tap on the floor, and the caller had already recorded the
+        // session as running before it got here -- markSessionRunning:YES and
+        // SetHUDEnabled(YES) both run ahead of this call. So the Game tab went
+        // to "Active" with nothing drawing and nothing queued to draw it.
+        //
+        // Arm the request instead. Whoever owns the queue reads it at the
+        // kernel-only exit, and a plain boot needs no handling because it is
+        // already going to run stages 5 and 6.
+        if (!kernelOnly) {
+            g_startESPAfterBoot = YES;
+            L(@"WAIT Boot already running — the overlay and ESP start when it finishes.");
+        }
+        return;
+    }
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
         [[KeepAlive shared] start];
@@ -112,6 +131,10 @@ static void kernelBootStartEx(BOOL kernelOnly) {
         if (kret != 0) {
             L(@"ERR Kernel exploit failed (%d)", kret);
             L(@"DONE Boot aborted at stage 3/6.");
+            // Nothing is left to run the deferred stages 5 and 6, so drop the
+            // request rather than let the next boot pick it up and start an ESP
+            // nobody is watching for.
+            g_startESPAfterBoot = NO;
             g_booting = NO;
             return;
         }
@@ -149,7 +172,13 @@ static void kernelBootStartEx(BOOL kernelOnly) {
         // Everything below this point is what puts the box on screen. A
         // kernel-only boot stops here: the exploit, the sandbox and KeepAlive
         // are ready, and nothing is drawn until the user asks for it.
-        if (kernelOnly) {
+        //
+        // The one exception is a Start that arrived while this boot was already
+        // running. That is g_startESPAfterBoot, and when it is set the request
+        // wins over the kernel-only mode: the user asked for the ESP, so the boot
+        // carries on into stages 5 and 6 instead of stopping here and reporting
+        // "Kernel ready — ESP off" for a session the Game tab already calls live.
+        if (kernelOnly && !g_startESPAfterBoot) {
             // "Kernel only" has to mean only, or the Game tab lies.
             //
             // ESPRealSessionRunning() is ESPHostIsRunning() ||
@@ -180,12 +209,20 @@ static void kernelBootStartEx(BOOL kernelOnly) {
         }
 
         L(@"RUN 5/6 Opening SpringBoard dedicated overlay (staged)");
+        if (g_startESPAfterBoot) {
+            // Only reachable from a boot that started as kernel-only. Say so,
+            // because the console is showing a six-stage log for a boot that was
+            // asked to stop at four.
+            L(@"RUN Start requested while booting — continuing past kernel-only.");
+            g_startESPAfterBoot = NO;
+        }
         boot_start_sb_overlay();
         L(@"OK SpringBoard session pending (background).");
 
         L(@"RUN 6/6 Starting hidden ESP host (mirror → SpringBoard)");
         boot_start_esp_host();
         L(@"OK ESP host started — draw only via SpringBoard.");
+        g_startESPAfterBoot = NO;
         g_ready = YES;
         g_booting = NO;
     });

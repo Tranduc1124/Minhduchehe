@@ -16,6 +16,13 @@ extern kernel_boot_log_fn kernelBootLog;
 // after stage 4: exploit, sandbox, KeepAlive, and nothing that draws. It is
 // what AutoBootOnLaunch uses, so turning that on gets the exploit ready at
 // launch without the ESP appearing on its own.
+//
+// Calling either form while a boot is already in flight does not start a
+// second one. A plain call is remembered, and the in-flight boot runs stages 5
+// and 6 when it reaches them -- including when that boot was started
+// kernel-only, which otherwise stops at stage 4. That is the case the tap lands
+// in when the app auto-boots the kernel at launch and the user presses Start
+// while that boot is still running.
 #ifdef __cplusplus
 extern "C" {
 #endif
