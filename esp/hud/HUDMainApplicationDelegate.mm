@@ -333,10 +333,44 @@ BOOL HUDFloatButtonHandleTouch(CGPoint screenPoint, UITouchPhase phase, NSIntege
         BOOL parked = [[NSFileManager defaultManager] fileExistsAtPath:parkPath];
 
         if (!parked) {
-            NSLog(@"[HUD] Running kexploit (first time this boot)...");
-            int kret = kexploit_opa334();
-            if (kret != 0) {
+            // Retried, because one attempt was the difference between working for
+            // the rest of the session and not working at all.
+            //
+            // kexploit_opa334 is a race on the socket zone allocator. It fails on
+            // timing, and it failed often enough that the reported symptom was
+            // "I have to start the hack while I am already in a match" — which is
+            // also when the process is doing enough work for the race to land. The
+            // old code ran it once and, on failure, returned from this block: no
+            // platformize, no sandbox escape, g_kexploit_ready stays false, and
+            // ds_attach() bails on that flag forever. Nothing in the process ever
+            // tried again, so the only recovery was killing the app and pressing
+            // Activate a second time — which is exactly the manual retry this loop
+            // now does by itself.
+            //
+            // Bounded, and the delays grow, because the park guard above is right
+            // that hammering the allocator is not free. Three attempts over about
+            // 19 seconds, then it stays dead and says so.
+            static const int kAttempts = 3;
+            static const NSTimeInterval kBackoff[3] = { 2.0, 5.0, 12.0 };
+            BOOL exploited = NO;
+            for (int attempt = 0; attempt < kAttempts; attempt++) {
+                if (attempt > 0) {
+                    NSLog(@"[HUD] kexploit attempt %d failed — retrying in %.0fs",
+                          attempt, kBackoff[attempt - 1]);
+                    [NSThread sleepForTimeInterval:kBackoff[attempt - 1]];
+                }
+                NSLog(@"[HUD] Running kexploit (attempt %d, first time this boot)...", attempt + 1);
+                int kret = kexploit_opa334();
+                if (kret == 0) {
+                    exploited = YES;
+                    break;
+                }
                 NSLog(@"[HUD] kexploit failed: %d", kret);
+            }
+            if (!exploited) {
+                NSLog(@"[HUD] kexploit failed %d times — kernel r/w unavailable, "
+                      @"ESP will stay off. Stop the hack and start it again.",
+                      kAttempts);
                 return;
             }
             [@"1" writeToFile:parkPath atomically:YES
