@@ -1783,6 +1783,10 @@ static inline int PlayerCacheSlot(uint64_t pawn) {
 // stale while walking the player dict + reading bones).
 struct EspPawnSnap {
     uint64_t pawn = 0;
+    // Carried so the tally can dedup by identity without a second read per pawn
+    // per frame. The count is decided in the draw pass, not in the world-read
+    // pass, because that is where on-screen is known.
+    uint64_t uid = 0;
     Vector3 head{};
     Vector3 hip{};
     Vector3 aimPos{};
@@ -3740,6 +3744,9 @@ static uint64_t s_espCountKey[192]  = {0};
 static int64_t  s_espCountFrame[192] = {0};
 static uint8_t  s_espCountBot[192]   = {0};
 static int      s_espCountN = 0;
+// Live pawns inside the draw limit whose projection is outside the viewport: not
+// drawn, so not counted. Reset per frame where the draw pass runs.
+static int      s_countOffScreen = 0;
 
 - (ESPFrameStats)renderESPWithBuffers:(ESPGeometryBuffers *)buffers
                             viewWidth:(CGFloat)viewWidth
@@ -4570,41 +4577,23 @@ static int      s_espCountN = 0;
         // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
         if (CurHP <= 0) continue;
 
-        // Count exactly what is drawn, here, where wantDraw is decided.
+        // The tally used to be recorded here, on wantDraw alone. It cannot be:
+        // this pass runs before the view matrix is sampled (it is sampled at
+        // esp.mm:4663, after this loop, deliberately — a fresher matrix is what
+        // stops the overlay lagging the camera), so nothing here knows whether the
+        // pawn is on the screen. wantDraw is a distance test, so every live pawn
+        // inside the limit counted, including the ones behind you whose boxes land
+        // outside the viewport and are never seen. Reported as "4 enemies and it
+        // says 5", and 5 with two enemies, and no extra box on screen to account
+        // for the difference.
         //
-        // This used to be a second filter of its own, sitting further up, and
-        // the two drifted apart. It skipped bots unless the EspBot pref was on,
-        // skipped anything with CurHP <= 0, and applied the distance limit a
-        // second time. Drawing has its own rules and they are looser: a bot is
-        // drawn whenever isEspBot is set, which the aim can force on for a
-        // single frame. The result on the device was three boxes on the screen
-        // and a counter reading zero, because the three were bots and the
-        // counter did not count bots by default.
-        //
-        // A number that disagrees with the picture beside it is worse than no
-        // number, so there is one decision now and it is wantDraw. Dedup stays
-        // because the player dictionary can name the same pawn twice.
-        if (wantDraw) {
-            // Recorded, not counted. The tally happens after the loop.
-            const uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
-            const uint64_t key = (uid != 0) ? uid : PawnObject;
-            int slot = -1;
-            for (int ci = 0; ci < s_espCountN; ci++) {
-                if (s_espCountKey[ci] == key) { slot = ci; break; }
-            }
-            if (slot < 0 && s_espCountN < (int)(sizeof(s_espCountKey) / sizeof(s_espCountKey[0]))) {
-                slot = s_espCountN++;
-                s_espCountKey[slot] = key;
-            }
-            if (slot >= 0) {
-                s_espCountFrame[slot] = g_cacheFrameCounter;
-                s_espCountBot[slot] = isBot ? 1 : 0;
-            }
-        }
+        // It is recorded in the draw pass instead, next to the same isOnScreen the
+        // box is drawn from, so the number counts what the picture shows.
 
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
             s.pawn = PawnObject;
+            s.uid = ReadAddr<uint64_t>(PawnObject + kUserID);
             s.head = headBonePos;
             s.hip = espHipPos;
             s.aimPos = aimPos;
@@ -4637,24 +4626,9 @@ static int      s_espCountN = 0;
     //
     // Three frames is about 85ms at 35fps. Far shorter than looking away from a
     // player and back, far longer than the jitter.
-    {
-        int rc = 0, bc = 0;
-        for (int ci = 0; ci < s_espCountN; ci++) {
-            if (g_cacheFrameCounter - s_espCountFrame[ci] > ESP_COUNT_HOLD_FRAMES) continue;
-            if (s_espCountBot[ci]) bc++; else rc++;
-        }
-        stats.realCount = rc;
-        stats.botCount = bc;
-    }
-
-    static int s_countDiagLog = 0;
-    if (++s_countDiagLog % 180 == 1) {
-        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
-              @"local=0x%llx self=%d",
-              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
-              stats.realCount, stats.botCount,
-              (unsigned long long)myPawnObject, selfSkipped);
-    }
+    // The tally itself lives below the draw pass: it needs isOnScreen, which
+    // needs the matrix sampled there. Nothing here counts anything.
+    s_countOffScreen = 0;
 
     // -------------------------------------------------------------------------
     // Phase-2: sample view matrix as late as possible (after all world reads),
@@ -4694,6 +4668,30 @@ static int      s_espCountN = 0;
         Vector3 aimW = looksLikeWorldPos(s.aimPos) ? s.aimPos : s.head;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
+
+        // The tally, here, where isOnScreen is the same test the box is drawn
+        // from. Dedup by UID because the player dictionary can name one pawn
+        // twice; the frame stamp is the 3-frame hold described below.
+        if (isOnScreen) {
+            const uint64_t key = s.uid ? s.uid : s.pawn;
+            int slot = -1;
+            for (int ci = 0; ci < s_espCountN; ci++) {
+                if (s_espCountKey[ci] == key) { slot = ci; break; }
+            }
+            if (slot < 0 && s_espCountN < (int)(sizeof(s_espCountKey) / sizeof(s_espCountKey[0]))) {
+                slot = s_espCountN++;
+                s_espCountKey[slot] = key;
+            }
+            if (slot >= 0) {
+                s_espCountFrame[slot] = g_cacheFrameCounter;
+                s_espCountBot[slot] = s.isBot ? 1 : 0;
+            }
+        } else if (s.dis < espDistanceLimit) {
+            // Live, inside the limit, would have been counted before the tally
+            // moved here, and is not drawn. Printed so "the number is one too
+            // high" either has a cause in the log or provably does not.
+            s_countOffScreen++;
+        }
 
         // [PUSH] 1 Hz on the first drawn snap: splits "frozen data" from
         // "frozen hand-off". w2sAimCheck is already computed for this pawn and
@@ -5011,6 +5009,39 @@ static int      s_espCountN = 0;
                                hipP.x, hipP.y, hipP.z,
                                s.isBot ? 1 : 0, s.isKnocked ? 1 : 0);
         }
+    }
+
+    // The count, with hysteresis, now that the draw pass has stamped it.
+    //
+    // A pawn counts if it was on screen within the last ESP_COUNT_HOLD_FRAMES
+    // frames, not only if it is on screen on this one, because isOnScreen flips on
+    // the edges of the viewport with every camera move. Counting that directly made
+    // the number change several times a second.
+    //
+    // That was not cosmetic either. Every change is a new string, and a new string
+    // is a new NSString built in the other process, a setString: and a setFrame:
+    // across the process boundary, and all of it inside the publish that is drawing
+    // the boxes, so the boxes were dragged along at the counter's rhythm.
+    //
+    // Three frames is about 85ms at 35fps. Far shorter than looking away from a
+    // player and back, far longer than the jitter.
+    {
+        int rc = 0, bc = 0;
+        for (int ci = 0; ci < s_espCountN; ci++) {
+            if (g_cacheFrameCounter - s_espCountFrame[ci] > ESP_COUNT_HOLD_FRAMES) continue;
+            if (s_espCountBot[ci]) bc++; else rc++;
+        }
+        stats.realCount = rc;
+        stats.botCount = bc;
+    }
+
+    static int s_countDiagLog = 0;
+    if (++s_countDiagLog % 180 == 1) {
+        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
+              @"local=0x%llx self=%d off=%d",
+              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
+              stats.realCount, stats.botCount,
+              (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen);
     }
 
     // Aim target pick on the same fresh matrix as ESP.
