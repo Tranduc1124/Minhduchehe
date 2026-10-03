@@ -19,6 +19,11 @@
 #import "KeepAlive.h"
 #import "../esp/esp/ESPPrefs.h"
 
+// From app/sources/HUDHelper.mm. Declared here rather than included so the boot
+// path does not pull the HUD helper's Objective-C surface in.
+extern void StopESPSession(void);
+extern BOOL IsHUDEnabled(void);
+
 kernel_boot_log_fn kernelBootLog = NULL;
 
 static BOOL  g_booting   = NO;
@@ -145,7 +150,30 @@ static void kernelBootStartEx(BOOL kernelOnly) {
         // kernel-only boot stops here: the exploit, the sandbox and KeepAlive
         // are ready, and nothing is drawn until the user asks for it.
         if (kernelOnly) {
-            L(@"OK Kernel ready — not starting ESP.");
+            // "Kernel only" has to mean only, or the Game tab lies.
+            //
+            // ESPRealSessionRunning() is ESPHostIsRunning() ||
+            // SBoardOverlayIsOn() || IsHUDEnabled(), and the last of those reads
+            // a pid file and kill(pid, 0) — a -hud process from an earlier session
+            // outlives this app, because it is spawned with posix_spawn and never
+            // waited on. So a launch that did nothing but the exploit still
+            // reported "ESP is on", and it was not only the report: that process
+            // really was alive and really was drawing.
+            //
+            // Stopped here, after sandbox_escape, because unlinking the pid file
+            // needs the filesystem escape and the kill does not; doing it earlier
+            // would silently leave the pid file behind and IsHUDEnabled() would
+            // keep answering yes.
+            {
+                const BOOL hadLeftover = IsHUDEnabled();
+                StopESPSession();
+                ESPPrefsSync();
+                if (hadLeftover) {
+                    L(@"OK Stopped a leftover ESP session from a previous run — "
+                      @"this launch is kernel only.");
+                }
+                L(@"OK Kernel ready — ESP off (not started).");
+            }
             g_ready = YES;
             g_booting = NO;
             return;
