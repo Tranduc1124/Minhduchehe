@@ -121,13 +121,15 @@ static void MDResetAccentPrefs(void) {
     // License gate: the window opens on the lock screen and only swaps to the
     // tab bar once the SDK reports a fresh signed lease. AutoBoot and the
     // exploit run after authorization, never before it.
-    __weak typeof(self) weakSelf = self;
+    // __typeof__ not typeof: the project compiles .mm with -std=c++17, and
+    // strict mode rejects the GNU typeof spelling.
+    __weak __typeof__(self) weakSelf = self;
     _lockController = [MDLicenseGate lockViewController];
     self.window.rootViewController = _lockController;
     [self.window makeKeyAndVisible];
 
     [MDLicenseGate startWithAuthorized:^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
         strongSelf->_tabController = [strongSelf buildMainTabController];
         MDThemeApplyToTabBar(strongSelf->_tabController.tabBar);
