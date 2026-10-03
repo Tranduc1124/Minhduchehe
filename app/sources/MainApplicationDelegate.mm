@@ -10,6 +10,7 @@
 #import "KeepAlive.h"
 #import "HUDHelper.h"
 #import "SpringBoardOverlay.h"
+#import "MDLicenseGate.h"
 #import "../KernelBoot.h"
 
 // The custom accent picker is gone, but an install that used it has
@@ -33,6 +34,7 @@ static void MDResetAccentPrefs(void) {
 
 @implementation MainApplicationDelegate {
     UITabBarController *_tabController;
+    UIViewController *_lockController;
 }
 
 - (void)themeDidChange {
@@ -44,20 +46,9 @@ static void MDResetAccentPrefs(void) {
     }
 }
 
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey,id> *)launchOptions {
-    MDResetAccentPrefs();
-    MDThemeLoadFromPrefs();
-
-    self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    // The app is light-only. UIViewControllerBasedStatusBarAppearance is
-    // false in Info.plist, so the window's style also decides the status bar.
-    self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
-    self.window.backgroundColor = MDThemeBg();
-
-    // KernelBoot has a single C callback, so the sink goes in once here
-    // rather than per screen. Both log views read the same buffer.
-    [MDLog attachKernelBoot];
-
+/// Builds the tab bar UI. Only installed as the window root once the license
+/// gate authorizes, so an unlicensed run never reaches the product.
+- (UITabBarController *)buildMainTabController {
     GameViewController *gameVC = [[GameViewController alloc] init];
     LogViewController *logVC = [[LogViewController alloc] init];
     SettingsViewController *settingsVC = [[SettingsViewController alloc] init];
@@ -94,15 +85,22 @@ static void MDResetAccentPrefs(void) {
     tab.view.userInteractionEnabled = YES;
     tab.tabBar.userInteractionEnabled = YES;
     MDThemeApplyToTabBar(tab.tabBar);
-    _tabController = tab;
+    return tab;
+}
 
-    self.window.rootViewController = tab;
-    [self.window makeKeyAndVisible];
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey,id> *)launchOptions {
+    MDResetAccentPrefs();
+    MDThemeLoadFromPrefs();
 
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(themeDidChange)
-                                                 name:MDThemeDidChangeNotification
-                                               object:nil];
+    self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // The app is light-only. UIViewControllerBasedStatusBarAppearance is
+    // false in Info.plist, so the window's style also decides the status bar.
+    self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    self.window.backgroundColor = MDThemeBg();
+
+    // KernelBoot has a single C callback, so the sink goes in once here
+    // rather than per screen. Both log views read the same buffer.
+    [MDLog attachKernelBoot];
 
     // Drop the optimistic flag when nothing is actually running. App_LocalHUDState
     // is written the moment the user taps Activate and is what makes the Game
@@ -115,14 +113,34 @@ static void MDResetAccentPrefs(void) {
         ESPPrefsSync();
     }
 
-    // Kernel only. This runs the exploit, the sandbox and KeepAlive and stops
-    // there: no overlay, no ESP host, so the Game tab reads Inactive and the
-    // box does not appear by itself. Turning the ESP on stays a deliberate tap
-    // on Activate.
-    if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
-        [MDLog appendLine:@"RUN Preparing the exploit at launch."];
-        kernelBootStartKernelOnly();
-    }
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(themeDidChange)
+                                                 name:MDThemeDidChangeNotification
+                                               object:nil];
+
+    // License gate: the window opens on the lock screen and only swaps to the
+    // tab bar once the SDK reports a fresh signed lease. AutoBoot and the
+    // exploit run after authorization, never before it.
+    __weak typeof(self) weakSelf = self;
+    _lockController = [MDLicenseGate lockViewController];
+    self.window.rootViewController = _lockController;
+    [self.window makeKeyAndVisible];
+
+    [MDLicenseGate startWithAuthorized:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf->_tabController = [strongSelf buildMainTabController];
+        MDThemeApplyToTabBar(strongSelf->_tabController.tabBar);
+        strongSelf.window.rootViewController = strongSelf->_tabController;
+        [strongSelf->_lockController removeFromParent];
+        strongSelf->_lockController = nil;
+        if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
+            [MDLog appendLine:@"RUN Preparing the exploit at launch."];
+            kernelBootStartKernelOnly();
+        }
+    } terminal:^(NSString *message) {
+        [MDLog appendLine:[NSString stringWithFormat:@"LICENSE %@", message]];
+    }];
     return YES;
 }
 

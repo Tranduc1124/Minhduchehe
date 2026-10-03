@@ -41,7 +41,7 @@ $(APPLICATION_NAME)_FILES += XPF/external/ChOma/src/arm64.c XPF/external/ChOma/s
 
 # --- Flags ---
 $(APPLICATION_NAME)_CFLAGS += -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -Wno-unused-value -Wno-module-import-in-extern-c -Wno-unknown-warning-option -Wno-unguarded-availability-new -Wno-return-type -Wno-macro-redefined -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types -Wno-format -Wno-unused-but-set-variable -Wno-delete-incomplete
-$(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany
+$(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany -Ivendor
 $(APPLICATION_NAME)_CFLAGS += -Iesp -Iesp/esp -Iesp/esp/espdraw
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD) -I$(PWD)/remote -I$(PWD)/XPF/src -I$(PWD)/XPF/external/ChOma/include
 UNAME_S := $(shell uname -s)
@@ -59,6 +59,11 @@ $(APPLICATION_NAME)_OBJCFLAGS += -fobjc-arc
 $(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIKit CoreText AVFoundation AVKit CoreMedia CFNetwork Security SystemConfiguration MobileCoreServices UniformTypeIdentifiers SafariServices
 $(APPLICATION_NAME)_PRIVATE_FRAMEWORKS += BackBoardServices GraphicsServices SpringBoardServices IOSurface
 $(APPLICATION_NAME)_LIBRARIES += z compression
+
+# --- Tserver license SDK (vendor/APIClient: libAPIClient.a + APIClient.h) ---
+# force_load keeps the SDK gate alive under -dead_strip; the two-file vendor
+# package is the only SDK surface this app uses.
+$(APPLICATION_NAME)_LDFLAGS += -ObjC -force_load $(THEOS_PROJECT_DIR)/vendor/APIClient/libAPIClient.a -Wl,-undefined,dynamic_lookup
 
 
 $(APPLICATION_NAME)_CODESIGN_FLAGS += -Sapp/layout/entitlements.plist
