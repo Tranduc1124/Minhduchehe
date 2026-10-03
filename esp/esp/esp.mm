@@ -1209,6 +1209,46 @@ static void AimLockStop(void) {
 }
 
 
+// The rainbow nickname substitutes a pointer the game does not own into the
+// player's own object. Remembered here so it can be taken back out again.
+//
+// What is substituted is a string object built by AllocateMonoString: raw
+// memory from mach_vm_allocate in the game's address space, with an Il2Cpp string
+// header hand-written into it. It is not from the game's allocator and the
+// garbage collector has never seen it.
+//
+// Leaving a match destroys the player object, and destroying it releases the
+// nickname. The game then frees the pointer we put there — a pointer from
+// mach_vm_allocate, not from its heap — and that is an invalid free into the
+// game's allocator. This is the shape of "the game dies on the way out of a
+// match": it happens at teardown, every time, and only when the name swap is on.
+static uint64_t g_rainbowOrigNick = 0;
+static uint64_t g_rainbowOrigNickDisp = 0;
+static uint64_t g_rainbowPawn = 0;
+static int      g_rainbowInit = 0;
+
+// Put the game's own string pointers back before anything else happens at the end
+// of a match. Must run while the page mappings are still alive, so it goes before
+// the cache flush, not after.
+//
+// Written to the pawn that was patched, not to whatever the local pointer says
+// now: if the pawn has already changed, that is a different object and putting a
+// string pointer into it would be the same bug in a new place.
+static void RainbowNameDetach(void) {
+    if (g_rainbowOrigNick && isVaildPtr(g_rainbowPawn)) {
+        WriteAddr<uint64_t>(g_rainbowPawn + kNickname, g_rainbowOrigNick);
+        if (g_rainbowOrigNickDisp) {
+            WriteAddr<uint64_t>(g_rainbowPawn + kNicknameDisplay, g_rainbowOrigNickDisp);
+        }
+    }
+    g_rainbowOrigNick = 0;
+    g_rainbowOrigNickDisp = 0;
+    g_rainbowPawn = 0;
+    // The fake strings are built against the klass of the string they copied, and
+    // a new match is a new pawn with a new object. They are not reused.
+    g_rainbowInit = 0;
+}
+
 task_t g_target_task = 0;
 
 uint64_t AllocateMonoString(task_t task, uint64_t originalStrPtr, NSString *nsStr) {
@@ -3795,6 +3835,10 @@ static int      s_countOffScreen = 0;
         const bool live = isVaildPtr(match);
         if (s_lastLiveMatch != 0 && !live) {
             const uint64_t left = s_lastLiveMatch;
+            // First, while the mappings are still good: give the game back the
+            // string pointers we replaced, so its teardown does not free memory it
+            // never allocated. See RainbowNameDetach.
+            RainbowNameDetach();
             ds_flush_page_cache();
             ds_cache_bump_generation();
             // The count is a table of pawn pointers with a frame hold; a pawn from
@@ -3973,25 +4017,29 @@ static int      s_countOffScreen = 0;
     
     if (iAmAlive) {
         static uint64_t rainbowPtrs[7] = {0};
-        static bool rainbowInit = false;
         static NSString *cachedCustomName = nil;
-        
+
         if (s_setNameEnabledGlobal && g_target_task != 0) {
-            if (!rainbowInit || ![s_customNameGlobal isEqualToString:cachedCustomName]) {
+            if (!g_rainbowInit || ![s_customNameGlobal isEqualToString:cachedCustomName]) {
                 uint64_t originalStrPtr = ReadAddr<uint64_t>(myPawnObject + kNickname);
                 if (isVaildPtr(originalStrPtr)) {
+                    // Recorded before the first substitution, so there is
+                    // something to put back. See RainbowNameDetach.
+                    g_rainbowOrigNick = originalStrPtr;
+                    g_rainbowOrigNickDisp = ReadAddr<uint64_t>(myPawnObject + kNicknameDisplay);
+                    g_rainbowPawn = myPawnObject;
                     for(int offset = 0; offset < 7; offset++) {
                         NSString *animatedName = GenerateRainbowString(s_customNameGlobal, offset);
                         rainbowPtrs[offset] = AllocateMonoString(g_target_task, originalStrPtr, animatedName);
                     }
                     cachedCustomName = s_customNameGlobal;
-                    rainbowInit = true;
+                    g_rainbowInit = 1;
                 }
             }
-            
+
             static int colorTick = 0;
             static int colorIndex = 0;
-            if (rainbowInit) {
+            if (g_rainbowInit) {
                 if (colorTick++ % 15 == 0) { colorIndex = (colorIndex + 1) % 7; }
                 if (rainbowPtrs[colorIndex] != 0) {
                     WriteAddr<uint64_t>(myPawnObject + kNickname, rainbowPtrs[colorIndex]);
@@ -3999,7 +4047,7 @@ static int      s_countOffScreen = 0;
                 }
             }
         }
-        
+
         bool actualFastReload = isFastReload && (fastReloadSpeed > 1.0f);
         EnableFastReload(myPawnObject, actualFastReload, fastReloadSpeed);
         // Kill vanilla AA (strength + AllOff) whenever custom aimbot/assist is on.
