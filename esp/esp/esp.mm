@@ -4099,6 +4099,22 @@ static int64_t  s_espCountFrame[192] = {0};
 static uint8_t  s_espCountBot[192]   = {0};
 static int      s_espCountN = 0;
 
+// The local player's identity, cached.
+//
+// "Enemy" is decided by comparing a pawn against these, not against a read of
+// match->localPlayer taken this frame. The report that sent this in: team of 2,
+// both alive, the counter says 3; only I die, it says 4. A counter that moves
+// when the local player dies is counting the local player, because
+// match->localPlayer stops being usable at exactly that moment.
+//
+// A field is only ever written from a non-zero read, so a failed read keeps the
+// last good value instead of erasing it. Cleared at the match -> lobby edge,
+// which is the only place the identity legitimately belongs to a different
+// player. See the block in the collect loop.
+static uint64_t s_locUid  = 0;
+static int64_t  s_locPid  = 0;
+static int      s_locTeam = 0;
+
 // Age an entry out of the count on the spot.
 //
 // The tally is stamped in the draw pass BEFORE the drawing branches, because
@@ -4191,6 +4207,12 @@ static int      s_countOffScreen = 0;
             // The count is a table of pawn pointers with a frame hold; a pawn from
             // the match that just ended is not a live enemy in the lobby.
             s_espCountN = 0;
+            // Same for the cached local identity: it described a player in the
+            // match that just ended, and carrying it into the lobby would filter
+            // the lobby's first pawns against a stranger's uid and team.
+            s_locUid = 0;
+            s_locPid = 0;
+            s_locTeam = 0;
             memset(s_espCountFrame, 0, sizeof(s_espCountFrame));
             memset(s_espCountBot, 0, sizeof(s_espCountBot));
             gAimLockTarget = 0;
@@ -4597,10 +4619,84 @@ static int      s_countOffScreen = 0;
             }
         }
         if (!isVaildPtr(PawnObject)) continue;
-        // Skip self: pointer, UserID, or PlayerID (local pointer can mismatch after death/rejoin).
-        if (isSamePlayerAsLocal(myPawnObject, PawnObject)) { selfSkipped++; continue; }
-        // Skip teammates when local is known.
-        if (isVaildPtr(myPawnObject) && isLocalTeamMate(myPawnObject, PawnObject)) continue;
+
+        // ---------------------------------------------------------------------
+        // WHO IS AN ENEMY, decided from a cached identity instead of one live read.
+        //
+        // The report: team of 2, both alive, the counter says 3. Only I die, it
+        // says 4. Both die, 3 again. A counter that moves when the local player
+        // dies is counting the local player, and a persistent +1 on a team of two
+        // is the local team.
+        //
+        // Both filters below decide "not mine" out of a read that returns 0 when
+        // it fails, and 0 means "I do not know":
+        //
+        //   isSamePlayerAsLocal   localPlayer == 0            -> false for everything
+        //                         uid == 0                   -> no match
+        //                         PlayerID.m_Value == 0      -> no match
+        //   isLocalTeamMate       myTeamID == 0 || TeamID==0 -> false, i.e. "enemy"
+        //                         isBot && !isAimIgnoreBot   -> false, before the team is
+        //                                                          even looked at
+        //
+        // So every one of those is fail-open: an unreadable identity is treated as
+        // a confirmed enemy. match->localPlayer is read fresh every frame at
+        // esp.mm:4284 and goes unusable exactly when the local player dies or the
+        // read is late, and that is when the extra entry appears.
+        //
+        // The identity is cached instead. It is refreshed from the live pawn
+        // whenever that pawn is readable, and a field that reads 0 is never
+        // allowed to overwrite a good one -- so a transient read failure keeps the
+        // last known identity rather than erasing it. Nothing is cleared while the
+        // match lives; the match->lobby transition is the only place that drops
+        // it, and that is the right place, because it is a different match.
+        //
+        // This is not "validate more". It is removing the dependency on a read
+        // being available at the instant it is needed, which is the same class of
+        // bug as the DSMemory degrade latch, and it is what makes the number
+        // stop depending on whether the local player happens to be alive.
+        // ---------------------------------------------------------------------
+        {
+            if (isVaildPtr(myPawnObject)) {
+                const uint64_t liveUid = ReadAddr<uint64_t>(myPawnObject + kUserID);
+                if (liveUid) s_locUid = liveUid;
+                const COW_GamePlay_PlayerID_o liveId =
+                    ReadAddr<COW_GamePlay_PlayerID_o>(myPawnObject + kPlayerID);
+                if (liveId.m_Value) s_locPid = liveId.m_Value;
+                if (liveId.m_TeamID) s_locTeam = liveId.m_TeamID;
+            }
+
+            // Self: pointer first, then the two stable identities. Any one of the
+            // three matching is enough -- that is the same rule as
+            // isSamePlayerAsLocal, only fed from values that survive the local
+            // pawn becoming unreadable.
+            bool isSelf = false;
+            if (PawnObject == myPawnObject) {
+                isSelf = true;
+            } else if (s_locUid) {
+                isSelf = (ReadAddr<uint64_t>(PawnObject + kUserID) == s_locUid);
+            }
+            if (!isSelf && s_locPid) {
+                isSelf = (ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_Value
+                          == s_locPid);
+            }
+            if (isSelf) { selfSkipped++; continue; }
+
+            // Teammate. The bot early-out is gone, because it used to
+            // answer "enemy" before the team was ever read: a teammate whose
+            // kIsClientBot byte came back non-zero stopped being a teammate, with
+            // no other condition involved. A bot on our team is still on our team.
+            //
+            // An unreadable team on EITHER side is not treated as a match, so the
+            // pawn is counted. That is deliberate and it is the safe direction:
+            // the alternative drops a real enemy every time one read is late,
+            // which is a hole in the count, while this is at worst one extra on a
+            // frame that the 3-frame hold already smooths. The self case, which
+            // is the one the report is actually about, is decided above from
+            // cached identity and does not depend on the team read at all.
+            const int theirTeam =
+                ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_TeamID;
+            if (s_locTeam && theirTeam && s_locTeam == theirTeam) continue;
+        }
 
         // HP/knocked EVERY frame (stale cache was the floating "ghost ESP" after kills).
         // Bot flag can lag 1 frame; vis only when Check Visible is on.
@@ -5046,11 +5142,6 @@ static int      s_countOffScreen = 0;
     const int crowdN = snapN;
     const bool crowded = crowdN >= 18;
     const bool veryCrowded = crowdN >= 28;
-    // Hoisted out of the alert block below because the counter needs it: an
-    // off-screen pawn is only ever visible as an alert arrow/number at the screen
-    // edge, so this distance is part of the answer to "is this pawn something the
-    // player can actually see". See the tally.
-    const float alertMaxDis = veryCrowded ? 70.f : (crowded ? 95.f : 120.f);
     // Re-sample matrix once more right before project when many targets — collect
     // pass can take several ms and cam has already moved (stick-then-snap feel).
     if (crowded) {
@@ -5069,37 +5160,25 @@ static int      s_countOffScreen = 0;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
 
-        // The tally counts what the ESP is actually showing, and that is the whole
-        // bug report: "team of 2, both alive, it says 3"; "only I die, it says
-        // 4". A number that changes when the local player dies is counting
-        // something that is not an enemy, and an enemy that is counted with
-        // nothing on screen to account for it is not a number anyone can check.
+        // The tally. 360 degrees, always: every live enemy inside the draw limit
+        // counts, the ones behind you and beside you as much as the ones in
+        // front, and no pref turns that off. That is what the counter is for.
         //
-        // 8d06a6a4a counted on-screen only. 14eda906c went back to 360, on the
-        // reasoning that knowing how many are behind you is the point. Both were
-        // half right, because the tally never asked whether the pawn was drawn:
+        // What was broken was never the 360. It was that "enemy" was decided by
+        // two live reads that fail open, so the local player and the local team
+        // got counted whenever those reads did not come back. The report says it
+        // plainly: team of 2, both alive, it says 3; only I die, it says 4. A
+        // number that moves when the local player dies is counting the local
+        // player. See the identity cache above.
         //
-        //   esp.mm  the alert block, a few lines below
-        //       if ((isAlert360 || isAlertNum) && !isOnScreen && s.dis < alertMaxDis)
-        //
-        // An off-screen pawn is drawn ONLY by that block, and only when an alert
-        // pref is on. With the alerts off, a 360 tally counted every enemy behind
-        // the player and the player could see none of them -- a permanent +1 with
-        // no box, which is exactly what was reported, every time, for as long as
-        // 360 counting was in.
-        //
-        // So the rule is the one the picture can be checked against: a pawn
-        // counts if its box is in the viewport, or if the alert arrow/number at
-        // the screen edge is standing in for it. Turn the alerts on and the 360
-        // is back, because now those pawns are visible again; turn them off and
-        // they stop being counted, because then they are genuinely not shown.
-        // Nothing is silently dropped either way.
+        // 8d06a6a4a made this on-screen only and 14eda906c put the 360 back --
+        // both were treating the symptom. f8cc10c92 gated it on "is it drawn",
+        // which matched the picture by throwing away the pawns behind the player,
+        // which is the half of a 360 that matters. Reverted; 360 stands.
         //
         // Stamped here, before the drawing branches, and the branches that end
         // up drawing nothing drop it again -- see esp_count_drop.
-        const bool shownAsAlert = !isOnScreen && (isAlert360 || isAlertNum) &&
-                                  s.dis < alertMaxDis;
-        if (isOnScreen || shownAsAlert) {
+        {
             const uint64_t key = s.uid ? s.uid : s.pawn;
             int slot = -1;
             for (int ci = 0; ci < s_espCountN; ci++) {
@@ -5135,10 +5214,10 @@ static int      s_countOffScreen = 0;
                 s_espCountFrame[slot] = g_cacheFrameCounter;
                 s_espCountBot[slot] = s.isBot ? 1 : 0;
             }
-            if (shownAsAlert) {
-                // Counted, but standing at the screen edge rather than in the
-                // viewport. Printed so the two kinds of count are two numbers in
-                // the log instead of one number and an argument.
+            if (!isOnScreen && s.dis < espDistanceLimit) {
+                // Counted under the 360 but outside the viewport, so it has no box
+                // on screen. Printed so this is a number in the log rather than an
+                // argument.
                 s_countOffScreen++;
             }
         }
@@ -5229,6 +5308,7 @@ static int      s_countOffScreen = 0;
         }
 
         // Alert only nearer off-screen threats; throttle harder when crowded.
+        const float alertMaxDis = veryCrowded ? 70.f : (crowded ? 95.f : 120.f);
         if ((isAlert360 || isAlertNum) && !isOnScreen && s.dis < alertMaxDis) {
             float viewX = aimW.x * matrixData[0] + aimW.y * matrixData[4] + aimW.z * matrixData[8] + matrixData[12];
             float viewY = aimW.x * matrixData[1] + aimW.y * matrixData[5] + aimW.z * matrixData[9] + matrixData[13];
