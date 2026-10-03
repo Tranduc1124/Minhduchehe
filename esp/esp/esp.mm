@@ -1620,7 +1620,6 @@ bool get_IsVisible(uint64_t player);
 bool get_IsVisibleByFlag(uint64_t player, uint32_t flag);
 bool get_IsFPPVisible(uint64_t player);
 static inline uint32_t get_VisibleFlags(uint64_t player);
-void EnableCamPC(uint64_t localPlayerPawn, bool isEnabled, float campcValue);
 
 uint64_t Moudule_Base = -1;
 int g_PlayerDrawIndex = 1;
@@ -1651,9 +1650,6 @@ bool isAimIgnoreBot = NO; bool isAimIgnoreKnock = NO;
 bool isAimRage = NO; bool isFastReload = NO;
 bool isAimLegit = NO;
 float fastReloadSpeed = 1.0f;
-
-bool isCamPC = NO; float camPCValue = 30.0f;
-static uint64_t s_lastFollowCameraObj = 0;
 
 bool isAimbot = NO; bool isAimAssist = NO;
 bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing)
@@ -2816,13 +2812,12 @@ void ESPSyncFromPrefs(void) {
     // Legacy: force-off removed InstantHeal / Fast Weapon Switch prefs.
     ESPPrefsSetBool(@"InstantHeal", NO);
     ESPPrefsSetBool(@"FastWeaponSwitch", NO);
-    // CamPC was pulled from the UI. The engine keeps honouring the pref so a
-    // user who had it on does not silently lose a working feature; what
-    // changed is that nothing in the app sets it any more.
-    isCamPC    = ESPPrefsBool(@"CamPC", NO);
-    camPCValue = ESPPrefsFloat(@"CamPCValue", 30.0f);
-    if (camPCValue < 0.0f) camPCValue = 0.0f;
-    if (camPCValue > 150.0f) camPCValue = 150.0f;
+    // CamPC is gone, not just unexposed. It wrote a float at (pawn + 0x628) + 0x70,
+    // where 0x628 is read as a pointer by other code in this file and the offset
+    // had no provenance of its own — the same shape of guess that wrote
+    // quaternions over a pointer and killed the game at match teardown
+    // (FreeFire-2026-10-03-082640.ips). Removed rather than defaulted off, so
+    // there is nothing left to switch on.
 
     ESPSyncTickRate();
 
@@ -3512,10 +3507,8 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         // Keep frame alive when Brutal needs work (ON, still patched, or has saved addrs to restore).
         // Critical: user turns Brutal OFF after leave → must NOT early-return before restore.
-        // CamPC must ALSO keep the frame alive — it was missing from this list,
-        // so "only CamPC on" early-returned and CamPC never applied.
         const bool brutalNeedsFrame = Norecoil || g_brutalPatched.load() || g_brutalHasAddrs.load();
-        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !isCamPC && !brutalNeedsFrame) {
+        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !brutalNeedsFrame) {
             [self clearAllContent];
             if (!self.hidden) self.hidden = YES;
             return;
@@ -4099,19 +4092,15 @@ static int      s_countOffScreen = 0;
         // Kill vanilla AA (strength + AllOff) whenever custom aimbot/assist is on.
         // Wall ON/OFF alike — no chest magnet when firing. LOS is geometric, not AA-list.
         DisableGameDefaultAimAssist(myPawnObject, isAimbot || isAimAssist);
-        EnableCamPC(myPawnObject, isCamPC, camPCValue);
 
-        // DIAG (once per 5s): confirm the cheat apply-path is actually running
-        // and what CamPC sees — surfaces "no effect" causes without a debugger.
+        // DIAG (once per 5s): confirm the cheat apply-path is actually running.
         {
             static CFTimeInterval s_lastDiag = 0;
             CFTimeInterval nowD = CACurrentMediaTime();
             if (nowD - s_lastDiag > 5.0) {
                 s_lastDiag = nowD;
-                uint64_t fc = isVaildPtr(myPawnObject) ? ReadAddr<uint64_t>(myPawnObject + 0x628) : 0;
-                NSLog(@"[DIAG] pawn=%llu alive=%d camPC=%d val=%.0f followCam=%llu valid=%d",
-                      (unsigned long long)myPawnObject, (int)(isVaildPtr(myPawnObject) && get_CurHP(myPawnObject) > 0),
-                      (int)isCamPC, camPCValue, (unsigned long long)fc, (int)isVaildPtr(fc));
+                NSLog(@"[DIAG] pawn=%llu alive=%d",
+                      (unsigned long long)myPawnObject, (int)(isVaildPtr(myPawnObject) && get_CurHP(myPawnObject) > 0));
 
                 // Is the view matrix actually LIVE? Print the first row and the
                 // two rows W2S divides by. If these are byte-identical across
@@ -4130,10 +4119,8 @@ static int      s_countOffScreen = 0;
                 kernel_boot_log_fn logFn = kernelBootLog;
                 if (logFn) {
                     NSString *line = [NSString stringWithFormat:
-                        @"[diag] pawn=%@ fc=%@ camPC=%d (%.0f)",
-                        isVaildPtr(myPawnObject) ? @"ok" : @"nil",
-                        isVaildPtr(fc) ? @"ok" : @"nil",
-                        (int)isCamPC, camPCValue];
+                        @"[diag] pawn=%@",
+                        isVaildPtr(myPawnObject) ? @"ok" : @"nil"];
                     dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
                 }
             }
@@ -6144,22 +6131,4 @@ bool get_IsFPPVisible(uint64_t player) {
     return (m_Value & 0x1u) != 0; // ISVISIBLE_CAMERA
 }
 
-void EnableCamPC(uint64_t localPlayerPawn, bool isEnabled, float campcValue) {
-    if (!isVaildPtr(localPlayerPawn)) {
-        s_lastFollowCameraObj = 0;
-        return;
-    }
-    uint64_t FollowCameraObj = ReadAddr<uint64_t>(localPlayerPawn + 0x628);
-    if (isVaildPtr(FollowCameraObj)) {
-        if (isEnabled && campcValue > 0.0f) {
-            WriteAddr<float>(FollowCameraObj + 0x70, campcValue);
-            s_lastFollowCameraObj = FollowCameraObj;
-        } else if (s_lastFollowCameraObj) {
-            WriteAddr<float>(FollowCameraObj + 0x70, 0.0f);
-            s_lastFollowCameraObj = 0;
-        }
-    } else {
-        s_lastFollowCameraObj = 0;
-    }
-}
 @end

@@ -167,8 +167,6 @@ extern bool isAimBehindWall;
 extern bool isAimRage;
 extern bool isAimLegit;
 extern bool isFastReload;
-extern bool isCamPC;
-extern float camPCValue;
 
 // --- AIMBOT (hard LookAt only; Aim Silent removed) ---
 extern bool isAimbot;

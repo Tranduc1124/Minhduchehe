@@ -1435,23 +1435,9 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         [_contentContainer addSubview:reloadSlider];
         y += 40;
 
-        addSwitchRow([self localized:@(oxorany("Enable Camera iPad")) viText:@(oxorany("Bật Cam xa"))], @(oxorany("CamPC")), NO);
-
-        CGFloat camPCVal = ESPPrefsFloat(@(oxorany("CamPCValue")), 30.0f);
-        UILabel *camLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y+5, contentWidth - 32, 20)];
-        camLbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Camera iPad Dist: %.1f")) viText:@(oxorany("Độ xa Camera: %.1f"))], camPCVal];
-        camLbl.font = MDFont(14, UIFontWeightMedium);
-        camLbl.textColor = textColor;
-        [_contentContainer addSubview:camLbl];
-        y += 25;
-        UISlider *camSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, y, contentWidth - 32, 30)];
-        camSlider.minimumValue = 0.0f; camSlider.maximumValue = 150.0f; camSlider.value = camPCVal;
-        camSlider.minimumTrackTintColor = MDAccent();
-        objc_setAssociatedObject(camSlider, kKeyKey, @(oxorany("CamPCValue")), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(camSlider, kLabelKey, camLbl, OBJC_ASSOCIATION_ASSIGN);
-        [camSlider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-        [_contentContainer addSubview:camSlider];
-        y += 40;
+        // CamPC rows used to live here ("Enable Camera iPad" + its distance
+        // slider). The feature is gone from the engine, so the rows are gone too
+        // rather than left toggling a pref nothing reads.
 
     } else if (tab == MenuTabSettings) {
         addSectionHeader([self localized:@(oxorany("Menu Mode")) viText:@(oxorany("Chế Độ Menu"))]);
@@ -2364,8 +2350,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Run Speed: %.2fx (online ≤1.28)")) viText:@(oxorany("Tốc độ chạy: %.2fx (online ≤1.28)"))], v];
     } else if ([key isEqualToString:@(oxorany("BrutalSpeed"))]) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Brutal Run Speed: %.2f")) viText:@(oxorany("Tốc độ chạy Brutal: %.2f"))], v];
-    } else if ([key isEqualToString:@(oxorany("CamPCValue"))]) {
-        lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Camera iPad Dist: %.1f")) viText:@(oxorany("Độ xa Camera: %.1f"))], v];
     } else if ([key isEqualToString:@(oxorany("FastReloadSpeed"))]) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Reload Speed: %.1fx")) viText:@(oxorany("Tốc độ nạp đạn: %.1fx"))], v];
     } else if ([key isEqualToString:@(oxorany("EspDistanceLimit"))]) {
