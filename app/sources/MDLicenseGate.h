@@ -11,6 +11,7 @@
 //
 
 #import <UIKit/UIKit.h>
+#import "APIClient/APIClient.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -27,6 +28,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Lock screen used as rootViewController until authorized. Blocks touches.
 + (UIViewController *)lockViewController;
+
+/// Reflects a failed run on the visible lock screen: status text, the matching
+/// icon and its colour. Safe to call before the lock screen exists.
++ (void)showMessage:(NSString *)message status:(TserverStatusCode)status;
 
 @end
 
