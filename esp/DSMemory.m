@@ -390,6 +390,10 @@ uint64_t ds_translate_page(uint64_t page_va) {
 #define DS_PAGE_CACHE_SLOTS 256
 #define DS_RECENT_SLOTS 8
 #define DS_FAIL_DEGRADE_THRESHOLD 3
+// How long a degrade pauses remapping before it is retried. Long enough not to
+// hammer a kernel that is refusing, short enough that a burst of failures costs
+// a quarter of a second of reads instead of the rest of the session.
+#define DS_DEGRADE_COOLDOWN_MS 250
 
 // Hard lifetime for a mapping, counted from the moment it was taken.
 //
@@ -446,6 +450,11 @@ static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
 static int g_readTxnDepth = 0;
 static uint64_t g_consecutiveMapFailures = 0;
 static bool g_degraded = false;
+// Wall clock at which the degrade is retried. Zero while not degraded.
+static uint64_t g_degradedUntilMs = 0;
+// How many times a degrade has been recovered from, reported by the [DS-TLB]
+// line so a session that keeps hitting this says so instead of looking stable.
+static uint32_t g_dsRecoverCount = 0;
 
 static void ds_page_cache_lock_init(void) {
     pthread_mutexattr_t attr;
@@ -585,8 +594,38 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     ds_lock();
 
     if (g_degraded) {
-        ds_unlock();
-        return 0;
+        // A cooldown, not a latch.
+        //
+        // This used to stay true until something called ds_detach or
+        // ds_flush_page_cache, and ds_detach only runs on a pid change. So three
+        // failed vm_map_remote_page calls — which is three pages the kernel would
+        // not hand over, and under a match's allocation rate that is a normal
+        // moment, not an exception — blinded every read in the process: ds_rw_remap
+        // and ds_read_uncached both return false on g_degraded, so the player
+        // dictionary, the HP pool and the bones all read as zero.
+        //
+        // That is the reported instability exactly: it works, then after a while
+        // in the same match the targets stop being found, and it stays that way
+        // until the session is restarted. Nothing in the log said why, because the
+        // degrade line is the only trace and it reads like a deliberate decision.
+        //
+        // Dropping the page cache on the way in is the other half: a mapping the
+        // kernel no longer honours is the likeliest reason the remap failed, and
+        // keeping it is what made the next attempt fail too.
+        if (ds_now_ms() < g_degradedUntilMs) {
+            ds_unlock();
+            return 0;
+        }
+        g_degraded = false;
+        g_consecutiveMapFailures = 0;
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+            ds_release_page_slot_locked(i);
+        }
+        g_pageCacheNext = 0;
+        g_recentCount = 0;
+        g_dsRemapCount++;
+        g_dsRecoverCount++;
+        NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
@@ -634,8 +673,10 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         g_consecutiveMapFailures++;
         if (g_consecutiveMapFailures >= DS_FAIL_DEGRADE_THRESHOLD) {
             g_degraded = true;
-            NSLog(@"[DS] degraded after %llu consecutive map failures — stop remapping",
-                  (unsigned long long)g_consecutiveMapFailures);
+            g_degradedUntilMs = ds_now_ms() + DS_DEGRADE_COOLDOWN_MS;
+            NSLog(@"[DS] degraded after %llu consecutive map failures — pausing remap "
+                  @"for %dms, cache dropped on the way back in",
+                  (unsigned long long)g_consecutiveMapFailures, DS_DEGRADE_COOLDOWN_MS);
         }
         ds_unlock();
         return 0;
