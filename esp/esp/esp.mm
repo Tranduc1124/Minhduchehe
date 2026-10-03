@@ -2354,19 +2354,65 @@ extern "C" void ToggleSpeedX50(bool enable) {
     });
 }
 
+// A quaternion is four floats. Its first eight bytes are two components, and a
+// normalised one has both inside [-1, 1], so the pair reads as a 64-bit value
+// that is either zero or a denormal-looking float pattern.
+//
+// A pointer never looks like that. Anything at or above 0x100000000 at the target
+// is therefore not a rotation field, it is a pointer the game owns, and writing
+// sixteen bytes of float over it is what FreeFire-2026-10-03-082640.ips is:
+//
+//   EXC_BAD_ACCESS, KERN_INVALID_ADDRESS at 0x3a3a69ed00000000
+//   -> 0x0000006d00000000 (possible pointer authentication failure)
+//
+// 0x3a3a69ed00000000 is two floats: 0.0f and 0.00059f. Stripping the PAC leaves
+// 0x6d00000000, which lands in the GPU carveout — reserved, unallocated address
+// space — and the game faults on it when it uses that field at teardown. The
+// address is the fingerprint of this write, not a mystery: it is a normalised
+// quaternion's first two components, read as a pointer.
+//
+// The crash was on the main thread inside UnityFramework with no ESP frames,
+// because the corrupted field is read by the game long after the write.
+static inline bool AimFieldLooksLikePointer(uint64_t player, uint64_t off) {
+    const uint64_t v = ReadAddr<uint64_t>(player + off);
+    return v >= 0x100000000ULL;
+}
+
 // Single clean write per call. Double-writes + multi-burst made the camera thrash
 // even when bullets (silent/fire-dir) were already accurate.
+//
+// Only the three offsets that come from the offsets table. This used to write
+// five: the same quaternion to kAimRotation, kAimRotationAux, kCurrentAimRotation
+// AND to 0x5B4, 0x5C4, 0x19A4, behind `if (kAimRotation != 0x5B4)` guards that
+// only skipped a legacy address when it happened to equal the table's. With the
+// table at 0x614/0x628/0x1A8C (FF) or 0x61C/0x630/0x1AA4 (MAX) every guard was
+// true, so all five writes ran every call. 0x5B4, 0x5C4 and 0x19A4 carry no
+// provenance comment and are from an older layout; in the current build whatever
+// lives there is not a rotation, and a quaternion written over it is the crash
+// above. The aimbot runs this continuously, so the damage is already in the object
+// by the time the match ends and the game reads the field.
 static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
-    WriteAddr<Quaternion>(player + kAimRotation, out);
-    WriteAddr<Quaternion>(player + kAimRotationAux, out);
-    if (kAimRotation != 0x5B4) {
-        WriteAddr<Quaternion>(player + 0x5B4, out);
-        WriteAddr<Quaternion>(player + 0x5C4, out);
-    }
-    WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
-    if (kCurrentAimRotation != 0x19A4) {
-        WriteAddr<Quaternion>(player + 0x19A4, out);
+    struct { uint64_t off; const char *name; } targets[] = {
+        { kAimRotation,        "AimRotation" },
+        { kAimRotationAux,     "AimRotationAux" },
+        { kCurrentAimRotation, "CurrentAimRotation" },
+    };
+    for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
+        const uint64_t off = targets[i].off;
+        if (!off) continue;
+        if (AimFieldLooksLikePointer(player, off)) {
+            static uint32_t s_refused = 0;
+            if (s_refused < 8) {
+                s_refused++;
+                NSLog(@"[AIM-WRITE] refused %s at +0x%llx — field holds 0x%llx, "
+                      @"that is a pointer and not a rotation",
+                      targets[i].name, (unsigned long long)off,
+                      (unsigned long long)ReadAddr<uint64_t>(player + off));
+            }
+            continue;
+        }
+        WriteAddr<Quaternion>(player + off, out);
     }
 }
 
