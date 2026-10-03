@@ -1620,6 +1620,26 @@ bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing
 // Aim sphere mode (requires Aimbot): 0=FOV circle, 1=180 front, 2=360 full.
 int aimSphereMode = 0;
 int triggerMode = 0; int aimPosition = 0;
+
+// Which probe inside get_IsFiring said "the fire button is held". Declared up
+// here because [AIM-DIAG] prints the mask and that log runs long before the
+// function that fills it.
+//
+// Only the three marked (tbl) come from GameOffsets. The other two are magic
+// numbers that were already inside get_IsFiring with no record of where they
+// came from, and they are in neither kOffsetsFF nor kOffsetsFFMax. They are
+// still read, and still reported, but they no longer decide the answer — see
+// get_IsFiring for why that matters.
+enum {
+    kFireSrcEnum   = 1 << 0,   // tbl: kIsFiring  (StartFireState enum)
+    kFireSrcAlt    = 1 << 1,   // magic 0x1C14, in neither offsets table
+    kFireSrcPrep   = 1 << 2,   // tbl: kIsPrepareAttack
+    kFireSrcAltB   = 1 << 3,   // magic 0x7D8, in neither offsets table
+    kFireSrcPri    = 1 << 4,   // tbl: PRI var 21
+};
+#define kFireSrcDecidable (kFireSrcEnum | kFireSrcPrep | kFireSrcPri)
+static int g_fireSrcMask = 0;
+
 int aimTargetMode = 0; float aimFov = 150.0f;
 float aimDistance = 200.0f; float aimSpeed = 1.0f;
 int aimMode = 1; 
@@ -5465,10 +5485,12 @@ static int      s_espCountN = 0;
         default: shouldActivate = true; break;                    // Auto
     }
 
-    if (useAssistOnly) {
-        shouldActivate = true; // Aim Assist should assist when near target without waiting for fire
-    }
-
+    // No override here for Aim Assist. This used to force shouldActivate = true
+    // whenever assist ran on its own, which threw the Trigger selection away in
+    // exactly the mode where a user is most likely to set one: pick Both, see the
+    // camera keep tracking, and conclude the setting does nothing. The trigger is
+    // the user's decision about when aim may move the camera, and it is read
+    // from the same pref in every mode.
     // Silent (AimSilent.h style): keep a locked target for a high-freq direction-rewrite
     // thread. Camera aim (Aimbot/Assist) stays independent via LookAt.
     const bool cameraAimActive = (isAimbot || useAssist) && shouldActivate;
@@ -5492,10 +5514,11 @@ static int      s_espCountN = 0;
         // None of the three can be told apart from the fields that were already
         // printed, so they are printed.
         NSLog(@"[AIM-DIAG] isAimbot=%d useAssist=%d trig=%d isFiring=%d isScoping=%d act=%d target=0x%llx "
-              @"aimFov=%.1f aimFovSq=%.0f sphere=%d firing=%d",
+              @"aimFov=%.1f aimFovSq=%.0f sphere=%d firing=%d fireSrc=0x%x",
               (int)isAimbot, (int)useAssist, trig, (int)isFiring, (int)isScoping, (int)shouldActivate,
               (unsigned long long)bestTarget,
-              (double)aimFov, (double)aimFovSq, (int)aimSphereMode, (int)isFiring);
+              (double)aimFov, (double)aimFovSq, (int)aimSphereMode, (int)isFiring,
+              (unsigned)g_fireSrcMask);
     }
 
     // Hard-stop camera path the instant trigger is off or no aim mode.
@@ -5790,33 +5813,56 @@ static inline bool StartFireStateIsActive(int state) {
     }
 }
 
+// Which probe said "firing" is kFireSrcMask, declared next to triggerMode above.
+
 bool get_IsFiring(uint64_t player) {
     if (!isVaildPtr(player)) return false;
+
+    // Local, published once at the end. This runs three times a frame and the
+    // mask has to describe this call, not accumulate over the session.
+    int src = 0;
 
     // 1) StartFireState enum (when offset is valid).
     int startFire = ReadAddr<int>(player + kIsFiring);
     if (startFire > 0 && startFire <= 9) {
-        return true;
+        src |= kFireSrcEnum;
     }
     int startFireAlt = ReadAddr<int>(player + 0x1C14);
     if (startFireAlt > 0 && startFireAlt <= 9) {
-        return true;
+        src |= kFireSrcAlt;
     }
 
     // 2) IsPrepareAttack — true while fire button held (hipfire + ADS fire).
     if (ReadAddr<uint8_t>(player + kIsPrepareAttack) != 0) {
-        return true;
+        src |= kFireSrcPrep;
     }
     if (ReadAddr<uint8_t>(player + 0x7D8) != 0) {
-        return true;
+        src |= kFireSrcAltB;
     }
 
     // 3) PRI fire status (var 21).
     if (GetDataUInt16(player, kPriVarFire) != 0) {
-        return true;
+        src |= kFireSrcPri;
     }
 
-    return false;
+    g_fireSrcMask = src;
+
+    // Only the table-backed probes decide this, and the reason is the bug that
+    // was reported: Trigger = Both kept aiming as if Auto, and StickFighting
+    // (the same call) kept the FOV gate switched off.
+    //
+    // A "fire button is held" signal has to be able to go false. This function
+    // OR-ed five probes together, two of which read a fixed offset that appears
+    // in neither kOffsetsFF nor kOffsetsFFMax, and a nonzero byte at an offset
+    // nobody can name is the normal state of a large object, so either of the
+    // two was enough to hold the result true every frame. Once that is true,
+    // `shouldActivate = isFiring || isScoping` is permanently true and Both is
+    // Auto with an extra step.
+    //
+    // The two are still read, and still reported, because if fire now reads false
+    // the mask says which of the three real ones is wrong instead of leaving that
+    // to be guessed at.
+    return (src & kFireSrcDecidable) != 0;
 }
 
 bool get_IsScoping(uint64_t player) {
