@@ -4,6 +4,7 @@
 #import "MDTheme.h"
 #import "MDLog.h"
 #import "../KernelBoot.h"
+#import "../../remote/SpringBoardOverlay.h"
 
 #import <QuartzCore/QuartzCore.h>
 
@@ -67,6 +68,14 @@
     _barBottom.backgroundColor = [UIColor colorWithRed:0.043f green:0.055f blue:0.086f alpha:1.0f];
     [self.view addSubview:_barBottom];
 
+    // The footer was the console background over the console background, so the
+    // status row had no edge and read as empty space under the log. One line
+    // makes it a strip.
+    UIView *botSep = [[UIView alloc] initWithFrame:CGRectZero];
+    botSep.backgroundColor = MDThemeLine();
+    botSep.tag = 8102;
+    [_barBottom addSubview:botSep];
+
     _spinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.color = [UIColor colorWithWhite:1.0f alpha:0.55f];
@@ -102,16 +111,78 @@
     [_pollTimer invalidate];
 }
 
+// The footer strip carries the state, not just the sentence in it. The bar was
+// the console background over the console background, so it had no edge and read
+// as empty space under the log; it now has a top rule and a wash of the state
+// colour. Kept dark -- a low-alpha blend into the console background, not a
+// solid fill, so a long log stays the brightest thing on the sheet.
+//
+// The wash is animated because the poll runs four times a second and a hard cut
+// between two washes every tick is what makes a status bar look broken.
+- (void)setFooterState:(UIColor *)tint label:(UIColor *)text text:(NSString *)text_ {
+    _statusLabel.text = text_;
+    _statusLabel.textColor = text;
+
+    UIColor *from = _barBottom.backgroundColor;
+    if (!from) from = [UIColor colorWithRed:0.043f green:0.055f blue:0.086f alpha:1.0f];
+    const CGFloat kWash = 0.16f;
+    CGFloat fr = 0, fg = 0, fb = 0, fa = 1;
+    CGFloat tr = 0, tg = 0, tb = 0, ta = 1;
+    [from getRed:&fr green:&fg blue:&fb alpha:&fa];
+    [tint getRed:&tr green:&tg blue:&tb alpha:&ta];
+    UIColor *to = [UIColor colorWithRed:fr + (tr - fr) * kWash
+                                  green:fg + (tg - fg) * kWash
+                                   blue:fb + (tb - fb) * kWash
+                                  alpha:1.0f];
+    UIView *sep = [_barBottom viewWithTag:8102];
+    UIColor *sepTo = [to colorWithAlphaComponent:1.0f];
+
+    if (@available(iOS 13.0, *)) {
+        [UIView animateWithDuration:0.25 animations:^{
+            self.barBottom.backgroundColor = to;
+            sep.backgroundColor = sepTo;
+        }];
+    } else {
+        _barBottom.backgroundColor = to;
+        sep.backgroundColor = sepTo;
+    }
+}
+
 // The sheet's whole point is "it is still working". Spinner and wording stop
 // when kernelBootReady() flips, which is KernelBoot's own flag and not a
 // guess about how long a boot takes.
+//
+// Two facts, not one, because they finish at different times. The boot is done
+// at stage 6. The ESP is not on screen until a frame has actually reached
+// SpringBoard, which is a separate moment, and the log reaches
+// "OK ESP host started" well before that. Showing only the boot flag left the
+// footer reading "Done" while the picture was still empty, which is the same
+// claim-too-early problem the Game tab had.
+//
+// The log is the evidence and is left alone: it is append-only and every line
+// in it is something that actually happened.
 - (void)updateStatus {
-    if (kernelBootReady()) {
+    const BOOL booted   = kernelBootReady();
+    const BOOL painting = (SBoardOverlayHasPublishedFrame() != 0);
+
+    if (painting) {
         [_spinner stopAnimating];
-        _statusLabel.text = @"Done — swipe down or tap Hide.";
+        [self setFooterState:MDThemeGreen()
+                        label:[UIColor colorWithRed:0.34f green:0.86f blue:0.55f alpha:1.0f]
+                          text:booted ? @"ESP is drawing — swipe down or tap Hide."
+                                      : @"ESP is drawing, kernel still finishing."];
+    } else if (booted) {
+        // Kernel up, nothing painted yet. Still spinning, because this is the
+        // window where the old wording said the run was complete.
+        [_spinner startAnimating];
+        [self setFooterState:MDThemeOrange()
+                        label:[UIColor colorWithRed:0.98f green:0.72f blue:0.32f alpha:1.0f]
+                          text:@"Kernel ready — ESP not on screen yet."];
     } else {
         [_spinner startAnimating];
-        _statusLabel.text = @"Running — stay here until complete.";
+        [self setFooterState:MDThemeBlue()
+                        label:[UIColor colorWithWhite:1.0f alpha:0.62f]
+                          text:@"Running — stay here until complete."];
     }
 }
 
@@ -138,6 +209,9 @@
 
     CGFloat botH = 40.0f + insets.bottom;
     _barBottom.frame = CGRectMake(0.0f, h - botH, w, botH);
+
+    UIView *botSep = [_barBottom viewWithTag:8102];
+    botSep.frame = CGRectMake(0.0f, 0.0f, w, 1.0f);
 
     CGSize ss = _spinner.intrinsicContentSize;
     CGFloat sy = CGRectGetMinY(_barBottom.frame) + (botH - insets.bottom - ss.height) * 0.5f;
