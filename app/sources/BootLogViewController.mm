@@ -65,7 +65,7 @@
 
     // ---- Bottom bar: spinner + status, on the console background ----
     _barBottom = [[UIView alloc] initWithFrame:CGRectZero];
-    _barBottom.backgroundColor = [UIColor colorWithRed:0.043f green:0.055f blue:0.086f alpha:1.0f];
+    _barBottom.backgroundColor = BootFooterBackground();
     [self.view addSubview:_barBottom];
 
     // The footer was the console background over the console background, so the
@@ -111,41 +111,24 @@
     [_pollTimer invalidate];
 }
 
-// The footer strip carries the state, not just the sentence in it. The bar was
-// the console background over the console background, so it had no edge and read
-// as empty space under the log; it now has a top rule and a wash of the state
-// colour. Kept dark -- a low-alpha blend into the console background, not a
-// solid fill, so a long log stays the brightest thing on the sheet.
+// The footer strip reports the state; it does not colour itself. It was a 16%
+// wash of the state colour over the console background and that read as a solid
+// orange slab under the log -- louder than the log it was annotating, and the
+// one thing on the sheet that changed appearance. So the bar is a fixed grey and
+// only the sentence carries the state.
 //
-// The wash is animated because the poll runs four times a second and a hard cut
-// between two washes every tick is what makes a status bar look broken.
-- (void)setFooterState:(UIColor *)tint label:(UIColor *)text text:(NSString *)text_ {
-    _statusLabel.text = text_;
+// Nothing is animated. The poll runs four times a second, and the only thing
+// that can change in a run is the state itself, which is rare -- animating the
+// label on every tick is what makes a status line flicker.
+- (void)setFooterLabel:(UIColor *)text {
     _statusLabel.textColor = text;
+}
 
-    UIColor *from = _barBottom.backgroundColor;
-    if (!from) from = [UIColor colorWithRed:0.043f green:0.055f blue:0.086f alpha:1.0f];
-    const CGFloat kWash = 0.16f;
-    CGFloat fr = 0, fg = 0, fb = 0, fa = 1;
-    CGFloat tr = 0, tg = 0, tb = 0, ta = 1;
-    [from getRed:&fr green:&fg blue:&fb alpha:&fa];
-    [tint getRed:&tr green:&tg blue:&tb alpha:&ta];
-    UIColor *to = [UIColor colorWithRed:fr + (tr - fr) * kWash
-                                  green:fg + (tg - fg) * kWash
-                                   blue:fb + (tb - fb) * kWash
-                                  alpha:1.0f];
-    UIView *sep = [_barBottom viewWithTag:8102];
-    UIColor *sepTo = [to colorWithAlphaComponent:1.0f];
-
-    if (@available(iOS 13.0, *)) {
-        [UIView animateWithDuration:0.25 animations:^{
-            self.barBottom.backgroundColor = to;
-            sep.backgroundColor = sepTo;
-        }];
-    } else {
-        _barBottom.backgroundColor = to;
-        sep.backgroundColor = sepTo;
-    }
+// A flat grey that reads as a strip against the near-black console, darker than
+// the header bar above so the sheet has a top and a bottom rather than two
+// identical caps.
+static UIColor *BootFooterBackground(void) {
+    return [UIColor colorWithRed:0.12f green:0.13f blue:0.16f alpha:1.0f];
 }
 
 // The sheet's whole point is "it is still working". Spinner and wording stop
@@ -167,22 +150,20 @@
 
     if (painting) {
         [_spinner stopAnimating];
-        [self setFooterState:MDThemeGreen()
-                        label:[UIColor colorWithRed:0.34f green:0.86f blue:0.55f alpha:1.0f]
-                          text:booted ? @"ESP is drawing — swipe down or tap Hide."
-                                      : @"ESP is drawing, kernel still finishing."];
+        _statusLabel.text = booted ? @"ESP is drawing — swipe down or tap Hide."
+                                   : @"ESP is drawing, kernel still finishing.";
+        [self setFooterLabel:MDThemeGreen()];
     } else if (booted) {
         // Kernel up, nothing painted yet. Still spinning, because this is the
-        // window where the old wording said the run was complete.
+        // window where the old wording said the run was complete. Amber for the
+        // wait rather than green for a session that is not on screen yet.
         [_spinner startAnimating];
-        [self setFooterState:MDThemeOrange()
-                        label:[UIColor colorWithRed:0.98f green:0.72f blue:0.32f alpha:1.0f]
-                          text:@"Kernel ready — ESP not on screen yet."];
+        _statusLabel.text = @"Kernel ready — ESP not on screen yet.";
+        [self setFooterLabel:MDThemeOrange()];
     } else {
         [_spinner startAnimating];
-        [self setFooterState:MDThemeBlue()
-                        label:[UIColor colorWithWhite:1.0f alpha:0.62f]
-                          text:@"Running — stay here until complete."];
+        _statusLabel.text = @"Running — stay here until complete.";
+        [self setFooterLabel:[UIColor colorWithWhite:0.62f alpha:1.0f]];
     }
 }
 
@@ -207,7 +188,7 @@
     _hideButton.frame = CGRectMake(w - hideW - 14.0f, insets.top + 8.0f, hideW, 36.0f);
     _titleLabel.frame = CGRectMake(0.0f, insets.top + 8.0f, w, 36.0f);
 
-    CGFloat botH = 40.0f + insets.bottom;
+    CGFloat botH = 34.0f + insets.bottom;
     _barBottom.frame = CGRectMake(0.0f, h - botH, w, botH);
 
     UIView *botSep = [_barBottom viewWithTag:8102];
