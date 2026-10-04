@@ -495,11 +495,20 @@ static uint64_t   g_vmoSnapCursor  = 0;
 static uint64_t   g_vmoSnapStartMs = 0;
 static uint64_t   g_vmoSnapNextMs  = 0;
 static bool       g_vmoSweeping    = false;
+// True only between one completed pass and the start of the next. A pass in
+// progress has filled a PREFIX of g_vmoSnap, and answering from a prefix makes
+// every page in the unwalked tail look unmapped.
+static bool       g_vmoSnapReady   = false;
 // Mappings dropped because the map said a different object backs that address.
 static uint64_t   g_dsStaleDropCount = 0;
-// Slots the map cannot answer for, so no comparison is possible this pass.
-static uint64_t   g_dsVmoBlindCount  = 0;
-static uint64_t   g_dsSweepCount     = 0;
+// Slots released because no map entry covers their address at all, so our own
+// memory entry was the only thing keeping that physical page alive.
+static uint64_t   g_dsOrphanDropCount = 0;
+// Slots with no baseline as of the last completed pass. A gauge, not a running
+// total: a slot that gets armed a pass later is no longer blind, and a cumulative
+// counter cannot tell those two states apart on screen.
+static uint32_t   g_dsVmoBlindNow    = 0;
+static uint64_t   g_dsSweepCount      = 0;
 
 static struct {
     uint64_t pageVA;
@@ -625,6 +634,19 @@ static uint64_t ds_vmo_from_snapshot(uint64_t page_va) {
     return 0;
 }
 
+// What may be recorded as a baseline right now.
+//
+// Only a COMPLETED pass may answer. Mid-pass, g_vmoSnapFilled is a prefix, so a
+// page in the unwalked tail looks unmapped and would be filed with no baseline at
+// all. That was the cause of blind climbing in the first device log of this check:
+// it was not the map being unclear, it was this asking a half-built array.
+// Answering zero is safe -- the next completed pass arms the slot -- and it is
+// what stops the cache from learning the wrong thing from a partial map.
+static uint64_t ds_vmo_recordable(uint64_t page_va) {
+    if (!g_vmoSnapReady) return 0;
+    return ds_vmo_from_snapshot(page_va);
+}
+
 // One tick of an incremental pass over the game's vm_map, then the judgement.
 //
 // Called with g_pageCacheLock held, from ds_end_read_transaction, so it runs at
@@ -661,6 +683,7 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
         g_vmoSnapCursor  = kread_ptr(hdr + off_vm_map_header_links_next);
         g_vmoSnapStartMs = nowMs;
         g_vmoSweeping    = true;
+        g_vmoSnapReady   = false;
     }
 
     for (uint32_t n = 0; n < DS_VMO_SWEEP_PER_TICK; n++) {
@@ -684,7 +707,7 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
         return;
     }
 
-    uint32_t dropped = 0, judged = 0, blind = 0, armed = 0;
+    uint32_t dropped = 0, judged = 0, armed = 0, orphaned = 0;
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         if (!g_pageCache[i].localAddr) continue;
         // The snapshot answers for one instant. A slot mapped after the pass
@@ -693,10 +716,28 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
         if (g_pageCache[i].vmoEpochMs > g_vmoSnapStartMs) continue;
         const uint64_t now = ds_vmo_from_snapshot(g_pageCache[i].pageVA);
         if (g_pageCache[i].vmo == 0) {
-            // No baseline yet. Adopt one if the map can answer, so a slot mapped
-            // during the warm-up is armed from the next pass on instead of being
-            // blind for the rest of the session.
-            if (now != 0) { g_pageCache[i].vmo = now; armed++; } else { blind++; }
+            if (now != 0) {
+                // A whole map is available now, so this slot can finally be armed.
+                // A slot mapped during warm-up gets its baseline here instead of
+                // being blind for the rest of the session.
+                g_pageCache[i].vmo = now;
+                armed++;
+            } else {
+                // The whole map was walked and NOTHING covers this address. That is
+                // not "the map cannot tell" -- it means the game has unmapped the
+                // page and our own memory entry is the only reference still holding
+                // that physical frame alive. The bytes behind it now belong to
+                // whatever the allocator put there next, and the slot is a perfectly
+                // valid pointer to a frame with nothing to do with the match.
+                //
+                // Keeping these is the "sometimes it picks the match up, sometimes
+                // it does not" report in its pure form: an orphan serves reads
+                // forever, isVaildPtr passes it, the cache matches it on pageVA,
+                // and nothing ever questions it. The only previous cure was
+                // dropping the whole cache, which is what toggling the ESP did.
+                orphaned++;
+                ds_release_page_slot_locked(i);
+            }
             continue;
         }
         judged++;
@@ -708,14 +749,23 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
             ds_release_page_slot_locked(i);
         }
     }
+    // Recomputed rather than accumulated, so a slot that got armed above stops
+    // being counted as blind immediately.
+    uint32_t blindNow = 0;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].localAddr && g_pageCache[i].vmo == 0) blindNow++;
+    }
+    g_dsVmoBlindNow    = blindNow;
     g_dsStaleDropCount += dropped;
-    g_dsVmoBlindCount  += blind;
+    g_dsOrphanDropCount += orphaned;
     g_dsSweepCount++;
-    if (dropped) {
-        NSLog(@"[DS] sweep dropped %u dead mapping(s) (judged %u, armed %u, blind %u)",
-              dropped, judged, armed, blind);
+    if (dropped || orphaned) {
+        NSLog(@"[DS] sweep dropped %u dead and %u orphaned mapping(s) "
+              @"(judged %u, armed %u, blind %u)",
+              dropped, orphaned, judged, armed, blindNow);
     }
     g_vmoSweeping   = false;
+    g_vmoSnapReady  = true;
     g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
 }
 
@@ -777,12 +827,13 @@ void ds_end_read_transaction(void) {
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu sweeps=%llu",
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu orphan=%llu blind=%u sweeps=%llu",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
                   (unsigned long long)evictDelta,
                   (unsigned long long)g_dsStaleDropCount,
-                  (unsigned long long)g_dsVmoBlindCount,
+                  (unsigned long long)g_dsOrphanDropCount,
+                  g_dsVmoBlindNow,
                   (unsigned long long)g_dsSweepCount);
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;
@@ -901,7 +952,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     // entry and the map is at its largest exactly then. A snapshot old enough to
     // be wrong about this page can only drop a live mapping later, at the cost
     // of one remap, which is the cheap direction to be wrong in.
-    g_pageCache[victim].vmo = ds_vmo_from_snapshot(pageVA);
+    g_pageCache[victim].vmo = ds_vmo_recordable(pageVA);
     g_pageCache[victim].vmoEpochMs = g_vmoSnapStartMs;
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;

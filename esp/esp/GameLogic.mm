@@ -56,15 +56,64 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         0xC3299C8ULL, // older MAX dump
         0xC012848ULL, // FFTH table default
     };
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    // How far the best candidate got, and what it saw there.
+    //
+    // getMatchGame returning 0 is the difference between an ESP that tracks the
+    // match and one that reports a lobby for the rest of the session, and all
+    // nine candidates can fail for unrelated reasons with nothing said about
+    // which: a TypeInfo that moved, a statics block at a different offset, or a
+    // match pointer that is honestly null because no match is running yet. Those
+    // three look identical from outside. step= means base bad, 1 = no candidate
+    // produced a pointer worth reading, 2 = TypeInfo read but no statics block
+    // at any of its six offsets, 3 = statics found and both CurrentMatchGame and
+    // CurrentGame came back invalid -- which is the one that says the chain is
+    // intact and there is simply no match yet.
+    int      bestStep = 0;
+    size_t   bestIdx  = 0;
+    uint64_t bOff = 0, bTi = 0, bSt = 0, bMg = 0, bCg = 0;
+    uint32_t candValid = 0;
+    const size_t candN = sizeof(candidates) / sizeof(candidates[0]);
+
+    for (size_t i = 0; i < candN; i++) {
         uint64_t off = candidates[i];
         if (off == 0 || off > 0x20000000ULL) continue;
         uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
         if (!isVaildPtr(typeInfo)) continue;
+        candValid++;
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
-        if (!isVaildPtr(statics)) continue;
-        uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
+        if (!isVaildPtr(statics)) {
+            if (2 > bestStep) { bestStep = 2; bestIdx = i; bOff = off; bTi = typeInfo; bSt = statics; }
+            continue;
+        }
+        // Read both here rather than through the helper, so the failure log can
+        // show which of the two was null. The helper prefers CurrentMatchGame and
+        // falls back to CurrentGame, and that fallback is why `match` can look
+        // valid in a lobby at all.
+        const uint64_t mg = ReadAddr<uint64_t>(statics + (uint64_t)kCurrentMatchGame);
+        const uint64_t cg = ReadAddr<uint64_t>(statics + (uint64_t)kCurrentGame);
+        uint64_t matchGame = mg;
+        if (!isVaildPtr(matchGame)) matchGame = cg;
         if (isVaildPtr(matchGame)) return matchGame;
+        if (3 > bestStep) {
+            bestStep = 3; bestIdx = i; bOff = off; bTi = typeInfo; bSt = statics;
+            bMg = mg; bCg = cg;
+        }
+    }
+
+    // Throttled to 2s: this runs every frame and a failing chain is the normal
+    // state of a lobby, so an unthrottled line here is two a second forever.
+    {
+        static uint64_t s_lastFailUS = 0;
+        const uint64_t tUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        if (tUS - s_lastFailUS >= 2000000ULL) {
+            s_lastFailUS = tUS;
+            NSLog(@"[CHAIN] getMatchGame failed: step=%d cand=%u/%zu off=0x%llx "
+                  @"typeInfo=0x%llx statics=0x%llx matchGame=0x%llx currentGame=0x%llx",
+                  bestStep, candValid, candN,
+                  (unsigned long long)bOff, (unsigned long long)bTi,
+                  (unsigned long long)bSt, (unsigned long long)bMg,
+                  (unsigned long long)bCg);
+        }
     }
 
     // Il2CppResolveMatchGame needs a FreeFire RemoteCall session. While the
