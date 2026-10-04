@@ -461,24 +461,6 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // device log, not defended.
 #define DS_PAGE_TTL_MS 2000ULL
 
-// Ceiling on how long one mapping may live, measured from insert and independent
-// of how often the slot is read.
-//
-// DS_PAGE_TTL_MS alone measures from lastUseMs, which is re-stamped on every hit,
-// so a page the ESP polls every frame never ages out. That was deliberate when it
-// was introduced -- it stopped a hot page from being remapped on a timer, which was
-// the hitch it was fixing -- but it also means the match-resolution chain is
-// immortal. renderESPWithBuffers reads getMatchGame before any gate, every frame,
-// and again in the 1Hz heartbeat, so the pages holding GameFacade's static_fields
-// block always have lastUseMs == now.
-//
-// The generation check on the hit path now catches those when the generation is
-// bumped. This is the other half: a hard ceiling so that nothing survives a scene
-// rebuild even if nothing remembered to bump. Eight seconds is far longer than any
-// healthy mapping needs, so this should cost nothing in the steady state -- it is
-// a bound, not a policy.
-#define DS_PAGE_MAX_AGE_MS 8000ULL
-
 // Upper bound on mappings torn down in one transaction. Releasing all 256 at
 // once is what produced "Taking non-sleepable RW lock with preemption enabled"
 // (see the note in ds_end_read_transaction). Spreading the same total over many
@@ -644,9 +626,7 @@ void ds_end_read_transaction(void) {
         int evicted = 0;
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS && evicted < DS_MAX_EVICT_PER_TXN; i++) {
             if (!g_pageCache[i].localAddr) continue;
-            const bool idleTooLong  = (nowMs - g_pageCache[i].lastUseMs) >= DS_PAGE_TTL_MS;
-            const bool livedTooLong = (nowMs - g_pageCache[i].bornMs)    >= DS_PAGE_MAX_AGE_MS;
-            if (!idleTooLong && !livedTooLong) continue;
+            if (nowMs - g_pageCache[i].lastUseMs < DS_PAGE_TTL_MS) continue;
             ds_release_page_slot_locked(i);
             evicted++;
         }
@@ -666,9 +646,8 @@ void ds_end_read_transaction(void) {
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums max=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu",
-                  (unsigned long long)DS_PAGE_TTL_MS,
-                  (unsigned long long)DS_PAGE_MAX_AGE_MS, live,
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu",
+                  (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
                   (unsigned long long)evictDelta,
                   (unsigned long long)g_dsStaleEvictCount,
