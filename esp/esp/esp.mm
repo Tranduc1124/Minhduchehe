@@ -4265,6 +4265,13 @@ static int      s_countTeamUnknown = 0;
     // Declared here rather than inside the flush block below, which runs after
     // this one and is reset by it when a match ends.
     static uint64_t s_lastMatchDiag = 0;
+    // "This match has had its page-cache flush already." NOT derivable from
+    // s_lastMatchDiag: that key is cleared on every not-live frame (see the
+    // s_lastMatchDiag = 0 line below and why it has to be there), so in a lobby
+    // where *(CurrentGame + 0x90) reads as a valid pointer it reads as zero every
+    // frame and "s_lastMatchDiag == 0" cannot mean "first frame of a new match".
+    // See the firstMatch test further down for what that cost.
+    static bool s_firstMatchFlushed = false;
     // The last matchGame this pass saw. This is the only one of the three
     // pointers that can still be trusted at the boundary, and it is what makes
     // the match -> match edge observable at all.
@@ -4376,6 +4383,7 @@ static int      s_countTeamUnknown = 0;
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
             s_lastLiveMatch = 0;
+            s_firstMatchFlushed = false;
             // Not reset here. The new match's matchGame is already in hand and
             // is a different pointer from the one this edge was detected
             // against, so clearing it would hide the fact that a swap just
@@ -4393,6 +4401,11 @@ static int      s_countTeamUnknown = 0;
                   (unsigned long long)s_lastMatchGame,
                   (unsigned long long)matchGame);
         } else if (live) {
+            // A match just went live (0 -> non-zero is a transition, not a level).
+            // Clearing the latch here is what makes entering a match flush once:
+            // a lobby frame can already have consumed the latch, and entering a
+            // match is exactly when the lobby's pages go stale.
+            if (s_lastLiveMatch == 0) s_firstMatchFlushed = false;
             s_lastLiveMatch = match;
         }
         if (isVaildPtr(matchGame)) s_lastMatchGame = matchGame;
@@ -4454,7 +4467,31 @@ static int      s_countTeamUnknown = 0;
             // match is exactly when the lobby's pages go stale, and right after
             // it Unity rebuilds the address space, so this is the moment worth
             // dropping every slot.
-            bool firstMatch = (s_lastMatchDiag == 0 && match != 0);
+            // Read the latch, not s_lastMatchDiag.
+            //
+            // s_lastMatchDiag is cleared above on every frame where no match is
+            // live, and it has to be: it is the key for "has the match changed
+            // since I last flushed", and while a match is live the leave edge
+            // cannot run, so without that line it stays pinned to the previous
+            // match's address for the rest of the session.
+            //
+            // Testing it for "first match" then breaks the invariant the comment
+            // below states -- once per match, never per frame. In a lobby,
+            // getMatchGame falls back to CurrentGame (GameLogic.mm:20) so `match`
+            // is *(CurrentGame + 0x90) and can read as a valid pointer. On such a
+            // frame: s_lastMatchDiag was just cleared, match != 0, so firstMatch
+            // is true, so ds_flush_page_cache() and ds_cache_bump_generation() both
+            // ran -- on the next frame too, and every frame after. The whole
+            // 256-slot cache was dropped 60 times a second and every read after it
+            // was a miss at 116-plus syscalls, on a dispatch timer driving the
+            // main queue at 30-60Hz. The frame loop was starved, so positions were
+            // recomputed in lurches seconds apart instead of tracking: the boxes
+            // did not follow a moving enemy at all.
+            //
+            // The latch is cleared only where the match-liveness state actually
+            // changes -- on the leave edge and when live goes 0 -> non-zero -- so
+            // it can never be true "once per frame".
+            bool firstMatch = (!s_firstMatchFlushed && match != 0);
             if (s_lastMatchDiag != 0 || firstMatch) {
                 // A page slot pins one shmem mapping made by the kernel remap.
                 // ds_page_local (DSMemory.m:430) re-serves that slot on a bare
@@ -4472,6 +4509,7 @@ static int      s_countTeamUnknown = 0;
                       (unsigned long long)match,
                       before.liveSlots, before.staleGen, after.liveSlots);
                 ds_cache_bump_generation();
+                s_firstMatchFlushed = true;
             }
             s_lastMatchDiag = match;
         }
