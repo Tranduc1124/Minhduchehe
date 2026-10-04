@@ -172,6 +172,23 @@ typedef struct RemoteCallState {
     int stableExceptionTimeoutFloorMS;
     bool originalThreadOnly;
     bool vphoneBridge;
+    // Two latches about a thread that is running inside SpringBoard right now.
+    //
+    // crossingPoisoned: a crossing timed out waiting for that thread's sentinel
+    // fault and the fault was never reaped, so the port queue no longer matches
+    // the crossings. Hijacking the thread in that state resumes it with a state
+    // belonging to a different call, and the address it then executes is one
+    // nobody chose.
+    //
+    // wedgeKeepPorts: restore_trojan_thread failed, so the thread is still alive in
+    // SpringBoard, still sitting on one of our sentinels, and the two exception
+    // ports are the only thing that can catch it waking up. Destroying a receive
+    // right is enough to cause that even though the kernel keeps the port object
+    // alive, because SpringBoard holds a reference to it: with no receive right
+    // left the exception has nowhere to go, the kernel treats it as unhandled, and
+    // SpringBoard takes a SIGBUS. That is the crash this was written for.
+    bool crossingPoisoned;
+    bool wedgeKeepPorts;
 } RemoteCallState;
 
 static RemoteCallState g_RC_defaultState = { .success = true, .stableExceptionTimeoutFloorMS = 10000 };
@@ -228,6 +245,8 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_stableExceptionTimeoutFloorMS (remote_call_current_state()->stableExceptionTimeoutFloorMS)
 #define g_RC_originalThreadOnly      (remote_call_current_state()->originalThreadOnly)
 #define g_RC_vphoneBridge            (remote_call_current_state()->vphoneBridge)
+#define g_RC_crossingPoisoned        (remote_call_current_state()->crossingPoisoned)
+#define g_RC_wedgeKeepPorts          (remote_call_current_state()->wedgeKeepPorts)
 
 static void remote_call_note_init_failure(RemoteCallInitFailure failure, uint32_t pid)
 {
@@ -1080,6 +1099,15 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
     pthread_mutex_lock(&g_universal_ipc_mutex);
+    // A crossing poisoned by an earlier wait2 timeout still has a live thread
+    // behind it whose sentinel nobody reaped. Hijacking it now would resume it
+    // with a state from a different call, which is the way SpringBoard ends up
+    // executing an address nobody chose. Refuse rather than compound it.
+    if (g_RC_crossingPoisoned) {
+        RC_DIAG("temp/%s refused: crossing poisoned by an earlier wait2 timeout", name ?: "?");
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        return 0;
+    }
     uint64_t res = do_remote_call_temp_internal(timeout, name, x0, x1, x2, x3, x4, x5, x6, x7);
     pthread_mutex_unlock(&g_universal_ipc_mutex);
     return res;
@@ -1220,6 +1248,16 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
         return res;
     }
 
+    // Same refusal as do_remote_call_temp, and it has to be here too: this is the
+    // entry every publish goes through once an extra thread exists. The
+    // vphoneBridge branch above is the one case with no trojan thread to poison, so
+    // the latch is necessarily clear there.
+    if (g_RC_crossingPoisoned) {
+        RC_DIAG("stable/%s refused: crossing poisoned by an earlier wait2 timeout", name ?: "?");
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        return 0;
+    }
+
     if (!g_RC_creatingExtraThread) {
         res = do_remote_call_temp_internal(timeout, name, x0, x1, x2, x3, x4, x5, x6, x7);
         pthread_mutex_unlock(&g_universal_ipc_mutex);
@@ -1251,6 +1289,53 @@ uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *na
     uint64_t res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
     pthread_mutex_unlock(&g_universal_ipc_mutex);
     return res;
+}
+
+// A wait2 timeout means the trojan thread was resumed with LR = FAKE_LR_TROJAN,
+// which is 0x401, and its sentinel return has not come back yet. Returning failure
+// and walking away leaves two possibilities undifferentiated: the remote function
+// was merely slow and the fault is still coming with nobody there to read it, or
+// the fault arrived and something else consumed it.
+//
+// Either way the crossing is out of step with the port queue. The next call waits
+// on firstExceptionPort for the exception its own reply will produce, but the queue
+// holds this call's leftovers, so it hijacks the thread with a state belonging to a
+// different call. That is how a thread comes to execute an address nobody picked,
+// and the resulting fault is not a sentinel, so the port that catches sentinels
+// does not recognise it and SpringBoard takes an unhandled EXC_BAD_ACCESS. The
+// three crash reports from this machine are exactly that shape: PC = LR = 0x401 in
+// the injected image, which is this design's own sentinel, arriving uncaught.
+//
+// So reap the late exception if it is merely late and put the thread back on the
+// canonical park -- the same FAKE_PC_TROJAN state init parks in, which re-faults at
+// 0x301 and blocks, and blocked-on-a-sentinel is the resting state every later
+// crossing expects to find.
+//
+// Returning false is not fatal on its own. The ports stay armed either way, so a
+// sentinel fault that turns up late is still caught rather than escalated.
+static bool rc_resync_trojan_after_wait2_timeout(const char *name)
+{
+    ExceptionMessage late;
+    // Deliberately short. This runs on a path that already burned newTimeout while
+    // holding the IPC mutex, and another long wait would stall every publisher.
+    if (!wait_exception(g_RC_secondExceptionPort, &late, 2000, false)) {
+        RC_DIAG("resync/%s no late exception, thread left on its sentinel (ports stay armed)",
+                name ?: "?");
+        return false;
+    }
+    // Replying with the state unchanged re-runs the faulting instruction and spins.
+    // Replying with the park re-faults at 0x301 and the thread blocks there.
+    // {} rather than {0}: -Wmissing-braces is an error under this gate's flags,
+    // and the two existing park initialisers in this file are why it is tolerated
+    // at all. Not adding a third.
+    arm_thread_state64_internal park = {};
+    park.__sp    = g_RC_originalState.__sp;
+    park.__fp    = g_RC_originalState.__fp;
+    park.__flags = late.threadState.__flags;
+    sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+    reply_with_state(&late, &park);
+    RC_DIAG("resync/%s reparked at 0x301 after wait2 timeout", name ?: "?");
+    return true;
 }
 
 uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const char *name,
@@ -1346,10 +1431,17 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
         RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
-        printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
+        printf("[%s:%d] Don't receive second exception on new thread (name=%s) — resync\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");
-        // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
-        // abandon/reinit. Leaving success=false prevents further publishes.
+        // The thread was resumed with LR = 0x401. It must not be left holding an
+        // exception nobody will read, and the queue must not be left holding a
+        // result the next call will mistake for its own. Reap and re-park if the
+        // fault is only late; otherwise latch the crossing so that nothing hijacks
+        // the thread again out of step. See rc_resync_trojan_after_wait2_timeout.
+        if (!rc_resync_trojan_after_wait2_timeout(name)) {
+            g_RC_crossingPoisoned = true;
+        }
+        // From here it is best-effort. A completed init_remote_call clears the latch.
         g_RC_success = false;
         return 0;
     }
@@ -1400,11 +1492,32 @@ void abandon_remote_call(void) {
 static void fail_after_creator_park(RemoteCallInitFailure why, int targetPid)
 {
     remote_call_note_init_failure(why, targetPid);
+    bool wedged = false;
     if (g_RC_trojanThreadAddr && g_RC_firstExceptionPort) {
         if (!restore_trojan_thread(&g_RC_originalState)) {
             printf("[%s:%d] restore after FAKE_PC park failed — SB may WATCHDOG\n",
                    __FUNCTION__, __LINE__);
+            wedged = true;
         }
+    }
+    // abandon_remote_call() destroys both exception ports. When the restore above
+    // failed there is still a live thread inside SpringBoard, still parked on one of
+    // our sentinels, and those two ports are the only thing between it and an
+    // unhandled EXC_BAD_ACCESS -- which is a dead SpringBoard, not a watchdog.
+    //
+    // Destroying the receive right is enough to cause that even though the kernel
+    // keeps the port object alive: SpringBoard holds a reference to it, so the port
+    // does not die, but with no receive right left there is nowhere to deliver the
+    // exception. The kernel then treats it as unhandled and the thread takes a
+    // SIGBUS. Three crash reports from this machine are that fault, at PC = 0x401,
+    // the sentinel this thread is parked on.
+    //
+    // So latch it. A wedged thread costs a watchdog on the next respawn; taking the
+    // catcher away costs the process the overlay is drawn in.
+    g_RC_wedgeKeepPorts = wedged;
+    if (wedged) {
+        printf("[%s:%d] trojan thread wedged on a sentinel — KEEPING both exception ports armed\n",
+               __FUNCTION__, __LINE__);
     }
     // abandon_remote_call takes the IPC mutex; init_remote_call does not hold it here.
     abandon_remote_call();
@@ -1422,8 +1535,23 @@ void abandon_remote_call_internal(void) {
     // Skip every SB-side IPC. Caller has decided that the remote task is dead
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
-    destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    //
+    // g_RC_wedgeKeepPorts overrides that decision. It is set when
+    // restore_trojan_thread failed, which means the caller has NOT established that
+    // the remote task is dead -- it means a thread of ours is still in there. Ports
+    // and names are both left alone, so the ports stay armed for it and stay
+    // reachable, and destroy_remote_call() releases them on the proper teardown.
+    // The crossing stays poisoned: only a completed init makes that thread worth
+    // hijacking again.
+    if (g_RC_wedgeKeepPorts) {
+        printf("[%s:%d] wedged trojan — keeping both exception ports alive and armed\n",
+               __FUNCTION__, __LINE__);
+    } else {
+        destroy_exception_port(g_RC_firstExceptionPort);
+        destroy_exception_port(g_RC_secondExceptionPort);
+        g_RC_firstExceptionPort = MACH_PORT_NULL;
+        g_RC_secondExceptionPort = MACH_PORT_NULL;
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1431,8 +1559,6 @@ void abandon_remote_call_internal(void) {
     clear_remote_shmem_cache();
     (void)reap_dead_port_names("abandon_remote_call");
     g_RC_taskAddr = 0;
-    g_RC_firstExceptionPort = MACH_PORT_NULL;
-    g_RC_secondExceptionPort = MACH_PORT_NULL;
     g_RC_firstExceptionPortAddr = 0;
     g_RC_secondExceptionPortAddr = 0;
     g_RC_dummyThread = NULL;
@@ -1513,6 +1639,11 @@ int destroy_remote_call_internal(void) {
     g_RC_pid = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
+    // The original thread is back, so nothing of ours is left in SpringBoard to
+    // poison or to protect. This is also the teardown that releases any ports a
+    // wedged abandon had to keep.
+    g_RC_crossingPoisoned = false;
+    g_RC_wedgeKeepPorts = false;
     g_RC_vphoneBridge = false;
     g_RC_trojanMem = 0;
 
@@ -1776,6 +1907,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
     remote_call_note_init_failure(RemoteCallInitFailureNone, 0);
     g_RC_vphoneBridge = false;
+    // A completed init is the only thing that puts the trojan thread back into a
+    // state worth hijacking, so both latches start clear here and nowhere else
+    // except the destroy path, which genuinely restores the original thread.
+    g_RC_crossingPoisoned = false;
+    g_RC_wedgeKeepPorts = false;
 
     if (cyanide_vphone_debug_build() &&
         process && strcmp(process, "SpringBoard") == 0) {
