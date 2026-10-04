@@ -445,6 +445,62 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // transactions keeps the port deallocations apart in time.
 #define DS_MAX_EVICT_PER_TXN 4
 
+// ---------------------------------------------------------------------------
+// What actually kills the ESP: a mapping whose physical page the game has freed.
+//
+// vm_map_remote_page maps the game's own vm_object with copy=FALSE, so the
+// mapping is a live alias of that physical page and the game's writes to it are
+// visible immediately. The resolution chain resolves on its own the moment the
+// game writes the match pointer, which is why it works at all. The mapping only
+// dies one way: the game frees the page, the allocator hands the address out
+// again, and our memory entry still maps the old physical page. Nothing about
+// that is visible from here -- isVaildPtr is a range check on the VA, the cache
+// matches on pageVA, and a mapping of freed memory is still a perfectly good
+// pointer. So the read returns whatever now occupies that physical page, the
+// chain never resolves again, and the only recovery is dropping the cache, which
+// is why toggling the ESP off and on is what makes it come back. That is the
+// "sometimes it picks up, sometimes it does not" report: it depends entirely on
+// whether the allocator happened to recycle that page or leave it alone.
+//
+// vm_map_entry carries the vm_object a page is backed by, and the game changes
+// that pointer exactly when it frees the page. Recording it and comparing later
+// is the only check available that does not have to guess when a boundary
+// happened.
+//
+// The previous version of this check (401858e9d, reverted) asked the map once
+// per second PER SLOT, plus once per remap, and every question was a fresh walk
+// of the whole map from entry 0 -- nentries times about three syscalls. Its cost
+// therefore scaled with the slot count, which is the part that mattered: a lobby
+// holds five or six slots and costs nothing, and entering a match takes the count
+// from five to well over a hundred. At a few thousand map entries that is over
+// half a million syscalls a second, on the main queue, and it is why that build
+// broke at match entry and lost aim. It was not the idea that was wrong.
+//
+// So the same question is answered once per pass instead of once per slot: one
+// walk produces a snapshot of (start, end, object) per map entry, spread over
+// frames, and every later question is a lookup in that array -- no syscalls at
+// all. The walk never runs on the read path or the insert path. Steady cost is
+// DS_VMO_SWEEP_PER_TICK entries per frame regardless of how many slots are live,
+// and the comparison at the end of a pass is arithmetic over the slot table.
+#define DS_VMO_SWEEP_INTERVAL_MS 5000ULL
+#define DS_VMO_SWEEP_PER_TICK   64
+#define DS_VMO_SNAP_MAX         8192
+
+typedef struct { uint64_t start, end, object; } DSVmoRange;
+
+static DSVmoRange g_vmoSnap[DS_VMO_SNAP_MAX];
+static uint32_t   g_vmoSnapFilled  = 0;
+static uint32_t   g_vmoSnapTotal   = 0;
+static uint64_t   g_vmoSnapCursor  = 0;
+static uint64_t   g_vmoSnapStartMs = 0;
+static uint64_t   g_vmoSnapNextMs  = 0;
+static bool       g_vmoSweeping    = false;
+// Mappings dropped because the map said a different object backs that address.
+static uint64_t   g_dsStaleDropCount = 0;
+// Slots the map cannot answer for, so no comparison is possible this pass.
+static uint64_t   g_dsVmoBlindCount  = 0;
+static uint64_t   g_dsSweepCount     = 0;
+
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
@@ -460,6 +516,10 @@ static struct {
     // the pages that are demonstrably alive alone.
     uint64_t lastUseMs;
     uint64_t gen;      // match generation this mapping was taken under
+    // The vm_object this mapping was taken under, and when the snapshot that
+    // answered that was built. Zero means not armed yet. See the block above.
+    uint64_t vmo;
+    uint64_t vmoEpochMs;
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
@@ -532,6 +592,8 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].bornMs = 0;
     g_pageCache[i].lastUseMs = 0;
     g_pageCache[i].gen = 0;
+    g_pageCache[i].vmo = 0;
+    g_pageCache[i].vmoEpochMs = 0;
     g_pageCache[i].useCount = 0;
 }
 
@@ -548,6 +610,113 @@ void ds_begin_read_transaction(void) {
     ds_lock();
     g_readTxnDepth++;
     ds_unlock();
+}
+
+// What object backs this page, according to the last completed snapshot.
+// Zero means the snapshot cannot say, which includes the page not being mapped
+// at all. No syscalls: this is the whole point of building the snapshot.
+static uint64_t ds_vmo_from_snapshot(uint64_t page_va) {
+    page_va &= ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint32_t i = 0; i < g_vmoSnapFilled; i++) {
+        if (page_va >= g_vmoSnap[i].start && page_va < g_vmoSnap[i].end) {
+            return g_vmoSnap[i].object;
+        }
+    }
+    return 0;
+}
+
+// One tick of an incremental pass over the game's vm_map, then the judgement.
+//
+// Called with g_pageCacheLock held, from ds_end_read_transaction, so it runs at
+// most once per frame and never inside a read.
+//
+// The judgement is deliberately one-directional. A snapshot describes one instant
+// and is up to DS_VMO_SWEEP_INTERVAL_MS plus the pass duration older than now, so
+// it can name an object the page no longer has, and that drops a live mapping and
+// costs one remap. The reverse cannot happen: the snapshot cannot still name the
+// old object after the game has replaced it, because the snapshot is read from
+// the live map. So being wrong here costs a mapping, never a read.
+static void ds_vmo_sweep_tick(uint64_t nowMs) {
+    if (!K(g_ff_task)) return;
+
+    if (!g_vmoSweeping) {
+        if (nowMs < g_vmoSnapNextMs) return;
+        const uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
+        const uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
+        if (nentries == 0 || nentries > DS_VMO_SNAP_MAX) {
+            // Cannot hold it. Say so once rather than truncating: a partial map
+            // would report "not mapped" for every entry past the cut and drop
+            // live mappings wholesale.
+            static uint32_t s_oversizeLogged = 0;
+            if (s_oversizeLogged < 2) {
+                s_oversizeLogged++;
+                NSLog(@"[DS] vm_map has %u entries, over the %d this build holds "
+                      @"— dead-mapping check cannot run", nentries, DS_VMO_SNAP_MAX);
+            }
+            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+            return;
+        }
+        g_vmoSnapTotal   = nentries;
+        g_vmoSnapFilled  = 0;
+        g_vmoSnapCursor  = kread_ptr(hdr + off_vm_map_header_links_next);
+        g_vmoSnapStartMs = nowMs;
+        g_vmoSweeping    = true;
+    }
+
+    for (uint32_t n = 0; n < DS_VMO_SWEEP_PER_TICK; n++) {
+        if (g_vmoSnapFilled >= g_vmoSnapTotal) break;
+        if (!K(g_vmoSnapCursor)) break;
+        g_vmoSnap[g_vmoSnapFilled].start  = kread64(g_vmoSnapCursor + E_START);
+        g_vmoSnap[g_vmoSnapFilled].end    = kread64(g_vmoSnapCursor + E_END);
+        g_vmoSnap[g_vmoSnapFilled].object = kread_ptr(g_vmoSnapCursor + E_OBJECT);
+        g_vmoSnapFilled++;
+        g_vmoSnapCursor = kread_ptr(g_vmoSnapCursor + off_vm_map_entry_links_next);
+    }
+
+    if (g_vmoSnapFilled < g_vmoSnapTotal) {
+        if (!K(g_vmoSnapCursor)) {
+            // The map was rebuilt mid-pass. Half a map is worse than none: throw
+            // the pass away instead of judging slots against it.
+            g_vmoSweeping   = false;
+            g_vmoSnapFilled = 0;
+            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+        }
+        return;
+    }
+
+    uint32_t dropped = 0, judged = 0, blind = 0, armed = 0;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (!g_pageCache[i].localAddr) continue;
+        // The snapshot answers for one instant. A slot mapped after the pass
+        // started would be judged against a map that predates it, so it waits for
+        // the next pass.
+        if (g_pageCache[i].vmoEpochMs > g_vmoSnapStartMs) continue;
+        const uint64_t now = ds_vmo_from_snapshot(g_pageCache[i].pageVA);
+        if (g_pageCache[i].vmo == 0) {
+            // No baseline yet. Adopt one if the map can answer, so a slot mapped
+            // during the warm-up is armed from the next pass on instead of being
+            // blind for the rest of the session.
+            if (now != 0) { g_pageCache[i].vmo = now; armed++; } else { blind++; }
+            continue;
+        }
+        judged++;
+        if (now != g_pageCache[i].vmo) {
+            // Either a different object backs the address now, or the map has no
+            // entry covering it and the page is gone. Both mean this mapping
+            // belongs to an address space that no longer exists.
+            dropped++;
+            ds_release_page_slot_locked(i);
+        }
+    }
+    g_dsStaleDropCount += dropped;
+    g_dsVmoBlindCount  += blind;
+    g_dsSweepCount++;
+    if (dropped) {
+        NSLog(@"[DS] sweep dropped %u dead mapping(s) (judged %u, armed %u, blind %u)",
+              dropped, judged, armed, blind);
+    }
+    g_vmoSweeping   = false;
+    g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
 }
 
 void ds_end_read_transaction(void) {
@@ -589,6 +758,11 @@ void ds_end_read_transaction(void) {
         }
         g_dsEvictCount += (uint64_t)evicted;
 
+        // Once per frame at most, and never inside a read. The alternative --
+        // asking the map per slot, per second -- is what made the previous
+        // version of this check cost more the more slots a match had.
+        ds_vmo_sweep_tick(nowMs);
+
         // 1 Hz. remaps and evictions are the two halves of the TTL trade: a TTL
         // that is too long leaves stale pages in place, one that is too short
         // burns CPU on vm_map_remote_page. These two rates are what tells them
@@ -603,10 +777,13 @@ void ds_end_read_transaction(void) {
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu",
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu sweeps=%llu",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
-                  (unsigned long long)evictDelta);
+                  (unsigned long long)evictDelta,
+                  (unsigned long long)g_dsStaleDropCount,
+                  (unsigned long long)g_dsVmoBlindCount,
+                  (unsigned long long)g_dsSweepCount);
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;
             s_lastEvictCount = g_dsEvictCount;
@@ -718,6 +895,14 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
     g_pageCache[victim].gen = g_cacheGeneration;
+    // From the snapshot, which is free. This used to be a fresh walk of the
+    // whole map on every single remap -- the other half of the cost that made
+    // entering a match unaffordable, since a miss is the common case at match
+    // entry and the map is at its largest exactly then. A snapshot old enough to
+    // be wrong about this page can only drop a live mapping later, at the cost
+    // of one remap, which is the cheap direction to be wrong in.
+    g_pageCache[victim].vmo = ds_vmo_from_snapshot(pageVA);
+    g_pageCache[victim].vmoEpochMs = g_vmoSnapStartMs;
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     g_pageCache[victim].bornMs = ds_now_ms();
