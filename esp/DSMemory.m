@@ -681,6 +681,33 @@ void ds_end_read_transaction(void) {
 static uint64_t ds_page_local(uint64_t pageVA) {
     ds_lock();
 
+    // Cache hits are served before the degrade gate is even looked at, and that
+    // ordering is the point.
+    //
+    // A degrade means the kernel is refusing to hand over NEW mappings. Pages we
+    // already hold are not new mappings and are unaffected by it. The gate used to
+    // sit above this loop, so for the length of the 250ms cooldown every read in
+    // the process returned zero -- including the 255 good cached pages sitting in
+    // the table. That turned a remap pause into a total blackout: isVaildPtr(0)
+    // fails, so every pawn is skipped, every path comes out empty, and the counter
+    // prints "--", with nothing on the ESP side to say why. The only trace was the
+    // degrade line itself.
+    //
+    // So the loop moved up. A hit is served, and only a miss has to wait out the
+    // cooldown.
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
+            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
+            g_pageCache[i].lastUse = g_pageUseCounter++;
+            // Stamped on every hit. This is what the TTL is measured against,
+            // so a page the game is reading every frame never ages out.
+            g_pageCache[i].lastUseMs = ds_now_ms();
+            uint64_t aHit = g_pageCache[i].localAddr;
+            ds_unlock();
+            return aHit;
+        }
+    }
+
     if (g_degraded) {
         // A cooldown, not a latch.
         //
@@ -746,19 +773,6 @@ static uint64_t ds_page_local(uint64_t pageVA) {
                       @"recovery #%llu", liveAtResume,
                       (unsigned long long)g_dsRecoverCount);
             }
-        }
-    }
-
-    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
-            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
-            g_pageCache[i].lastUse = g_pageUseCounter++;
-            // Stamped on every hit. This is what the TTL is measured against,
-            // so a page the game is reading every frame never ages out.
-            g_pageCache[i].lastUseMs = ds_now_ms();
-            uint64_t a = g_pageCache[i].localAddr;
-            ds_unlock();
-            return a;
         }
     }
 

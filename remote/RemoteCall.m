@@ -1286,6 +1286,14 @@ uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *na
 {
     pthread_once(&g_universal_ipc_mutex_once, init_universal_mutex);
     pthread_mutex_lock(&g_universal_ipc_mutex);
+    // The other two entry points refuse when the crossing is poisoned and this one
+    // did not, which is a hole in the latch rather than a deliberate exemption.
+    if (g_RC_crossingPoisoned) {
+        RC_DIAG("stable-addr/%s refused: crossing poisoned by an earlier wait2 timeout",
+                name ?: "?");
+        pthread_mutex_unlock(&g_universal_ipc_mutex);
+        return 0;
+    }
     uint64_t res = do_remote_call_stable_addr_internal(timeout, pcAddr, name, x0, x1, x2, x3, x4, x5, x6, x7);
     pthread_mutex_unlock(&g_universal_ipc_mutex);
     return res;
@@ -1440,8 +1448,21 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         // the thread again out of step. See rc_resync_trojan_after_wait2_timeout.
         if (!rc_resync_trojan_after_wait2_timeout(name)) {
             g_RC_crossingPoisoned = true;
+            // The thread is STILL on the sentinel, so the ports have to stay.
+            //
+            // This latch was only being set by fail_after_creator_park, which is an
+            // init-failure helper that this path never goes near -- so a session
+            // poisoned here looked un-wedged to everything downstream. And the very
+            // next thing such a session does is give up: after three consecutive
+            // failures SpringBoardOverlay.m calls abandon_remote_call(), which
+            // destroys both exception ports. That is the crash, exactly -- a live
+            // thread in SpringBoard sitting on LR = 0x401 with the catcher removed,
+            // which is the fault every report shows, and it is why
+            // consecutiveCrashCount kept climbing after the previous fix stopped
+            // the next hijack.
+            g_RC_wedgeKeepPorts = true;
         }
-        // From here it is best-effort. A completed init_remote_call clears the latch.
+        // From here it is best-effort.
         g_RC_success = false;
         return 0;
     }
@@ -1608,14 +1629,38 @@ int destroy_remote_call_internal(void) {
         g_RC_trojanMem = 0;
     }
     if (g_RC_creatingExtraThread) {
-        do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        // This is the call that kills the wedged thread, and it was being REFUSED:
+        // crossingPoisoned short-circuits do_remote_call_stable, which is the only
+        // way to make this call. So destroy removed the catcher and then, by the
+        // same latch, declined to remove the thread it belonged to.
+        //
+        // The refusal is right for ordinary callers and wrong here, so the escape is
+        // explicit: clear the latch, kill the thread, then put it back. Nothing runs
+        // between those two points, since destroy holds the IPC mutex.
+        if (g_RC_crossingPoisoned) {
+            g_RC_crossingPoisoned = false;
+            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+            g_RC_crossingPoisoned = true;
+        } else {
+            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        }
     }
     else {
         restore_trojan_thread(&g_RC_originalState);
     }
 
-    destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    // Same rule as abandon: a thread that is still parked on a sentinel needs its
+    // ports. destroy normally reaches here with the original thread already restored,
+    // in which case there is nothing to protect and this is false.
+    if (g_RC_wedgeKeepPorts) {
+        printf("[%s:%d] wedged trojan — keeping both exception ports alive and armed\n",
+               __FUNCTION__, __LINE__);
+        g_RC_firstExceptionPort = MACH_PORT_NULL;
+        g_RC_secondExceptionPort = MACH_PORT_NULL;
+    } else {
+        destroy_exception_port(g_RC_firstExceptionPort);
+        destroy_exception_port(g_RC_secondExceptionPort);
+    }
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1907,11 +1952,17 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
     remote_call_note_init_failure(RemoteCallInitFailureNone, 0);
     g_RC_vphoneBridge = false;
-    // A completed init is the only thing that puts the trojan thread back into a
-    // state worth hijacking, so both latches start clear here and nowhere else
-    // except the destroy path, which genuinely restores the original thread.
+    // crossingPoisoned clears here: a fresh trojan thread is a fresh subject, and
+    // refusing to talk to it would leave the overlay permanently dead.
+    //
+    // wedgeKeepPorts does NOT clear here. This runs before any new thread exists, so
+    // clearing it would disarm the catcher for a thread that is still parked on
+    // 0x401 inside SpringBoard from the previous session -- which init then walks
+    // past while scanning for a thread to hijack. Only destroy clears it, because
+    // destroy is the path that actually kills or restores the thread. The cost of
+    // holding it is two mach ports for the life of the process, which is nothing
+    // next to a SpringBoard that cannot be brought back without a respawn.
     g_RC_crossingPoisoned = false;
-    g_RC_wedgeKeepPorts = false;
 
     if (cyanide_vphone_debug_build() &&
         process && strcmp(process, "SpringBoard") == 0) {
