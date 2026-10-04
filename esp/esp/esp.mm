@@ -3859,6 +3859,21 @@ static inline uint64_t ESPPhaseNowUS(void) {
             bool needAttach = (Moudule_Base == (uint64_t)-1 || Moudule_Base == 0 ||
                                !ds_attached() || ds_pid() != s_attachedPid);
             if (needAttach) {
+                // needAttach can be true because the pid moved while ds is still
+                // attached to the OLD process. GameTargetModuleBase() used to
+                // short-circuit on ds_attached() and hand back the dead process's
+                // base, the success test below passed on it, and s_attachedPid was
+                // then set to that dead pid -- so needAttach went false and the ESP
+                // stayed wired to a process that no longer existed, for the rest of
+                // the session. Drop the attach first when the pid is not the one
+                // this loop last recorded; ds_detach() also drops the page cache
+                // and the degrade flag, both of which were populated against the
+                // process that just died.
+                if (ds_attached() && s_attachedPid != -1 && ds_pid() != s_attachedPid) {
+                    NSLog(@"[ESP] pid moved %d -> %d, dropping the attach on the old one",
+                          (int)s_attachedPid, (int)ds_pid());
+                    ds_detach();
+                }
                 if (s_reattachCooldown > 0) {
                     s_reattachCooldown--;
                 } else {
