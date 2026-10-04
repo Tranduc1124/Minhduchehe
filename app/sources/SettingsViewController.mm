@@ -16,29 +16,16 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 
 #import <SafariServices/SafariServices.h>
 
-// The bounds kexploit_opa334.m actually gates on. Parsed from the running OS
-// rather than hardcoded to a yes, so this row can disagree with the "Supported"
-// line above it and be the one that is right.
-//
-// Two mistakes are corrected here. It used to compare only the major component,
-// so 26.6.2 answered "supported" on `major >= 26` while the offsets it depends on
-// are gated on a numeric compare against 26.1 and refuse anything from 26.1 up --
-// the advertised line said "26.0-26.0.1", so the screen contradicted itself on
-// exactly the devices the range excludes. And 16.x is excluded: the advertised
-// range starts at 17.0, and kexploit's own condition is >=16.0 but <19.0, so
-// including it here would claim a device the app never lists.
-//
-// The comparison is NSNumericSearch on the whole version string, which is what
-// kexploit's SYSTEM_VERSION_* macros do, so this row and the code that gates the
-// exploit cannot drift apart by parsing differently.
+// The bounds kexploit_opa334.m actually gates on: 16.0 <= v < 19.0, or 26.0
+// and above. Parsed from the running OS rather than hardcoded to a yes, so
+// this row can disagree with the "Supported" line above it and be the one that
+// is right.
 static BOOL MDCurrentDeviceIsSupported(void) {
-    NSString *v = [[UIDevice currentDevice] systemVersion] ?: @"0";
-    NSComparisonResult r = [v compare:@"17.0" options:NSNumericSearch];
-    if (r == NSOrderedAscending) return NO;                 // below 17.0
-    if ([v compare:@"19.0" options:NSNumericSearch] == NSOrderedAscending) return YES;
-    // 19.x through 25.x are the gap the offsets refuse.
-    if ([v compare:@"26.0" options:NSNumericSearch] == NSOrderedAscending) return NO;
-    return [v compare:@"26.1" options:NSNumericSearch] == NSOrderedAscending;
+    NSString *version = [[UIDevice currentDevice] systemVersion] ?: @"0";
+    NSArray<NSString *> *parts = [version componentsSeparatedByString:@"."];
+    if (parts.count == 0) return NO;
+    NSInteger major = [parts.firstObject integerValue];
+    return (major >= 16 && major < 19) || (major >= 26);
 }
 
 typedef NS_ENUM(NSInteger, SettingsSection) {

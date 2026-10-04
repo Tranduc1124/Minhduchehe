@@ -477,11 +477,7 @@ bool GameTargetIsRunning(void) {
 }
 
 uintptr_t GameTargetModuleBase(void) {
-    // A base of zero counts as not attached. ds_attached() is a bare K(g_ff_task)
-    // and g_ff_task survives a failed ds_attach() -- see the note at the top of
-    // ds_attach -- so the old test made this function hand back a stale zero for
-    // the rest of the process without ever asking ds_attach() to try again.
-    if (!ds_attached() || ds_base() == 0) {
+    if (!ds_attached()) {
         // Throttled, not removed. The game not running is the normal state of
         // this app for most of its life, the ESP tick retries every 30 frames,
         // and an unthrottled NSLog here put two lines a second into the device
