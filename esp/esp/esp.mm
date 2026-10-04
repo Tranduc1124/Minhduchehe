@@ -4233,9 +4233,31 @@ static int      s_countTeamUnknown = 0;
     // Declared here rather than inside the flush block below, which runs after
     // this one and is reset by it when a match ends.
     static uint64_t s_lastMatchDiag = 0;
+    // The last matchGame this pass saw. This is the only one of the three
+    // pointers that can still be trusted at the boundary, and it is what makes
+    // the match -> match edge observable at all.
+    //
+    // match, camera and myPawnObject all hang off objects the game frees when it
+    // rebuilds the scene, and they are read through the page cache that is being
+    // invalidated, so they keep answering with the previous match. matchGame is
+    // reached through GameFacade's static_fields, which live in the binary's own
+    // data segment: nothing about a new match tears those down, so the pointer
+    // moves to the new game object while the old match object is still being
+    // served from the cache. That difference is the edge.
+    static uint64_t s_lastMatchGame = 0;
     {
         const bool live = isVaildPtr(match);
-        if (s_lastLiveMatch != 0 && !live) {
+        // Match -> match. The old edge below watches `match` going invalid, and at
+        // this boundary it never does: isVaildPtr is a range check, so a freed
+        // object still passes, and the read that produced it came from a mapping
+        // of the vm_object the game has already freed. So nothing fired, no page
+        // was dropped, and the next match was drawn out of the last match's
+        // memory -- the boxes moved because the camera moved, the counter held
+        // its number because it was the same stale dictionary, and nothing in the
+        // pipeline reported a problem because nothing in the pipeline was wrong.
+        const bool newGame = (isVaildPtr(matchGame) && s_lastMatchGame != 0 &&
+                              matchGame != s_lastMatchGame);
+        if (s_lastLiveMatch != 0 && (!live || newGame)) {
             const uint64_t left = s_lastLiveMatch;
             // First, while the mappings are still good: give the game back the
             // string pointers we replaced, so its teardown does not free memory it
@@ -4258,20 +4280,45 @@ static int      s_countTeamUnknown = 0;
             gAimLockLostFrames = 0;
             s_lockHoldFrames = 0;
             AimLockClear();
+            // The per-pawn trackers were not in this list. Each one self-heals on
+            // a pointer mismatch, so at match -> match -- where the pointers are
+            // still the old match's -- nothing about them resets.
+            // g_posTrack is the one that matters: it carries deadUntilFrame, which
+            // suppresses a pawn for up to 120 frames out of a hashed slot, so a
+            // new match's player can land in a slot the previous match marked dead
+            // and go invisible for the first couple of seconds.
+            //
+            // g_deadPawn and s_instFilt are function-local statics further down
+            // this file and cannot be reached from here. They are left alone
+            // deliberately: they would need hoisting to file scope, which is a
+            // larger change than this edge, and the symptom they cause is a short
+            // gap at the start of a match rather than data that never updates.
+            memset(g_posTrack, 0, sizeof(g_posTrack));
+            memset(g_playerCache, 0, sizeof(g_playerCache));
+            memset(g_aimMotion, 0, sizeof(g_aimMotion));
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
             s_lastLiveMatch = 0;
+            // Not reset here. The new match's matchGame is already in hand and
+            // is a different pointer from the one this edge was detected
+            // against, so clearing it would hide the fact that a swap just
+            // happened on the very frame the swap was noticed.
+            //
             // The plate and the names live on CAShapeLayers in SpringBoard that
             // keep whatever path they were last handed, and the publish that
             // clears them stops running the moment the ESP goes silent — which is
             // exactly what a match ending does. Without this the dark plate stays
             // on screen for the rest of the session.
             SBClearESPNameLayers();
-            NSLog(@"[PUSH-FLUSH] left match 0x%llx — page cache dropped, locks and names cleared",
-                  (unsigned long long)left);
+            NSLog(@"[PUSH-FLUSH] left match 0x%llx (matchGame 0x%llx -> 0x%llx) — "
+                  @"page cache dropped, locks and names cleared",
+                  (unsigned long long)left,
+                  (unsigned long long)s_lastMatchGame,
+                  (unsigned long long)matchGame);
         } else if (live) {
             s_lastLiveMatch = match;
         }
+        if (isVaildPtr(matchGame)) s_lastMatchGame = matchGame;
     }
 
     if (!isVaildPtr(matchGame)) {

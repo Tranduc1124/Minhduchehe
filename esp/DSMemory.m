@@ -657,7 +657,20 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
+        // The generation test is what makes ds_cache_bump_generation mean
+        // anything. It used to increment a counter that nothing consulted on the
+        // hit path, so a bump was a diagnostic label rather than an
+        // invalidation, and every mapping the previous match left behind kept
+        // being handed back: the slot matched on pageVA, the VA was still in
+        // range, and the frozen bytes came straight out of a freed vm_object.
+        //
+        // ds_flush_page_cache releases the slots outright, so it is the stronger
+        // of the two and the ESP calls both. This is the belt to that pair: a
+        // mapping that slips past the flush still cannot be served once the
+        // generation has moved, and a stale slot here is skipped rather than
+        // evicted, so the replacement is mapped on the normal miss path.
+        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr &&
+            g_pageCache[i].gen == g_cacheGeneration) {
             if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
             g_pageCache[i].lastUse = g_pageUseCounter++;
             // Stamped on every hit. This is what the TTL is measured against,
