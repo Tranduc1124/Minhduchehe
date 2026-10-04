@@ -4233,6 +4233,9 @@ static int      s_countTeamUnknown = 0;
     // Declared here rather than inside the flush block below, which runs after
     // this one and is reset by it when a match ends.
     static uint64_t s_lastMatchDiag = 0;
+    // The MatchGame pointer, which is what the flush below keys on. `match` is a
+    // recycled address and cannot be; see the block that uses this.
+    static uint64_t s_lastMatchGame = 0;
     {
         const bool live = isVaildPtr(match);
         if (s_lastLiveMatch != 0 && !live) {
@@ -4260,6 +4263,7 @@ static int      s_countTeamUnknown = 0;
             AimLockClear();
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
+            s_lastMatchGame = 0;
             s_lastLiveMatch = 0;
             // The plate and the names live on CAShapeLayers in SpringBoard that
             // keep whatever path they were last handed, and the publish that
@@ -4301,37 +4305,55 @@ static int      s_countTeamUnknown = 0;
     // pixels every frame because the data behind them is the same freed memory.
     // Report it rather than guess: staleGen > 0 means the cache crossed a match.
     {
-        // s_lastMatchDiag is declared above, at the match -> lobby transition,
-        // which resets it so this fires again for the next match.
-        if (match != s_lastMatchDiag) {
-            // Fire on the FIRST valid match of this attach, not only on a
-            // change. The previous attempt hung the flush off `match` changing
-            // and the 19:51 log proved it never fires: mt=0x13d66e800 was
-            // constant for the whole window, so zero [FLUSH] lines. Entering a
-            // match is exactly when the lobby's pages go stale, and right after
-            // it Unity rebuilds the address space, so this is the moment worth
-            // dropping every slot.
-            bool firstMatch = (s_lastMatchDiag == 0 && match != 0);
-            if (s_lastMatchDiag != 0 || firstMatch) {
-                // A page slot pins one shmem mapping made by the kernel remap.
-                // ds_page_local (DSMemory.m:430) re-serves that slot on a bare
-                // VA match, with no re-validation and no age. Once Unity reuses
-                // the physical page, every later read of that VA is a frozen
-                // snapshot. Releasing slots drops the shmem ports so the next
-                // read re-maps. Once per match only, never per frame: the
-                // comment at DSMemory.m:410 records that a full per-frame flush
-                // caused RW-lock panics, and this is deliberately not that.
-                DSPageCacheDiag before = ds_page_cache_diag();
-                ds_flush_page_cache();
-                DSPageCacheDiag after = ds_page_cache_diag();
-                NSLog(@"[PUSH-FLUSH] first=%d 0x%llx->0x%llx dropped live=%d stale=%d now live=%d",
-                      (int)firstMatch, (unsigned long long)s_lastMatchDiag,
-                      (unsigned long long)match,
-                      before.liveSlots, before.staleGen, after.liveSlots);
-                ds_cache_bump_generation();
-            }
-            s_lastMatchDiag = match;
+        // s_lastMatchDiag and s_lastMatchGame are declared above, at the match ->
+        // lobby transition, which resets them so this fires again for the next
+        // match.
+        //
+        // The trigger is matchGame, and `match` is the reason it was not before.
+        //
+        // `match` is a recycled address. When a match ends the game frees the
+        // Match object, and the next match's Match can land on the same VA, so
+        // `match` compares equal straight across the boundary and the whole block
+        // is skipped. That is measured, not guessed: the comment this replaces
+        // records that the previous attempt hung the flush off `match` changing
+        // and that "the 19:51 log proved it never fires" -- mt=0x13d66e800 was
+        // constant for the whole window with zero [PUSH-FLUSH] lines.
+        //
+        // A skipped flush is the whole bug. A page slot pins one shmem mapping
+        // made by the kernel remap, and ds_page_local re-serves that slot on a
+        // bare VA match with no re-validation and no age. So every mapping from
+        // the finished match keeps answering with the bytes it was taken with,
+        // the chain reads the lobby's values, getMatchGame returns 0, the lobby
+        // gate below trips, and both this block and the leave-edge detector above
+        // become unreachable. The ESP then never picks the next match up, for the
+        // rest of the session, and carries it into the match after that.
+        //
+        // matchGame is the head of that chain and is re-read every frame from the
+        // statics block, so it is what actually differs across a boundary.
+        //
+        // Once per match, never per frame: both keys are written below every frame
+        // this block is reached at all -- which is only past the lobby gate and the
+        // camera/match check above, so never in a lobby -- and firstMatch goes
+        // false the moment the keys are set. The DSMemory.m:410 note about per-frame
+        // flushes causing RW-lock panics still applies, and this does not become
+        // that: a changed matchGame is one flush, and the keys move immediately.
+        const bool firstMatch    = (s_lastMatchDiag == 0);
+        const bool newMatchGame  = (s_lastMatchGame != 0 && matchGame != s_lastMatchGame);
+        if (firstMatch || newMatchGame) {
+            DSPageCacheDiag before = ds_page_cache_diag();
+            ds_flush_page_cache();
+            DSPageCacheDiag after = ds_page_cache_diag();
+            NSLog(@"[PUSH-FLUSH] first=%d match 0x%llx->0x%llx matchGame 0x%llx->0x%llx "
+                  @"dropped live=%d stale=%d now live=%d",
+                  (int)firstMatch, (unsigned long long)s_lastMatchDiag,
+                  (unsigned long long)match,
+                  (unsigned long long)s_lastMatchGame,
+                  (unsigned long long)matchGame,
+                  before.liveSlots, before.staleGen, after.liveSlots);
+            ds_cache_bump_generation();
         }
+        s_lastMatchDiag = match;
+        s_lastMatchGame = matchGame;
         static CFTimeInterval s_cacheLog = 0;
         CFTimeInterval nowC = CACurrentMediaTime();
         if (nowC - s_cacheLog > 5.0) {
