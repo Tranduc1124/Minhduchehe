@@ -1859,6 +1859,92 @@ static inline int PosTrackSlot(uint64_t pawn) {
     return (int)(x % kPawnSlotCount);
 }
 
+// ---------------------------------------------------------------------------
+// One resolved aim bone per pawn per FRAME.
+//
+// Both resolvers are pure functions of the pawn's live transform chain, and the
+// chain is not cheap: getBoneTrans tries up to three node layouts and
+// getPositionExt then walks up to 64 parents, each level costing a TMatrix read
+// plus a parent-index read, every one of them a different page.
+//
+// The aim half of a frame used to ask for the same pawn's bone over and over.
+// Counting the call sites inside one renderESPWithBuffers call, for one target:
+// AimTargetStillValid is invoked three times (the pre-decision check, the silent
+// branch, the camera branch) and each invocation resolved the bone again; the
+// silent branch then resolved it once more for silentBone, once more for liveBone
+// with nothing in between that could change it, and thirty more times inside the
+// burst loop, one every fourth of 120 iterations; the camera branch resolved it
+// again for lookBone, and the fire-dir spoof resolved it twice more. That is
+// roughly forty resolutions of the SAME pawn inside one frame, on top of the
+// SilentAimThread doing an unbounded number of its own on another thread.
+//
+// Re-resolving inside a frame can only ever see the target move a couple of
+// centimetres, because a 120-iteration burst loop finishes in a millisecond or
+// two. What it does reliably see, once the per-pawn working set no longer fits the
+// page cache, is a miss on every one of those pages: a Clash Squad match resolves
+// all of it out of resident mappings, and a Survival match with fifty to a hundred
+// players re-maps the target's chain dozens of times per frame through
+// vm_map_remote_page, under the one lock the render loop is also blocked on. The
+// aim write is the LAST thing a frame does, so it is the first thing to slip past
+// its tick when that happens. The boxes, drawn in the middle of the frame, keep
+// working -- which is the reported shape of the bug.
+//
+// One slot is enough: every consumer in a frame is asking about the same bestTarget
+// with the same aimPosition.
+//
+// Scope: main queue only. Every call site replaced below sits inside
+// renderESPWithBuffers, which has one caller (updateFrame, main queue). The
+// SilentAimThread keeps calling the raw resolver, so nothing here is read or
+// invalidated from another thread. g_cacheFrameCounter is bumped once at the top of
+// every renderESPWithBuffers call, so it is the frame identity and needs no atomics.
+//
+// Deliberately NOT memoized: a resolve that came back zero or off-world. Caching a
+// failed read would turn "retry on the next call" into "retry never, this frame",
+// and every existing fallback chain depends on that retry.
+enum : int { kAimBoneSilent = 0, kAimBonePosMode = 1 };
+
+struct AimBoneMemo {
+    uint64_t pawn = 0;
+    Vector3 pos{};
+    int posMode = -1;
+    int kind = -1;
+    int frame = -1;
+};
+static AimBoneMemo s_aimBoneMemo{};
+
+static inline bool AimBoneMemoFrameHit(int kind, uint64_t pawn, int posMode) {
+    if (!isVaildPtr(pawn)) return false;
+    if (s_aimBoneMemo.frame != g_cacheFrameCounter) return false;
+    if (s_aimBoneMemo.kind != kind) return false;
+    if (s_aimBoneMemo.pawn != pawn) return false;
+    if (s_aimBoneMemo.posMode != posMode) return false;
+    return true;
+}
+
+static inline void AimBoneMemoStore(int kind, uint64_t pawn, int posMode, const Vector3 &p) {
+    if (!isVaildPtr(pawn)) return;
+    if (IsZeroVec(p) || !looksLikeWorldPos(p)) return; // never memoize a failed read
+    s_aimBoneMemo.pawn = pawn;
+    s_aimBoneMemo.pos = p;
+    s_aimBoneMemo.posMode = posMode;
+    s_aimBoneMemo.kind = kind;
+    s_aimBoneMemo.frame = g_cacheFrameCounter;
+}
+
+static inline Vector3 ResolveSilentAimWorldPosOnce(uint64_t pawn, int posMode) {
+    if (AimBoneMemoFrameHit(kAimBoneSilent, pawn, posMode)) return s_aimBoneMemo.pos;
+    Vector3 p = ResolveSilentAimWorldPos(pawn, posMode);
+    AimBoneMemoStore(kAimBoneSilent, pawn, posMode, p);
+    return p;
+}
+
+static inline Vector3 GetAimTargetPosModeOnce(uint64_t pawn, int posMode, float distance) {
+    if (AimBoneMemoFrameHit(kAimBonePosMode, pawn, posMode)) return s_aimBoneMemo.pos;
+    Vector3 p = GetAimTargetPosMode(pawn, posMode, distance);
+    AimBoneMemoStore(kAimBonePosMode, pawn, posMode, p);
+    return p;
+}
+
 static inline int PlayerCacheSlot(uint64_t pawn) {
     // Stable per-pawn slot so cache state (visGoodFrames, isTrueVis, etc.) survives
     // dict walk order changes and pawns temporarily leaving the processed set.
@@ -6012,11 +6098,21 @@ static int      s_countTeamUnknown = 0;
                 if (!inFront) canConsiderForAim = NO;
             }
 
+            if (!canConsiderForAim) continue;
+
+            // After the early-out, not before it. This is the LOS gate for one
+            // candidate, and in wall-off mode it is not a local computation:
+            // GameClearLosToEnemy walks the IceWall aim-assist list, up to 31
+            // candidate objects times two pointer reads each, plus the
+            // last-weapon-target read. Off-screen and behind-camera pawns -- most of
+            // them in a fifty to a hundred player match, where the ring is a few
+            // dozen pixels on a 390pt-tall viewport -- can never reach posLos: its
+            // only consumer is the bucket update further down, which is behind this
+            // continue. Nothing between the old and the new position reads it, so
+            // moving it is exactly equivalent for every candidate that survives.
             const bool posLos = allowThroughWall
                 ? true
                 : GameClearLosToEnemy(myPawnObject, PawnObject, aimPos);
-
-            if (!canConsiderForAim) continue;
 
             float deltaX = 0.f, deltaY = 0.f, distSq = 0.f;
             if (inFront) {
@@ -6223,7 +6319,7 @@ static int      s_countTeamUnknown = 0;
         if (rawBestTarget == gAimLockTarget) {
             Vector3 lb = rawBestHead;
             if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
-                lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
+                lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
             }
             const bool liveLos = allowThroughWall
                 ? true
@@ -6238,7 +6334,7 @@ static int      s_countTeamUnknown = 0;
         } else if (bestLosTarget == gAimLockTarget) {
             Vector3 lb = bestLosHead;
             if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
-                lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
+                lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
             }
             const bool liveLos = allowThroughWall
                 ? true
@@ -6271,7 +6367,7 @@ static int      s_countTeamUnknown = 0;
             const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
             if (!lhpBad && (lhp > 0) && !(isAimIgnoreKnock && lknock) &&
                 !(isAimIgnoreBot && get_IsBot(gAimLockTarget))) {
-                Vector3 lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
+                Vector3 lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
                 if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
                     if (hasLiveHead) lb = liveHeadTarget;
                 }
@@ -6441,9 +6537,15 @@ static int      s_countTeamUnknown = 0;
         if (hp > 2000 || (maxHp > 0 && hp > maxHp + 50)) return false;
         if (isAimIgnoreKnock && knocked) return false;
         if (isAimIgnoreBot && get_IsBot(pawn)) return false;
+        // Memoized. This lambda runs three times per frame on the same pawn (the
+        // pre-decision check, the silent branch, the camera branch) and the bone it
+        // resolves is the same point all three times. What is NOT memoized, and must
+        // not be, is the liveness gate above it: liveHeadCheck is a live
+        // getPositionExt(getHead(pawn)) on every call, so a pawn that dies
+        // mid-frame is still caught. Only the redundant re-walk of the chain goes.
         Vector3 bone = (useSilent && !isAimbot && !useAssist)
-            ? ResolveSilentAimWorldPos(pawn, aimPosition)
-            : GetAimTargetPosMode(pawn, aimPosition, bestDistance);
+            ? ResolveSilentAimWorldPosOnce(pawn, aimPosition)
+            : GetAimTargetPosModeOnce(pawn, aimPosition, bestDistance);
         if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
             Vector3 liveHead = getPositionExt(getHead(pawn));
             if (looksLikeWorldPos(liveHead)) bone = liveHead;
@@ -6638,14 +6740,18 @@ static int      s_countTeamUnknown = 0;
     // Honor AimPos — never force head when Neck/Body selected.
     if (silentActive && bestTarget != 0 && AimTargetStillValid(bestTarget) &&
         (allowThroughWall || AimTargetVisibleStrictForSilent(bestTarget))) {
-        Vector3 silentBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+        Vector3 silentBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
         if (!IsZeroVec(silentBone) && bestDistance >= 0.15f) {
             SilentAimSetTarget(myPawnObject, bestTarget, silentBone, myLocation, aimPosition);
             s_lastAimPawn = bestTarget;
             bestHeadPos = silentBone;
 
             // Live AimPos bone only (no lead) — prediction was landing a head-width off.
-            Vector3 liveBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+            // One resolve for the frame. This line used to repeat the resolve
+            // immediately above it, and the burst loop below used to repeat it
+            // another thirty times, for a target that cannot move more than a couple
+            // of centimetres while 120 bursts are written.
+            Vector3 liveBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
             if (IsZeroVec(liveBone)) liveBone = silentBone;
             {
                 std::lock_guard<std::mutex> lk(g_silentMtx);
@@ -6655,7 +6761,7 @@ static int      s_countTeamUnknown = 0;
             const int bursts = silentFireWindow ? 120 : 4;
             for (int burst = 0; burst < bursts; burst++) {
                 if ((burst & 3) == 0) {
-                    Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+                    Vector3 h2 = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
                     if (!IsZeroVec(h2) && looksLikeWorldPos(h2)) {
                         liveBone = h2;
                         std::lock_guard<std::mutex> lk(g_silentMtx);
@@ -6688,9 +6794,9 @@ static int      s_countTeamUnknown = 0;
             update_aim_assist_legit_tuning(false);
         } else {
             // LookAt uses AimPos bone (Head/Neck/Chest) for FOV / 180 / 360.
-            Vector3 lookBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+            Vector3 lookBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
             if (IsZeroVec(lookBone) || !looksLikeWorldPos(lookBone))
-                lookBone = GetAimTargetPosMode(bestTarget, aimPosition, bestDistance);
+                lookBone = GetAimTargetPosModeOnce(bestTarget, aimPosition, bestDistance);
             if (IsZeroVec(lookBone) || !looksLikeWorldPos(lookBone)) {
                 // Last resort only — still prefer mode-aware head drop over pure skull for body.
                 lookBone = ResolveAimHeadWorldPos(bestTarget);
@@ -6783,15 +6889,15 @@ static int      s_countTeamUnknown = 0;
                     ZeroWeaponScatterForAim(myPawnObject);
                     Vector3 fromNow = AimCameraOrigin(myPawnObject, myLocation);
                     // Fire-dir spoof follows AimPos (Head/Neck/Body) — do not force skull.
-                    Vector3 hit = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+                    Vector3 hit = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
                     if (IsZeroVec(hit) || !looksLikeWorldPos(hit))
-                        hit = GetAimTargetPosMode(bestTarget, aimPosition, bestDistance);
+                        hit = GetAimTargetPosModeOnce(bestTarget, aimPosition, bestDistance);
                     if (IsZeroVec(hit) || !looksLikeWorldPos(hit))
                         hit = bestHeadPos;
                     bestHeadPos = hit;
                     for (int i = 0; i < 3; i++) {
                         if (i == 0) {
-                            Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+                            Vector3 h2 = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
                             if (!IsZeroVec(h2) && looksLikeWorldPos(h2)) hit = h2;
                         }
                         AimSyncFireHit(myPawnObject, fromNow, hit);
