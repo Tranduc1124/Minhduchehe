@@ -445,6 +445,13 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // transactions keeps the port deallocations apart in time.
 #define DS_MAX_EVICT_PER_TXN 4
 
+// How stale a mapping is allowed to get before it is checked against the game's
+// own map. One second is an arbitrary compromise, and a much smaller number than
+// DS_PAGE_TTL_MS on purpose: the TTL is a cost knob for mappings we have no
+// reason to doubt, this one is a correctness check, and a second of exposure is
+// one second of drawing the previous match.
+#define DS_VMO_VERIFY_MS 1000ULL
+
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
@@ -460,6 +467,10 @@ static struct {
     // the pages that are demonstrably alive alone.
     uint64_t lastUseMs;
     uint64_t gen;      // match generation this mapping was taken under
+    // The vm_object this mapping was taken under, and the last time that was
+    // compared against what the game's map says now. See ds_lookup_page_vmo.
+    uint64_t vmo;
+    uint64_t lastVerifyMs;
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
@@ -472,6 +483,14 @@ static int g_pageCacheNext = 0;
 // flushes so a rate never goes negative.
 static uint64_t g_dsRemapCount = 0;
 static uint64_t g_dsEvictCount = 0;
+// Mappings dropped because the game's map said they were backed by a different
+// vm_object than the one they were taken under. A non-zero value means stale
+// mappings from a torn-down address space were really being served.
+static uint64_t g_dsStaleEvictCount = 0;
+// Slots whose backing object the map would not resolve, so the check above could
+// not arm on them. Should be a small fraction of remaps; if it is not, the
+// stale-drop is only covering part of the cache.
+static uint64_t g_dsVmoBlindCount = 0;
 // Recursive: begin/end txn + ds_page_local nest like Fl0rk NSRecursiveLock.
 static pthread_mutex_t g_pageCacheLock;
 static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
@@ -532,6 +551,8 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].bornMs = 0;
     g_pageCache[i].lastUseMs = 0;
     g_pageCache[i].gen = 0;
+    g_pageCache[i].vmo = 0;
+    g_pageCache[i].lastVerifyMs = 0;
     g_pageCache[i].useCount = 0;
 }
 
@@ -603,16 +624,50 @@ void ds_end_read_transaction(void) {
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu",
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
-                  (unsigned long long)evictDelta);
+                  (unsigned long long)evictDelta,
+                  (unsigned long long)g_dsStaleEvictCount,
+                  (unsigned long long)g_dsVmoBlindCount);
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;
             s_lastEvictCount = g_dsEvictCount;
         }
     }
     ds_unlock();
+}
+
+// Which vm_object backs this page right now, by the game's own map.
+//
+// Deliberately does not read or write g_cached_entry. That cache exists to keep
+// ds_translate_page cheap and it never expires, which makes it worse than
+// useless here: asked about a page the game has already freed, it would hand
+// back the object that was freed, the comparison would match, and the check
+// would confirm the exact thing it exists to catch. The point of asking is to
+// ask fresh, so the walk below is a walk from the top of the map every time.
+//
+// Zero means "cannot tell", which is also what a page the game has unmapped
+// looks like. Callers treat that the same way, and pay a remap for it, because
+// being wrong in that direction costs a mapping and being wrong the other way
+// costs the read.
+static uint64_t ds_lookup_page_vmo(uint64_t page_va) {
+    if (!K(g_ff_task)) return 0;
+    page_va &= ~PAGE_MASK;
+
+    uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
+    uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
+    uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
+
+    for (uint32_t i = 0; i < nentries && K(e); i++) {
+        uint64_t s = kread64(e + E_START);
+        uint64_t t = kread64(e + E_END);
+        if (page_va >= s && page_va < t) {
+            return kread_ptr(e + E_OBJECT);
+        }
+        e = kread_ptr(e + off_vm_map_entry_links_next);
+    }
+    return 0;
 }
 
 // Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
@@ -671,6 +726,45 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         // evicted, so the replacement is mapped on the normal miss path.
         if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr &&
             g_pageCache[i].gen == g_cacheGeneration) {
+            // The generation test above is a guess about *when* the previous
+            // match's mappings died: it can only fire if something bumps it, at
+            // the right moment, and the frame matchGame happens to move is not
+            // that moment — the scene is mid-teardown then, and the pages mapped
+            // from it belong to an address space already being destroyed and
+            // about to be reused. That is why the same transition worked some
+            // matches and not others.
+            //
+            // This is the check of whether the guess was right, asked of the
+            // only party that knows. vm_map_entry carries the vm_object a page
+            // is backed by, and the game changes it when it frees that memory
+            // and hands the address out again. Compare it against the value
+            // recorded when this mapping was taken and a leftover from a dead
+            // address space cannot be served, whichever generation it was
+            // filed under.
+            //
+            // Once a second per slot, not per hit: the walk is real kernel work
+            // and this path runs dozens of times a frame. Once a second is well
+            // inside the window a teardown takes, and the cost lands off the
+            // per-frame read path for slots nobody is reading.
+            const uint64_t tVerify = ds_now_ms();
+            if (g_pageCache[i].vmo != 0 &&
+                tVerify - g_pageCache[i].lastVerifyMs >= DS_VMO_VERIFY_MS) {
+                g_pageCache[i].lastVerifyMs = tVerify;
+                if (ds_lookup_page_vmo(pageVA) != g_pageCache[i].vmo) {
+                    static uint32_t s_staleLogged = 0;
+                    if (s_staleLogged < 4) {
+                        s_staleLogged++;
+                        NSLog(@"[DS] STALE mapping dropped: page=0x%llx was backed by "
+                              @"vmo=0x%llx, map says 0x%llx now",
+                              (unsigned long long)pageVA,
+                              (unsigned long long)g_pageCache[i].vmo,
+                              (unsigned long long)ds_lookup_page_vmo(pageVA));
+                    }
+                    g_dsStaleEvictCount++;
+                    ds_release_page_slot_locked(i);
+                    break;   // out of the hit test, onto the normal miss path
+                }
+            }
             if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
             g_pageCache[i].lastUse = g_pageUseCounter++;
             // Stamped on every hit. This is what the TTL is measured against,
@@ -705,6 +799,15 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         if (victim < 0) victim = g_pageCacheNext % DS_PAGE_CACHE_SLOTS;
     }
 
+    // Read the object first, remap second. The order is what makes the recorded
+    // value safe to trust: if the game frees this memory in between, we end up
+    // holding a mapping taken under the old object and a vmo read from the new
+    // one, the check on the hit path sees them disagree and drops the mapping.
+    // Read after the remap and the same race lands the other way — a mapping
+    // taken under the freed object, filed under the vmo that replaced it, and
+    // then nothing in the cache would ever question it again.
+    const uint64_t vmo = ds_lookup_page_vmo(pageVA);
+
     // Hold lock through remap — Fl0rk does not drop lock around map.
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
@@ -731,7 +834,22 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
     g_pageCache[victim].gen = g_cacheGeneration;
+    g_pageCache[victim].vmo = vmo;
+    g_pageCache[victim].lastVerifyMs = 0;   // verify on the next hit, not now
     g_pageCache[victim].useCount = 1;
+    // A zero vmo is the one case where the hit-path check cannot arm itself: it
+    // has nothing to compare against, so it skips the slot for good. Counting it
+    // is the difference between "the stale-drop fired" and "the stale-drop was
+    // never watching", which read the same on screen otherwise.
+    if (vmo == 0) {
+        g_dsVmoBlindCount++;
+        static uint32_t s_blindLogged = 0;
+        if (s_blindLogged < 4) {
+            s_blindLogged++;
+            NSLog(@"[DS] blind slot: map did not resolve an object for page=0x%llx "
+                  @"— stale check cannot arm on it", (unsigned long long)pageVA);
+        }
+    }
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     g_pageCache[victim].bornMs = ds_now_ms();
     g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;

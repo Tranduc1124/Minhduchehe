@@ -4245,6 +4245,30 @@ static int      s_countTeamUnknown = 0;
     // moves to the new game object while the old match object is still being
     // served from the cache. That difference is the edge.
     static uint64_t s_lastMatchGame = 0;
+    // Keep dropping mappings until the next match is actually playable.
+    //
+    // The single flush below lands on the first frame matchGame moves, and that
+    // frame is the middle of the scene teardown: the pages mapped right then
+    // belong to an address space that is being destroyed and whose blocks the
+    // game is about to reuse. They are not stale when they are mapped, they are
+    // about to be, and the cache will not let go of them on its own. That is
+    // why the same transition works sometimes and does not others — it depends
+    // on whether the blocks that happened to be mapped during the teardown
+    // window are the ones the game frees afterwards.
+    //
+    // 500ms, at most 3s, so at most six flushes per transition. Not per frame:
+    // DSMemory.m records that a per-frame flush caused "Taking non-sleepable RW
+    // lock" panics. stats.inMatch is still false on the frames that return early
+    // at the lobby and loading checks, which is the window that needs it, and
+    // the window closes itself on the first frame that reaches the dictionary
+    // check with entries in it.
+    //
+    // This is a liveness net behind the mapping check in ds_page_local, not the
+    // mechanism. That one is self-detecting; this one only matters for the slots
+    // where the check could not arm itself, and it covers them whether or not
+    // anyone can tell which those were.
+    static uint64_t s_flushUntilUS = 0;
+    static uint64_t s_nextFlushUS  = 0;
     {
         const bool live = isVaildPtr(match);
         // Match -> match. The old edge below watches `match` going invalid, and at
@@ -4265,6 +4289,9 @@ static int      s_countTeamUnknown = 0;
             RainbowNameDetach();
             ds_flush_page_cache();
             ds_cache_bump_generation();
+            // Not a one-shot, and the reason is written at the declaration.
+            s_flushUntilUS = ESPPhaseNowUS() + 3000000ULL;   // 3s
+            s_nextFlushUS  = 0;
             // The count is a table of pawn pointers with a frame hold; a pawn from
             // the match that just ended is not a live enemy in the lobby.
             s_espCountN = 0;
@@ -4319,6 +4346,23 @@ static int      s_countTeamUnknown = 0;
             s_lastLiveMatch = match;
         }
         if (isVaildPtr(matchGame)) s_lastMatchGame = matchGame;
+    }
+
+    // The repeat net armed by the reset above, declared up there with the reset.
+    // 500ms, not per frame: DSMemory.m records that a per-frame flush caused
+    // "Taking non-sleepable RW lock" panics, and six calls per transition buys
+    // the same coverage for a hundredth of the lock traffic.
+    if (s_flushUntilUS != 0) {
+        if (stats.inMatch) {
+            s_flushUntilUS = 0;
+        } else {
+            const uint64_t tFlush = ESPPhaseNowUS();
+            if (tFlush >= s_nextFlushUS) {
+                ds_flush_page_cache();
+                ds_cache_bump_generation();
+                s_nextFlushUS = tFlush + 500000ULL;      // 500ms
+            }
+        }
     }
 
     if (!isVaildPtr(matchGame)) {
