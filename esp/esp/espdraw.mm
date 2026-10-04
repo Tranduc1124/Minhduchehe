@@ -413,6 +413,27 @@ static void ESPRenderPawnCore(
     const CGFloat barH   = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
     const CGFloat barGap = 3.0f;       // đáy thanh lên khỏi đỉnh box
 
+    // Chiều dài thanh máu ở đầy máu, và chiều cao cố định của card tên.
+    //
+    // Cả hai đặt ở đây vì ba chỗ phải agree: thanh máu dùng nó làm chiều dài,
+    // card tên dùng chính chiều dài đó làm bề rộng, và bề cao card phải giữ
+    // đúng con số này. Một số viết ở ba nơi là một số sẽ được sửa một lần.
+    //
+    // barFullLen dài hơn boxWidth một chút. Trước đây nó bằng đúng boxWidth, tức
+    // thanh dài y hệt cạnh box và đọc ra như một đường viền dưới thay vì một
+    // thanh. Không có nền sau thanh nên kéo dài ra không vỡ gì: chỉ là rect xanh
+    // dài thêm.
+    const CGFloat barFullLen = boxWidth * 1.18f;
+
+    // Bề cao card tên: CỐ ĐỊNH, không theo khoảng cách.
+    //
+    // Trước đây plateH = dynFontSize * 0.86 + 4, và dynFontSize là
+    // clamp(350/dis, 4.5, 10) — tức bề cao card tăng lên khi đến gần và nhỏ đi
+    // khi lùi xa. Đó là điều không mong muốn: cùng một cái tên thì card phải
+    // luôn cao bằng nhau, người đọc không phải nhìn xem thẻ nào to thẻ nào nhỏ.
+    // Sửa ở đây chứ không sửa chỗ dùng, vì còn hai chỗ nữa phải theo.
+    const CGFloat kPlateHeight = 11.0f;
+
     // ---------------------------------------------------------
     // BONE — bỏ hẳn.
     //
@@ -519,8 +540,11 @@ static void ESPRenderPawnCore(
         // text. 0.86 is small enough to read as secondary and large enough to
         // stay legible at the far end where dynFontSize is already at its 4.5
         // floor and the whole tag is three characters.
-        const CGFloat nameSize = dynFontSize * 0.86f;
-        const CGFloat lineH = nameSize + 4.0f;
+        // Clamped to fit the fixed card. Without the clamp a close target gets
+        // nameSize 8.6 against an 11pt card and the glyphs run out through the
+        // bottom, which is the overflow the fixed height would otherwise trade in.
+        const CGFloat nameSize = fminf(dynFontSize * 0.86f, kPlateHeight - 4.0f);
+        const CGFloat lineH = kPlateHeight;
 
         // The plate covers the NAME only. The distance is not on it and does not
         // have a background at all, because the distance belongs under the feet
@@ -536,18 +560,21 @@ static void ESPRenderPawnCore(
         // number cannot drift away from the bar.
         const CGFloat plateBottom = y - barGap - barH;
 
-        // Width is boxWidth so the plate does not shrink when the health drops,
-        // with a floor on top of that, because boxWidth itself shrinks with range
-        // and at the far end it is about four points wide. A plate four points
-        // wide cannot hold a name at any point size, so the name was being drawn
-        // outside its own background. The floor is estimated from the character
-        // count rather than a measured advance, because measuring means laying the
-        // string out first and the plate has to exist before the glyphs go in.
-        // 0.62em per character plus a four point gutter either side, never below
-        // boxWidth, so the health-scaling rule still holds.
+        // Width is barFullLen -- the health bar's full length, not its health-
+        // scaled fill and not boxWidth -- so the card sits exactly as wide as the
+        // bar it belongs to. Anchored on the bar's left edge (x) for the same
+        // reason, and grown symmetrically so the bar and the card share a centre.
+        //
+        // The charsW floor stays. It is not a contradiction of "as wide as the
+        // bar": at range the bar is a few points long and a name cannot be drawn
+        // inside that at any point size, so the card grows only when the name
+        // genuinely does not fit and never shrinks below the bar. Estimated from
+        // the character count rather than a measured advance, because measuring
+        // means laying the string out first and the card has to exist before the
+        // glyphs go in.
         const CGFloat charsW = (CGFloat)plateName.length * nameSize * 0.62f + 8.0f;
-        const CGFloat plateW = (boxWidth > charsW) ? boxWidth : charsW;
-        const CGRect plate = CGRectMake(x - (plateW - boxWidth) * 0.5f,
+        const CGFloat plateW = (barFullLen > charsW) ? barFullLen : charsW;
+        const CGRect plate = CGRectMake(x - (plateW - barFullLen) * 0.5f,
                                         plateBottom - plateH, plateW, plateH);
 
         // CGPathAddRect, not CGPathAddEllipseInRect: four distinct corners is
@@ -608,12 +635,13 @@ static void ESPRenderPawnCore(
     // đẹp nhất trong ba giá trị thử; không phải thanh to thêm, chỉ dời lên.
     //
     // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung, và nó là
-    // thứ duy nhất ở đây co lại được: nền xám của tên cố ý dùng boxWidth
-    // chứ không dùng barW, xem phần NAME PLATE.
+    // thứ duy nhất ở đây co lại được: nền xám của tên cố ý dùng barFullLen —
+    // chiều dài ĐẦY của thanh — chứ không dùng barW, để card không co theo
+    // lượng máu. Xem phần NAME PLATE.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barW = boxWidth * healthRatio;
+        const CGFloat barW = barFullLen * healthRatio;
         const CGFloat barTop = y - barGap - barH;
 
         CGPathAddRect(buffers->hpFillGreenPath, NULL,
