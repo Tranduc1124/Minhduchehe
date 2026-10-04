@@ -1328,7 +1328,23 @@ struct AimMotionTrack {
     bool valid = false;
 };
 
-static AimMotionTrack g_aimMotion[96];
+// Slot count shared by EVERY per-pawn table in this file, and the modulus used to
+// index them. One name for both: they used to be separate bare literals repeated in
+// ten places, and nothing stopped them disagreeing.
+//
+// 96 was sized for a Clash Squad lobby. A Survival lobby does not fit in it -- with
+// 100 pawns in 96 slots the expected number of colliding pairs is C(100,2)/96 =
+// 51.6, so 64 of the 100 pawns share a slot with another, and a colliding pair is
+// in a PERMANENT per-frame cache miss because the slot's identity is written after
+// the lookup that reads it. At 1024 that is 4.83 pairs.
+//
+// This does not make collisions impossible, only rare: a 100-pawn lobby has no
+// collision at all with probability exp(-4.8), about 0.8%. It is a tenfold
+// improvement, not a cure, and the cure for the remaining residue is not a table
+// size -- see the note where s_countTeamUnknown is printed.
+static constexpr int kPawnSlotCount = 1024;
+
+static AimMotionTrack g_aimMotion[kPawnSlotCount];
 
 static AimMotionTrack *AimMotionSlot(uint64_t pawn) {
     if (pawn == 0) return nullptr;
@@ -1396,8 +1412,8 @@ static Vector3 AimTrackAndLeadEx(uint64_t pawn, Vector3 bodyPos, float distanceM
     };
 
     // Low-pass the instantaneous samples before EMA (kills animation jitter).
-    static Vector3 s_instFilt[96] = {};
-    int slot = (int)(pawn % 96);
+    static Vector3 s_instFilt[kPawnSlotCount] = {};
+    int slot = (int)(pawn % kPawnSlotCount);
     Vector3 &filt = s_instFilt[slot];
     if (filt.x == 0.f && filt.z == 0.f) {
         filt = inst;
@@ -1801,7 +1817,7 @@ struct PlayerCache {
     int frame = 0;
 };
 
-static PlayerCache g_playerCache[96];
+static PlayerCache g_playerCache[kPawnSlotCount];
 static int g_cacheFrameCounter = 0;
 
 // Sticky ESP/aim world pos.
@@ -1826,7 +1842,7 @@ struct PosTrack {
     bool hasHead = false;
     bool hasHip = false;
     bool isBot = false;
-    // Death hold tied to exact pawn (avoids %96 collisions with s_deadPawn buckets)
+    // Death hold tied to exact pawn (avoids kPawnSlotCount bucket collisions)
     int deadUntilFrame = 0;
     // Canonical body length (world) learned from good live head<->hip pairs; stabilizes box height
     float bodyLen = 0.f;
@@ -1836,11 +1852,11 @@ struct PosTrack {
     int lastHeadSrcDisp = 0;
     int lastHipSrcDisp = 0;
 };
-static PosTrack g_posTrack[96];
+static PosTrack g_posTrack[kPawnSlotCount];
 
 static inline int PosTrackSlot(uint64_t pawn) {
     uint64_t x = pawn ^ (pawn >> 17) ^ (pawn << 7);
-    return (int)(x % 96ull);
+    return (int)(x % kPawnSlotCount);
 }
 
 static inline int PlayerCacheSlot(uint64_t pawn) {
@@ -1952,7 +1968,7 @@ struct BoxScreenTrack {
     float topY = 0.f;
     bool has = false;
 };
-static BoxScreenTrack g_boxScr[96];
+static BoxScreenTrack g_boxScr[kPawnSlotCount];
 
 static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
                                    float &boxH, float &boxW) {
@@ -1961,10 +1977,11 @@ static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
     //   offset     the minimum follow factor is 0.55, so the box converges on the
     //              true position asymptotically and never reaches it. A moving
     //              player is drawn permanently behind where they are.
-    //   wrong      the track table has 96 slots indexed by pawn % 96. Two
-    //              different pawns collide, the t.pawn check resets on each
-    //              collision, and the box alternates between the two players'
-    //              remembered state, which reads as boxes jumping around.
+    //   wrong      the track table has kPawnSlotCount slots indexed by a pawn
+    //              hash. Two different pawns collide, the t.pawn check resets on
+    //              each collision, and the box alternates between the two
+    //              players' remembered state, which reads as boxes jumping
+    //              around.
     //   stale      the table is static and is never cleared on a match change,
     //              so a new pawn landing on a recycled address inherits the old
     //              one's size.
@@ -1977,7 +1994,7 @@ static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
 
 #if 0
     if (pawn == 0 || boxH < 1.f || boxW < 1.f) return;
-    BoxScreenTrack &t = g_boxScr[pawn % 96ull];
+    BoxScreenTrack &t = g_boxScr[pawn % kPawnSlotCount];
     if (t.pawn != pawn || !t.has) {
         t.pawn = pawn;
         t.h = boxH; t.w = boxW; t.cx = centerX; t.topY = topY;
@@ -2008,7 +2025,7 @@ static inline void SmoothBoxScreen(uint64_t pawn, float &topY, float &centerX,
 
 static inline void ClearBoxScreenForPawn(uint64_t pawn) {
     if (pawn == 0) return;
-    BoxScreenTrack &t = g_boxScr[pawn % 96ull];
+    BoxScreenTrack &t = g_boxScr[pawn % kPawnSlotCount];
     if (t.pawn == pawn) t = BoxScreenTrack{};
 }
 
@@ -4859,15 +4876,36 @@ static int      s_countTeamUnknown = 0;
         // ---- Ghost ESP filter (do not invent alive players) ----
         // Sticky death: once fully dead/unreadable, suppress longer so free-list
         // dict entries + sticky PosTrack cannot reappear as floating ESP/aim.
-        static uint64_t s_deadPawn[96] = {};
-        static int s_deadUntilFrame[96] = {};
-        const int deadSlot = (int)(PawnObject % 96ull);
-        if (s_deadPawn[deadSlot] == PawnObject && g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
-            continue;
+        static uint64_t s_deadPawn[kPawnSlotCount] = {};
+        static int s_deadUntilFrame[kPawnSlotCount] = {};
+        const int deadSlot = (int)(PawnObject % kPawnSlotCount);
+
+        // Lift the ban the moment this pawn reads as alive. This is the actual bug,
+        // and it is not a collision problem -- the test below compares the pointer,
+        // so a colliding live pawn was never suppressed by a colliding tombstone,
+        // at 96 slots or at 1024. What does suppress a live pawn is address reuse:
+        // a pawn dies, the game frees it, the allocator hands the SAME address to
+        // the next player it spawns, and now s_deadPawn[deadSlot] == PawnObject is
+        // true again for someone demonstrably alive. It then stays suppressed for
+        // the rest of the 120-frame hold, about two seconds, with no table size in
+        // the world that changes it.
+        //
+        // The hold itself is deliberate and stays -- it is what stops a free-list
+        // dict entry from reappearing as floating ESP or a floating aim target.
+        // What was missing is the way out. The sibling has exactly this, keyed on
+        // HP being positive; there was no counterpart here, so a revived address
+        // had nothing to lift the ban.
+        if (s_deadPawn[deadSlot] == PawnObject) {
+            if (CurHP > 0 && MaxHP > 0) {
+                s_deadUntilFrame[deadSlot] = 0;
+            } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
+                continue;
+            }
         }
         auto markGhostDead = [&](int holdFrames) {
-            // Tombstone inside PosTrack by exact pawn (not just %96 bucket).
-            // This prevents the same pawn (or a colliding %96 occupant) from reviving
+            // Tombstone inside PosTrack by exact pawn (not just the
+            // kPawnSlotCount bucket). This prevents the same pawn (or a colliding
+            // bucket occupant) from reviving
             // smoothing/track state for a hold window even if dict still yields the pointer.
             PosTrack &trDead = g_posTrack[PosTrackSlot(PawnObject)];
             trDead.pawn = PawnObject;
