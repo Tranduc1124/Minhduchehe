@@ -670,45 +670,64 @@ static uint64_t ds_lookup_page_vmo(uint64_t page_va) {
     return 0;
 }
 
+// True while reads are paused after a run of failed remaps, and lifts the pause
+// itself once the cooldown has passed.
+//
+// This has to be the only way anything tests the pause, and the reason is the
+// bug it replaces. The recovery used to live inside ds_page_local, while
+// ds_rw_remap and ds_read_uncached both returned on the raw flag before they
+// ever called it — so the one piece of code that could lift the pause was the
+// one piece of code the pause made unreachable. The cooldown was 250ms and the
+// flag stayed set for the rest of the session.
+//
+// Three failed vm_map_remote_page calls is not an exceptional moment under a
+// match's allocation rate; it is a normal one. Hitting it blinded every read in
+// the process: the dictionary, the HP pool, the bones, all zero. What stayed on
+// screen was the last frame published before it, which is indistinguishable from
+// stale data — the boxes held their positions, the counter held its number, and
+// the log showed nothing but a degrade line that reads like a decision. That is
+// the whole of the reported "sometimes it picks up the match, sometimes it
+// does not": the frame that stayed up was whichever one had been published
+// before the reads stopped.
+//
+// The note this replaces claimed ds_flush_page_cache also lifted it. It never
+// did — that function contains no reference to the flag. Only ds_detach did,
+// and ds_detach runs on a pid change. The belief was written down, repeated,
+// and wrong, which is most of how it survived.
+//
+// Takes the lock rather than assuming it is held: ds_read_uncached tests the
+// flag before it locks, ds_page_local holds it already. It is recursive.
+static bool ds_degraded_paused(void) {
+    if (!g_degraded) return false;
+    if (ds_now_ms() < g_degradedUntilMs) return true;
+
+    ds_lock();
+    g_degraded = false;
+    g_consecutiveMapFailures = 0;
+    // A mapping the kernel no longer honours is the likeliest reason the remap
+    // failed in the first place, and keeping it is what made the next attempt
+    // fail too. So the cache goes, on the way back in.
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        ds_release_page_slot_locked(i);
+    }
+    g_pageCacheNext = 0;
+    g_recentCount = 0;
+    g_dsRemapCount++;
+    g_dsRecoverCount++;
+    NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
+    ds_unlock();
+    return false;
+}
+
 // Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
 // Unlocking before vm_map_remote_page raced kwrite_zone_element →
 // "Taking non-sleepable RW lock with preemption enabled".
 static uint64_t ds_page_local(uint64_t pageVA) {
     ds_lock();
 
-    if (g_degraded) {
-        // A cooldown, not a latch.
-        //
-        // This used to stay true until something called ds_detach or
-        // ds_flush_page_cache, and ds_detach only runs on a pid change. So three
-        // failed vm_map_remote_page calls — which is three pages the kernel would
-        // not hand over, and under a match's allocation rate that is a normal
-        // moment, not an exception — blinded every read in the process: ds_rw_remap
-        // and ds_read_uncached both return false on g_degraded, so the player
-        // dictionary, the HP pool and the bones all read as zero.
-        //
-        // That is the reported instability exactly: it works, then after a while
-        // in the same match the targets stop being found, and it stays that way
-        // until the session is restarted. Nothing in the log said why, because the
-        // degrade line is the only trace and it reads like a deliberate decision.
-        //
-        // Dropping the page cache on the way in is the other half: a mapping the
-        // kernel no longer honours is the likeliest reason the remap failed, and
-        // keeping it is what made the next attempt fail too.
-        if (ds_now_ms() < g_degradedUntilMs) {
-            ds_unlock();
-            return 0;
-        }
-        g_degraded = false;
-        g_consecutiveMapFailures = 0;
-        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-            ds_release_page_slot_locked(i);
-        }
-        g_pageCacheNext = 0;
-        g_recentCount = 0;
-        g_dsRemapCount++;
-        g_dsRecoverCount++;
-        NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
+    if (ds_degraded_paused()) {
+        ds_unlock();
+        return 0;
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
@@ -863,7 +882,10 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
 static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    if (g_degraded) return false;
+    // Through the helper, not the raw flag: this is the line that used to make
+    // the cooldown unreachable, because it returned before ds_page_local — the
+    // only code that could lift the pause — was ever entered.
+    if (ds_degraded_paused()) return false;
 
     uint8_t *p = (uint8_t *)buf;
     uint64_t cur = va;
@@ -934,7 +956,10 @@ void ds_detach(void) {
 // dropping it around the remap raced kwrite_zone_element.
 bool ds_read_uncached(uint64_t va, void *buf, size_t len) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    if (g_degraded) return false;
+    // Same reason as ds_rw_remap, and the same helper: this path never touches
+    // the page cache, so it never reaches the recovery through ds_page_local
+    // either. Tested raw, it held the pause open on its own.
+    if (ds_degraded_paused()) return false;
 
     const uint64_t pageVA = va & ~((uint64_t)PAGE_SIZE - 1);
     const size_t off = (size_t)(va - pageVA);
