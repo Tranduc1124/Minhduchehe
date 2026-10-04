@@ -29,6 +29,12 @@ uint64_t getLeftHand(uint64_t player);
 uint64_t getRightHand(uint64_t player);
 uint64_t getLocalPlayer(uint64_t match);
 int GetDataUInt16(uint64_t player, int varID);
+
+// Report whether HP was actually read. False is "could not tell", which is not 0:
+// a dead player really does read 0, and the death filter used to treat a failed
+// read as one and wrote a two-second tombstone for a live player.
+bool get_CurHPOk(uint64_t player, int *outHp);
+bool get_MaxHPOk(uint64_t player, int *outHp);
 void SetDataUInt16(uint64_t player, int varID, uint16_t value);
 int get_CurHP(uint64_t Player);
 int get_MaxHP(uint64_t Player);

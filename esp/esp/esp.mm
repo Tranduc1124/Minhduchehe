@@ -5084,8 +5084,13 @@ static int      s_countTeamUnknown = 0;
             c.isBot = get_IsBot(PawnObject);
         }
         c.isKnocked = get_IsKnockedDown(PawnObject);
-        c.curHP     = get_CurHP(PawnObject);
-        c.maxHP     = get_MaxHP(PawnObject);
+        // Read both ways: the value, and whether it was a value at all. HP is the
+        // only thing this loop uses to decide a player is dead, and a failed read
+        // is indistinguishable from a zero HP unless somebody asks.
+        bool hpReadOk = get_CurHPOk(PawnObject, &c.curHP);
+        const bool maxReadOk = get_MaxHPOk(PawnObject, &c.maxHP);
+        if (!hpReadOk) c.curHP = get_CurHP(PawnObject);
+        if (!maxReadOk) c.maxHP = get_MaxHP(PawnObject);
         c.frame     = g_cacheFrameCounter;
 
         if (isEspCheckVisible && (cacheMiss || (g_cacheFrameCounter & 1) == 0)) {
@@ -5186,6 +5191,30 @@ static int      s_countTeamUnknown = 0;
 
         // Alive/knocked always have MaxHP > 0.
         const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
+
+        // HP did not land AND the bones did not land either: this pawn is UNKNOWN,
+        // not dead. Tombstoning here is what produced the reported symptom.
+        //
+        // The death filter writes a 120-frame hold, which is about two seconds at
+        // 60Hz. In a crowded match the reads fail often enough that a live player
+        // whose HP page and whose bones both failed to map in the same frame landed
+        // in that branch, and stayed suppressed for the full hold: no box, not
+        // aimable, looking exactly like an ESP that had not loaded yet. It lifted
+        // only once a later frame's reads succeeded, which is why it looked
+        // intermittent rather than constant.
+        //
+        // Both halves of the condition are needed. When the bones DO read, the
+        // fallback above has already turned the unreadable HP into 200 and the pawn
+        // draws, which is the right answer -- a body left in the world keeps
+        // readable bones, so bones alone cannot decide death, but they are enough to
+        // decide the pawn is not being misread as a corpse. And when HP DID read and
+        // said 0, that is a real death and fullyDead below still handles it.
+        //
+        // Skipping the pawn for this frame is the honest response either way: the
+        // next frame retries.
+        if (!hpReadOk && !hasLiveBone) {
+            continue;
+        }
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
                                 (MaxHP > 0 && CurHP > MaxHP + 50));
         // A dead body keeps readable bones for as long as it lies in the world, so

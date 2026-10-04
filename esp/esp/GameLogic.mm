@@ -268,8 +268,20 @@ bool isSamePlayerAsLocal(uint64_t localPlayer, uint64_t player) {
 // PRI DataPool on Player (dump-stable): pool @ 0x70, inner @ +0x10,
 // entries base +0x20, stride 0x8, value @ +0x18. varID 0=CurHP, 1=MaxHP.
 // Some seasons/build paths put a thin wrapper; try pool ptr alts + value size.
-static int ReadDataPoolVar(uint64_t player, int varID) {
-    if (!isVaildPtr(player) || varID < 0 || varID > 64) return 0;
+// Same walk, but it reports whether a value was actually READ.
+//
+// The distinction matters and nothing else in this file provides it. ReadAddr
+// initialises to zero and ignores _read's return value, so a failed read and a
+// legitimate zero are the same number. For HP that is not academic: the caller
+// treats 0 as dead, and the acceptance test below is `i32 >= 0 && i32 <= 2000`,
+// which a failed read passes by returning exactly 0.
+//
+// So a pawn whose HP page could not be mapped looked dead rather than unread, and
+// the death filter wrote a two-second tombstone for it. Reads fail far more often
+// in a crowded match, which is why this showed up only in one mode.
+static bool ReadDataPoolVarOk(uint64_t player, int varID, int *outValue) {
+    if (outValue) *outValue = 0;
+    if (!isVaildPtr(player) || varID < 0 || varID > 64) return false;
     const uint64_t poolOff = kDataPool ? kDataPool : 0x70;
     const uint64_t innerOff = kDataPoolInner ? kDataPoolInner : 0x10;
     const uint64_t entriesBase = kDataPoolEntriesBase ? kDataPoolEntriesBase : 0x20;
@@ -298,19 +310,46 @@ static int ReadDataPoolVar(uint64_t player, int varID) {
             // Value may be int32 or uint16 at +0x18 (and rarely +0x10/+0x14).
             const uint64_t valOffs[] = { valueOff, 0x18, 0x14, 0x10 };
             for (size_t v = 0; v < sizeof(valOffs) / sizeof(valOffs[0]); v++) {
-                int32_t i32 = ReadAddr<int32_t>(entry + valOffs[v]);
+                int32_t i32 = 0;
+                if (!_read((long)(entry + valOffs[v]), &i32, (int)sizeof(i32))) {
+                    continue;   // this offset did not read; try the next candidate
+                }
                 if (varID <= 1) {
                     // HP / MaxHP: accept uint16 range stored in low word too.
-                    if (i32 >= 0 && i32 <= 2000) return i32;
-                    uint16_t u16 = ReadAddr<uint16_t>(entry + valOffs[v]);
-                    if (u16 > 0 && u16 <= 2000) return (int)u16;
+                    if (i32 >= 0 && i32 <= 2000) {
+                        if (outValue) *outValue = i32;
+                        return true;
+                    }
+                    uint16_t u16 = 0;
+                    if (!_read((long)(entry + valOffs[v]), &u16, (int)sizeof(u16))) continue;
+                    if (u16 > 0 && u16 <= 2000) {
+                        if (outValue) *outValue = (int)u16;
+                        return true;
+                    }
                 } else {
-                    return i32;
+                    if (outValue) *outValue = i32;
+                    return true;
                 }
             }
         }
     }
-    return 0;
+    return false;   // nothing resolved, or nothing read
+}
+
+static int ReadDataPoolVar(uint64_t player, int varID) {
+    int v = 0;
+    ReadDataPoolVarOk(player, varID, &v);
+    return v;
+}
+
+// True only when the HP was actually read. False means "could not tell", which is
+// NOT the same as 0 -- 0 is a legitimate reading for a dead player.
+bool get_CurHPOk(uint64_t player, int *outHp) {
+    return ReadDataPoolVarOk(player, 0, outHp);
+}
+
+bool get_MaxHPOk(uint64_t player, int *outHp) {
+    return ReadDataPoolVarOk(player, 1, outHp);
 }
 
 int GetDataUInt16(uint64_t player, int varID) {
