@@ -512,6 +512,62 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // transactions keeps the port deallocations apart in time.
 #define DS_MAX_EVICT_PER_TXN 4
 
+// ---------------------------------------------------------------------------
+// The one failure nothing else can see: a mapping of a page the game has freed.
+//
+// vm_map_remote_page maps the game's own vm_object with copy=FALSE, so the mapping
+// is a live alias of that physical frame rather than a snapshot. Worth stating
+// plainly because it rules out the theory this work was built on: the game's writes
+// to a mapped page are visible immediately, and the resolution chain does resolve on
+// its own the moment the game writes the match pointer. Any explanation that has the
+// cache serving old bytes while the game writes new ones underneath it is wrong for
+// this read path.
+//
+// The mapping dies exactly one way. The game frees the page, the allocator hands the
+// address out again, and our memory entry still maps the old physical frame. Nothing
+// about that is observable from here: isVaildPtr is a range check on the VA, the slot
+// matches on pageVA, and a mapping of freed memory is still a perfectly good pointer.
+// The read then returns whatever now occupies that frame, the chain never resolves,
+// and the only thing that recovers it is dropping the cache -- which is why toggling
+// the ESP off and on was what made it come back. Whether a given match hit that is
+// the allocator's business, which is exactly why it looked arbitrary.
+//
+// vm_map_entry carries the vm_object a page is backed by, and the game changes that
+// pointer when it frees the page. Record it, compare it later, and a leftover from a
+// dead address space cannot be served. That is the only check available that does not
+// have to guess when a boundary happened.
+//
+// The first version of this check (401858e9d, reverted) asked the map once per
+// second PER SLOT, plus once per remap, and every question was a fresh walk of the
+// whole map from entry 0. Its cost scaled with the slot count, which is what mattered:
+// five or six slots in a lobby and well over a hundred on entering a match, and at a
+// few thousand map entries that is hundreds of thousands of syscalls a second on the
+// main queue. That is why it was abandoned rather than the idea.
+//
+// So the same question is answered once per pass: one walk produces a snapshot of
+// (start, end, object) per map entry, spread over frames, and every later question is
+// a lookup in that array -- no syscalls. The walk never runs on the read path or the
+// insert path. Steady cost is DS_VMO_SWEEP_PER_TICK entries per frame regardless of
+// how many slots are live, and the judgement at the end of a pass is arithmetic.
+#define DS_VMO_SWEEP_INTERVAL_MS 5000ULL
+#define DS_VMO_SWEEP_PER_TICK   64
+#define DS_VMO_SNAP_MAX         8192
+
+typedef struct { uint64_t start, end, object; } DSVmoRange;
+
+static DSVmoRange g_vmoSnap[DS_VMO_SNAP_MAX];
+static uint32_t   g_vmoSnapFilled  = 0;
+static uint32_t   g_vmoSnapTotal   = 0;
+static uint64_t   g_vmoSnapCursor  = 0;
+static uint64_t   g_vmoSnapStartMs = 0;
+static uint64_t   g_vmoSnapNextMs  = 0;
+static bool       g_vmoSweeping    = false;
+// True only between one completed pass and the start of the next. A pass in progress
+// has filled a PREFIX of g_vmoSnap, and answering from a prefix makes every page in
+// the unwalked tail look unmapped. That was the cause of the first build's blind
+// count climbing: the insert path was asking a half-built array.
+static bool       g_vmoSnapReady   = false;
+
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
@@ -532,6 +588,10 @@ static struct {
     // g_txnFrameStamp to mean "the frame running right now already read it".
     // Free: useCount alone left four bytes of padding in this struct.
     uint32_t touchedFrame;
+    // The vm_object this mapping was taken under, and when the snapshot that
+    // answered that was built. Zero means not armed yet.
+    uint64_t vmo;
+    uint64_t vmoEpochMs;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
 static uint64_t g_cacheGeneration = 1;
@@ -565,6 +625,17 @@ static uint64_t g_dsMissCount = 0;
 // True if some read path was refused this second, sampled by the report so a
 // second with no hits and no remaps is attributable.
 static bool g_dsBlockedLastSecond = false;
+// Mappings dropped because the map now names a different object behind that address.
+static uint64_t g_dsStaleDropCount = 0;
+// Mappings dropped because the whole map contains nothing at that address, which
+// means the game unmapped the page and our own memory entry was the last reference
+// holding the physical frame alive.
+static uint64_t g_dsOrphanDropCount = 0;
+// Live slots with no baseline yet, as a gauge rather than a running total.
+static uint32_t g_dsVmoBlindNow = 0;
+// Completed passes. If this stops climbing, the check is not running and anything else
+// it has to say is void.
+static uint64_t g_dsSweepCount = 0;
 
 static void ds_page_cache_lock_init(void) {
     pthread_mutexattr_t attr;
@@ -609,6 +680,8 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].bornMs = 0;
     g_pageCache[i].lastUseMs = 0;
     g_pageCache[i].gen = 0;
+    g_pageCache[i].vmo = 0;
+    g_pageCache[i].vmoEpochMs = 0;
     g_pageCache[i].useCount = 0;
 }
 
@@ -665,6 +738,139 @@ static void ds_expire_degrade_locked(void) {
     }
 }
 
+// What object backs this page, according to the last COMPLETED snapshot. Zero means
+// the snapshot cannot say, which includes the page not being mapped at all. No
+// syscalls: building the snapshot is the only thing that costs anything.
+static uint64_t ds_vmo_from_snapshot(uint64_t page_va) {
+    page_va &= ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint32_t i = 0; i < g_vmoSnapFilled; i++) {
+        if (page_va >= g_vmoSnap[i].start && page_va < g_vmoSnap[i].end) {
+            return g_vmoSnap[i].object;
+        }
+    }
+    return 0;
+}
+
+// What may be recorded as a baseline right now.
+//
+// Only a completed pass may answer. Mid-pass, g_vmoSnapFilled is a prefix, so a page
+// in the unwalked tail looks unmapped and would be filed with no baseline at all.
+// Answering zero is safe: the next completed pass arms the slot.
+static uint64_t ds_vmo_recordable(uint64_t page_va) {
+    if (!g_vmoSnapReady) return 0;
+    return ds_vmo_from_snapshot(page_va);
+}
+
+// One tick of an incremental pass over the game's vm_map, then the judgement.
+//
+// Called under the lock, from the outermost read transaction, so at most once a frame
+// and never inside a read.
+//
+// The judgement is one-directional on purpose. A snapshot describes one instant and
+// can name an object a live page no longer has, and that drops a live mapping and
+// costs one remap. The reverse cannot happen: the snapshot is read from the live map,
+// so once the game has replaced the object the snapshot names the new one. Being
+// wrong here costs a mapping, never a read.
+static void ds_vmo_sweep_tick(uint64_t nowMs) {
+    if (!K(g_ff_task)) return;
+
+    if (!g_vmoSweeping) {
+        if (nowMs < g_vmoSnapNextMs) return;
+        const uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
+        const uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
+        if (nentries == 0 || nentries > DS_VMO_SNAP_MAX) {
+            // Cannot hold it. Say so once rather than truncating: a partial map
+            // reports "not mapped" for everything past the cut and drops live
+            // mappings wholesale.
+            static uint32_t s_oversizeLogged = 0;
+            if (s_oversizeLogged < 2) {
+                s_oversizeLogged++;
+                NSLog(@"[DS] vm_map has %u entries, over the %d this build holds "
+                      @"— dead-mapping check cannot run", nentries, DS_VMO_SNAP_MAX);
+            }
+            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+            return;
+        }
+        g_vmoSnapTotal   = nentries;
+        g_vmoSnapFilled  = 0;
+        g_vmoSnapCursor  = kread_ptr(hdr + off_vm_map_header_links_next);
+        g_vmoSnapStartMs = nowMs;
+        g_vmoSweeping    = true;
+        g_vmoSnapReady   = false;
+    }
+
+    for (uint32_t n = 0; n < DS_VMO_SWEEP_PER_TICK; n++) {
+        if (g_vmoSnapFilled >= g_vmoSnapTotal) break;
+        if (!K(g_vmoSnapCursor)) break;
+        g_vmoSnap[g_vmoSnapFilled].start  = kread64(g_vmoSnapCursor + E_START);
+        g_vmoSnap[g_vmoSnapFilled].end    = kread64(g_vmoSnapCursor + E_END);
+        g_vmoSnap[g_vmoSnapFilled].object = kread_ptr(g_vmoSnapCursor + E_OBJECT);
+        g_vmoSnapFilled++;
+        g_vmoSnapCursor = kread_ptr(g_vmoSnapCursor + off_vm_map_entry_links_next);
+    }
+
+    if (g_vmoSnapFilled < g_vmoSnapTotal) {
+        if (!K(g_vmoSnapCursor)) {
+            // The map was rebuilt mid-pass. Half a map is worse than none.
+            g_vmoSweeping   = false;
+            g_vmoSnapFilled = 0;
+            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+        }
+        return;
+    }
+
+    uint32_t dropped = 0, judged = 0, armed = 0, orphaned = 0;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (!g_pageCache[i].localAddr) continue;
+        // A slot mapped after the pass started would be judged against a map that
+        // predates it, so it waits for the next one.
+        if (g_pageCache[i].vmoEpochMs > g_vmoSnapStartMs) continue;
+        const uint64_t now = ds_vmo_from_snapshot(g_pageCache[i].pageVA);
+        if (g_pageCache[i].vmo == 0) {
+            if (now != 0) {
+                // A whole map is available now, so this can finally be armed. A slot
+                // mapped during warm-up gets its baseline here.
+                g_pageCache[i].vmo = now;
+                armed++;
+            } else {
+                // The whole map was walked and NOTHING covers this address. That is
+                // not "cannot tell": the game has unmapped the page and our memory
+                // entry is the only reference still holding that physical frame
+                // alive. Keeping it is the "sometimes it picks the match up,
+                // sometimes it does not" report in its pure form -- a slot serving
+                // reads forever, isVaildPtr passing it, the cache matching it on
+                // pageVA, with no timeout on a pointer.
+                orphaned++;
+                ds_release_page_slot_locked(i);
+            }
+            continue;
+        }
+        judged++;
+        if (now != g_pageCache[i].vmo) {
+            // Either a different object backs the address now, or the map has no
+            // entry covering it and the page is gone.
+            dropped++;
+            ds_release_page_slot_locked(i);
+        }
+    }
+    uint32_t blindNow = 0;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].localAddr && g_pageCache[i].vmo == 0) blindNow++;
+    }
+    g_dsVmoBlindNow    = blindNow;
+    g_dsStaleDropCount += dropped;
+    g_dsOrphanDropCount += orphaned;
+    g_dsSweepCount++;
+    if (dropped || orphaned) {
+        NSLog(@"[DS] sweep dropped %u dead and %u orphaned mapping(s) "
+              @"(judged %u, armed %u, blind %u)",
+              dropped, orphaned, judged, armed, blindNow);
+    }
+    g_vmoSweeping   = false;
+    g_vmoSnapReady  = true;
+    g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+}
+
 void ds_begin_read_transaction(void) {
     ds_lock();
     // Before the depth bump, so a frame that opens during a cooldown is already
@@ -683,6 +889,11 @@ void ds_end_read_transaction(void) {
         // pairs begin/end correctly releases a cooldown here even if it never
         // opened a transaction while latched.
         ds_expire_degrade_locked();
+        // Once per outermost transaction, i.e. at most once a frame, and never
+        // inside a read. The alternative -- asking the map per slot, per second --
+        // is what made the previous version of this check cost more the more slots a
+        // match had.
+        ds_vmo_sweep_tick(ds_now_ms());
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
             if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
         }
@@ -744,13 +955,18 @@ void ds_end_read_transaction(void) {
             // novictim says whether the table size is the binding ceiling, so a
             // session that genuinely needs 1024 slots will say so itself.
             NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu "
-                  @"hit=%llu miss=%llu novictim=%llu%@",
+                  @"hit=%llu miss=%llu novictim=%llu stale=%llu orphan=%llu "
+                  @"blind=%u sweeps=%llu%@",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
                   (unsigned long long)evictDelta,
                   (unsigned long long)hitDelta,
                   (unsigned long long)missDelta,
                   (unsigned long long)novictimDelta,
+                  (unsigned long long)g_dsStaleDropCount,
+                  (unsigned long long)g_dsOrphanDropCount,
+                  g_dsVmoBlindNow,
+                  (unsigned long long)g_dsSweepCount,
                   g_dsBlockedLastSecond ? @" BLOCKED" : @"");
             g_dsBlockedLastSecond = false;
             s_lastReportMs = nowMs;
@@ -949,6 +1165,12 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].bornMs = ds_now_ms();
     g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;
     g_pageCache[victim].touchedFrame = (uint32_t)g_txnFrameStamp;
+    // From the snapshot, which is free. This used to be a fresh walk of the whole map
+    // on every remap -- the other half of the cost that made entering a match
+    // unaffordable, since a miss is the common case at match entry and the map is at
+    // its largest exactly then.
+    g_pageCache[victim].vmo = ds_vmo_recordable(pageVA);
+    g_pageCache[victim].vmoEpochMs = g_vmoSnapStartMs;
     g_dsRemapCount++;
     g_dsMissCount++;
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
