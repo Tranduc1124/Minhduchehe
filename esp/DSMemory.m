@@ -108,7 +108,29 @@ static void init_physmap(void) {
 #pragma mark - attach
 
 int ds_attach(void) {
-    if (ds_attached()) return 0;
+    // "Already attached" has to mean "already attached AND usable", not merely
+    // "g_ff_task is non-zero".
+    //
+    // g_ff_task is assigned at the line below that reads proc_ro->pr_task, which
+    // is BEFORE the base walk. Every failure from there to the end of the walk --
+    // proc_ro, task, map, nentries, first entry, no base -- returns -1 with
+    // g_ff_task still set. So one failed attempt left ds_attached() -- a bare
+    // K(g_ff_task) -- answering true for the rest of the process, this early-out
+    // returned 0 without walking anything, and the ds_detach() reset further down,
+    // which exists for exactly this, was unreachable behind it.
+    //
+    // Requiring g_ff_base is what lets that reset run on the retry.
+    //
+    // What the latch looks like from outside: the game exits and the ESP keeps the
+    // module base it had; a new game starts and this attach finds the process but
+    // fails the base walk; g_ff_task is now set, so from here on nothing re-walks
+    // anything and Moudule_Base stays pointed at an address space that no longer
+    // exists. Every read then returns something that fails isVaildPtr, which is
+    // indistinguishable from a broken offset table -- getMatchGame's nine
+    // candidates all read invalid and the chain reports a lobby forever. It also
+    // matches the only thing that reliably recovered it: toggling the ESP off and
+    // on, because that is the one path that re-runs an attach from a clean state.
+    if (ds_attached() && g_ff_base) return 0;
     if (!g_kexploit_ready) return -1;
 
     // Drop any half-finished attempt before starting a new one.
@@ -308,9 +330,15 @@ int ds_attach(void) {
     }
 
     if (!g_ff_base) {
-        static int s_baseLogged = 0;
-        if (!s_baseLogged) {
-            s_baseLogged = 1;
+        // Throttled, not one-shot. It used to fire at most once per process, so a
+        // user who hit this saw a single line and then permanent silence for the
+        // rest of the session -- which is a large part of why the log never said
+        // why. Five seconds apart says "still failing" without becoming a second
+        // steady line on top of the [GameOffsets] retry line.
+        static uint64_t s_lastBaseLogUS = 0;
+        const uint64_t tBaseUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        if (tBaseUS - s_lastBaseLogUS >= 5000000ULL) {
+            s_lastBaseLogUS = tBaseUS;
             NSLog(@"[DS] module base not found (nentries walk failed)");
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
