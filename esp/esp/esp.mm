@@ -4313,6 +4313,24 @@ static int      s_countTeamUnknown = 0;
         // pipeline reported a problem because nothing in the pipeline was wrong.
         const bool newGame = (isVaildPtr(matchGame) && s_lastMatchGame != 0 &&
                               matchGame != s_lastMatchGame);
+
+        // s_lastMatchDiag is the key for the flush that runs when the next match
+        // appears, so it is only meaningful while a match is live -- and this is
+        // the only place that knows the match is not. It has to be cleared on EVERY
+        // not-live frame, OUTSIDE the guard below.
+        //
+        // Inside it, it is not cleared, because the guard needs
+        // s_lastLiveMatch != 0. And the else-if at the bottom of this block
+        // overwrites s_lastLiveMatch with whatever `match` reads on a lobby frame.
+        // getMatchGame falls back to CurrentGame when CurrentMatchGame is null
+        // (GameLogic.mm:20), and ReadGameFacadeStatics accepts a statics block on
+        // CurrentGame alone (:38), so in the lobby `match` is *(CurrentGame + 0x90)
+        // and can read as a valid pointer. When it does, live stays true for the
+        // whole lobby, this guard never opens, and s_lastMatchDiag stays pinned to
+        // the last match's address for the rest of the session -- which starves the
+        // flush further down of the trigger it needs.
+        if (!live) s_lastMatchDiag = 0;
+
         if (s_lastLiveMatch != 0 && (!live || newGame)) {
             const uint64_t left = s_lastLiveMatch;
             // First, while the mappings are still good: give the game back the
