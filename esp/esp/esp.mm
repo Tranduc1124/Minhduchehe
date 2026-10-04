@@ -4617,8 +4617,76 @@ static int      s_countTeamUnknown = 0;
         return stats;
     }
 
+    // ---- Bad read, or a big match? Today they are one integer, and only one of
+    // ---- them should stop the frame.
+    //
+    // entriesArr+0x18 is an Il2CppArray max_length, so it is the dictionary's
+    // CAPACITY, not its player count. This value is handled twice, twenty-odd
+    // lines apart, with two opposite answers:
+    //
+    //   cap > 256  ->  "the frame is bogus, stop"      (here -- before
+    //                  stats.inMatch is set and before the pawn loop)
+    //   cap > 128  ->  "the walk is clamped, draw what we found"   (below)
+    //
+    // One number, two opposite answers, and the wrong one runs first. In a 50-100
+    // player match the capacity sits one geometric growth step above the player
+    // count, so a 256 ceiling does not truncate the match, it deletes the frame: no
+    // boxes, counter reading "--", and nothing logged because this return is
+    // silent. The 128 clamp would have handled the same value by degrading.
+    //
+    // 256 was never a player-count ceiling either. It is the corrupt-read ceiling
+    // that replaced 2048/512 after a 2048-slot read had been walked for two thousand
+    // iterations, each of which could add a phantom. What one integer cannot do is
+    // say which of the two situations it is, and the two need opposite answers, so
+    // the answer has to come from more than one integer.
+    //
+    // A dictionary has a second number, and the two are not independent:
+    //
+    //   1. cap >= dictCount always holds. A capacity below the live count means
+    //      the two reads came from different structures or one of them failed.
+    //   2. cap is never far above count. Growth is geometric (double, then rounded
+    //      up to a prime), so cap stays within a small factor of count at all
+    //      times. 16x is outside anything a real Dictionary produces, and it
+    //      catches the exact failure the old 256 was standing in for -- cap=2048
+    //      with dc=100 -- even though 2048 is under any absolute ceiling.
+    //   3. Neither number is absurd alone. 2048 slots is not a player array, so the
+    //      original bad-read ceiling is kept as the backstop for when it is
+    //      dictCount, not the capacity, that is the corrupt read.
+    //
+    // Anything surviving all three is a big match, and a big match is clamped
+    // below rather than discarded.
+    //
+    // dictCount was already read a few lines above and used only for the <= 0
+    // guard. The discriminator this needed was already in hand.
+    const int kMaxPlausibleSlotCap = 2048;
+    const int kMaxPlausiblePlayers = 1024;
     int slotCap = ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength);
-    if (slotCap <= 0 || slotCap > 256) {
+    const bool capZero      = (slotCap <= 0);
+    const bool capTooHuge   = (slotCap > kMaxPlausibleSlotCap);
+    const bool capTooSmall  = (slotCap > 0 && dictCount > slotCap);
+    const bool capTooSparse = (slotCap > 16 * (dictCount + 1) + 64);
+    const bool countGarbage = (dictCount < 0 || dictCount > kMaxPlausiblePlayers);
+    const bool capGarbage   = (capZero || capTooHuge || capTooSmall || capTooSparse);
+    // One throttle for every capacity outcome, 5s, the same window DIAG_EARLY uses,
+    // so a log alternating between two states is still one line per 5s. An NSLog
+    // rather than DIAG_EARLY because DIAG_EARLY prints "stop:", which is true of
+    // the reject below and false of the clamp further down, and the whole point of
+    // the change is that ONE device log can tell the two apart. [ESP-DICT] sits
+    // next to [ESP-COUNT], same cadence, greppable.
+    static CFTimeInterval s_dictCapLog = 0;
+    const CFTimeInterval dictCapNow = CACurrentMediaTime();
+    const bool dictCapLogNow = (dictCapNow - s_dictCapLog) > 5.0;
+    if (capGarbage || countGarbage) {
+        if (dictCapLogNow) {
+            s_dictCapLog = dictCapNow;
+            NSLog(@"[ESP-DICT] REJECT bad read: dict=0x%llx entries=0x%llx cap=%d dc=%d "
+                  @"(zero=%d huge=%d small=%d sparse=%d dcGarbage=%d) -- frame dropped, "
+                  @"no players walked",
+                  (unsigned long long)playerDict, (unsigned long long)entriesArr,
+                  slotCap, dictCount,
+                  (int)capZero, (int)capTooHuge, (int)capTooSmall,
+                  (int)capTooSparse, (int)countGarbage);
+        }
         return stats;
     }
     // dictCount is the number of live entries. When it is zero the backing array is
@@ -4627,6 +4695,12 @@ static int      s_countTeamUnknown = 0;
     // left the match. Guard here rather than clamp the loop, because the loop is
     // also what finds the players that are live.
     if (dictCount <= 0) {
+        if (dictCapLogNow) {
+            s_dictCapLog = dictCapNow;
+            NSLog(@"[ESP-DICT] REJECT empty: dict=0x%llx entries=0x%llx cap=%d dc=0 "
+                  @"-- dictionary holds no live entries",
+                  (unsigned long long)playerDict, (unsigned long long)entriesArr, slotCap);
+        }
         return stats;
     }
 
@@ -4692,8 +4766,22 @@ static int      s_countTeamUnknown = 0;
     const uint64_t entriesBase = entriesArr + kIl2CppArrayItems;
     const uint64_t entryStride = kDictEntryStrideBytePlayer ? kDictEntryStrideBytePlayer : 0x28;
     const uint64_t entryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
+    // The clamp: the second of the two places this capacity is handled, and the one
+    // that degrades instead of deleting the frame.
+    //
+    // 512 is what this was before it was lowered to 128, and it clears every mode
+    // that exists here -- the capacity only passes 512 in a match with more players
+    // than that. Walking 512 is affordable now for the reason the limit was invented
+    // for, because that case can no longer reach this line: a corrupt capacity is
+    // rejected above, and the walk ends on the dictionary's own live count.
+    //
+    // 128 was not a player-count decision either. Walking 128 slots of a 163-slot
+    // capacity finds about 50*128/163 = 39 of 50 players, because the entries are
+    // hash-placed across the whole capacity and not packed at the front -- so the
+    // players that go missing are a spread-out 22%, not a tail.
+    const int kMaxWalkSlots = 512;
     int loopCount = slotCap;
-    if (loopCount > 128) loopCount = 128;
+    if (loopCount > kMaxWalkSlots) loopCount = kMaxWalkSlots;
     // How many dict entries were dropped as "that is me". Printed with the count
     // below because it is the whole question behind "the counter counts me": the
     // self filter needs the local pawn, and getLocalPlayer(match) returns 0 when
@@ -4703,24 +4791,83 @@ static int      s_countTeamUnknown = 0;
     // different bug entirely. One log line separates them.
     int selfSkipped = 0;
 
+    // ---- What the walk found, and the one bound that is not a constant -------
+    //
+    // Exactly dictCount slots of this array can hold a live entry, so the first
+    // dictCount resolvable pawns are the players and anything past that did not come
+    // from this dictionary. That is the phantom budget, and it is the dictionary's
+    // own number rather than a constant that has to be chosen small enough to also
+    // fit a real match: a corrupt array is cut off here instead of after a thousand
+    // iterations of full pawn pipeline, and a real match cannot reach it, because
+    // exactly dictCount live entries exist. A slot whose pawn pointer fails to read
+    // is skipped without consuming budget, so a late read costs a slot and not a
+    // player.
+    const int liveBudget = dictCount;
+    int dictClamped   = (loopCount < slotCap) ? 1 : 0;
+    int dictIters     = 0;  // loop iterations actually performed
+    int dictWalkSlots = 0;  // slots whose hash code was not a free marker
+    int dictLive      = 0;  // slots that yielded a pawn not already seen
+    int dictDupes     = 0;  // slots naming a pawn an earlier slot already named
+    int dictValueProbe = 0; // pawns whose value did not read at the documented offset
+    int dictStopLive  = 0;  // 1 = the walk ended on the live count
+    int snapDrop      = 0;  // pawns refused by the 128-snapshot draw buffer
+
+    // One pawn, one slot. This dictionary can name the same Player under two keys --
+    // the count table's own comment above s_espCountKey says so -- and the tally
+    // already dedupes by pawn pointer, so a duplicate never inflated the number, but
+    // it did cost a second full read pipeline and a second box. Depth matches the
+    // count table, which a 100+ player match also fits inside.
+    uint64_t seenPawn[192];
+    int seenPawnN = 0;
+
     for (int i = 0; i < loopCount; i++) {
+        // The live count is the bound, checked at the top of the iteration so the
+        // walk stops without reading one more slot than there are players.
+        if (dictLive >= liveBudget) { dictStopLive = 1; break; }
+        dictIters++;
         uint64_t ent = entriesBase + entryStride * (uint64_t)i;
         int hc = ReadAddr<int>(ent);
         // Free slots typically 0 or -1.
         if (hc == 0 || hc == -1) continue;
+        dictWalkSlots++;
 
         uint64_t PawnObject = ReadAddr<uint64_t>(ent + entryValueOff);
+        // Set when the documented value offset did not answer and a pointer came
+        // from the layout-probe list instead. 0x10 and 0x18 sit inside the 0x18-byte
+        // key, so this probe can pick up something that was never a Player. Counted
+        // rather than removed, because it is also the layout tolerance that
+        // kDictEntryValueOffByte exists for, and a count is what tells the two apart.
+        bool pawnFromProbe = false;
         if (!isVaildPtr(PawnObject)) {
             const uint64_t vOffs[] = { 0x10, 0x18, 0x20, 0x28 };
             for (size_t vo = 0; vo < 4; vo++) {
                 uint64_t cand = ReadAddr<uint64_t>(ent + vOffs[vo]);
                 if (isVaildPtr(cand)) {
                     PawnObject = cand;
+                    pawnFromProbe = true;
                     break;
                 }
             }
         }
         if (!isVaildPtr(PawnObject)) continue;
+
+        // isVaildPtr is a range test and nothing else -- not below 0x100000, not
+        // above 0x0000FFFFFFFFFFFF, top bit clear. A freed entry's stale Player*
+        // passes it. This is where the alias case is caught: a slot naming a pawn
+        // another slot already named is a stale or duplicated entry, and one box
+        // per pawn is the right answer whichever of the two slots is the live one.
+        {
+            bool dupPawn = false;
+            for (int pi = 0; pi < seenPawnN; pi++) {
+                if (seenPawn[pi] == PawnObject) { dupPawn = true; break; }
+            }
+            if (dupPawn) { dictDupes++; continue; }
+            if (seenPawnN < (int)(sizeof(seenPawn) / sizeof(seenPawn[0]))) {
+                seenPawn[seenPawnN++] = PawnObject;
+            }
+        }
+        dictLive++;
+        if (pawnFromProbe) dictValueProbe++;
 
         // Hoisted. The teammate test below needs this pawn's team and the per-pawn
         // cache block further down needs the same slot; declaring it in both places
@@ -5237,6 +5384,11 @@ static int      s_countTeamUnknown = 0;
         // It is recorded in the draw pass instead, next to the same isOnScreen the
         // box is drawn from, so the number counts what the picture shows.
 
+        // 128 is the draw buffer's ceiling and is the next ceiling for a 100+ player
+        // match, though 99 possible enemies still fits inside it. Not raised here:
+        // 128 EspPawnSnap is already ~9KB of stack on the render path and 192 would
+        // be ~14KB of the same stack. Counted instead, because a silent drop is
+        // invisible boxes and a counted one is a number in [ESP-COUNT].
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
             s.pawn = PawnObject;
@@ -5252,6 +5404,25 @@ static int      s_countTeamUnknown = 0;
             s.treatAsVehicle = treatAsVehicle;
             s.canAim = canAimThisPawn;
             s.wantDraw = wantDraw;
+        } else {
+            snapDrop++;
+        }
+    }
+
+    // The clamp, announced. This is not a stop -- the frame completed and every
+    // player the walk found has been drawn -- so it does not belong under the
+    // "stop:" tag. What it says is that a dictionary with more slots than
+    // kMaxWalkSlots is being walked in part, and because the entries are
+    // hash-placed the slots that were not read are a spread-out subset of the
+    // players rather than the ones past a line.
+    if (dictClamped) {
+        if (dictCapLogNow) {
+            s_dictCapLog = dictCapNow;
+            NSLog(@"[ESP-DICT] CLAMPED walk: dict=0x%llx cap=%d dc=%d walk=%d live=%d "
+                  @"dup=%d snapDrop=%d -- %d of %d slots not read; entries are "
+                  @"hash-placed so the players missed are a spread-out subset",
+                  (unsigned long long)playerDict, slotCap, dictCount, loopCount,
+                  dictLive, dictDupes, snapDrop, slotCap - loopCount, slotCap);
         }
     }
 
@@ -5769,9 +5940,28 @@ static int      s_countTeamUnknown = 0;
             if (dmin < 0.0f || d < dmin) dmin = d;
             if (dmax < 0.0f || d > dmax) dmax = d;
         }
-        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
+        // cap   = dictionary capacity, an Il2CppArray max_length and NOT a player
+        //         count -- see the gate above
+        // dc    = dictCount, the live entries the dictionary says it holds
+        // walk  = slots iterated after the clamp, i.e. min(cap, kMaxWalkSlots)
+        // clamped = the walk ended on kMaxWalkSlots rather than on the live count
+        // iter  = loop iterations performed (walk, minus an early exit on the live
+        //         count); read = slots among them that were not free markers
+        // live  = pawns accepted after the duplicate filter
+        // dup   = slots that named a pawn an earlier slot already named
+        // probe = pawns whose value did not read at the documented entry offset and
+        //         came from a layout-probe offset instead (0x10/0x18 sit inside the
+        //         key, so this is the widest remaining phantom surface)
+        // stopLive = the walk ended on dictCount, which is the NORMAL end of a walk
+        // drop  = pawns refused because the 128-snapshot buffer was full
+        // The invariant the phantom budget guarantees: live <= read <= dictCount.
+        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d dc=%d walk=%d clamped=%d "
+              @"iter=%d read=%d live=%d dup=%d probe=%d stopLive=%d drop=%d snapN=%d "
+              @"(real=%d, bot=%d) "
               @"local=0x%llx self=%d off=%d team?=0x%x dmin=%.1f dmax=%.1f",
-              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
+              (unsigned long long)match, (unsigned long long)playerDict, slotCap, dictCount,
+              loopCount, dictClamped, dictIters, dictWalkSlots, dictLive, dictDupes,
+              dictValueProbe, dictStopLive, snapDrop, snapN,
               stats.realCount, stats.botCount,
               (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen,
               s_countTeamUnknown,
