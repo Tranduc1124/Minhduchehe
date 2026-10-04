@@ -86,3 +86,10 @@ struct vm_map_entry {
 };
 
 struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address);
+
+// Same as vm_get_object for a caller that already holds the map entry covering
+// the address. Skips the map walk, which is the point: walking it twice is what
+// made the base walk quadratic.
+struct VMObject vm_get_object_from_entry(uint64_t entryAddr, uint64_t address);
+// Build the mapping for an object the caller resolved. Takes the remap lock.
+struct VMShmem vm_create_shmem_with_object(struct VMObject *object);

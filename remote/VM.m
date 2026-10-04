@@ -177,11 +177,21 @@ uint64_t VME_OFFSET(uint64_t vme_offset_raw)
     return vme_offset_raw << 12;
 }
 
-struct VMObject vm_get_object(uint64_t map, uint64_t address)
+static struct VMObject vm_get_object_impl(uint64_t map, uint64_t address, uint64_t knownEntry)
 {
     struct VMObject result = {0};
- 
-    uint64_t entryAddr = vm_map_find_entry(map, address);
+
+    // knownEntry non-zero means the caller already holds the map entry covering
+    // `address`, and that is the entire reason for this split.
+    //
+    // The base walk in DSMemory.m was calling vm_map_remote_page once per map
+    // entry, and vm_map_remote_page resolves an address by walking the whole map
+    // to find its entry. So the base walk was quadratic, with every step of both
+    // walks going through the socket-based kernel read primitive. That was
+    // measured as a watchdog kill: MINHDUC was SIGKILLed on the main thread with
+    // the stack vm_get_object -> vm_map_find_entry -> vm_map_iterate_entries ->
+    // kreadbuf -> early_kread -> set_target_kaddr -> setsockopt.
+    uint64_t entryAddr = knownEntry ? knownEntry : vm_map_find_entry(map, address);
     if (!entryAddr) {
         // Rate limited rather than removed. A miss on an address the game has
         // freed is an expected event at a match boundary -- the caller asked for
@@ -240,6 +250,23 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
     result.entryOffset  = entryOffs;
  
     return result;
+}
+
+struct VMObject vm_get_object(uint64_t map, uint64_t address)
+{
+    return vm_get_object_impl(map, address, 0);
+}
+
+// Same answer as vm_get_object(map, address) for an address inside an entry the
+// caller already holds, without walking the map to find it a second time.
+struct VMObject vm_get_object_from_entry(uint64_t entryAddr, uint64_t address)
+{
+    struct VMObject empty = {0};
+    // is_kaddr_valid rather than E_START, which lives in DSMemory.m: this file
+    // does not define it, and the entry is about to be kreadbuf'd whole anyway,
+    // so validating the pointer itself is the whole of the check.
+    if (!is_kaddr_valid(entryAddr)) return empty;
+    return vm_get_object_impl(0, address, entryAddr);
 }
  
 

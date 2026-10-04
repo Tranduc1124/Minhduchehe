@@ -48,6 +48,16 @@ extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mac
 
 extern uint64_t early_kread64(uint64_t where);
 
+// Minimum wall-clock gap between two base walks. Long enough that a walk which
+// cannot succeed costs a fraction of the main queue instead of all of it, short
+// enough that a game which appears is still picked up promptly. Declared here
+// rather than with the other cache constants because ds_attach, near the top of
+// this file, is what enforces it.
+#define DS_ATTACH_RETRY_MS 5000ULL
+
+static uint64_t ds_now_ms(void);      // defined with the cache, below
+static uint64_t g_lastBaseWalkMs = 0; // when the last base walk ran
+
 static uint64_t g_ff_proc = 0;
 static uint64_t g_ff_task = 0;
 static uint64_t g_ff_map  = 0; // target's vm_map — used with vm_map_remote_page
@@ -132,6 +142,27 @@ int ds_attach(void) {
     // on, because that is the one path that re-runs an attach from a clean state.
     if (ds_attached() && g_ff_base) return 0;
     if (!g_kexploit_ready) return -1;
+
+    // The base walk is the expensive part of attaching and it is not affordable at
+    // any rate the ESP tick can drive, so it limits itself here, in wall clock,
+    // where no call site can bypass it.
+    //
+    // The call site had a frame counter set to 30, commented "~0.5s at 60fps", which
+    // is two full walks a second on the main queue. That is how a walk which used to
+    // run once and then latch on failure turned into a repeating hang after
+    // ds_attach was allowed to retry at all: MINHDUC was SIGKILLed by the watchdog on
+    // the main thread 35 seconds after launch, with the stack in
+    // vm_map_iterate_entries -> early_kread -> setsockopt.
+    //
+    // Gated on g_ff_task being set, so the cheap "game is not running" case still
+    // returns immediately and a launch is still picked up promptly. Only a walk that
+    // actually ran and failed is worth spacing out.
+    const uint64_t nowAttachMs = ds_now_ms();
+    if (g_ff_task != 0 && g_ff_base == 0 &&
+        nowAttachMs - g_lastBaseWalkMs < DS_ATTACH_RETRY_MS) {
+        return -1;
+    }
+    g_lastBaseWalkMs = nowAttachMs;
 
     // Drop any half-finished attempt before starting a new one.
     //
@@ -294,7 +325,16 @@ int ds_attach(void) {
         uint64_t size  = (end > start) ? (end - start) : 0;
 
         if (start >= 0x100000000 && size > 0x400000 && start < 0x800000000) {
-            struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
+            // Resolve from the entry this loop is already holding. It used to call
+            // vm_map_remote_page, which looks the address up by walking the whole map
+            // again -- so this walk was quadratic, with both walks' every step going
+            // through the socket kernel-read primitive. On the main queue, twice a
+            // second, that is a watchdog kill, and it was measured as one.
+            struct VMObject probe =
+                vm_get_object_from_entry(e, start & ~0x3FFFULL);
+            struct VMShmem page = probe.address
+                ? vm_create_shmem_with_object(&probe)
+                : (struct VMShmem){0};
             if (page.localAddress) {
                 mappedCount++;
                 uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
@@ -697,9 +737,16 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         g_consecutiveMapFailures = 0;
         g_dsRemapCount++;
         g_dsRecoverCount++;
-        NSLog(@"[DS] degraded cooldown over — resuming with %d mapping(s) intact, "
-              @"recovery #%llu", liveAtResume,
-              (unsigned long long)g_dsRecoverCount);
+        {
+            static uint64_t s_lastRecLogMs = 0;
+            const uint64_t tRec = ds_now_ms();
+            if (tRec - s_lastRecLogMs >= 1000ULL) {
+                s_lastRecLogMs = tRec;
+                NSLog(@"[DS] degraded cooldown over — resuming with %d mapping(s) intact, "
+                      @"recovery #%llu", liveAtResume,
+                      (unsigned long long)g_dsRecoverCount);
+            }
+        }
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
@@ -759,9 +806,20 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         if (g_consecutiveMapFailures >= DS_FAIL_DEGRADE_THRESHOLD) {
             g_degraded = true;
             g_degradedUntilMs = ds_now_ms() + DS_DEGRADE_COOLDOWN_MS;
-            NSLog(@"[DS] degraded after %llu consecutive map failures — pausing remap "
-                  @"for %dms, cache dropped on the way back in",
-                  (unsigned long long)g_consecutiveMapFailures, DS_DEGRADE_COOLDOWN_MS);
+            // Throttled. This path can be entered many times a second now that
+            // recovery no longer spends 256 releases slowing each lap down, and an
+            // NSLog is not free -- on a failing read path it is the difference
+            // between a degraded frame and an unusable app.
+            {
+                static uint64_t s_lastDegLogMs = 0;
+                const uint64_t tDeg = ds_now_ms();
+                if (tDeg - s_lastDegLogMs >= 1000ULL) {
+                    s_lastDegLogMs = tDeg;
+                    NSLog(@"[DS] degraded after %llu consecutive map failures — pausing remap "
+                          @"for %dms, cache kept intact",
+                          (unsigned long long)g_consecutiveMapFailures, DS_DEGRADE_COOLDOWN_MS);
+                }
+            }
         }
         ds_unlock();
         return 0;
@@ -846,6 +904,7 @@ void ds_detach(void) {
     g_degraded = false;
     ds_unlock();
     g_ff_proc = g_ff_task = g_ff_base = 0;
+    g_lastBaseWalkMs = 0;
     g_ff_map = 0;
     g_ff_pid = 0;
     g_cached_entry = 0;
