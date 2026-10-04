@@ -528,6 +528,10 @@ static struct {
     uint64_t lastUseMs;
     uint64_t gen;      // match generation this mapping was taken under
     uint32_t useCount;
+    // Frame stamp of the most recent hit or insert, compared against
+    // g_txnFrameStamp to mean "the frame running right now already read it".
+    // Free: useCount alone left four bytes of padding in this struct.
+    uint32_t touchedFrame;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
 static uint64_t g_cacheGeneration = 1;
@@ -548,6 +552,19 @@ static uint64_t g_degradedUntilMs = 0;
 // How many times a degrade has been recovered from, reported by the [DS-TLB]
 // line so a session that keeps hitting this says so instead of looking stable.
 static uint32_t g_dsRecoverCount = 0;
+// Bumped once per outermost transaction, i.e. once per ESP frame.
+static uint64_t g_txnFrameStamp = 1;
+// A read refused because every slot in the table was already read this frame. This
+// is the direct measurement of "the working set exceeds the table", and it is what
+// would justify a bigger table rather than a bigger read budget.
+static uint64_t g_dsNoVictimCount = 0;
+// Hits and misses per second. `live` cannot tell a saturated cache from a barely
+// read one; these can.
+static uint64_t g_dsHitCount = 0;
+static uint64_t g_dsMissCount = 0;
+// True if some read path was refused this second, sampled by the report so a
+// second with no hits and no remaps is attributable.
+static bool g_dsBlockedLastSecond = false;
 
 static void ds_page_cache_lock_init(void) {
     pthread_mutexattr_t attr;
@@ -604,8 +621,55 @@ static uint64_t ds_now_ms(void) {
     return (mach_absolute_time() * tb.numer / tb.denom) / 1000000ULL;
 }
 
+// Clear a degrade whose cooldown has run out. Must be called under the lock.
+//
+// This exists because clearing the flag inside ds_page_local did not work, and not
+// because clearing it twice is nice. Both read paths refused on g_degraded before
+// ds_page_local was ever entered, so the recovery branch in there could not be
+// reached from a read: the gate made the only code that could release the latch
+// unreachable from every caller of it.
+//
+// The consequence was that g_degraded was written false in exactly two places, that
+// dead branch and ds_detach -- which only runs on a pid change. ds_flush_page_cache
+// did not clear it either. So three consecutive failed vm_map_remote_page calls
+// meant every read in the process returned zero until the app was restarted, while
+// the log said "pausing remap for 250ms".
+//
+// That is the device line this explains. live=37, remaps=0, evicts=16: reads were
+// refused, so nothing was mapped, and ds_end_read_transaction is not gated on the
+// flag so it kept evicting four per transaction against a table nothing could
+// refill. It is not a cache under pressure. It is a cache nobody was allowed to
+// fill.
+//
+// ds_begin_read_transaction is the right place to close it because it is the one
+// hook that runs every frame regardless of what the read path decides: esp.mm calls
+// it unconditionally at 3925, before it knows whether there is anything to read.
+// Latch lifetime becomes the cooldown the log claims.
+static void ds_expire_degrade_locked(void) {
+    if (!g_degraded) return;
+    if (ds_now_ms() < g_degradedUntilMs) return;
+    int liveAtResume = 0;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].localAddr) liveAtResume++;
+    }
+    g_degraded = false;
+    g_consecutiveMapFailures = 0;
+    g_dsRecoverCount++;
+    static uint64_t s_lastRecLogMs = 0;
+    const uint64_t tRec = ds_now_ms();
+    if (tRec - s_lastRecLogMs >= 1000ULL) {
+        s_lastRecLogMs = tRec;
+        NSLog(@"[DS] degraded cooldown over — resuming with %d mapping(s) intact, "
+              @"recovery #%llu", liveAtResume,
+              (unsigned long long)g_dsRecoverCount);
+    }
+}
+
 void ds_begin_read_transaction(void) {
     ds_lock();
+    // Before the depth bump, so a frame that opens during a cooldown is already
+    // un-latched by the time its first read lands.
+    ds_expire_degrade_locked();
     g_readTxnDepth++;
     ds_unlock();
 }
@@ -615,6 +679,10 @@ void ds_end_read_transaction(void) {
     if (g_readTxnDepth > 0) g_readTxnDepth--;
     // Fl0rk soft-age — never full per-frame flush (that caused RW-lock panics).
     if (g_readTxnDepth == 0) {
+        // Belt and braces on a path that already runs every frame: a session that
+        // pairs begin/end correctly releases a cooldown here even if it never
+        // opened a transaction while latched.
+        ds_expire_degrade_locked();
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
             if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
         }
@@ -657,19 +725,40 @@ void ds_end_read_transaction(void) {
         if (nowMs > s_lastReportMs + 1000ULL) {
             static uint64_t s_lastRemapCount = 0;
             static uint64_t s_lastEvictCount = 0;
+            static uint64_t s_lastHitCount = 0;
+            static uint64_t s_lastMissCount = 0;
+            static uint64_t s_lastNoVictimCount = 0;
             uint64_t remapDelta = g_dsRemapCount - s_lastRemapCount;
             uint64_t evictDelta = g_dsEvictCount - s_lastEvictCount;
+            uint64_t hitDelta  = g_dsHitCount - s_lastHitCount;
+            uint64_t missDelta = g_dsMissCount - s_lastMissCount;
+            uint64_t novictimDelta = g_dsNoVictimCount - s_lastNoVictimCount;
             int live = 0;
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu",
+            // hit/miss is what this line was missing. live is a residency count
+            // and nothing more: on device it read 37 to 58 while remaps was 0 and
+            // evicts was 16, which is neither a saturated 256-slot table nor an
+            // idle one, and those two are only separable with a request rate.
+            // novictim says whether the table size is the binding ceiling, so a
+            // session that genuinely needs 1024 slots will say so itself.
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu "
+                  @"hit=%llu miss=%llu novictim=%llu%@",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
-                  (unsigned long long)evictDelta);
+                  (unsigned long long)evictDelta,
+                  (unsigned long long)hitDelta,
+                  (unsigned long long)missDelta,
+                  (unsigned long long)novictimDelta,
+                  g_dsBlockedLastSecond ? @" BLOCKED" : @"");
+            g_dsBlockedLastSecond = false;
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;
             s_lastEvictCount = g_dsEvictCount;
+            s_lastHitCount = g_dsHitCount;
+            s_lastMissCount = g_dsMissCount;
+            s_lastNoVictimCount = g_dsNoVictimCount;
         }
     }
     ds_unlock();
@@ -702,6 +791,8 @@ static uint64_t ds_page_local(uint64_t pageVA) {
             // Stamped on every hit. This is what the TTL is measured against,
             // so a page the game is reading every frame never ages out.
             g_pageCache[i].lastUseMs = ds_now_ms();
+            g_pageCache[i].touchedFrame = (uint32_t)g_txnFrameStamp;
+            g_dsHitCount++;
             uint64_t aHit = g_pageCache[i].localAddr;
             ds_unlock();
             return aHit;
@@ -753,26 +844,14 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         // continuously, and refusals are routine -- so it latched, wiped, burst,
         // and latched again. Same code, same offsets, different memory pressure.
         if (ds_now_ms() < g_degradedUntilMs) {
+            // While the cooldown runs a cold read is refused and a warm one was
+            // already served above. The release moved to ds_expire_degrade_locked,
+            // which both transaction hooks call: it cannot live here, because
+            // ds_rw_remap returned false on g_degraded before this function was
+            // ever entered.
+            g_dsBlockedLastSecond = true;
             ds_unlock();
             return 0;
-        }
-        int liveAtResume = 0;
-        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-            if (g_pageCache[i].localAddr) liveAtResume++;
-        }
-        g_degraded = false;
-        g_consecutiveMapFailures = 0;
-        g_dsRemapCount++;
-        g_dsRecoverCount++;
-        {
-            static uint64_t s_lastRecLogMs = 0;
-            const uint64_t tRec = ds_now_ms();
-            if (tRec - s_lastRecLogMs >= 1000ULL) {
-                s_lastRecLogMs = tRec;
-                NSLog(@"[DS] degraded cooldown over — resuming with %d mapping(s) intact, "
-                      @"recovery #%llu", liveAtResume,
-                      (unsigned long long)g_dsRecoverCount);
-            }
         }
     }
 
@@ -805,9 +884,27 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         uint64_t bestUse = UINT64_MAX;
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
             if (g_pageCache[i].localAddr == 0 && g_pageCache[i].port == 0) continue;
+            // LRU order is unchanged -- this only removes from the candidate set
+            // the pages this frame has already read. Evicting one of those is how a
+            // full table becomes a remap storm: the next frame asks for it again,
+            // misses, and re-maps it.
+            if (g_pageCache[i].touchedFrame == (uint32_t)g_txnFrameStamp) continue;
             if (g_pageCache[i].lastUse < bestUse) { bestUse = g_pageCache[i].lastUse; victim = i; }
         }
-        if (victim < 0) victim = g_pageCacheNext % DS_PAGE_CACHE_SLOTS;
+        // No empty slot and no slot this frame has not read: all 256 are live work.
+        // This used to fall through to g_pageCacheNext and evict one anyway, which
+        // is what made a crowded match unfixable by any cache size. Evicting
+        // round-robin against a working set larger than the table gives every
+        // reference a miss -- each one destroys a mapping the frame still needs,
+        // and the same page comes back next frame -- so the table sustains zero
+        // hits and the miss rate is the whole working set, every frame. Refusing
+        // bounds misses by (working set - table) instead, and the resident window
+        // rotates around the working set rather than thrashing inside it.
+        if (victim < 0) {
+            g_dsNoVictimCount++;
+            ds_unlock();
+            return 0;
+        }
     }
 
     // Hold lock through remap — Fl0rk does not drop lock around map.
@@ -851,7 +948,9 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     g_pageCache[victim].bornMs = ds_now_ms();
     g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;
+    g_pageCache[victim].touchedFrame = (uint32_t)g_txnFrameStamp;
     g_dsRemapCount++;
+    g_dsMissCount++;
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
     uint64_t a = page.localAddress;
     ds_unlock();
@@ -860,7 +959,19 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
 static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    if (g_degraded) return false;
+    // There used to be `if (g_degraded) return false;` here, and it is why
+    // reordering the hit loop inside ds_page_local changed nothing.
+    //
+    // This is the top of the read path. ds_page_local -- where a hit is now
+    // served before the flag is looked at -- is called from the loop at the
+    // bottom of this function, so a flag tested here returns false before that
+    // loop can run at all. The reorder was correct and unreachable.
+    //
+    // Nothing is lost by dropping it. A degrade is the kernel declining to map an
+    // address NOW. The flag is enforced one level down, inside ds_page_local, which
+    // is the only place that calls vm_map_remote_page, and this loop resolves
+    // pages through that function -- so it inherits the gate where it belongs,
+    // together with the hit-first ordering.
 
     uint8_t *p = (uint8_t *)buf;
     uint64_t cur = va;
@@ -931,7 +1042,16 @@ void ds_detach(void) {
 // dropping it around the remap raced kwrite_zone_element.
 bool ds_read_uncached(uint64_t va, void *buf, size_t len) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    if (g_degraded) return false;
+    // Scoped to the cooldown rather than to the flag, which is the difference
+    // between a pause and a latch. This path maps a fresh page on every call and
+    // unmaps it again, so it is the one place that genuinely should not add
+    // mapping pressure while the kernel is refusing. Gating on the flag meant the
+    // [PUSH] cache-versus-uncached cross-check in esp.mm could not run at all once
+    // a degrade latched -- which is the only moment it is worth running.
+    if (g_degraded && ds_now_ms() < g_degradedUntilMs) {
+        g_dsBlockedLastSecond = true;
+        return false;
+    }
 
     const uint64_t pageVA = va & ~((uint64_t)PAGE_SIZE - 1);
     const size_t off = (size_t)(va - pageVA);
@@ -962,6 +1082,12 @@ void ds_flush_page_cache(void) {
     }
     g_pageCacheNext = 0;
     g_pageUseCounter++;
+    // Clearing the mappings without clearing the flag was the worst of both: an
+    // empty cache and reads still refused. This is called on a match transition,
+    // and every mapping it dropped was taken against an address space the game has
+    // since torn down, so it is the natural moment to be able to read again.
+    g_degraded = false;
+    g_consecutiveMapFailures = 0;
     ds_unlock();
     // The single-entry cache holds a raw vm_map_entry pointer. After the map is
     // rebuilt that entry is freed, and the [start,end) range it cached will
