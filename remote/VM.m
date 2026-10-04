@@ -183,8 +183,20 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
  
     uint64_t entryAddr = vm_map_find_entry(map, address);
     if (!entryAddr) {
-        NSLog(@"[DS] DIAG vm_map_find_entry FAILED addr=0x%llx (no entry covers it)",
-              (unsigned long long)address);
+        // Rate limited rather than removed. A miss on an address the game has
+        // freed is an expected event at a match boundary -- the caller asked for
+        // a page that is genuinely gone -- so this used to print once per read
+        // for every pointer the stale object graph still pointed at. Four lines
+        // is enough to see that it is happening; the count it used to imply is
+        // better read off [DS-TLB] remaps, which is one line a second instead of
+        // one per failed lookup.
+        static uint32_t s_noEntryLogged = 0;
+        if (s_noEntryLogged < 4) {
+            s_noEntryLogged++;
+            NSLog(@"[DS] vm_map_find_entry: no entry covers addr=0x%llx "
+                  @"(further ones suppressed)",
+                  (unsigned long long)address);
+        }
         return result;
     }
 
@@ -200,11 +212,20 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
     uint32_t vme_object = entry.vme_object_or_delta;
     uint64_t vmeObject = vm_unpack_pointer((uint64_t)vme_object, &params);
     if (!is_kaddr_valid(vmeObject)) {
-        printf("[DS][%s:%d] invalid VM object 0x%llx for addr=0x%llx (raw32=0x%x unpacked=0x%llx)\n",
-               __FUNCTION__, __LINE__,
-               (unsigned long long)vmeObject,
-               (unsigned long long)address,
-               vme_object, (unsigned long long)vmeObject);
+        // Same event as the no-entry and no-object cases further down: a lookup
+        // for memory the game has already freed. Rate limited for the same
+        // reason -- ungated, this printed once per read for every pointer
+        // the stale object graph still pointed at.
+        static uint32_t s_badObjLogged = 0;
+        if (s_badObjLogged < 4) {
+            s_badObjLogged++;
+            printf("[DS][%s:%d] invalid VM object 0x%llx for addr=0x%llx "
+                   "(raw32=0x%x) -- further ones suppressed\n",
+                   __FUNCTION__, __LINE__,
+                   (unsigned long long)vmeObject,
+                   (unsigned long long)address,
+                   vme_object);
+        }
         return result;
     }
  
@@ -226,9 +247,13 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
 {
     struct VMShmem shmem = {0};
     if (!object || !is_kaddr_valid(object->address)) {
-        printf("[DS][%s:%d] invalid VM object 0x%llx\n",
-               __FUNCTION__, __LINE__,
-               object ? (unsigned long long)object->address : 0);
+        static uint32_t s_noObjAddrLogged = 0;
+        if (s_noObjAddrLogged < 4) {
+            s_noObjAddrLogged++;
+            printf("[DS][%s:%d] invalid VM object 0x%llx -- further ones suppressed\n",
+                   __FUNCTION__, __LINE__,
+                   object ? (unsigned long long)object->address : 0);
+        }
         return shmem;
     }
 
@@ -240,11 +265,16 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     uint64_t pageObjectOffset = object->entryOffset & ~PAGE_MASK_K;
     uint64_t objectSize = kread64(object->address + off_vm_object_vo_un1_vou_size);
     if (objectSize && pageObjectOffset >= objectSize) {
-        printf("[DS][%s:%d] page offset 0x%llx past object size 0x%llx addr=0x%llx\n",
-               __FUNCTION__, __LINE__,
-               (unsigned long long)pageObjectOffset,
-               (unsigned long long)objectSize,
-               (unsigned long long)object->vmAddress);
+        static uint32_t s_pastSizeLogged = 0;
+        if (s_pastSizeLogged < 4) {
+            s_pastSizeLogged++;
+            printf("[DS][%s:%d] page offset 0x%llx past object size 0x%llx "
+                   "addr=0x%llx -- further ones suppressed\n",
+                   __FUNCTION__, __LINE__,
+                   (unsigned long long)pageObjectOffset,
+                   (unsigned long long)objectSize,
+                   (unsigned long long)object->vmAddress);
+        }
         return shmem;
     }
 
@@ -470,34 +500,18 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         }
     }
 
-    // DIAG via NSLog (3uTools realtime only captures NSLog, not printf):
-    // dump the real 72 bytes so the kernel's actual layout is measured on the
-    // device instead of inferred.
-    {
-        uint8_t raw[VME_ENTRY_ZONE_BYTES];
-        kreadbuf(nextAddr, raw, sizeof(raw));
-        // Plain C hex, not -appendFormat:- which is an NSMutableString category
-        // and is not visible under this SDK's module map.
-        static const char *hexdig = "0123456789abcdef";
-        char hexbuf[VME_ENTRY_ZONE_BYTES * 2 + 1];
-        for (int i = 0; i < (int)VME_ENTRY_ZONE_BYTES; i++) {
-            hexbuf[i * 2]     = hexdig[(raw[i] >> 4) & 0xF];
-            hexbuf[i * 2 + 1] = hexdig[raw[i] & 0xF];
-        }
-        hexbuf[VME_ENTRY_ZONE_BYTES * 2] = '\0';
-        NSLog(@"[DS] DIAG vmmapcopy copy=0x%llx entry=0x%llx copyBytes=0x%lx sizeof(vm_map_entry)=0x%lx raw=%s",
-              (unsigned long long)shmemVMCopyAddr,
-              (unsigned long long)nextAddr,
-              (unsigned long)VME_ENTRY_ZONE_BYTES,
-              (unsigned long)sizeof(struct vm_map_entry),
-              hexbuf);
-        NSLog(@"[DS] DIAG vme_object_or_delta@0x%lx=0x%08x is_sub_map=%d ko=%d wantObj=0x%llx wantOff=0x%llx",
-              (unsigned long)offsetof(struct vm_map_entry, vme_object_or_delta),
-              (unsigned)entry.vme_object_or_delta,
-              (int)entry.is_sub_map, (int)entry.vme_kernel_object,
-              (unsigned long long)object->address,
-              (unsigned long long)pageObjectOffset);
-    }
+    // A 72-byte DIAG hex dump used to live here, ungated, on every remap. It cost
+    // 9 kreads -- 18 syscalls, since kreadbuf walks 8 bytes per call -- to build a
+    // string, and the bytes it read were used by nothing else: `raw` was local to
+    // the block. That is 18 of the ~116 syscalls a miss costs, spent on a log line
+    // nobody reads twice.
+    //
+    // The layout question it was answering is answered, in the comments above: the
+    // entry to patch is vm_map_copy_first_entry, not the copy itself, and the 7
+    // device samples that established it are recorded there. If the layout ever
+    // needs measuring again, gate it on a counter rather than restoring it
+    // ungated -- a miss is not a rare event, it is what the cache does whenever
+    // the working set moves.
 
     if (entry.vme_kernel_object || entry.is_sub_map) {
         printf("[DS][%s:%d] REJECT submap/kernel-object: addr=0x%llx submap=%d ko=%d\n",
@@ -571,11 +585,11 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
 
         early_kwrite32bytes(nextAddr + VME_BLOCK_HI, blk);
 
+        // Readback kept, log dropped. The read is not diagnostic: it is the
+        // MISMATCH guard immediately below, which is what stands between a stale
+        // map entry and vm_map_enter. Only the NSLog went.
         uint32_t check = 0;
         kreadbuf(nextAddr + odOff, &check, sizeof(check));
-        NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
-              (unsigned long)odOff, newOD, check,
-              check == newOD ? @"MATCH" : @"MISMATCH");
 
         // A write that did not land is a live map entry holding whatever it held
         // before, and the map below goes on to resolve the memory entry through
@@ -638,15 +652,11 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     {
         enum { NE_DUMP_BYTES = 0x30 };
 
-        static const char *hexdigNE = "0123456789abcdef";
+        // The read stays because the copySize search below consumes it. What went
+        // is the hex rendering of it -- 96 nibble conversions per remap to format
+        // a string nobody reads -- and the NSLog below that printed it.
         uint8_t ne[NE_DUMP_BYTES];
         kreadbuf(shmemNamedEntry, ne, sizeof(ne));
-        char neHex[NE_DUMP_BYTES * 2 + 1];
-        for (uint32_t i = 0; i < (uint32_t)NE_DUMP_BYTES; i++) {
-            neHex[i * 2]     = hexdigNE[(ne[i] >> 4) & 0xF];
-            neHex[i * 2 + 1] = hexdigNE[ne[i] & 0xF];
-        }
-        neHex[NE_DUMP_BYTES * 2] = '\0';
 
         // vm_map_copy.size, written by vm_named_entry_associate_vm_object().
         const uint64_t copySize = kread64(shmemVMCopyAddr + 0x10);
@@ -664,10 +674,8 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         }
         const uint32_t offAt = (sizeAt == NE_NONE) ? NE_NONE : (sizeAt - 8);
 
-        NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
-              (unsigned long long)shmemNamedEntry, neHex,
-              (unsigned long long)copySize,
-              (unsigned)sizeAt, (unsigned)offAt);
+        // sizeAt and offAt are derived below and still used; only the dump went.
+        (void)copySize;
 
         if (offAt != NE_NONE && offAt + sizeof(uint64_t) <= VNE_BLOCK_BYTES) {
             uint8_t blk[EARLY_KRW_LENGTH];
@@ -678,16 +686,32 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
 
             early_kwrite32bytes(shmemNamedEntry, blk);
 
-            uint64_t check = 0;
-            kreadbuf(shmemNamedEntry + offAt, &check, sizeof(check));
-            NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
-                  (unsigned)offAt, (unsigned long long)newOffset,
-                  (unsigned long long)check,
-                  check == newOffset ? @"MATCH" : @"MISMATCH");
+            // The readback that used to sit here is gone with the log, and that is
+            // a deliberate removal rather than an oversight: it existed only to be
+            // printed. Nothing ever branched on it -- unlike the
+            // vme_object_or_delta readback above, which guards the mapping and so
+            // has to stay -- so once the NSLog went the read had no consumer and
+            // cost 2 syscalls per remap to produce a number nobody looked at.
+            //
+            // Worth knowing, since it is now invisible: this kernel write is
+            // never verified. If a write to vm_named_entry.offset silently fails,
+            // the memory entry keeps pointing at the wrong place in the object and
+            // the mapping reads wrong bytes while looking successful. Giving this
+            // the same guard the other write has is a behaviour change and was not
+            // part of removing the logs; it is a separate decision.
         } else {
-            NSLog(@"[DS] DIAG SKIP named_entry.offset: located at 0x%x, not inside "
-                  @"the writable 32-byte block [0x00,0x%x)", (unsigned)offAt,
-                  (unsigned)VNE_BLOCK_BYTES);
+            // This branch means the layout assumption did not hold on this device,
+            // so it is worth saying once. It fired per remap before, which is the
+            // worst possible ratio for a line that only ever reports the same
+            // single fact: if the offset cannot be found, it cannot be found on
+            // the next remap either, and the run is already degraded by it.
+            static uint32_t s_skipLogged = 0;
+            if (s_skipLogged < 4) {
+                s_skipLogged++;
+                NSLog(@"[DS] named_entry.offset not located (got 0x%x, writable "
+                      @"block is [0x00,0x%x)) — further ones suppressed",
+                      (unsigned)offAt, (unsigned)VNE_BLOCK_BYTES);
+            }
         }
     }
 
@@ -746,8 +770,17 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
     struct VMObject vmObject = vm_get_object(vmMap, address);
     if (!vmObject.address)
     {
-        NSLog(@"[DS] DIAG vm_map_remote_page no object for 0x%llx",
-              (unsigned long long)address);
+        // Same reasoning as the no-entry case above, and this one fires from the
+        // same moment: a lookup for a page the game has already torn down. It was
+        // the loudest line in the file, once per failed miss, for as long as the
+        // stale pointers kept being followed.
+        static uint32_t s_noObjLogged = 0;
+        if (s_noObjLogged < 4) {
+            s_noObjLogged++;
+            NSLog(@"[DS] vm_map_remote_page: no object for addr=0x%llx "
+                  @"(further ones suppressed)",
+                  (unsigned long long)address);
+        }
         return shmem;
     }
 
