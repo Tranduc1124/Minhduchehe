@@ -896,16 +896,21 @@ static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
     Vector3 bone = GetAimTargetPosMode(pawn, posMode, 0.0f);
     if (!IsZeroVec(bone) && looksLikeWorldPos(bone)) return bone;
     // Fallbacks still respect mode: neck slightly below head, body toward hip.
+    // The neck fraction and the no-hip drop are held at the same 0.14 the hip
+    // path in GetAimTargetPosMode uses, so that picking neck cannot aim the
+    // silent path somewhere else than the visible one. They were 0.22 and 0.12
+    // here against 0.22 and 0.14 there: two numbers, two more, none of them
+    // agreeing.
     Vector3 head = ResolveSilentHeadWorldPos(pawn);
     if (IsZeroVec(head) || !looksLikeWorldPos(head)) return Vector3{0, 0, 0};
     Vector3 hip = getPositionExt(getHip(pawn));
     if (looksLikeWorldPos(hip) && !IsZeroVec(hip)) {
-        const float t = (posMode == 1) ? 0.22f : 0.52f;
+        const float t = (posMode == 1) ? 0.14f : 0.52f;
         return Vector3(head.x + (hip.x - head.x) * t,
                        head.y + (hip.y - head.y) * t,
                        head.z + (hip.z - head.z) * t);
     }
-    head.y -= (posMode == 1) ? 0.12f : 0.32f;
+    head.y -= (posMode == 1) ? 0.14f : 0.32f;
     return head;
 }
 
@@ -1509,7 +1514,10 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
         if (looksLikeWorldPos(root)) {
             hipPos = root;
         } else {
-            // No hip: drop Y enough that Neck/Body are visibly not skull.
+            // No hip: drop Y enough that Neck/Body are visibly not skull. Held at
+            // the same 0.14 as the neck fraction above and as the silent path's
+            // no-hip drop, so a pawn without a readable hip aims at the same
+            // place whichever path resolves it.
             head.y -= (posMode == 1) ? 0.14f : 0.34f;
             return head;
         }
@@ -1520,8 +1528,20 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     const float dz = hipPos.z - head.z;
 
     if (posMode == 1) {
-        // Neck: ~22% head→hip (old 0.10 still read as headshots).
-        const float t = 0.22f;
+        // Neck: ~14% head→hip, up from 22%. Higher on the body, which is what
+        // makes the drag easier -- the target sits nearer the head, so the stick
+        // travels less to put it there.
+        //
+        // 0.22 was not a value anyone chose against 0.10; it was chosen against
+        // it. 0.10 read as a headshot, so 0.22 was the step away from that. 0.14
+        // is a step back towards it on purpose, and deliberately not further:
+        // the same note that rejected 0.10 is the reason to stop short of it.
+        //
+        // Matched by ResolveSilentAimWorldPos's fallback and by both no-hip
+        // fallbacks below, so the visible aim and the silent one cannot land on
+        // different points. They were already 0.14 and 0.12 there, i.e. already
+        // disagreeing with each other and with this 0.22.
+        const float t = 0.14f;
         return Vector3(head.x + dx * t, head.y + dy * t, head.z + dz * t);
     }
 
