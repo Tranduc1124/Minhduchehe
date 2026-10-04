@@ -444,7 +444,6 @@ uint64_t ds_translate_page(uint64_t page_va) {
 //   _pageSlots[256] {VMShmem + lastUse}, _recentPageSlots[8], soft-age on txn end,
 //   NSRecursiveLock across map+insert, degraded after 3 consecutive map failures.
 #define DS_PAGE_CACHE_SLOTS 256
-#define DS_RECENT_SLOTS 8
 #define DS_FAIL_DEGRADE_THRESHOLD 3
 // How long a degrade pauses remapping before it is retried. Long enough not to
 // hammer a kernel that is refusing, short enough that a burst of failures costs
@@ -492,8 +491,6 @@ static struct {
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
 static uint64_t g_cacheGeneration = 1;
-static int g_recentPageSlots[DS_RECENT_SLOTS];
-static int g_recentCount = 0;
 static uint64_t g_pageUseCounter = 1;
 static int g_pageCacheNext = 0;
 // Lifetime counters, reported once a second as [DS-TLB]. Kept monotonic across
@@ -529,18 +526,13 @@ static void ds_unlock(void) {
     pthread_mutex_unlock(&g_pageCacheLock);
 }
 
-static void ds_note_recent_locked(int slot) {
-    for (int i = 0; i < g_recentCount; i++) {
-        if (g_recentPageSlots[i] == slot) {
-            for (int j = i; j > 0; j--) g_recentPageSlots[j] = g_recentPageSlots[j - 1];
-            g_recentPageSlots[0] = slot;
-            return;
-        }
-    }
-    if (g_recentCount < DS_RECENT_SLOTS) g_recentCount++;
-    for (int j = g_recentCount - 1; j > 0; j--) g_recentPageSlots[j] = g_recentPageSlots[j - 1];
-    g_recentPageSlots[0] = slot;
-}
+// There used to be a recent-slot ring here, eight entries long, that every hit
+// updated and that the eviction victim was chosen from. Choosing the coldest slot
+// inside a ring of the most recently touched slots evicts the eighth-hottest page
+// in a 256-entry table, which is worse than useless once the table is full, so the
+// ring went with it: the scan is now over the whole table and the ring had no
+// other reader. Keeping it would have meant a linear scan and an eight-int memmove
+// on the hit path for a value nothing looked at.
 
 static void ds_release_page_slot_locked(int i) {
     if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) return;
@@ -665,23 +657,49 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         // until the session is restarted. Nothing in the log said why, because the
         // degrade line is the only trace and it reads like a deliberate decision.
         //
-        // Dropping the page cache on the way in is the other half: a mapping the
-        // kernel no longer honours is the likeliest reason the remap failed, and
-        // keeping it is what made the next attempt fail too.
+        // The cache is NOT dropped on the way back in. That used to be the stated
+        // plan -- "a mapping the kernel no longer honours is the likeliest reason
+        // the remap failed, and keeping it is what made the next attempt fail too"
+        // -- and it is what turned a pause into a loop.
+        //
+        // A failed remap is the kernel declining to map an address NOW. It says
+        // nothing about the 256 mappings already held, each of which was handed
+        // over successfully and is still referenced by a live shmem entry. There
+        // is no mechanism by which holding them makes a new mapping of a different
+        // address any less likely to succeed, and if the address itself is the
+        // problem -- freed, no longer in the map -- then dropping whatever we
+        // cached for it would not help either, because the next attempt maps the
+        // same dead address and fails the same way.
+        //
+        // Dropping it anyway cost three things and bought nothing measurable. It
+        // forced 256 fresh remaps immediately after, which is more mapping pressure
+        // than the state we were escaping, so it drove the next failure and the
+        // next latch. It did 512 mach_vm_deallocate and mach_port_deallocate calls
+        // while holding g_pageCacheLock, which is the lock the render thread on the
+        // main queue and the aim thread both contend for. And it discarded mappings
+        // that were fine, so every page of the working set had to be re-fetched
+        // while the cache was cold.
+        //
+        // This is why the failure was mode-dependent. Clash Squad has a handful of
+        // players and the kernel rarely refuses, so three consecutive failures never
+        // happen and none of this runs. Survival has fifty to a hundred, allocating
+        // continuously, and refusals are routine -- so it latched, wiped, burst,
+        // and latched again. Same code, same offsets, different memory pressure.
         if (ds_now_ms() < g_degradedUntilMs) {
             ds_unlock();
             return 0;
         }
+        int liveAtResume = 0;
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+            if (g_pageCache[i].localAddr) liveAtResume++;
+        }
         g_degraded = false;
         g_consecutiveMapFailures = 0;
-        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-            ds_release_page_slot_locked(i);
-        }
-        g_pageCacheNext = 0;
-        g_recentCount = 0;
         g_dsRemapCount++;
         g_dsRecoverCount++;
-        NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
+        NSLog(@"[DS] degraded cooldown over — resuming with %d mapping(s) intact, "
+              @"recovery #%llu", liveAtResume,
+              (unsigned long long)g_dsRecoverCount);
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
@@ -691,14 +709,30 @@ static uint64_t ds_page_local(uint64_t pageVA) {
             // Stamped on every hit. This is what the TTL is measured against,
             // so a page the game is reading every frame never ages out.
             g_pageCache[i].lastUseMs = ds_now_ms();
-            ds_note_recent_locked(i);
             uint64_t a = g_pageCache[i].localAddr;
             ds_unlock();
             return a;
         }
     }
 
-    // Prefer empty slot; else coldest among recent window then global next.
+    // Prefer an empty slot. Otherwise evict the genuinely coldest one.
+    //
+    // This used to scan only the recent window and pick the coldest within it,
+    // which is the opposite of what the comment claimed. g_recentPageSlots holds
+    // the DS_RECENT_SLOTS most recently touched slots, most recent first, so
+    // "coldest among the recent window" is the eighth-hottest page in the whole
+    // table -- hotter than the other 248. Every eviction therefore dropped a page
+    // that was in active use, the next read of it missed, and the re-mapped entry
+    // became the newest member of the same eight. That is a cascade: the hot set
+    // rotates through the victims while the genuinely cold pages stay pinned
+    // forever.
+    //
+    // It only bites once the working set passes DS_PAGE_CACHE_SLOTS, which is also
+    // why it looked mode-dependent on top of the degrade loop: Clash Squad fits in
+    // 256 pages and never evicts, Survival with fifty to a hundred players does.
+    //
+    // lastUse is a monotonic counter handed out per touch, so a full scan of 256
+    // slots is exact LRU and costs 256 comparisons on the miss path only.
     int victim = -1;
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         if (g_pageCache[i].localAddr == 0 && g_pageCache[i].port == 0) {
@@ -708,14 +742,9 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     }
     if (victim < 0) {
         uint64_t bestUse = UINT64_MAX;
-        int window = g_recentCount > 0 ? g_recentCount : DS_RECENT_SLOTS;
-        for (int k = 0; k < window; k++) {
-            int i = (g_recentCount > 0)
-                ? g_recentPageSlots[k]
-                : ((g_pageCacheNext + k) % DS_PAGE_CACHE_SLOTS);
-            if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) continue;
-            uint64_t score = g_pageCache[i].lastUse;
-            if (score < bestUse) { bestUse = score; victim = i; }
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+            if (g_pageCache[i].localAddr == 0 && g_pageCache[i].port == 0) continue;
+            if (g_pageCache[i].lastUse < bestUse) { bestUse = g_pageCache[i].lastUse; victim = i; }
         }
         if (victim < 0) victim = g_pageCacheNext % DS_PAGE_CACHE_SLOTS;
     }
@@ -751,7 +780,6 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].bornMs = ds_now_ms();
     g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;
     g_dsRemapCount++;
-    ds_note_recent_locked(victim);
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
     uint64_t a = page.localAddress;
     ds_unlock();
@@ -814,7 +842,6 @@ void ds_detach(void) {
         ds_release_page_slot_locked(i);
     }
     g_pageCacheNext = 0;
-    g_recentCount = 0;
     g_consecutiveMapFailures = 0;
     g_degraded = false;
     ds_unlock();
@@ -861,7 +888,6 @@ void ds_flush_page_cache(void) {
         ds_release_page_slot_locked(i);
     }
     g_pageCacheNext = 0;
-    g_recentCount = 0;
     g_pageUseCounter++;
     ds_unlock();
     // The single-entry cache holds a raw vm_map_entry pointer. After the map is
