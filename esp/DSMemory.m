@@ -108,7 +108,25 @@ static void init_physmap(void) {
 #pragma mark - attach
 
 int ds_attach(void) {
-    if (ds_attached()) return 0;
+    // "Already attached" has to mean "already attached AND usable", not merely
+    // "g_ff_task is non-zero".
+    //
+    // g_ff_task is assigned at DSMemory.m:231, which reads proc_ro->pr_task and is
+    // BEFORE the base walk. Every failure from there to the end of the walk --
+    // proc_ro, task, map, nentries, first entry, no base -- returns -1 with
+    // g_ff_task still set. So one failed attempt left ds_attached() -- a bare
+    // K(g_ff_task) -- answering true for the rest of the process, this early-out
+    // returned 0 without walking anything, and the ds_detach() reset further down,
+    // which exists for exactly this, was unreachable behind it.
+    //
+    // Requiring g_ff_base is what lets the reset run on the retry. The log this
+    // came from is the shape the comment further down already describes:
+    // "[DS] base walk: mapped=7 fail=7 best=0x0", then module base not found, then
+    // base=0x0 for the rest of the session. Found the process, lost the base, and
+    // never asked again -- which is also exactly what a chain reading zero from
+    // every offset looks like from the outside, because there is nothing valid to
+    // read through any more.
+    if (ds_attached() && g_ff_base) return 0;
     if (!g_kexploit_ready) return -1;
 
     // Drop any half-finished attempt before starting a new one.
@@ -308,9 +326,14 @@ int ds_attach(void) {
     }
 
     if (!g_ff_base) {
-        static int s_baseLogged = 0;
-        if (!s_baseLogged) {
-            s_baseLogged = 1;
+        // Throttled, not one-shot. It used to fire at most once per process, so a
+        // user who hit this saw one line and then permanent silence for the rest of
+        // the session, which is a large part of why the log never said why. Five
+        // seconds apart says "still failing" without becoming a second steady line.
+        static uint64_t s_lastBaseLogUS = 0;
+        const uint64_t tBaseUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        if (tBaseUS - s_lastBaseLogUS >= 5000000ULL) {
+            s_lastBaseLogUS = tBaseUS;
             NSLog(@"[DS] module base not found (nentries walk failed)");
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
