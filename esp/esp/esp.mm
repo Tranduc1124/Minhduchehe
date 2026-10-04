@@ -4207,8 +4207,25 @@ static int      s_countTeamUnknown = 0;
     CGMutablePathRef aNumOPath  = CGPathCreateMutable();
     CGMutablePathRef aNumRPath  = CGPathCreateMutable();
 
+    // These four were freed in exactly two places -- the matrix early-out and the
+    // tail -- while renderESPWithBuffers has seven other returns. The lobby one
+    // fires every frame for the whole lobby, so it leaked four CGPathRefs a frame
+    // at 60Hz: 240 a second, for as long as the ESP sat in a lobby. The lobby is
+    // also the only place those returns are reachable in a steady state, so it was
+    // a lobby leak and nothing else.
+    //
+    // ESPGeometryBuffersRelease does not cover these. That releases the
+    // buffers->*Path objects, which are different allocations.
+    auto releaseNumPaths = [&]() {
+        CGPathRelease(aNumBGPath);
+        CGPathRelease(aNumGPath);
+        CGPathRelease(aNumOPath);
+        CGPathRelease(aNumRPath);
+    };
+
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
         DIAG_EARLY(@"no-base");
+        releaseNumPaths();
         return stats;
     }
 
@@ -4371,11 +4388,13 @@ static int      s_countTeamUnknown = 0;
             NSLog(@"[ESP] Lobby mode: waiting for match...");
         }
         DIAG_EARLY(@"lobby");
+        releaseNumPaths();
         return stats;
     }
 
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
         DIAG_EARLY(@"loading-match");
+        releaseNumPaths();
         return stats;
     }
 
@@ -4654,6 +4673,8 @@ static int      s_countTeamUnknown = 0;
     // die, because that pawn is not an enemy and never disappears.
     uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
     if (!isVaildPtr(playerDict)) {
+        DIAG_EARLY(@"no-playerDict");
+        releaseNumPaths();
         return stats;
     }
 
@@ -4666,11 +4687,15 @@ static int      s_countTeamUnknown = 0;
         }
     }
     if (!isVaildPtr(entriesArr)) {
+        DIAG_EARLY(@"no-dict-entries");
+        releaseNumPaths();
         return stats;
     }
 
     int slotCap = ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength);
     if (slotCap <= 0 || slotCap > 256) {
+        DIAG_EARLY(@"slot-implausible");
+        releaseNumPaths();
         return stats;
     }
     // dictCount is the number of live entries. When it is zero the backing array is
@@ -4679,6 +4704,8 @@ static int      s_countTeamUnknown = 0;
     // left the match. Guard here rather than clamp the loop, because the loop is
     // also what finds the players that are live.
     if (dictCount <= 0) {
+        DIAG_EARLY(@"dict-empty");
+        releaseNumPaths();
         return stats;
     }
 
@@ -5315,10 +5342,8 @@ static int      s_countTeamUnknown = 0;
     // -------------------------------------------------------------------------
     if (!GetViewMatrixInto(camera, matrixData)) {
         // Paths allocated above — free before early out (matrix unavailable this frame).
-        CGPathRelease(aNumBGPath);
-        CGPathRelease(aNumGPath);
-        CGPathRelease(aNumOPath);
-        CGPathRelease(aNumRPath);
+        DIAG_EARLY(@"no-view-matrix");
+        releaseNumPaths();
         if (stats.aimAssistPath) {
             CGPathRelease(stats.aimAssistPath);
             stats.aimAssistPath = NULL;
@@ -6676,10 +6701,7 @@ static int      s_countTeamUnknown = 0;
     self.alertNumOrangeLayer.path = CGPathIsEmpty(aNumOPath) ? nil : aNumOPath;
     self.alertNumRedLayer.path = CGPathIsEmpty(aNumRPath) ? nil : aNumRPath;
 
-    CGPathRelease(aNumBGPath);
-    CGPathRelease(aNumGPath);
-    CGPathRelease(aNumOPath);
-    CGPathRelease(aNumRPath);
+    releaseNumPaths();
 
     return stats;
 }
