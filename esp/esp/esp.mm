@@ -3859,21 +3859,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
             bool needAttach = (Moudule_Base == (uint64_t)-1 || Moudule_Base == 0 ||
                                !ds_attached() || ds_pid() != s_attachedPid);
             if (needAttach) {
-                // needAttach can be true because the pid moved while ds is still
-                // attached to the OLD process. GameTargetModuleBase() used to
-                // short-circuit on ds_attached() and hand back the dead process's
-                // base, the success test below passed on it, and s_attachedPid was
-                // then set to that dead pid -- so needAttach went false and the ESP
-                // stayed wired to a process that no longer existed, for the rest of
-                // the session. Drop the attach first when the pid is not the one
-                // this loop last recorded; ds_detach() also drops the page cache
-                // and the degrade flag, both of which were populated against the
-                // process that just died.
-                if (ds_attached() && s_attachedPid != -1 && ds_pid() != s_attachedPid) {
-                    NSLog(@"[ESP] pid moved %d -> %d, dropping the attach on the old one",
-                          (int)s_attachedPid, (int)ds_pid());
-                    ds_detach();
-                }
                 if (s_reattachCooldown > 0) {
                     s_reattachCooldown--;
                 } else {
@@ -4222,25 +4207,8 @@ static int      s_countTeamUnknown = 0;
     CGMutablePathRef aNumOPath  = CGPathCreateMutable();
     CGMutablePathRef aNumRPath  = CGPathCreateMutable();
 
-    // These four were freed in exactly two places -- the matrix early-out and the
-    // tail -- while renderESPWithBuffers has seven other returns. The lobby one
-    // fires every frame for the whole lobby, so it leaked four CGPathRefs a frame
-    // at 60Hz: 240 a second, for as long as the ESP sat in a lobby. The lobby is
-    // also the only place those returns are reachable in a steady state, so it was
-    // a lobby leak and nothing else.
-    //
-    // ESPGeometryBuffersRelease does not cover these. That releases the
-    // buffers->*Path objects, which are different allocations.
-    auto releaseNumPaths = [&]() {
-        CGPathRelease(aNumBGPath);
-        CGPathRelease(aNumGPath);
-        CGPathRelease(aNumOPath);
-        CGPathRelease(aNumRPath);
-    };
-
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
         DIAG_EARLY(@"no-base");
-        releaseNumPaths();
         return stats;
     }
 
@@ -4265,80 +4233,9 @@ static int      s_countTeamUnknown = 0;
     // Declared here rather than inside the flush block below, which runs after
     // this one and is reset by it when a match ends.
     static uint64_t s_lastMatchDiag = 0;
-    // "This match has had its page-cache flush already." NOT derivable from
-    // s_lastMatchDiag: that key is cleared on every not-live frame (see the
-    // s_lastMatchDiag = 0 line below and why it has to be there), so in a lobby
-    // where *(CurrentGame + 0x90) reads as a valid pointer it reads as zero every
-    // frame and "s_lastMatchDiag == 0" cannot mean "first frame of a new match".
-    // See the firstMatch test further down for what that cost.
-    static bool s_firstMatchFlushed = false;
-    // The last matchGame this pass saw. This is the only one of the three
-    // pointers that can still be trusted at the boundary, and it is what makes
-    // the match -> match edge observable at all.
-    //
-    // match, camera and myPawnObject all hang off objects the game frees when it
-    // rebuilds the scene, and they are read through the page cache that is being
-    // invalidated, so they keep answering with the previous match. matchGame is
-    // reached through GameFacade's static_fields, which live in the binary's own
-    // data segment: nothing about a new match tears those down, so the pointer
-    // moves to the new game object while the old match object is still being
-    // served from the cache. That difference is the edge.
-    static uint64_t s_lastMatchGame = 0;
-    // Keep dropping mappings until the next match is actually playable.
-    //
-    // The single flush below lands on the first frame matchGame moves, and that
-    // frame is the middle of the scene teardown: the pages mapped right then
-    // belong to an address space that is being destroyed and whose blocks the
-    // game is about to reuse. They are not stale when they are mapped, they are
-    // about to be, and the cache will not let go of them on its own. That is
-    // why the same transition works sometimes and does not others — it depends
-    // on whether the blocks that happened to be mapped during the teardown
-    // window are the ones the game frees afterwards.
-    //
-    // 500ms, at most 3s, so at most six flushes per transition. Not per frame:
-    // DSMemory.m records that a per-frame flush caused "Taking non-sleepable RW
-    // lock" panics. stats.inMatch is still false on the frames that return early
-    // at the lobby and loading checks, which is the window that needs it, and
-    // the window closes itself on the first frame that reaches the dictionary
-    // check with entries in it.
-    //
-    // This is a liveness net behind the mapping check in ds_page_local, not the
-    // mechanism. That one is self-detecting; this one only matters for the slots
-    // where the check could not arm itself, and it covers them whether or not
-    // anyone can tell which those were.
-    static uint64_t s_flushUntilUS = 0;
-    static uint64_t s_nextFlushUS  = 0;
     {
         const bool live = isVaildPtr(match);
-        // Match -> match. The old edge below watches `match` going invalid, and at
-        // this boundary it never does: isVaildPtr is a range check, so a freed
-        // object still passes, and the read that produced it came from a mapping
-        // of the vm_object the game has already freed. So nothing fired, no page
-        // was dropped, and the next match was drawn out of the last match's
-        // memory -- the boxes moved because the camera moved, the counter held
-        // its number because it was the same stale dictionary, and nothing in the
-        // pipeline reported a problem because nothing in the pipeline was wrong.
-        const bool newGame = (isVaildPtr(matchGame) && s_lastMatchGame != 0 &&
-                              matchGame != s_lastMatchGame);
-
-        // s_lastMatchDiag is the key for the flush that runs when the next match
-        // appears, so it is only meaningful while a match is live -- and this is
-        // the only place that knows the match is not. It has to be cleared on EVERY
-        // not-live frame, OUTSIDE the guard below.
-        //
-        // Inside it, it is not cleared, because the guard needs
-        // s_lastLiveMatch != 0. And the else-if at the bottom of this block
-        // overwrites s_lastLiveMatch with whatever `match` reads on a lobby frame.
-        // getMatchGame falls back to CurrentGame when CurrentMatchGame is null
-        // (GameLogic.mm:20), and ReadGameFacadeStatics accepts a statics block on
-        // CurrentGame alone (:38), so in the lobby `match` is *(CurrentGame + 0x90)
-        // and can read as a valid pointer. When it does, live stays true for the
-        // whole lobby, this guard never opens, and s_lastMatchDiag stays pinned to
-        // the last match's address for the rest of the session -- which starves the
-        // flush further down of the trigger it needs.
-        if (!live) s_lastMatchDiag = 0;
-
-        if (s_lastLiveMatch != 0 && (!live || newGame)) {
+        if (s_lastLiveMatch != 0 && !live) {
             const uint64_t left = s_lastLiveMatch;
             // First, while the mappings are still good: give the game back the
             // string pointers we replaced, so its teardown does not free memory it
@@ -4346,9 +4243,6 @@ static int      s_countTeamUnknown = 0;
             RainbowNameDetach();
             ds_flush_page_cache();
             ds_cache_bump_generation();
-            // Not a one-shot, and the reason is written at the declaration.
-            s_flushUntilUS = ESPPhaseNowUS() + 3000000ULL;   // 3s
-            s_nextFlushUS  = 0;
             // The count is a table of pawn pointers with a frame hold; a pawn from
             // the match that just ended is not a live enemy in the lobby.
             s_espCountN = 0;
@@ -4364,67 +4258,19 @@ static int      s_countTeamUnknown = 0;
             gAimLockLostFrames = 0;
             s_lockHoldFrames = 0;
             AimLockClear();
-            // The per-pawn trackers were not in this list. Each one self-heals on
-            // a pointer mismatch, so at match -> match -- where the pointers are
-            // still the old match's -- nothing about them resets.
-            // g_posTrack is the one that matters: it carries deadUntilFrame, which
-            // suppresses a pawn for up to 120 frames out of a hashed slot, so a
-            // new match's player can land in a slot the previous match marked dead
-            // and go invisible for the first couple of seconds.
-            //
-            // g_deadPawn and s_instFilt are function-local statics further down
-            // this file and cannot be reached from here. They are left alone
-            // deliberately: they would need hoisting to file scope, which is a
-            // larger change than this edge, and the symptom they cause is a short
-            // gap at the start of a match rather than data that never updates.
-            memset(g_posTrack, 0, sizeof(g_posTrack));
-            memset(g_playerCache, 0, sizeof(g_playerCache));
-            memset(g_aimMotion, 0, sizeof(g_aimMotion));
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
             s_lastLiveMatch = 0;
-            s_firstMatchFlushed = false;
-            // Not reset here. The new match's matchGame is already in hand and
-            // is a different pointer from the one this edge was detected
-            // against, so clearing it would hide the fact that a swap just
-            // happened on the very frame the swap was noticed.
-            //
             // The plate and the names live on CAShapeLayers in SpringBoard that
             // keep whatever path they were last handed, and the publish that
             // clears them stops running the moment the ESP goes silent — which is
             // exactly what a match ending does. Without this the dark plate stays
             // on screen for the rest of the session.
             SBClearESPNameLayers();
-            NSLog(@"[PUSH-FLUSH] left match 0x%llx (matchGame 0x%llx -> 0x%llx) — "
-                  @"page cache dropped, locks and names cleared",
-                  (unsigned long long)left,
-                  (unsigned long long)s_lastMatchGame,
-                  (unsigned long long)matchGame);
+            NSLog(@"[PUSH-FLUSH] left match 0x%llx — page cache dropped, locks and names cleared",
+                  (unsigned long long)left);
         } else if (live) {
-            // A match just went live (0 -> non-zero is a transition, not a level).
-            // Clearing the latch here is what makes entering a match flush once:
-            // a lobby frame can already have consumed the latch, and entering a
-            // match is exactly when the lobby's pages go stale.
-            if (s_lastLiveMatch == 0) s_firstMatchFlushed = false;
             s_lastLiveMatch = match;
-        }
-        if (isVaildPtr(matchGame)) s_lastMatchGame = matchGame;
-    }
-
-    // The repeat net armed by the reset above, declared up there with the reset.
-    // 500ms, not per frame: DSMemory.m records that a per-frame flush caused
-    // "Taking non-sleepable RW lock" panics, and six calls per transition buys
-    // the same coverage for a hundredth of the lock traffic.
-    if (s_flushUntilUS != 0) {
-        if (stats.inMatch) {
-            s_flushUntilUS = 0;
-        } else {
-            const uint64_t tFlush = ESPPhaseNowUS();
-            if (tFlush >= s_nextFlushUS) {
-                ds_flush_page_cache();
-                ds_cache_bump_generation();
-                s_nextFlushUS = tFlush + 500000ULL;      // 500ms
-            }
         }
     }
 
@@ -4434,13 +4280,11 @@ static int      s_countTeamUnknown = 0;
             NSLog(@"[ESP] Lobby mode: waiting for match...");
         }
         DIAG_EARLY(@"lobby");
-        releaseNumPaths();
         return stats;
     }
 
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
         DIAG_EARLY(@"loading-match");
-        releaseNumPaths();
         return stats;
     }
 
@@ -4467,31 +4311,7 @@ static int      s_countTeamUnknown = 0;
             // match is exactly when the lobby's pages go stale, and right after
             // it Unity rebuilds the address space, so this is the moment worth
             // dropping every slot.
-            // Read the latch, not s_lastMatchDiag.
-            //
-            // s_lastMatchDiag is cleared above on every frame where no match is
-            // live, and it has to be: it is the key for "has the match changed
-            // since I last flushed", and while a match is live the leave edge
-            // cannot run, so without that line it stays pinned to the previous
-            // match's address for the rest of the session.
-            //
-            // Testing it for "first match" then breaks the invariant the comment
-            // below states -- once per match, never per frame. In a lobby,
-            // getMatchGame falls back to CurrentGame (GameLogic.mm:20) so `match`
-            // is *(CurrentGame + 0x90) and can read as a valid pointer. On such a
-            // frame: s_lastMatchDiag was just cleared, match != 0, so firstMatch
-            // is true, so ds_flush_page_cache() and ds_cache_bump_generation() both
-            // ran -- on the next frame too, and every frame after. The whole
-            // 256-slot cache was dropped 60 times a second and every read after it
-            // was a miss at 116-plus syscalls, on a dispatch timer driving the
-            // main queue at 30-60Hz. The frame loop was starved, so positions were
-            // recomputed in lurches seconds apart instead of tracking: the boxes
-            // did not follow a moving enemy at all.
-            //
-            // The latch is cleared only where the match-liveness state actually
-            // changes -- on the leave edge and when live goes 0 -> non-zero -- so
-            // it can never be true "once per frame".
-            bool firstMatch = (!s_firstMatchFlushed && match != 0);
+            bool firstMatch = (s_lastMatchDiag == 0 && match != 0);
             if (s_lastMatchDiag != 0 || firstMatch) {
                 // A page slot pins one shmem mapping made by the kernel remap.
                 // ds_page_local (DSMemory.m:430) re-serves that slot on a bare
@@ -4509,7 +4329,6 @@ static int      s_countTeamUnknown = 0;
                       (unsigned long long)match,
                       before.liveSlots, before.staleGen, after.liveSlots);
                 ds_cache_bump_generation();
-                s_firstMatchFlushed = true;
             }
             s_lastMatchDiag = match;
         }
@@ -4744,8 +4563,6 @@ static int      s_countTeamUnknown = 0;
     // die, because that pawn is not an enemy and never disappears.
     uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
     if (!isVaildPtr(playerDict)) {
-        DIAG_EARLY(@"no-playerDict");
-        releaseNumPaths();
         return stats;
     }
 
@@ -4758,15 +4575,11 @@ static int      s_countTeamUnknown = 0;
         }
     }
     if (!isVaildPtr(entriesArr)) {
-        DIAG_EARLY(@"no-dict-entries");
-        releaseNumPaths();
         return stats;
     }
 
     int slotCap = ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength);
     if (slotCap <= 0 || slotCap > 256) {
-        DIAG_EARLY(@"slot-implausible");
-        releaseNumPaths();
         return stats;
     }
     // dictCount is the number of live entries. When it is zero the backing array is
@@ -4775,8 +4588,6 @@ static int      s_countTeamUnknown = 0;
     // left the match. Guard here rather than clamp the loop, because the loop is
     // also what finds the players that are live.
     if (dictCount <= 0) {
-        DIAG_EARLY(@"dict-empty");
-        releaseNumPaths();
         return stats;
     }
 
@@ -5413,8 +5224,10 @@ static int      s_countTeamUnknown = 0;
     // -------------------------------------------------------------------------
     if (!GetViewMatrixInto(camera, matrixData)) {
         // Paths allocated above — free before early out (matrix unavailable this frame).
-        DIAG_EARLY(@"no-view-matrix");
-        releaseNumPaths();
+        CGPathRelease(aNumBGPath);
+        CGPathRelease(aNumGPath);
+        CGPathRelease(aNumOPath);
+        CGPathRelease(aNumRPath);
         if (stats.aimAssistPath) {
             CGPathRelease(stats.aimAssistPath);
             stats.aimAssistPath = NULL;
@@ -6772,7 +6585,10 @@ static int      s_countTeamUnknown = 0;
     self.alertNumOrangeLayer.path = CGPathIsEmpty(aNumOPath) ? nil : aNumOPath;
     self.alertNumRedLayer.path = CGPathIsEmpty(aNumRPath) ? nil : aNumRPath;
 
-    releaseNumPaths();
+    CGPathRelease(aNumBGPath);
+    CGPathRelease(aNumGPath);
+    CGPathRelease(aNumOPath);
+    CGPathRelease(aNumRPath);
 
     return stats;
 }

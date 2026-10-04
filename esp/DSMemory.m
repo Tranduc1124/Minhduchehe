@@ -108,24 +108,7 @@ static void init_physmap(void) {
 #pragma mark - attach
 
 int ds_attach(void) {
-    // "Already attached" has to mean "already attached AND usable", not merely
-    // "g_ff_task is non-zero".
-    //
-    // g_ff_task is assigned before the vm_map walk (the line that reads
-    // proc_ro->pr_task), and every failure from there to the end of the walk
-    // returns -1 with it still set: proc_ro, task, map, nentries, first entry, no
-    // base. So one failed attempt left ds_attached() -- a bare K(g_ff_task) --
-    // answering true for the rest of the process, this early-out returned 0
-    // without walking anything, and the ds_detach() reset further down, which
-    // exists for exactly this, was unreachable behind it.
-    //
-    // Requiring g_ff_base is what lets the reset run on the retry. The device log
-    // this came from is the one quoted in the comment below: "[DS] base walk:
-    // mapped=7 fail=7 best=0x0", then module base not found, then base=0x0
-    // repeated for the rest of the session. Found the process, lost the base, and
-    // never asked again -- which is also exactly "started the ESP in the lobby and
-    // it never picked up anything".
-    if (ds_attached() && g_ff_base) return 0;
+    if (ds_attached()) return 0;
     if (!g_kexploit_ready) return -1;
 
     // Drop any half-finished attempt before starting a new one.
@@ -325,14 +308,9 @@ int ds_attach(void) {
     }
 
     if (!g_ff_base) {
-        // Throttled, not one-shot. It used to fire at most once per process, so a
-        // user who hit this saw one line and then permanent silence for the rest of
-        // the session -- which is a large part of why "nothing in the log said
-        // why". A retry that fails again is new information.
-        static uint64_t s_lastBaseLogUS = 0;
-        const uint64_t tBaseUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
-        if (tBaseUS - s_lastBaseLogUS >= 5000000ULL) {
-            s_lastBaseLogUS = tBaseUS;
+        static int s_baseLogged = 0;
+        if (!s_baseLogged) {
+            s_baseLogged = 1;
             NSLog(@"[DS] module base not found (nentries walk failed)");
             kernel_boot_log_fn logFn = kernelBootLog;
             if (logFn) {
@@ -467,13 +445,6 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // transactions keeps the port deallocations apart in time.
 #define DS_MAX_EVICT_PER_TXN 4
 
-// How stale a mapping is allowed to get before it is checked against the game's
-// own map. One second is an arbitrary compromise, and a much smaller number than
-// DS_PAGE_TTL_MS on purpose: the TTL is a cost knob for mappings we have no
-// reason to doubt, this one is a correctness check, and a second of exposure is
-// one second of drawing the previous match.
-#define DS_VMO_VERIFY_MS 1000ULL
-
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
@@ -489,10 +460,6 @@ static struct {
     // the pages that are demonstrably alive alone.
     uint64_t lastUseMs;
     uint64_t gen;      // match generation this mapping was taken under
-    // The vm_object this mapping was taken under, and the last time that was
-    // compared against what the game's map says now. See ds_lookup_page_vmo.
-    uint64_t vmo;
-    uint64_t lastVerifyMs;
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
@@ -505,14 +472,6 @@ static int g_pageCacheNext = 0;
 // flushes so a rate never goes negative.
 static uint64_t g_dsRemapCount = 0;
 static uint64_t g_dsEvictCount = 0;
-// Mappings dropped because the game's map said they were backed by a different
-// vm_object than the one they were taken under. A non-zero value means stale
-// mappings from a torn-down address space were really being served.
-static uint64_t g_dsStaleEvictCount = 0;
-// Slots whose backing object the map would not resolve, so the check above could
-// not arm on them. Should be a small fraction of remaps; if it is not, the
-// stale-drop is only covering part of the cache.
-static uint64_t g_dsVmoBlindCount = 0;
 // Recursive: begin/end txn + ds_page_local nest like Fl0rk NSRecursiveLock.
 static pthread_mutex_t g_pageCacheLock;
 static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
@@ -573,8 +532,6 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].bornMs = 0;
     g_pageCache[i].lastUseMs = 0;
     g_pageCache[i].gen = 0;
-    g_pageCache[i].vmo = 0;
-    g_pageCache[i].lastVerifyMs = 0;
     g_pageCache[i].useCount = 0;
 }
 
@@ -646,12 +603,10 @@ void ds_end_read_transaction(void) {
             for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
                 if (g_pageCache[i].localAddr) live++;
             }
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu stale=%llu blind=%llu",
+            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu",
                   (unsigned long long)DS_PAGE_TTL_MS, live,
                   (unsigned long long)remapDelta,
-                  (unsigned long long)evictDelta,
-                  (unsigned long long)g_dsStaleEvictCount,
-                  (unsigned long long)g_dsVmoBlindCount);
+                  (unsigned long long)evictDelta);
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;
             s_lastEvictCount = g_dsEvictCount;
@@ -660,152 +615,49 @@ void ds_end_read_transaction(void) {
     ds_unlock();
 }
 
-// Which vm_object backs this page right now, by the game's own map.
-//
-// Deliberately does not read or write g_cached_entry. That cache exists to keep
-// ds_translate_page cheap and it never expires, which makes it worse than
-// useless here: asked about a page the game has already freed, it would hand
-// back the object that was freed, the comparison would match, and the check
-// would confirm the exact thing it exists to catch. The point of asking is to
-// ask fresh, so the walk below is a walk from the top of the map every time.
-//
-// Zero means "cannot tell", which is also what a page the game has unmapped
-// looks like. Callers treat that the same way, and pay a remap for it, because
-// being wrong in that direction costs a mapping and being wrong the other way
-// costs the read.
-static uint64_t ds_lookup_page_vmo(uint64_t page_va) {
-    if (!K(g_ff_task)) return 0;
-    page_va &= ~PAGE_MASK;
-
-    uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
-    uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
-    uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
-
-    for (uint32_t i = 0; i < nentries && K(e); i++) {
-        uint64_t s = kread64(e + E_START);
-        uint64_t t = kread64(e + E_END);
-        if (page_va >= s && page_va < t) {
-            return kread_ptr(e + E_OBJECT);
-        }
-        e = kread_ptr(e + off_vm_map_entry_links_next);
-    }
-    return 0;
-}
-
-// True while reads are paused after a run of failed remaps, and lifts the pause
-// itself once the cooldown has passed.
-//
-// This has to be the only way anything tests the pause, and the reason is the
-// bug it replaces. The recovery used to live inside ds_page_local, while
-// ds_rw_remap and ds_read_uncached both returned on the raw flag before they
-// ever called it — so the one piece of code that could lift the pause was the
-// one piece of code the pause made unreachable. The cooldown was 250ms and the
-// flag stayed set for the rest of the session.
-//
-// Three failed vm_map_remote_page calls is not an exceptional moment under a
-// match's allocation rate; it is a normal one. Hitting it blinded every read in
-// the process: the dictionary, the HP pool, the bones, all zero. What stayed on
-// screen was the last frame published before it, which is indistinguishable from
-// stale data — the boxes held their positions, the counter held its number, and
-// the log showed nothing but a degrade line that reads like a decision. That is
-// the whole of the reported "sometimes it picks up the match, sometimes it
-// does not": the frame that stayed up was whichever one had been published
-// before the reads stopped.
-//
-// The note this replaces claimed ds_flush_page_cache also lifted it. It never
-// did — that function contains no reference to the flag. Only ds_detach did,
-// and ds_detach runs on a pid change. The belief was written down, repeated,
-// and wrong, which is most of how it survived.
-//
-// Takes the lock rather than assuming it is held: ds_read_uncached tests the
-// flag before it locks, ds_page_local holds it already. It is recursive.
-static bool ds_degraded_paused(void) {
-    if (!g_degraded) return false;
-    if (ds_now_ms() < g_degradedUntilMs) return true;
-
-    ds_lock();
-    g_degraded = false;
-    g_consecutiveMapFailures = 0;
-    // A mapping the kernel no longer honours is the likeliest reason the remap
-    // failed in the first place, and keeping it is what made the next attempt
-    // fail too. So the cache goes, on the way back in.
-    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        ds_release_page_slot_locked(i);
-    }
-    g_pageCacheNext = 0;
-    g_recentCount = 0;
-    g_dsRemapCount++;
-    g_dsRecoverCount++;
-    NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
-    ds_unlock();
-    return false;
-}
-
 // Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
 // Unlocking before vm_map_remote_page raced kwrite_zone_element →
 // "Taking non-sleepable RW lock with preemption enabled".
 static uint64_t ds_page_local(uint64_t pageVA) {
     ds_lock();
 
-    if (ds_degraded_paused()) {
-        ds_unlock();
-        return 0;
+    if (g_degraded) {
+        // A cooldown, not a latch.
+        //
+        // This used to stay true until something called ds_detach or
+        // ds_flush_page_cache, and ds_detach only runs on a pid change. So three
+        // failed vm_map_remote_page calls — which is three pages the kernel would
+        // not hand over, and under a match's allocation rate that is a normal
+        // moment, not an exception — blinded every read in the process: ds_rw_remap
+        // and ds_read_uncached both return false on g_degraded, so the player
+        // dictionary, the HP pool and the bones all read as zero.
+        //
+        // That is the reported instability exactly: it works, then after a while
+        // in the same match the targets stop being found, and it stays that way
+        // until the session is restarted. Nothing in the log said why, because the
+        // degrade line is the only trace and it reads like a deliberate decision.
+        //
+        // Dropping the page cache on the way in is the other half: a mapping the
+        // kernel no longer honours is the likeliest reason the remap failed, and
+        // keeping it is what made the next attempt fail too.
+        if (ds_now_ms() < g_degradedUntilMs) {
+            ds_unlock();
+            return 0;
+        }
+        g_degraded = false;
+        g_consecutiveMapFailures = 0;
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+            ds_release_page_slot_locked(i);
+        }
+        g_pageCacheNext = 0;
+        g_recentCount = 0;
+        g_dsRemapCount++;
+        g_dsRecoverCount++;
+        NSLog(@"[DS] degraded cooldown over — retrying remap with an empty cache");
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        // The generation test is what makes ds_cache_bump_generation mean
-        // anything. It used to increment a counter that nothing consulted on the
-        // hit path, so a bump was a diagnostic label rather than an
-        // invalidation, and every mapping the previous match left behind kept
-        // being handed back: the slot matched on pageVA, the VA was still in
-        // range, and the frozen bytes came straight out of a freed vm_object.
-        //
-        // ds_flush_page_cache releases the slots outright, so it is the stronger
-        // of the two and the ESP calls both. This is the belt to that pair: a
-        // mapping that slips past the flush still cannot be served once the
-        // generation has moved, and a stale slot here is skipped rather than
-        // evicted, so the replacement is mapped on the normal miss path.
-        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr &&
-            g_pageCache[i].gen == g_cacheGeneration) {
-            // The generation test above is a guess about *when* the previous
-            // match's mappings died: it can only fire if something bumps it, at
-            // the right moment, and the frame matchGame happens to move is not
-            // that moment — the scene is mid-teardown then, and the pages mapped
-            // from it belong to an address space already being destroyed and
-            // about to be reused. That is why the same transition worked some
-            // matches and not others.
-            //
-            // This is the check of whether the guess was right, asked of the
-            // only party that knows. vm_map_entry carries the vm_object a page
-            // is backed by, and the game changes it when it frees that memory
-            // and hands the address out again. Compare it against the value
-            // recorded when this mapping was taken and a leftover from a dead
-            // address space cannot be served, whichever generation it was
-            // filed under.
-            //
-            // Once a second per slot, not per hit: the walk is real kernel work
-            // and this path runs dozens of times a frame. Once a second is well
-            // inside the window a teardown takes, and the cost lands off the
-            // per-frame read path for slots nobody is reading.
-            const uint64_t tVerify = ds_now_ms();
-            if (g_pageCache[i].vmo != 0 &&
-                tVerify - g_pageCache[i].lastVerifyMs >= DS_VMO_VERIFY_MS) {
-                g_pageCache[i].lastVerifyMs = tVerify;
-                if (ds_lookup_page_vmo(pageVA) != g_pageCache[i].vmo) {
-                    static uint32_t s_staleLogged = 0;
-                    if (s_staleLogged < 4) {
-                        s_staleLogged++;
-                        NSLog(@"[DS] STALE mapping dropped: page=0x%llx was backed by "
-                              @"vmo=0x%llx, map says 0x%llx now",
-                              (unsigned long long)pageVA,
-                              (unsigned long long)g_pageCache[i].vmo,
-                              (unsigned long long)ds_lookup_page_vmo(pageVA));
-                    }
-                    g_dsStaleEvictCount++;
-                    ds_release_page_slot_locked(i);
-                    break;   // out of the hit test, onto the normal miss path
-                }
-            }
+        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
             if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
             g_pageCache[i].lastUse = g_pageUseCounter++;
             // Stamped on every hit. This is what the TTL is measured against,
@@ -840,15 +692,6 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         if (victim < 0) victim = g_pageCacheNext % DS_PAGE_CACHE_SLOTS;
     }
 
-    // Read the object first, remap second. The order is what makes the recorded
-    // value safe to trust: if the game frees this memory in between, we end up
-    // holding a mapping taken under the old object and a vmo read from the new
-    // one, the check on the hit path sees them disagree and drops the mapping.
-    // Read after the remap and the same race lands the other way — a mapping
-    // taken under the freed object, filed under the vmo that replaced it, and
-    // then nothing in the cache would ever question it again.
-    const uint64_t vmo = ds_lookup_page_vmo(pageVA);
-
     // Hold lock through remap — Fl0rk does not drop lock around map.
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
@@ -875,22 +718,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
     g_pageCache[victim].gen = g_cacheGeneration;
-    g_pageCache[victim].vmo = vmo;
-    g_pageCache[victim].lastVerifyMs = 0;   // verify on the next hit, not now
     g_pageCache[victim].useCount = 1;
-    // A zero vmo is the one case where the hit-path check cannot arm itself: it
-    // has nothing to compare against, so it skips the slot for good. Counting it
-    // is the difference between "the stale-drop fired" and "the stale-drop was
-    // never watching", which read the same on screen otherwise.
-    if (vmo == 0) {
-        g_dsVmoBlindCount++;
-        static uint32_t s_blindLogged = 0;
-        if (s_blindLogged < 4) {
-            s_blindLogged++;
-            NSLog(@"[DS] blind slot: map did not resolve an object for page=0x%llx "
-                  @"— stale check cannot arm on it", (unsigned long long)pageVA);
-        }
-    }
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     g_pageCache[victim].bornMs = ds_now_ms();
     g_pageCache[victim].lastUseMs = g_pageCache[victim].bornMs;
@@ -904,10 +732,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
 static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    // Through the helper, not the raw flag: this is the line that used to make
-    // the cooldown unreachable, because it returned before ds_page_local — the
-    // only code that could lift the pause — was ever entered.
-    if (ds_degraded_paused()) return false;
+    if (g_degraded) return false;
 
     uint8_t *p = (uint8_t *)buf;
     uint64_t cur = va;
@@ -978,10 +803,7 @@ void ds_detach(void) {
 // dropping it around the remap raced kwrite_zone_element.
 bool ds_read_uncached(uint64_t va, void *buf, size_t len) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
-    // Same reason as ds_rw_remap, and the same helper: this path never touches
-    // the page cache, so it never reaches the recovery through ds_page_local
-    // either. Tested raw, it held the pause open on its own.
-    if (ds_degraded_paused()) return false;
+    if (g_degraded) return false;
 
     const uint64_t pageVA = va & ~((uint64_t)PAGE_SIZE - 1);
     const size_t off = (size_t)(va - pageVA);
