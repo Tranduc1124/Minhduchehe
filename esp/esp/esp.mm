@@ -1787,6 +1787,10 @@ struct PlayerCache {
     uint64_t pawn = 0;
     bool isBot = false;
     bool isKnocked = false;
+    // Last successfully read team, 0 meaning "not known yet". Cached because the
+    // teammate test reads it before the HP reads and cannot afford a late read to
+    // change the answer -- see the comment at the test.
+    int team = 0;
     int curHP = 0;
     int maxHP = 0;
     bool isFPP = false;
@@ -4180,6 +4184,12 @@ static void esp_count_drop(uint64_t key) {
 // drawn, so not counted. Reset per frame where the draw pass runs.
 static int      s_countOffScreen = 0;
 
+// Pawns refused because their team has never been read successfully. Non-zero
+// means the fail-closed teammate test is withholding pawns, which is the cost of
+// it and the thing to watch: if this climbs and stays up, reads are not healthy
+// and the counter is under-reporting for that reason rather than over-reporting.
+static int      s_countTeamUnknown = 0;
+
 - (ESPFrameStats)renderESPWithBuffers:(ESPGeometryBuffers *)buffers
                             viewWidth:(CGFloat)viewWidth
                            viewHeight:(CGFloat)viewHeight
@@ -4673,6 +4683,14 @@ static int      s_countOffScreen = 0;
         }
         if (!isVaildPtr(PawnObject)) continue;
 
+        // Hoisted. The teammate test below needs this pawn's team and the per-pawn
+        // cache block further down needs the same slot; declaring it in both places
+        // would shadow one with the other. It cannot simply be moved down to that
+        // block instead, because the teammate test has to run BEFORE the HP reads:
+        // get_CurHP is a DataPool walk costing up to 45 reads, and a teammate should
+        // not pay that to be thrown away.
+        PlayerCache &c = g_playerCache[PlayerCacheSlot(PawnObject)];
+
         // ---------------------------------------------------------------------
         // WHO IS AN ENEMY, decided from a cached identity instead of one live read.
         //
@@ -4739,23 +4757,48 @@ static int      s_countOffScreen = 0;
             // kIsClientBot byte came back non-zero stopped being a teammate, with
             // no other condition involved. A bot on our team is still on our team.
             //
-            // An unreadable team on EITHER side is not treated as a match, so the
-            // pawn is counted. That is deliberate and it is the safe direction:
-            // the alternative drops a real enemy every time one read is late,
-            // which is a hole in the count, while this is at worst one extra on a
-            // frame that the 3-frame hold already smooths. The self case, which
-            // is the one the report is actually about, is decided above from
-            // cached identity and does not depend on the team read at all.
-            const int theirTeam =
-                ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_TeamID;
-            if (s_locTeam && theirTeam && s_locTeam == theirTeam) continue;
+            // The team is cached per pawn now, and an unknown team is NOT counted.
+            //
+            // It used to be read fresh every frame and treated fail-open:
+            //
+            //     const int theirTeam =
+            //         ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_TeamID;
+            //     if (s_locTeam && theirTeam && s_locTeam == theirTeam) continue;
+            //
+            // An unreadable team was not a match, so the pawn was counted, and the
+            // comment above called that the safe direction. It was the wrong
+            // direction, because the failure is not one frame long. Reads degrade
+            // for stretches, this pawn is stamped into the count table on every
+            // frame it is seen, and an entry only leaves on the 3-frame hold. So a
+            // pawn whose team read keeps failing is not "at worst one extra on a
+            // frame" -- it is +1 for as long as it lives. That is a persistent
+            // over-count, and it is the one being reported.
+            //
+            // Caching the team is what makes fail-closed affordable here. Without
+            // it, refusing to count an unknown team drops every pawn on whichever
+            // frame its PlayerID read happens to be late, so the hole moves around
+            // instead of closing. With it, a pawn is refused only until its team
+            // has been read successfully once, and from then on a late read costs
+            // nothing at all -- which is also why this is fewer reads than before.
+            const bool teamCacheMiss = (c.pawn != PawnObject);
+            if (teamCacheMiss) c.team = 0;
+            if (teamCacheMiss || c.team == 0 || ((g_cacheFrameCounter & 7) == 0)) {
+                const int t =
+                    ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_TeamID;
+                if (t) c.team = t;
+            }
+            // Unknown team: not counted. The self case, which is the one the
+            // original report was about, is decided above from cached identity and
+            // does not depend on the team read at all.
+            if (c.team == 0) { s_countTeamUnknown++; continue; }
+            if (s_locTeam && c.team == s_locTeam) continue;
         }
 
         // HP/knocked EVERY frame (stale cache was the floating "ghost ESP" after kills).
         // Bot flag can lag 1 frame; vis only when Check Visible is on.
         // Use pawn-stable slot (hash), not walk index — prevents cache thrash when
         // dict walk order changes or pawns leave/re-enter range (the "treo" cause).
-        PlayerCache &c = g_playerCache[PlayerCacheSlot(PawnObject)];
+        // c is the hoisted reference above; do not redeclare it here.
         const bool cacheMiss = (c.pawn != PawnObject);
         if (cacheMiss) {
             c.pawn = PawnObject;
@@ -5173,6 +5216,7 @@ static int      s_countOffScreen = 0;
     // The tally itself lives below the draw pass: it needs isOnScreen, which
     // needs the matrix sampled there. Nothing here counts anything.
     s_countOffScreen = 0;
+    s_countTeamUnknown = 0;
 
     // -------------------------------------------------------------------------
     // Phase-2: sample view matrix as late as possible (after all world reads),
@@ -5232,7 +5276,24 @@ static int      s_countOffScreen = 0;
         // Stamped here, before the drawing branches, and the branches that end
         // up drawing nothing drop it again -- see esp_count_drop.
         {
-            const uint64_t key = s.uid ? s.uid : s.pawn;
+            // Keyed on the pawn pointer, not on uid.
+            //
+            // It used to be `s.uid ? s.uid : s.pawn`, which is two different keys
+            // for one pawn. kUserID is read three times per pawn per frame -- at
+            // the self test, in the collect pass, and again at 5140 where s.uid is
+            // filled -- and each read can fail on its own. When the 5140 read fails
+            // and the earlier one succeeded, this pawn looksups as a new key, gets
+            // a second table slot, and both slots are inside ESP_COUNT_HOLD_FRAMES
+            // at once. One pawn, two slots, counted twice.
+            //
+            // That is intermittent by construction -- it needs one read to fail
+            // while another succeeds, which is exactly what a degrading cache does
+            // -- and it does not need a failure to persist. A pointer cannot fail
+            // to be read, so it cannot produce a second key. The pawn pointer is
+            // already the identity everything else in this loop uses
+            // (PlayerCacheSlot, g_posTrack), and a recycled pointer landing on an
+            // old entry just re-stamps it, which counts once and is correct.
+            const uint64_t key = s.pawn;
             int slot = -1;
             for (int ci = 0; ci < s_espCountN; ci++) {
                 if (s_espCountKey[ci] == key) { slot = ci; break; }
@@ -5443,7 +5504,7 @@ static int      s_countOffScreen = 0;
             if (IsZeroVec(HeadPos) || !looksLikeWorldPos(HeadPos)) {
                 // Stamped by the tally above, and nothing drawn below. See
                 // esp_count_drop.
-                esp_count_drop(s.uid ? s.uid : s.pawn);
+                esp_count_drop(s.pawn);
                 continue;
             }
             Vector3 HipPos = s.hip;
@@ -5584,7 +5645,7 @@ static int      s_countOffScreen = 0;
                 // with a dead HP. Kept as a belt-and-braces guard, and it still
                 // drops the tally, because if it ever does fire the pawn is
                 // drawn by nothing. See esp_count_drop.
-                esp_count_drop(s.uid ? s.uid : s.pawn);
+                esp_count_drop(s.pawn);
                 continue;
             }
             // Crowded Pro: far off-screen enemies skip full Pro path (still counted/alerted).
@@ -5649,10 +5710,11 @@ static int      s_countOffScreen = 0;
             if (dmax < 0.0f || d > dmax) dmax = d;
         }
         NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d) "
-              @"local=0x%llx self=%d off=%d dmin=%.1f dmax=%.1f",
+              @"local=0x%llx self=%d off=%d team?=0x%x dmin=%.1f dmax=%.1f",
               (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN,
               stats.realCount, stats.botCount,
               (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen,
+              s_countTeamUnknown,
               dmin, dmax);
     }
 
