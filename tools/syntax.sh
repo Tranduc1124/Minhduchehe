@@ -21,6 +21,15 @@
 # here and only fails at the link step, so read a green run as "this file is
 # well-formed", never as "this builds".
 #
+# The language follows the file extension, because that is what Theos does and
+# because getting it wrong makes this gate worse than useless -- it reports green
+# for code the build rejects. It used to hardcode -x objective-c++ for every
+# file, so a .m file was never checked as the C it is actually compiled as, and a
+# change that put extern "C", noexcept and a C++ header into esp/DSMemory.m
+# passed here and then failed the real build with eleven errors. Anything written
+# in C++ inside a .m file is a build break, and this gate has to be able to see
+# that now.
+#
 # PID_PATH carries no @ prefix. HUDHelper.mm wraps it in ROOT_PATH_NS, which
 # adds the @ itself, and Makefile.app's copy has its @ stripped by the shell
 # before clang sees it. Passing it with the @ here gives @@ and every use fails.
@@ -30,13 +39,20 @@ SDK=/home/tduck/theos/sdks/iPhoneOS17.5.sdk
 PWD_ABS=$(pwd)
 fail=0
 for f in "$@"; do
-  out=$(clang -fsyntax-only -x objective-c++ -fobjc-arc \
+  # Mirror the extension rather than the content: Theos compiles .m as
+  # Objective-C and .mm as Objective-C++, and the gap is not cosmetic.
+  case "$f" in
+    *.mm)             LANG="-x objective-c++"; STD="-std=c++17" ;;
+    *.cpp|*.cc|*.cxx) LANG="-x c++";           STD="-std=c++17" ;;
+    *.c)              LANG="-x c";             STD="-std=gnu11" ;;
+    *)                LANG="-x objective-c";   STD="-std=gnu11" ;;
+  esac
+  out=$(clang -fsyntax-only $LANG $STD -fobjc-arc \
       --target=arm64-apple-ios15.0 -isysroot "$SDK" \
       -I. -Iapp -Iapp/sources -Iesp -Iesp/esp -Iesp/esp/espdraw -Iesp/hud \
       -Iapp/oxorany -I"$PWD_ABS" -I"$PWD_ABS/remote" \
       -DNOTIFY_DESTROY_HUD='"vn.vng.freefireth.hud.destroy"' \
       -DPID_PATH='"/var/mobile/Library/Caches/vn.vng.freefireth.pid"' \
-      -std=c++17 \
       -Wall \
       -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable \
       -Wno-unused-parameter -Wno-unused-value -Wno-module-import-in-extern-c \
@@ -48,7 +64,7 @@ for f in "$@"; do
       -Werror \
       "$f" 2>&1)
   if [ -n "$out" ]; then
-    echo "=== $f"
+    echo "=== $f  [$LANG]"
     echo "$out"
     fail=1
   else
