@@ -72,13 +72,27 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
     size_t   bestIdx  = 0;
     uint64_t bOff = 0, bTi = 0, bSt = 0, bMg = 0, bCg = 0;
     uint32_t candValid = 0;
+    // A candidate that reads zero and a candidate that reads a plausible-looking
+    // but wrong pointer are different faults and they point in opposite
+    // directions. Zero everywhere means the reads themselves are not landing --
+    // no attach, a base that is not the game, or a mapping that refuses. Non-zero
+    // but invalid means the reads work and the offsets are wrong for this build.
+    // The first log of this could not tell them apart, because step 1 was never
+    // recorded and the values printed were the initialisers.
+    uint32_t candZero = 0, candJunk = 0;
     const size_t candN = sizeof(candidates) / sizeof(candidates[0]);
 
     for (size_t i = 0; i < candN; i++) {
         uint64_t off = candidates[i];
         if (off == 0 || off > 0x20000000ULL) continue;
         uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
-        if (!isVaildPtr(typeInfo)) continue;
+        if (!isVaildPtr(typeInfo)) {
+            if (typeInfo == 0) candZero++; else candJunk++;
+            if (1 > bestStep) {
+                bestStep = 1; bestIdx = i; bOff = off; bTi = typeInfo;
+            }
+            continue;
+        }
         candValid++;
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
         if (!isVaildPtr(statics)) {
@@ -107,10 +121,15 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         const uint64_t tUS = (uint64_t)(CACurrentMediaTime() * 1000000.0);
         if (tUS - s_lastFailUS >= 2000000ULL) {
             s_lastFailUS = tUS;
-            NSLog(@"[CHAIN] getMatchGame failed: step=%d cand=%u/%zu off=0x%llx "
-                  @"typeInfo=0x%llx statics=0x%llx matchGame=0x%llx currentGame=0x%llx",
-                  bestStep, candValid, candN,
-                  (unsigned long long)bOff, (unsigned long long)bTi,
+            NSLog(@"[CHAIN] getMatchGame failed: step=%d cand=%u/%zu zero=%u junk=%u "
+                  @"base=0x%llx dsBase=0x%llx att=%d pid=%d primary=0x%llx "
+                  @"cand[%zu]=off 0x%llx -> 0x%llx statics=0x%llx matchGame=0x%llx currentGame=0x%llx",
+                  bestStep, candValid, candN, candZero, candJunk,
+                  (unsigned long long)Moudule_Base,
+                  (unsigned long long)ds_base(),
+                  ds_attached() ? 1 : 0, (int)ds_pid(),
+                  (unsigned long long)primary,
+                  bestIdx, (unsigned long long)bOff, (unsigned long long)bTi,
                   (unsigned long long)bSt, (unsigned long long)bMg,
                   (unsigned long long)bCg);
         }
