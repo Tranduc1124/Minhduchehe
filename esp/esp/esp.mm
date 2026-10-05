@@ -4345,6 +4345,28 @@ static int      s_countTeamUnknown = 0;
 //
 // The invariant the phantom budget guarantees, and the first thing to check when live
 // is short: live <= read <= dc.
+// Where the walked pawns went, one counter per exit from the pawn loop.
+//
+// The status line reports live=47 and snapN=1, and nothing anywhere said why the other
+// 46 are not in the snapshot. Fifteen filters sit between those numbers, most gated on
+// whether a read landed, and every one of them drops the pawn silently -- the frame is
+// simply shorter. That is the hole: "some players have no ESP and cannot be aimed at"
+// was indistinguishable from "some players were filtered out for a reason nobody
+// recorded", which is why several rounds of fixes have been argued from inference
+// rather than from the number.
+//
+// Each counter is a claim to be checked against the others, not a guess at which filter
+// matters. banned high means a tombstone is outliving its pawn. hpUnread high means
+// reads are failing where they matter. far high means nobody is in range and there is
+// nothing to fix. dead high is a real death and is the one counter that should look
+// like a kill feed. The sum is the answer: live minus the sum should be snapN, plus
+// whatever the team and distance gates kept out of the count for their own reasons.
+struct PawnRejects {
+    int banned, hpUnread, dead, hpBad, noUid;
+    int noAnchor, collapsed, noBone, noHead, origin, headFar;
+    int far, near, hpZero, team, self;
+};
+
 struct EspStatusLine {
     uint64_t match, dict, local;
     int slotCap, dictCount, walk, clamped, iters;
@@ -4353,6 +4375,7 @@ struct EspStatusLine {
     int gate;
     float dmin, dmax;
     uint64_t aimTarget;
+    PawnRejects rej;
 };
 static EspStatusLine g_st;
 
@@ -4377,6 +4400,9 @@ static void EspEmitStatusLine(void) {
           @"cap=%d dc=%d walk=%d clamped=%d iters=%d read=%d live=%d dup=%d "
           @"probe=%d stopLive=%d drop=%d snapN=%d real=%d bot=%d off=%d team?=0x%x "
           @"self=%d dmin=%.1f dmax=%.1f aim=0x%llx "
+          @"rej{self=%d team=%d banned=%d hpUnread=%d dead=%d hpBad=%d noUid=%d "
+          @"noAnchor=%d collapsed=%d noBone=%d noHead=%d origin=%d headFar=%d "
+          @"far=%d near=%d hpZero=%d} "
           @"cache{slots=%d hit=%llu miss=%llu remap=%llu evict=%llu novictim=%llu "
           @"stale=%llu orphan=%llu blind=%d sweeps=%llu deg=%d blk=%d}",
           g_st.gate,
@@ -4388,6 +4414,10 @@ static void EspEmitStatusLine(void) {
           g_st.teamUnknown, g_st.selfSkip,
           (double)g_st.dmin, (double)g_st.dmax,
           (unsigned long long)g_st.aimTarget,
+          g_st.rej.self, g_st.rej.team, g_st.rej.banned, g_st.rej.hpUnread,
+          g_st.rej.dead, g_st.rej.hpBad, g_st.rej.noUid, g_st.rej.noAnchor,
+          g_st.rej.collapsed, g_st.rej.noBone, g_st.rej.noHead, g_st.rej.origin,
+          g_st.rej.headFar, g_st.rej.far, g_st.rej.near, g_st.rej.hpZero,
           cs.liveSlots,
           (unsigned long long)dHit, (unsigned long long)dMiss,
           (unsigned long long)dRemap, (unsigned long long)dEvict,
@@ -4985,6 +5015,11 @@ static void EspEmitStatusLine(void) {
     // different bug entirely. One log line separates them.
     int selfSkipped = 0;
 
+    // Zeroed here rather than at the top of the method, because this is where the walk
+    // begins and a frame that returns before it must not publish last frame's
+    // arithmetic.
+    PawnRejects rej{};
+
     // ---- What the walk found, and the one bound that is not a constant -------
     //
     // Exactly dictCount slots of this array can hold a live entry, so the first
@@ -5130,7 +5165,7 @@ static void EspEmitStatusLine(void) {
                 isSelf = (ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_Value
                           == s_locPid);
             }
-            if (isSelf) { selfSkipped++; continue; }
+            if (isSelf) { selfSkipped++; rej.self++; continue; }
 
             // Teammate. The bot early-out is gone, because it used to
             // answer "enemy" before the team was ever read: a teammate whose
@@ -5170,7 +5205,7 @@ static void EspEmitStatusLine(void) {
             // Unknown team: not counted. The self case, which is the one the
             // original report was about, is decided above from cached identity and
             // does not depend on the team read at all.
-            if (c.team == 0) { s_countTeamUnknown++; continue; }
+            if (c.team == 0) { s_countTeamUnknown++; rej.team++; continue; }
             if (s_locTeam && c.team == s_locTeam) continue;
         }
 
@@ -5278,6 +5313,7 @@ static void EspEmitStatusLine(void) {
             if (readsAlive) {
                 s_deadUntilFrame[deadSlot] = 0;
             } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
+                rej.banned++;
                 continue;
             }
         }
@@ -5397,6 +5433,7 @@ static void EspEmitStatusLine(void) {
         // Skipping the pawn for this frame is the honest response either way: the
         // next frame retries.
         if (!hpReadOk && !hasLiveBone && !pawnRemembered) {
+            rej.hpUnread++;
             continue;
         }
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
@@ -5409,10 +5446,12 @@ static void EspEmitStatusLine(void) {
         const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
         if (fullyDead) {
             markGhostDead(120); // longer hold for death
+            rej.dead++;
             continue;
         }
         if (!hasLiveBone && (hpGarbage || hpUnreadable || MaxHP <= 0)) {
             markGhostDead((hpUnreadable || MaxHP <= 0) ? 120 : 45);
+            rej.hpBad++;
             continue;
         }
         // Despawned/spectator shells often keep a free-list pointer with no identity.
@@ -5421,6 +5460,7 @@ static void EspEmitStatusLine(void) {
             COW_GamePlay_PlayerID_o pid = ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID);
             if (uid == 0 && pid.m_Value == 0 && pid.m_ID == 0 && !isBot && !hasLiveBone) {
                 markGhostDead(90);
+                rej.noUid++;
                 continue;
             }
         }
@@ -5466,6 +5506,7 @@ static void EspEmitStatusLine(void) {
             // remembered one, so this really is a despawned shell rather than a frame
             // whose reads happened not to land.
             markGhostDead(60);
+            rej.noAnchor++;
             continue;
         }
         // Standing ghost: collapsed body without vehicle → skip (was ESP/aim on empty).
@@ -5480,6 +5521,7 @@ static void EspEmitStatusLine(void) {
             }
             if (expectStanding && (rootSaysUpright || !looksLikeWorldPos(liveRoot))) {
                 markGhostDead(45);
+                rej.collapsed++;
                 continue;
             }
             // If root indicates low profile (knocked/prone) or isKnocked true, allow collapsed.
@@ -5488,6 +5530,7 @@ static void EspEmitStatusLine(void) {
         if (!treatAsVehicle && !looksLikeWorldPos(liveHead) && !looksLikeWorldPos(liveHip) &&
             !looksLikeWorldPos(liveRoot)) {
             markGhostDead(60);
+            rej.noBone++;
             continue;
         }
 
@@ -5512,11 +5555,13 @@ static void EspEmitStatusLine(void) {
         // No ResolveHeadWorldPosTracked fallback here — sticky track invents ghosts.
         if (!headFromLive || IsZeroVec(headBonePos) || !looksLikeWorldPos(headBonePos)) {
             markGhostDead(45);
+            rej.noHead++;
             continue;
         }
         // Reject world-origin / near-zero anchors (classic ghost after death).
         if (fabsf(headBonePos.x) < 0.5f && fabsf(headBonePos.z) < 0.5f && fabsf(headBonePos.y) < 2.0f) {
             markGhostDead(45);
+            rej.origin++;
             continue;
         }
         // Reject head lagging impossibly far from root (stale free-list transform).
@@ -5526,6 +5571,7 @@ static void EspEmitStatusLine(void) {
             float dXZ = sqrtf(dx * dx + dz * dz);
             if (dXZ > (treatAsVehicle ? 8.0f : 4.5f)) {
                 markGhostDead(30);
+                rej.headFar++;
                 continue;
             }
         }
@@ -5621,8 +5667,8 @@ static void EspEmitStatusLine(void) {
             : 0.0f;
         // On vehicle distance can be noisy; only skip clearly insane ranges.
         // Min-distance cull skipped for vehicle/collapsed (passenger next to you).
-        if (useLocalDistance && tempDisForAim > maxPossibleDistance) continue;
-        if (useLocalDistance && !treatAsVehicle && tempDisForAim < 0.35f) continue;
+        if (useLocalDistance && tempDisForAim > maxPossibleDistance) { rej.far++; continue; }
+        if (useLocalDistance && !treatAsVehicle && tempDisForAim < 0.35f) { rej.near++; continue; }
 
         // Aimbot + Aim Assist + Silent all honor AimPos (Head/Neck/Chest-Body).
         // Prefer GetAimTargetPosMode / ResolveSilentAimWorldPos (live).
@@ -5671,7 +5717,7 @@ static void EspEmitStatusLine(void) {
         }
 
         // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
-        if (CurHP <= 0) continue;
+        if (CurHP <= 0) { rej.hpZero++; continue; }
 
         // The tally used to be recorded here, on wantDraw alone. It cannot be:
         // this pass runs before the view matrix is sampled (it is sampled at
@@ -6280,6 +6326,7 @@ static void EspEmitStatusLine(void) {
         g_st.dmax       = dmax;
         g_st.gate       = 0;
         g_st.aimTarget  = gAimLockTarget;
+        g_st.rej        = rej;
     }
 
     // Aim target pick on the same fresh matrix as ESP.
