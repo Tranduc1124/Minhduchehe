@@ -142,7 +142,7 @@ static void kernelBootStartEx(BOOL kernelOnly) {
 
         uint64_t self_proc = proc_self();
 
-        // No platformize here. It was added so the DNS install could reach
+        // No platformize here. It was added so the profile install could reach
         // installd silently, and it returns -1 on this device with "our ucred
         // not found under proc_ro", so nothing depended on it actually
         // succeeding. The HUD process still platformizes and still needs to:

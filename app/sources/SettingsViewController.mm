@@ -2,7 +2,6 @@
 #import "GamePickerViewController.h"
 #import "ESPAimViewController.h"
 #import "LaunchOptionsViewController.h"
-#import "DNSViewController.h"
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "MDLog.h"
@@ -32,7 +31,6 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionGame = 0,
     SectionQuickActions,
     SectionTweaks,
-    SectionDNS,
     SectionAbout,
     SettingsSectionCount
 };
@@ -91,7 +89,6 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionGame:        return 1;
         case SectionQuickActions:return 2;
         case SectionTweaks:      return 2;
-        case SectionDNS:         return 1;
         case SectionAbout:       return 5;
         default: return 0;
     }
@@ -102,7 +99,6 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
         case SectionGame:        return @"GAME";
         case SectionQuickActions:return @"QUICK ACTIONS";
         case SectionTweaks:      return @"TWEAKS";
-        case SectionDNS:         return @"DNS";
         case SectionAbout:       return @"ABOUT";
         default: return nil;
     }
@@ -152,13 +148,6 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
                          subtitle:@"What the ESP box, lines and names draw."
                             value:nil showsChevron:YES tappable:YES];
             }
-            break;
-
-        case SectionDNS:
-            [cell applyIconNamed:@"globe" color:MDThemeBlue()];
-            [cell applyTitle:@"DNS"
-                     subtitle:@"Change which DNS your device uses."
-                        value:nil showsChevron:YES tappable:YES];
             break;
 
         case SectionAbout: {
@@ -232,9 +221,6 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
             } else {
                 [self push:[[ESPAimViewController alloc] init]];
             }
-            break;
-        case SectionDNS:
-            [self push:[[DNSViewController alloc] init]];
             break;
         default:
             break;

@@ -4,7 +4,7 @@
 extern "C" {
 #endif
 
-// Settings tab. Four groups: GAME, QUICK ACTIONS, TWEAKS, DNS, then ABOUT.
+// Settings tab. Four groups: GAME, QUICK ACTIONS, TWEAKS, then ABOUT.
 //
 // The rows are all real: every one of them either pushes a screen that exists
 // or opens something that already works. Nothing here is a stub pretending to

@@ -8,7 +8,7 @@
 # -Wno-everything, so a plain -Wno-everything here would pass files that CI then
 # rejects. The flags below are exactly Makefile.app's own suppressions, with
 # nothing added: a suppression here that CI does not have makes this gate
-# weaker than the build it stands in for, which is how DNSProfile.h once
+# weaker than the build it stands in for, which is how one header once
 # reached CI with five -Wnullability-completeness errors and failed there
 # while this script called it ok. Every new suppression here has to be one
 # Makefile.app also carries.
