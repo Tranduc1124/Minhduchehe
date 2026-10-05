@@ -159,13 +159,46 @@ uint64_t getTransNode(uint64_t BodyPart) {
 //  1) node itself (works if node already has transform layout)
 //  2) node->+0x10 (common ITransformNode -> Transform)
 // Return the pointer that yields a non-zero world position.
+// Resolving WHICH object holds the bone matrix costs 2-5 IPC reads, and getPositionExt
+// walks a parent chain to do it. ESP plus aim resolve bones 10-20 times per pawn per
+// frame, so that is hundreds of reads a frame spent rediscovering a pointer that does
+// not move.
+//
+// What is cached is the POINTER, never a position. The node pointer is stable for as
+// long as the pawn is alive; only the matrix inside it changes. So a hit still reads
+// the live matrix on the next getPositionExt and the position stays frame-fresh --
+// only the walk to find the node is skipped.
+//
+// One second is a safety refresh rather than a staleness window: it bounds how long a
+// pointer the game moved underneath us could survive, at the cost of one resolution per
+// bone per pawn per second.
+struct BoneTransCacheEntry {
+    uint64_t pawn = 0;
+    uint64_t nodeOff = 0;
+    uint64_t resolved = 0;
+    double nextCheck = 0;
+};
+// 193, not a power of two: a power-of-two modulus collides with the pointer's own
+// alignment, which is exactly the case where the cache has to work.
+static BoneTransCacheEntry g_boneTransCache[193];
+
 static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
     if (!isVaildPtr((uintptr_t)player)) return 0;
+    const size_t slot = (size_t)((player ^ nodeOffset) % 193ull);
+    BoneTransCacheEntry &e = g_boneTransCache[slot];
+    const double now = CACurrentMediaTime();
+    if (e.pawn == player && e.nodeOff == (uint64_t)nodeOffset &&
+        isVaildPtr((uintptr_t)e.resolved) && now < e.nextCheck) {
+        return e.resolved;
+    }
+
     uint64_t node = ReadAddr<uint64_t>(player + nodeOffset);
     if (!isVaildPtr((uintptr_t)node)) return 0;
 
     Vector3 direct = getPositionExt(node);
     if (!(direct.x == 0.0f && direct.y == 0.0f && direct.z == 0.0f)) {
+        e.pawn = player; e.nodeOff = nodeOffset; e.resolved = node;
+        e.nextCheck = now + 1.0;
         return node;
     }
 
@@ -173,6 +206,8 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
     if (isVaildPtr((uintptr_t)inner)) {
         Vector3 via = getPositionExt(inner);
         if (!(via.x == 0.0f && via.y == 0.0f && via.z == 0.0f)) {
+            e.pawn = player; e.nodeOff = nodeOffset; e.resolved = inner;
+            e.nextCheck = now + 1.0;
             return inner;
         }
         // Some wrappers nest one more level.
@@ -180,6 +215,8 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
         if (isVaildPtr((uintptr_t)inner2)) {
             Vector3 via2 = getPositionExt(inner2);
             if (!(via2.x == 0.0f && via2.y == 0.0f && via2.z == 0.0f)) {
+                e.pawn = player; e.nodeOff = nodeOffset; e.resolved = inner2;
+                e.nextCheck = now + 1.0;
                 return inner2;
             }
         }
@@ -189,8 +226,23 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
 }
 
 uint64_t getHead(uint64_t player) {
-    // FF dump: HeadNode 0x638, next slot 0x640 is HIP (kHipNode).
-    // NEVER fall back to +0x8 — that made aim snap head→hip→head (chest jitter while firing).
+    // HeadNode is 0x6A0 and HipNode 0x6A8. Both were previously documented here as
+    // 0x638 / 0x640, and that is WRONG: dump.cs puts
+    //
+    //     0x638  m_AimAssist           NLIMDENAFNN
+    //     0x640  m_AimAssistForIceWall PLOAJDMCLGB
+    //
+    // while the bone run is a contiguous ITransformNode ladder from 0x6A0:
+    //
+    //     0x698 EPDCPFACIPG   0x6A0 GBKFHDFCPMD   0x6A8 COBFGNOIPMF
+    //     0x6B0 FFFPCADFFGA   0x6B8 CBHHCCNKOND   ... every 8 bytes
+    //
+    // so 0x638 is an AimAssist object, and reading it as a transform yields garbage
+    // positions rather than an obvious failure. The table was already correct; only
+    // this comment was not, which is the more dangerous half.
+    //
+    // NEVER fall back to +0x8 -- that made aim snap head→hip→head (chest jitter while
+    // firing).
     return getBoneTrans(player, kHeadNode);
 }
 
