@@ -5241,8 +5241,41 @@ static void EspEmitStatusLine(void) {
         // What was missing is the way out. The sibling has exactly this, keyed on
         // HP being positive; there was no counterpart here, so a revived address
         // had nothing to lift the ban.
+        //
+        // Knocked counts as alive here, and it has to, because forty lines below the
+        // death test says exactly that:
+        //
+        //     const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
+        //
+        // A knocked player is on HP 0 by definition -- that is what knocked means. So
+        // lifting the ban on "HP positive" alone makes the exit unreachable for the
+        // one class of player who is provably alive, and the two tests disagree about
+        // what alive is: the death test lets a knocked player through, the ban exit
+        // keeps them out.
+        //
+        // The consequence is the reported symptom and nothing else fits it. Any
+        // transient filter drops a knocked player -- noBone, headFar, noUid, the anchor
+        // test -- and once they are tombstoned the ban can never be lifted, because
+        // the only key that opens it reads zero for them by definition. They then stay
+        // suppressed for the full 30-to-120 frame hold: no box, not aimable, and it
+        // repeats every time a filter catches them again. Knocked players are the ones
+        // most worth aiming at, and they are also the ones lying down, which is what
+        // makes the root-to-head and head-to-root geometry tests fire on them in the
+        // first place. So the filter most likely to catch a knocked player is a
+        // geometry test, and the geometry tests are also the ones whose geometry a
+        // crawling body violates.
+        //
+        // Reads that failed are still not treated as alive. hpReadOk is not consulted
+        // because an unreadable HP is not a fact about the player, and the hold
+        // expires on its own without this test.
+        //
+        // Lifting on a knocked read does not widen what gets drawn beyond what is
+        // already drawn: a garbage-true knocked read already stops fullyDead from
+        // firing, so that corpse was already going to be drawn this frame. This makes
+        // the ban agree with the drawing instead of adding a new way in.
         if (s_deadPawn[deadSlot] == PawnObject) {
-            if (CurHP > 0 && MaxHP > 0) {
+            const bool readsAlive = (CurHP > 0 || isKnocked) && MaxHP > 0;
+            if (readsAlive) {
                 s_deadUntilFrame[deadSlot] = 0;
             } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
                 continue;
