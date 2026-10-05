@@ -5635,7 +5635,27 @@ static void EspEmitStatusLine(void) {
             continue;
         }
         // Reject head lagging impossibly far from root (stale free-list transform).
-        if (looksLikeWorldPos(liveRoot)) {
+        //
+        // Not when the head is a REMEMBERED one. pawnRemembered substitutes up to
+        // kRememberedFrames (30) frames of old position into liveHead/liveHip, and
+        // liveRoot is read fresh for the same pawn in this same iteration. The two
+        // operands are not the same age, so this was measuring the pawn's own
+        // remembered position against its current root and calling the difference a
+        // stale transform.
+        //
+        // At 35fps that window is 0.86s. A player at 6 m/s covers 5.1 m in it, against
+        // a 4.5 m threshold -- so an ordinary live player moving at an ordinary speed
+        // trips this, and the remembered head is exactly the case it fires in, since
+        // the remembered path only engages when a read did not land.
+        //
+        // A remembered head is not evidence of a stale transform. It is the deliberate
+        // answer to a non-resident read, which the fallback's own comment calls
+        // routine rather than meaningful in a crowded match. Testing it here turned
+        // that mitigation into markGhostDead(30), and 30 frames of tombstone removes
+        // the pawn from snaps[] entirely: no box in the draw pass and no aim candidate
+        // in the pick. It re-arms on every frame the remembered path engages again,
+        // which is more often the more pawns there are.
+        if (!pawnRemembered && looksLikeWorldPos(liveRoot)) {
             float dx = headBonePos.x - liveRoot.x;
             float dz = headBonePos.z - liveRoot.z;
             float dXZ = sqrtf(dx * dx + dz * dz);
@@ -5679,6 +5699,30 @@ static void EspEmitStatusLine(void) {
         Vector3 preSmoothHip  = espHipPos;
         headBonePos = EspSmoothDisplayPos(PawnObject, headBonePos, /*isHead=*/true);
         espHipPos   = EspSmoothDisplayPos(PawnObject, espHipPos,   /*isHead=*/false);
+        // EspSmoothDisplayPos returns {0,0,0} as its DROP signal -- its own comment
+        // says "if dead hold is active for THIS pawn, do not smooth or emit". Nothing
+        // between here and the snapshot tested for it, so the drop signal was consumed
+        // as a coordinate and every later check read it as this pawn's position:
+        //
+        //   tempDisForAim = Distance(myLocation, {0,0,0})   distance to the WORLD
+        //                                                    ORIGIN, not to the pawn
+        //   dis            = that same wrong distance, so dis > espDrawLimit
+        //                                                    -> wantDraw = false
+        //   bone = headBonePos = {0,0,0}, so IsZeroVec(bone)  -> canAim stays false
+        //
+        // and the entry was published anyway, taking a snaps[] slot and putting
+        // |myLocation| into dmin/dmax -- the field that exists to reveal a collapsed
+        // world position.
+        //
+        // There is already a zero-head guard, but it is in the draw pass, hundreds of
+        // lines too late: dis, wantDraw and canAim are all decided by then.
+        //
+        // Falling back to preSmooth is safe because those are the pre-smoothing values,
+        // which already passed the headFromLive, IsZeroVec and world-origin gates, so
+        // this cannot manufacture a ghost. It is the same "prefer preSmooth" the
+        // source-flip branch below already uses.
+        if (!looksLikeWorldPos(headBonePos)) headBonePos = preSmoothHead;
+        if (!looksLikeWorldPos(espHipPos))   espHipPos   = preSmoothHip;
         if (headSrcFlip || hipSrcFlip) {
             if (looksLikeWorldPos(preSmoothHead)) headBonePos = preSmoothHead;
             if (looksLikeWorldPos(preSmoothHip))  espHipPos   = preSmoothHip;
@@ -6288,6 +6332,21 @@ static void EspEmitStatusLine(void) {
                 }
             }
         } else if (isESP) {
+            // s.dis is 0 whenever there is no local world anchor: the collect pass
+            // falls back to tempDisForAim, which is 0 when useLocalDistance is false.
+            // 0 is not a distance. ESPRenderPawnCore rejects `dis < 1.0f` as too
+            // close to be real and returns before drawing, so one unresolved camera
+            // chain removed EVERY Pro box in the frame while the status line still
+            // reported the pawns as live. isESP is the default and isESP2 is not, so
+            // this was the whole picture rather than a per-pawn loss.
+            //
+            // The renderer's own range guards are meaningless for exactly these pawns:
+            // the collect pass skipped its far and near culls because they are gated on
+            // useLocalDistance, so there is no range to check them against. Skipping is
+            // the honest answer -- the information the check needs is not there. The
+            // same zero also counted as off-screen (0 < espDistanceLimit) and
+            // collapsed distanceNorm in the aim score.
+            if (!useLocalDistance) continue;
             // CurHP<=0 is terminal; ignore lagged isKnocked (corpse/transition ghost).
             if (s.curHP <= 0) {
                 // Unreachable in practice: the collect pass drops CurHP <= 0
@@ -6718,7 +6777,18 @@ static void EspEmitStatusLine(void) {
                     if (hasLiveHead) lb = liveHeadTarget;
                 }
                 if (!IsZeroVec(lb) && looksLikeWorldPos(lb)) {
-                    float ld = iAmAlive ? Vector3::Distance(myLocation, lb) : 10.f;
+                    // useLocalDistance, not iAmAlive alone. myLocation is {0,0,0}
+                    // when no local world anchor resolved, and every myLocation
+                    // consumer in the collect pass is gated on useLocalDistance for
+                    // that reason. Here it was not, so ld became the distance from the
+                    // world origin to the target, the range test below failed every
+                    // frame, and the sticky re-eval could never keep a lock. 10.f is
+                    // this line's existing sentinel for "no usable local position";
+                    // the guard just has to cover the unknown-anchor case too.
+                    // iAmAlive is not that guard -- it is `curHp >= 0`, which is true
+                    // for a dead local player and true when the HP read fails.
+                    float ld = (iAmAlive && useLocalDistance)
+                        ? Vector3::Distance(myLocation, lb) : 10.f;
                     if (ld <= aimDistance + 5.f && ld >= 0.15f) {
                         Vector3 w2s = WorldToScreenLayer(lb, matrixData, (float)matrixVpWidth, (float)matrixVpHeight,
                                                         (float)viewWidth, (float)viewHeight);
@@ -6952,7 +7022,12 @@ static void EspEmitStatusLine(void) {
                 if ((dx * dx + dy * dy) > lim) return false;
             }
         }
-        if (iAmAlive) {
+        // useLocalDistance, for the reason above: with no local anchor myLocation is
+        // {0,0,0}, so d is the magnitude of the target's world position, which exceeds
+        // aimDistance + 5 for any real pawn. This returned false EVERY frame, so aim
+        // never acquired while ESP went on drawing -- the same visible symptom as a bad
+        // enemy anchor, reached by a bad LOCAL anchor instead.
+        if (iAmAlive && useLocalDistance) {
             float d = Vector3::Distance(myLocation, bone);
             // Allow closer while mounted/passenger; only block true self-range ghosts.
             if (d < 0.15f || d > aimDistance + 5.0f) return false;
@@ -7450,6 +7525,11 @@ bool get_IsScoping(uint64_t player) {
 
 
 static inline uint32_t get_VisibleFlags(uint64_t player) {
+    // The three siblings all validate first -- get_IsVisible, get_IsVisibleByFlag,
+    // get_IsFPPVisible -- and so does the in-file caller AimHasPositiveLos. Without
+    // it this is the one read here that offsets an unvalidated pawn and only checks
+    // the value it produces.
+    if (!isVaildPtr(player)) return 0;
     uint64_t bitArray = ReadAddr<uint64_t>(player + kVisibleObj);
     if (!isVaildPtr(bitArray)) return 0;
     return ReadAddr<uint32_t>(bitArray + kVisibleObjFlags);
