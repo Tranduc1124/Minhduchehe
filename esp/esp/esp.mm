@@ -6981,7 +6981,42 @@ static void EspEmitStatusLine(void) {
 
     // Trigger state lives outside the "has target" branch so releasing fire/scope
     // still hard-stops aim immediately even when target just died.
-    static uint64_t s_lastAimPawn = 0;
+    // No local declaration here, on purpose.
+    //
+    // There was one, identical to the file-scope s_lastAimPawn at 149, and it shadowed
+    // it from this line to the end of the function. So the two halves of the same
+    // feature were talking to different variables:
+    //
+    //   6598-6606  the "drop it when its pawn left snaps[]" cleanup -- BEFORE this
+    //               point, so it read and wrote the file-scope one
+    //   7062 7092 7138 7164 7204 7263  every write and the fire-stick read -- AFTER
+    //               this point, so all of them hit the local
+    //
+    // Both are static, so both persist across frames; the local was not a per-frame
+    // value, it was the same lifetime under a different name.
+    //
+    // The consequence is that the cleanup could never fire. The file-scope variable was
+    // only ever assigned 0 (at 6606) and never assigned anything else, so
+    //
+    //     if (s_lastAimPawn != 0) {          // 6600
+    //
+    // was permanently false. Meanwhile the local that the writes actually reached kept
+    // pointing at a pawn that had left snaps[] -- despawned, out of range, or
+    // tombstoned -- because nothing was ever clearing it.
+    //
+    // A stale id there is not cosmetic, because 7204 reads it:
+    //
+    //     (gAimLockTarget == bestTarget || s_lastAimPawn == bestTarget)
+    //         -> lookOk = true;
+    //
+    // That overrides the aim's own FOV gate for a target it did not geometrically
+    // select, and address reuse makes it reachable: the game frees a pawn and hands the
+    // same address to the next one, so the stale id can match a different live occupant
+    // in snaps[]. The symptom is the aim snapping to something the user did not point
+    // at, with no way to get it back.
+    //
+    // Deleting the declaration is the whole fix: every site then refers to the one
+    // variable the cleanup block already manages.
 
     bool rawScope = isVaildPtr(myPawnObject) ? get_IsScoping(myPawnObject) : false;
     bool rawFire  = isVaildPtr(myPawnObject) ? get_IsFiring(myPawnObject) : false;
