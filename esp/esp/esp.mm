@@ -5172,7 +5172,50 @@ static int      s_countTeamUnknown = 0;
 
         Vector3 liveHead = getPositionExt(getHead(PawnObject));
         Vector3 liveHip  = getPositionExt(getHip(PawnObject));
-        const bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
+        bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
+
+        // ---- A read that did not land is not a pawn that went away.
+        //
+        // This is the "some players yes, some players no, and some appear then
+        // disappear entirely" report. Its shape here is specific: when none of the
+        // four anchors read, the pawn was tombstoned for 60 frames -- a whole second
+        // with no box and no aim -- and markGhostDead also wipes headSmoothed and
+        // hipSmoothed, so there was nothing left to fall back on afterwards.
+        //
+        // But the reason the reads failed is that this pawn's transform pages were
+        // not resident, which in a crowded match is routine rather than meaningful.
+        // The per-pawn working set is far larger than the page cache, so a pawn's
+        // pages come and go as the resident window rotates across the roster. A pawn
+        // that reads for two seconds, misses for one, then reads again, is not a
+        // despawned ghost: it is a cache that cannot hold everyone at once, and the
+        // old behaviour turned that shortfall into a visible disappearance every
+        // couple of seconds.
+        //
+        // The pawn's own PosTrack still holds the last position that DID read, so use
+        // it. Bounded on purpose, because this must never keep a genuine ghost alive:
+        // thirty frames, after which the pawn is tombstoned exactly as before. A
+        // remembered position is also never used across a tombstone, since
+        // markGhostDead has already cleared it by then -- the two guards below are
+        // belt and braces, not redundant.
+        const int kRememberedFrames = 30;
+        bool pawnRemembered = false;
+        if (!hasLiveBone) {
+            PosTrack &trMem = g_posTrack[PosTrackSlot(PawnObject)];
+            const bool memOwned  = (trMem.pawn == PawnObject);
+            const bool memTombed = (trMem.deadUntilFrame > 0 &&
+                                    g_cacheFrameCounter < trMem.deadUntilFrame);
+            const bool memFresh  = (g_cacheFrameCounter - trMem.frame) < kRememberedFrames;
+            if (memOwned && !memTombed && memFresh) {
+                if (looksLikeWorldPos(trMem.headSmoothed)) {
+                    liveHead = trMem.headSmoothed;
+                    pawnRemembered = true;
+                } else if (looksLikeWorldPos(trMem.hipSmoothed)) {
+                    liveHip = trMem.hipSmoothed;
+                    pawnRemembered = true;
+                }
+                if (pawnRemembered) hasLiveBone = true;
+            }
+        }
 
         // Fallback HP if DataPool reads fail/delay but 3D bones exist. Only for a pawn
         // that is knocked or otherwise still in the round. A body left in the world
@@ -5212,7 +5255,7 @@ static int      s_countTeamUnknown = 0;
         //
         // Skipping the pawn for this frame is the honest response either way: the
         // next frame retries.
-        if (!hpReadOk && !hasLiveBone) {
+        if (!hpReadOk && !hasLiveBone && !pawnRemembered) {
             continue;
         }
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
@@ -5278,6 +5321,9 @@ static int      s_countTeamUnknown = 0;
             looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip) ||
             looksLikeWorldPos(liveRoot) || haveMountPos;
         if (!anyLiveAnchor) {
+            // Now reached only when the pawn has neither a live anchor nor a recent
+            // remembered one, so this really is a despawned shell rather than a frame
+            // whose reads happened not to land.
             markGhostDead(60);
             continue;
         }
