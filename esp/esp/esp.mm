@@ -1854,6 +1854,39 @@ struct PosTrack {
 };
 static PosTrack g_posTrack[kPawnSlotCount];
 
+// g_posTrack is shared with SilentAimThread, and it was shared unguarded.
+//
+// The path is: SilentAimThread:1051 -> ResolveSilentAimWorldPos ->
+// ResolveSilentHeadWorldPos, whose last fallback is ResolveAimHeadWorldPos ->
+// ResolveHeadWorldPosTracked. That last call is reached only when the aim thread's own
+// two head/hip reads fail, which in a crowded match is routine rather than rare -- the
+// target's pages are not always resident.
+//
+// When it is reached, the aim thread read-modify-writes the SAME PosTrack slot the
+// render thread is smoothing that frame:
+//
+//   2355  tr = PosTrack{}                  whole-struct overwrite
+//   2359  PickStableHeadRaw(pawn, tr)     writes headSrc, headSrcHold, isBot
+//   2369  TrackAndExtrapolate(...)        reads and writes lastHeadRaw, headVel,
+//                                         lastHeadT, hasHead
+//   2370  tr.headSmoothed, tr.frame
+//
+// The render thread reaches the same slot through EspSmoothDisplayPos and does the same
+// field writes. So the two interleave mid-struct. The consequences are not cosmetic:
+// headVel and hasHead end up describing one thread's sample of the other's raw, the
+// lead term then shifts the ESP box in a direction no player moved, and the
+// whole-struct reset at 2355 wipes whatever the other pawn in that bucket had there --
+// including a death tombstone, which is how a ghost gets drawn.
+//
+// Recursive because the alternative is a future caller nesting these and deadlocking on
+// itself; the cost is irrelevant at seven call sites.
+//
+// Lock order is g_posTrackMtx -> g_pageCacheLock, and it is the same order on both
+// threads: ds_read takes g_pageCacheLock inside these functions, and nothing in the
+// render loop or the aim thread holds g_pageCacheLock across a call that would take
+// g_posTrackMtx. There is no A->B / B->A pair, so there is no inversion.
+static std::recursive_mutex g_posTrackMtx;
+
 static inline int PosTrackSlot(uint64_t pawn) {
     uint64_t x = pawn ^ (pawn >> 17) ^ (pawn << 7);
     return (int)(x % kPawnSlotCount);
@@ -2346,6 +2379,7 @@ static inline Vector3 PickStableHipRaw(uint64_t pawn, PosTrack &tr) {
 // Used for ESP display (and aim when tracked path is allowed).
 static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
+    std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
     // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
     if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
@@ -2373,6 +2407,7 @@ static inline Vector3 ResolveHeadWorldPosTracked(uint64_t pawn) {
 
 static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
+    std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
     // Respect exact-pawn death tombstone: never revive a dead shell via tracked path.
     if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
@@ -2403,6 +2438,7 @@ static inline Vector3 ResolveHipWorldPosTracked(uint64_t pawn) {
 // Extra guard: if this pawn is tombstoned dead (exact match), refuse to smooth — drop.
 static inline Vector3 EspSmoothDisplayPos(uint64_t pawn, Vector3 raw, bool isHead) {
     if (!looksLikeWorldPos(raw) || !isVaildPtr(pawn)) return raw;
+    std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
     PosTrack &tr = g_posTrack[PosTrackSlot(pawn)];
     // Exact-pawn tombstone: if dead hold is active for THIS pawn, do not smooth or emit.
     if (tr.pawn == pawn && tr.deadUntilFrame > 0 && g_cacheFrameCounter < tr.deadUntilFrame) {
@@ -5341,6 +5377,7 @@ static void EspEmitStatusLine(void) {
                 // Which is what 16423b858 introduced. It fixed a real problem -- a
                 // knocked pawn could never leave the ban because it reads HP 0 -- and
                 // introduced this one by lifting half the state.
+                std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
                 PosTrack &trLift = g_posTrack[PosTrackSlot(PawnObject)];
                 if (trLift.pawn == PawnObject) trLift.deadUntilFrame = 0;
             } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
@@ -5349,6 +5386,7 @@ static void EspEmitStatusLine(void) {
             }
         }
         auto markGhostDead = [&](int holdFrames) {
+            std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
             // Tombstone inside PosTrack by exact pawn (not just the
             // kPawnSlotCount bucket). This prevents the same pawn (or a colliding
             // bucket occupant) from reviving
@@ -5408,6 +5446,7 @@ static void EspEmitStatusLine(void) {
         const int kRememberedFrames = 30;
         bool pawnRemembered = false;
         if (!hasLiveBone) {
+            std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
             PosTrack &trMem = g_posTrack[PosTrackSlot(PawnObject)];
             const bool memOwned  = (trMem.pawn == PawnObject);
             const bool memTombed = (trMem.deadUntilFrame > 0 &&
@@ -5632,6 +5671,7 @@ static void EspEmitStatusLine(void) {
         // World-space EMA on validated live positions only — kills bone micro-jitter
         // without inventing ghosts (markGhostDead already filtered dead shells).
         // If source flipped this frame, bypass smoothing to stop a stretch that box smoother can't hide.
+        std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
         PosTrack &trDisp = g_posTrack[PosTrackSlot(PawnObject)];
         const bool headSrcFlip = (trDisp.lastHeadSrcDisp != 0 && headSrcNow != 0 && trDisp.lastHeadSrcDisp != headSrcNow);
         const bool hipSrcFlip  = (trDisp.lastHipSrcDisp  != 0 && hipSrcNow  != 0 && trDisp.lastHipSrcDisp  != hipSrcNow);
