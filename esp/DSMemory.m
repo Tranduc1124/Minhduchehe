@@ -549,24 +549,56 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // a lookup in that array -- no syscalls. The walk never runs on the read path or the
 // insert path. Steady cost is DS_VMO_SWEEP_PER_TICK entries per frame regardless of
 // how many slots are live, and the judgement at the end of a pass is arithmetic.
-#define DS_VMO_SWEEP_INTERVAL_MS 5000ULL
-#define DS_VMO_SWEEP_PER_TICK   64
-#define DS_VMO_SNAP_MAX         8192
+// How many map entries are walked per frame. This is the entire cost of the
+// dead-mapping check and it is a constant: it does not scale with the slot count, the
+// read rate, or how long a match has run.
+//
+// It used to be 64 every five seconds instead of 256 continuously, and the device log
+// says exactly what that bought:
+//
+//   sweeps=1..8 over 50s, !vmo dropped 0 dead and 26 orphaned, then 26 dead, then 26
+//   orphaned again -- one drop of about 26 mappings every six to seven seconds
+//
+// Twenty-six mappings is about a tenth of the table, so roughly a tenth of the cache
+// was serving a page the game had freed, and the oldest of those was six seconds old.
+// A mapping of a freed page is not a failed read: it is a successful read of whatever
+// the allocator left behind. Nothing on the read path can see it -- isVaildPtr is a
+// range check on the VA, the slot matches on pageVA -- so the frame drew last frame's
+// transform, and again the frame after. That is "the ESP stands still and then
+// updates" and "the ESP hangs in the air", and the update arriving in six-second
+// bursts is the sweep coming round, not the game.
+//
+// So the pass does not rest. It walks a slice every frame and restarts the instant it
+// finishes, which turns the interval between noticing a dead mapping from six seconds
+// into one cycle -- a couple of hundred milliseconds -- at a cost that is a few
+// hundred kernel reads per frame against the ~17,000 the render loop already makes.
+#define DS_VMO_SWEEP_PER_TICK 256
+#define DS_VMO_SNAP_MAX       16384
+// Backoff before restarting after the map could not be read at all, so a torn or
+// absent map does not become a kread per frame.
+#define DS_VMO_RESTART_MS     2000ULL
 
 typedef struct { uint64_t start, end, object; } DSVmoRange;
 
-static DSVmoRange g_vmoSnap[DS_VMO_SNAP_MAX];
-static uint32_t   g_vmoSnapFilled  = 0;
-static uint32_t   g_vmoSnapTotal   = 0;
-static uint64_t   g_vmoSnapCursor  = 0;
-static uint64_t   g_vmoSnapStartMs = 0;
-static uint64_t   g_vmoSnapNextMs  = 0;
-static bool       g_vmoSweeping    = false;
-// True only between one completed pass and the start of the next. A pass in progress
-// has filled a PREFIX of g_vmoSnap, and answering from a prefix makes every page in
-// the unwalked tail look unmapped. That was the cause of the first build's blind
-// count climbing: the insert path was asking a half-built array.
-static bool       g_vmoSnapReady   = false;
+// Two buffers. One is being filled and the other is the one every lookup answers
+// from, and they swap when a pass completes.
+//
+// A single buffer cannot do this. The pass takes several frames, so the array is a
+// prefix for those frames, and a prefix answers "not mapped" for every page in the
+// unwalked tail. That is not a small error: it looks identical to the thing this
+// whole check exists to find, so asking it mid-pass either drops live mappings
+// wholesale or, as the first build had it, files every slot with no baseline and the
+// blind count climbs. Double buffering removes the question. A lookup only ever sees
+// a finished pass.
+static DSVmoRange g_vmoSnap[2][DS_VMO_SNAP_MAX];
+static int        g_vmoLive       = 0;   // which buffer lookups read
+static uint32_t   g_vmoLiveCount  = 0;
+static uint32_t   g_vmoLiveEpochMs = 0;  // when the live buffer finished, for the
+                                         // "mapped after this pass" guard
+static uint32_t   g_vmoFill       = 0;
+static uint32_t   g_vmoTotal      = 0;
+static uint64_t   g_vmoCursor     = 0;   // 0 means not currently walking
+static bool       g_vmoHaveLive   = false;
 
 static struct {
     uint64_t pageVA;
@@ -639,6 +671,9 @@ static uint32_t g_dsVmoBlindNow = 0;
 // Completed passes. If this stops climbing, the check is not running and anything else
 // it has to say is void.
 static uint64_t g_dsSweepCount = 0;
+// When the last pass finished, so the drop line can say how stale anything it did not
+// catch is. This is the whole quality measure of the dead-mapping check.
+static uint64_t g_dsLastSweepMs = 0;
 
 static void ds_page_cache_lock_init(void) {
     pthread_mutexattr_t attr;
@@ -741,27 +776,48 @@ static void ds_expire_degrade_locked(void) {
     }
 }
 
-// What object backs this page, according to the last COMPLETED snapshot. Zero means
-// the snapshot cannot say, which includes the page not being mapped at all. No
-// syscalls: building the snapshot is the only thing that costs anything.
-static uint64_t ds_vmo_from_snapshot(uint64_t page_va) {
-    page_va &= ~(uint64_t)(PAGE_SIZE - 1);
-    for (uint32_t i = 0; i < g_vmoSnapFilled; i++) {
-        if (page_va >= g_vmoSnap[i].start && page_va < g_vmoSnap[i].end) {
-            return g_vmoSnap[i].object;
+// Binary search for the entry covering this page.
+//
+// Sorted by start, so this is O(log n). The previous linear scan was O(n) and the
+// judgement asks it once per slot, so with a snapshot of a few thousand entries and a
+// full 256-slot table this was on the order of a million comparisons every cycle --
+// now every 0.2s rather than every 6s. Sorting is what makes asking more often
+// affordable; the map is walked in whatever order the kernel keeps it, which is not
+// address order.
+//
+// known distinguishes "no completed pass yet" from "a completed pass covers the whole
+// map and nothing covers this address". Those are different claims and the difference
+// is the entire orphan case, so they are not collapsed into one zero.
+static uint64_t ds_vmo_lookup(uint64_t page_va, bool *known) {
+    if (known) *known = g_vmoHaveLive;
+    if (!g_vmoHaveLive) return 0;
+    const uint64_t p = page_va & ~(uint64_t)(PAGE_SIZE - 1);
+    const DSVmoRange *a = g_vmoSnap[g_vmoLive];
+    uint32_t lo = 0, hi = g_vmoLiveCount;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (a[mid].end <= p) {
+            lo = mid + 1;
+        } else if (a[mid].start > p) {
+            hi = mid;
+        } else {
+            return a[mid].object;
         }
     }
     return 0;
 }
 
-// What may be recorded as a baseline right now.
-//
-// Only a completed pass may answer. Mid-pass, g_vmoSnapFilled is a prefix, so a page
-// in the unwalked tail looks unmapped and would be filed with no baseline at all.
-// Answering zero is safe: the next completed pass arms the slot.
+// What may be recorded as a baseline right now. Zero means no completed pass to answer
+// from, or that the pass does not cover the page; either way the next one arms it.
 static uint64_t ds_vmo_recordable(uint64_t page_va) {
-    if (!g_vmoSnapReady) return 0;
-    return ds_vmo_from_snapshot(page_va);
+    bool known = false;
+    return ds_vmo_lookup(page_va, &known);
+}
+
+static int ds_vmo_cmp(const void *a, const void *b) {
+    const uint64_t x = ((const DSVmoRange *)a)->start;
+    const uint64_t y = ((const DSVmoRange *)b)->start;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
 }
 
 // One tick of an incremental pass over the game's vm_map, then the judgement.
@@ -777,71 +833,87 @@ static uint64_t ds_vmo_recordable(uint64_t page_va) {
 static void ds_vmo_sweep_tick(uint64_t nowMs) {
     if (!K(g_ff_task)) return;
 
-    if (!g_vmoSweeping) {
-        if (nowMs < g_vmoSnapNextMs) return;
+    // Start a pass if none is running. g_vmoCursor == 0 is that state, which is why a
+    // completed pass clears it and lets the next tick begin another: the walk is
+    // continuous by construction rather than by a timer that can be starved.
+    if (g_vmoCursor == 0) {
         const uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
         const uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
         if (nentries == 0 || nentries > DS_VMO_SNAP_MAX) {
-            // Cannot hold it. Say so once rather than truncating: a partial map
-            // reports "not mapped" for everything past the cut and drops live
-            // mappings wholesale.
+            // Cannot hold it. Say so rather than truncating: a partial map reports "not
+            // mapped" for everything past the cut and drops live mappings wholesale.
             static uint32_t s_oversizeLogged = 0;
-            if (s_oversizeLogged < 2) {
+            static uint64_t s_oversizeNextMs = 0;
+            if (s_oversizeLogged < 3 && nowMs >= s_oversizeNextMs) {
                 s_oversizeLogged++;
-                NSLog(@"[DS] vm_map has %u entries, over the %d this build holds "
-                      @"— dead-mapping check cannot run", nentries, DS_VMO_SNAP_MAX);
+                s_oversizeNextMs = nowMs + DS_VMO_RESTART_MS;
+                NSLog(@"[ESP] !vmo cannot run: vm_map has %u entries, this build holds %d",
+                      nentries, DS_VMO_SNAP_MAX);
             }
-            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
             return;
         }
-        g_vmoSnapTotal   = nentries;
-        g_vmoSnapFilled  = 0;
-        g_vmoSnapCursor  = kread_ptr(hdr + off_vm_map_header_links_next);
-        g_vmoSnapStartMs = nowMs;
-        g_vmoSweeping    = true;
-        g_vmoSnapReady   = false;
+        g_vmoTotal  = nentries;
+        g_vmoFill   = 0;
+        g_vmoCursor = kread_ptr(hdr + off_vm_map_header_links_next);
+        if (!K(g_vmoCursor)) return;
     }
 
+    const int build = 1 - g_vmoLive;
+    DSVmoRange *a = g_vmoSnap[build];
     for (uint32_t n = 0; n < DS_VMO_SWEEP_PER_TICK; n++) {
-        if (g_vmoSnapFilled >= g_vmoSnapTotal) break;
-        if (!K(g_vmoSnapCursor)) break;
-        g_vmoSnap[g_vmoSnapFilled].start  = kread64(g_vmoSnapCursor + E_START);
-        g_vmoSnap[g_vmoSnapFilled].end    = kread64(g_vmoSnapCursor + E_END);
-        g_vmoSnap[g_vmoSnapFilled].object = kread_ptr(g_vmoSnapCursor + E_OBJECT);
-        g_vmoSnapFilled++;
-        g_vmoSnapCursor = kread_ptr(g_vmoSnapCursor + off_vm_map_entry_links_next);
+        if (g_vmoFill >= g_vmoTotal) break;
+        if (!K(g_vmoCursor)) break;
+        a[g_vmoFill].start  = kread64(g_vmoCursor + E_START);
+        a[g_vmoFill].end    = kread64(g_vmoCursor + E_END);
+        a[g_vmoFill].object = kread_ptr(g_vmoCursor + E_OBJECT);
+        g_vmoFill++;
+        g_vmoCursor = kread_ptr(g_vmoCursor + off_vm_map_entry_links_next);
     }
 
-    if (g_vmoSnapFilled < g_vmoSnapTotal) {
-        if (!K(g_vmoSnapCursor)) {
-            // The map was rebuilt mid-pass. Half a map is worse than none.
-            g_vmoSweeping   = false;
-            g_vmoSnapFilled = 0;
-            g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+    if (g_vmoFill < g_vmoTotal) {
+        if (!K(g_vmoCursor)) {
+            // The list ended early -- the map was rebuilt under us. Half a map is worse
+            // than none, so this buffer is discarded and the live one keeps serving.
+            g_vmoFill   = 0;
+            g_vmoCursor = 0;
         }
-        return;
+        return;   // mid-pass: the live buffer is untouched and still answering
     }
 
-    uint32_t dropped = 0, judged = 0, armed = 0, orphaned = 0;
+    // Finished. Sort so lookups are binary, publish it, then judge.
+    if (g_vmoFill > 1) {
+        qsort(a, g_vmoFill, sizeof(DSVmoRange), ds_vmo_cmp);
+    }
+    g_vmoLive       = build;
+    g_vmoLiveCount  = g_vmoFill;
+    g_vmoLiveEpochMs = (uint32_t)nowMs;
+    g_vmoHaveLive   = true;
+    g_vmoFill       = 0;
+    g_vmoCursor     = 0;   // next tick starts the following pass
+
+    uint32_t dropped = 0, judged = 0, armed = 0, orphaned = 0, blind = 0;
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         if (!g_pageCache[i].localAddr) continue;
-        // A slot mapped after the pass started would be judged against a map that
-        // predates it, so it waits for the next one.
-        if (g_pageCache[i].vmoEpochMs > g_vmoSnapStartMs) continue;
-        const uint64_t now = ds_vmo_from_snapshot(g_pageCache[i].pageVA);
+        if (g_pageCache[i].vmo == 0) blind++;
+        // A slot mapped after the pass that is now live began would be judged against
+        // a map that predates it. It waits one cycle, which is a fraction of a second
+        // and is the only case where a live mapping is not checked.
+        if (g_pageCache[i].vmoEpochMs > g_vmoLiveEpochMs) continue;
+        bool known = false;
+        const uint64_t now = ds_vmo_lookup(g_pageCache[i].pageVA, &known);
+        if (!known) continue;
         if (g_pageCache[i].vmo == 0) {
             if (now != 0) {
-                // A whole map is available now, so this can finally be armed. A slot
-                // mapped during warm-up gets its baseline here.
+                // A whole map is available now, so this can finally be armed. Slots
+                // mapped during warm-up get their baseline here.
                 g_pageCache[i].vmo = now;
                 armed++;
             } else {
-                // The whole map was walked and NOTHING covers this address. That is
-                // not "cannot tell": the game has unmapped the page and our memory
-                // entry is the only reference still holding that physical frame
-                // alive. Keeping it is the "sometimes it picks the match up,
-                // sometimes it does not" report in its pure form -- a slot serving
-                // reads forever, isVaildPtr passing it, the cache matching it on
+                // The whole map was walked and NOTHING covers this address. That is not
+                // "cannot tell": the game has unmapped the page and our own memory entry
+                // is the only reference still holding that physical frame alive, so the
+                // bytes behind it are whatever the allocator put there next. Keeping it
+                // is a slot that serves reads forever -- a valid pointer, matching on
                 // pageVA, with no timeout on a pointer.
                 orphaned++;
                 ds_release_page_slot_locked(i);
@@ -850,8 +922,8 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
         }
         judged++;
         if (now != g_pageCache[i].vmo) {
-            // Either a different object backs the address now, or the map has no
-            // entry covering it and the page is gone.
+            // Either a different object backs the address now, or the map has no entry
+            // covering it and the page is gone.
             dropped++;
             ds_release_page_slot_locked(i);
         }
@@ -865,13 +937,17 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
     g_dsOrphanDropCount += orphaned;
     g_dsSweepCount++;
     if (dropped || orphaned) {
+        // Cycle time is the number that matters here: it is how long a dead mapping
+        // can be served before this notices. sweepMs is how long ago the previous pass
+        // finished.
         NSLog(@"[ESP] !vmo dropped %u dead and %u orphaned mapping(s) "
-              @"(judged %u, armed %u, blind %u)",
-              dropped, orphaned, judged, armed, blindNow);
+              @"(judged %u, armed %u, blind %u, map=%u, cycle=%llums)",
+              dropped, orphaned, judged, armed, blindNow, g_vmoTotal,
+              (unsigned long long)(nowMs - g_dsLastSweepMs));
+        g_dsLastSweepMs = nowMs;
+    } else {
+        g_dsLastSweepMs = nowMs;
     }
-    g_vmoSweeping   = false;
-    g_vmoSnapReady  = true;
-    g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
 }
 
 void ds_page_cache_stats(DSPageCacheStats *out) {
@@ -1198,7 +1274,11 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     // unaffordable, since a miss is the common case at match entry and the map is at
     // its largest exactly then.
     g_pageCache[victim].vmo = ds_vmo_recordable(pageVA);
-    g_pageCache[victim].vmoEpochMs = g_vmoSnapStartMs;
+    // Stamped with the LIVE buffer's epoch, not a pass start: that is what decides
+    // later whether this slot may be judged against a given pass. A buffer swaps in
+    // once per cycle, so an unmapped game page is caught within one cycle of being
+    // freed rather than within one sweep interval.
+    g_pageCache[victim].vmoEpochMs = g_vmoLiveEpochMs;
     g_dsRemapCount++;
     g_dsMissCount++;
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
