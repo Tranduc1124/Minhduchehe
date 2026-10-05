@@ -402,6 +402,21 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"g", @"Aim Range",         @"AimSphereMode", @(0.0f),
                    @[ @"FOV", @"180°", @"360°" ] ],
                 @[ @"s", @"Aim Behind Wall",   @"AimBehindWall", @NO ],
+                // Everything on the far side of this already exists in esp.mm:
+                // ESPSyncFromPrefs reads the AimIgnoreKnock pref into
+                // isAimIgnoreKnock, and the aim pick, the low-HP target mode and
+                // AimTargetStillValid all honour it. What was missing is a row, so
+                // nothing ever wrote the pref and the switch was unreachable.
+                //
+                // The switch says what it does: ON ignores knocked pawns, so the aim
+                // passes over a downed enemy and goes to the next one. Default is NO,
+                // which is the pref's own default and leaves a fresh install behaving
+                // as it did before.
+                //
+                // It also releases a lock already held on someone who goes down, not
+                // just the initial pick -- AimTargetStillValid carries the same test,
+                // so a target that drops is released rather than kept.
+                @[ @"s", @"Ignore Knocked",    @"AimIgnoreKnock", @NO ],
                 @[ @"g", @"Aim Mode",          @"AimMode",       @(1.0f),
                    @[ @"Safe (PC)", @"Normal", @"Rage" ] ],
                 @[ @"g", @"Aim Type",          @"AimTypeMode",   @(0.0f),
