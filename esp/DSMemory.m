@@ -625,6 +625,9 @@ static uint64_t g_dsMissCount = 0;
 // True if some read path was refused this second, sampled by the report so a
 // second with no hits and no remaps is attributable.
 static bool g_dsBlockedLastSecond = false;
+// Sampled once a second, so the status line can report "a read was refused during the
+// last second" rather than an instantaneous value that is almost always false.
+static int g_dsBlockedLast = 0;
 // Mappings dropped because the map now names a different object behind that address.
 static uint64_t g_dsStaleDropCount = 0;
 // Mappings dropped because the whole map contains nothing at that address, which
@@ -862,13 +865,33 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
     g_dsOrphanDropCount += orphaned;
     g_dsSweepCount++;
     if (dropped || orphaned) {
-        NSLog(@"[DS] sweep dropped %u dead and %u orphaned mapping(s) "
+        NSLog(@"[ESP] !vmo dropped %u dead and %u orphaned mapping(s) "
               @"(judged %u, armed %u, blind %u)",
               dropped, orphaned, judged, armed, blindNow);
     }
     g_vmoSweeping   = false;
     g_vmoSnapReady  = true;
     g_vmoSnapNextMs = nowMs + DS_VMO_SWEEP_INTERVAL_MS;
+}
+
+void ds_page_cache_stats(DSPageCacheStats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (!g_pageCache[i].localAddr) continue;
+        out->liveSlots++;
+        if (g_pageCache[i].vmo == 0) out->blind++;
+    }
+    out->blockedLastSecond = g_dsBlockedLast;
+    out->degradeActive     = g_degraded ? 1 : 0;
+    out->remaps      = g_dsRemapCount;
+    out->evicts      = g_dsEvictCount;
+    out->hits        = g_dsHitCount;
+    out->misses      = g_dsMissCount;
+    out->novictim    = g_dsNoVictimCount;
+    out->staleDrops  = g_dsStaleDropCount;
+    out->orphanDrops = g_dsOrphanDropCount;
+    out->sweeps      = g_dsSweepCount;
 }
 
 void ds_begin_read_transaction(void) {
@@ -954,20 +977,25 @@ void ds_end_read_transaction(void) {
             // idle one, and those two are only separable with a request rate.
             // novictim says whether the table size is the binding ceiling, so a
             // session that genuinely needs 1024 slots will say so itself.
-            NSLog(@"[DS-TLB] ttl=%llums live=%d remaps=%llu evicts=%llu "
-                  @"hit=%llu miss=%llu novictim=%llu stale=%llu orphan=%llu "
-                  @"blind=%u sweeps=%llu%@",
-                  (unsigned long long)DS_PAGE_TTL_MS, live,
-                  (unsigned long long)remapDelta,
-                  (unsigned long long)evictDelta,
-                  (unsigned long long)hitDelta,
-                  (unsigned long long)missDelta,
-                  (unsigned long long)novictimDelta,
-                  (unsigned long long)g_dsStaleDropCount,
-                  (unsigned long long)g_dsOrphanDropCount,
-                  g_dsVmoBlindNow,
-                  (unsigned long long)g_dsSweepCount,
-                  g_dsBlockedLastSecond ? @" BLOCKED" : @"");
+            // This line used to print itself as [DS-TLB]. It is folded into the
+            // single [ESP] status line instead: two tags meant two filters, and one
+            // filter was all the device log view had room for -- so the two fields
+            // that answer a single question together could never be read off the same
+            // line. The cache hit rate and the number of players found are the two
+            // halves of "is the shortfall the cache or the walk", and separating them
+            // across two tags is what made that question need two screenshots.
+            //
+            // The sampling stays here rather than moving to the caller, because the
+            // blocked flag is only meaningful over a window: it is set by whichever
+            // read happened to be refused, and its instantaneous value is almost
+            // always false.
+            //
+            // Deltas are still computed here and discarded, deliberately. Keeping the
+            // bookkeeping means the counters stay monotonic across a cache flush, so
+            // the line's own differencing cannot be fooled by one.
+            (void)live; (void)remapDelta; (void)evictDelta;
+            (void)hitDelta; (void)missDelta; (void)novictimDelta;
+            g_dsBlockedLast = g_dsBlockedLastSecond ? 1 : 0;
             g_dsBlockedLastSecond = false;
             s_lastReportMs = nowMs;
             s_lastRemapCount = g_dsRemapCount;

@@ -4293,6 +4293,110 @@ static int      s_countOffScreen = 0;
 // and the counter is under-reporting for that reason rather than over-reporting.
 static int      s_countTeamUnknown = 0;
 
+// ---------------------------------------------------------------------------
+// The one status line.
+//
+// Every diagnosable number is published here by whichever stage last touched it, and
+// printed once a second on one tag. It was three: [DS-TLB] from the cache, [ESP-COUNT]
+// and [ESP-DICT] from the roster walk.
+//
+// Three tags means three filters, and the device log view had room for one. That is
+// not only inconvenient: the fields that answer a single question were on different
+// tags. The cache hit rate and the number of players found are the two halves of "is
+// the shortfall the cache or the walk", and separating them across two filters is what
+// made that question need two screenshots and a judgement call about which screenshot
+// was more recent.
+//
+// Publishing rather than printing at each site is what makes one line possible. The
+// walk finishes long after the cache counters were sampled, and the reject paths
+// return before any walk happens at all, so whichever site printed would be the one to
+// go quiet exactly when the failure is happening -- a reporter that prints on the
+// successful path is a reporter that only ever confirms success.
+//
+// Field meanings, carried over from the log each of these came out of:
+//
+//   gate     0 = the dictionary was walked. Non-zero = it was not, and the low bits
+//            say why: bit 0 capacity read 0, 1 above the plausible maximum, 2 smaller
+//            than the live count, 3 too sparse for the live count, 4 the live count
+//            itself out of range. 2 = the dictionary held no live entries at all.
+//            3 = there is no match yet.
+//            While gate != 0 the roster fields are the last successful walk, not this
+//            frame. That distinction is the whole match-pickup question: "the
+//            dictionary found nobody" and "the dictionary was never consulted" print
+//            identical numbers otherwise.
+//   cap      Il2CppArray.max_length -- capacity, roughly 1.3-2x the live count
+//   dc       dictCount, the live entries the dictionary says it holds
+//   walk     slots iterated after the clamp, i.e. min(cap, kMaxWalkSlots)
+//   clamped  the walk ended on kMaxWalkSlots rather than on the live count
+//   iters    loop iterations performed, i.e. walk minus an early exit on dc
+//   read     slots among those iterations that were not free markers
+//   live     pawns accepted after the duplicate filter
+//   dup      slots naming a pawn an earlier slot already named
+//   probe    pawns whose value did not read at the documented entry offset and came
+//            from a layout-probe offset instead (0x10/0x18 sit inside the key, so
+//            this is the widest remaining phantom surface)
+//   stopLive the walk ended on dictCount, which is the NORMAL end of a walk
+//   drop     pawns refused because the snapshot buffer was full
+//   off      live pawns inside the draw limit whose projection left the viewport
+//   team?    pawns refused because their team has never read successfully
+//   cache    hit/miss/remap/evict/novictim are per second; stale, orphan and sweeps
+//            are cumulative, and sweeps stopping is how you know the dead-mapping
+//            check stopped running
+//
+// The invariant the phantom budget guarantees, and the first thing to check when live
+// is short: live <= read <= dc.
+struct EspStatusLine {
+    uint64_t match, dict, local;
+    int slotCap, dictCount, walk, clamped, iters;
+    int readSlots, live, dupes, probe, stopLive, snapDrop, snapN;
+    int real, bots, offScreen, teamUnknown, selfSkip;
+    int gate;
+    float dmin, dmax;
+    uint64_t aimTarget;
+};
+static EspStatusLine g_st;
+
+static void EspEmitStatusLine(void) {
+    static CFTimeInterval s_last = 0;
+    const CFTimeInterval now = CACurrentMediaTime();
+    if ((now - s_last) < 1.0) return;
+    s_last = now;
+
+    DSPageCacheStats cs;
+    ds_page_cache_stats(&cs);
+    static uint64_t pRemap, pEvict, pHit, pMiss, pNoVictim;
+    const uint64_t dRemap  = cs.remaps   - pRemap;
+    const uint64_t dEvict  = cs.evicts   - pEvict;
+    const uint64_t dHit    = cs.hits     - pHit;
+    const uint64_t dMiss   = cs.misses   - pMiss;
+    const uint64_t dNoVict = cs.novictim - pNoVictim;
+    pRemap = cs.remaps; pEvict = cs.evicts; pHit = cs.hits;
+    pMiss = cs.misses; pNoVictim = cs.novictim;
+
+    NSLog(@"[ESP] gate=%d match=0x%llx dict=0x%llx local=0x%llx "
+          @"cap=%d dc=%d walk=%d clamped=%d iters=%d read=%d live=%d dup=%d "
+          @"probe=%d stopLive=%d drop=%d snapN=%d real=%d bot=%d off=%d team?=0x%x "
+          @"self=%d dmin=%.1f dmax=%.1f aim=0x%llx "
+          @"cache{slots=%d hit=%llu miss=%llu remap=%llu evict=%llu novictim=%llu "
+          @"stale=%llu orphan=%llu blind=%d sweeps=%llu deg=%d blk=%d}",
+          g_st.gate,
+          (unsigned long long)g_st.match, (unsigned long long)g_st.dict,
+          (unsigned long long)g_st.local,
+          g_st.slotCap, g_st.dictCount, g_st.walk, g_st.clamped, g_st.iters,
+          g_st.readSlots, g_st.live, g_st.dupes, g_st.probe, g_st.stopLive,
+          g_st.snapDrop, g_st.snapN, g_st.real, g_st.bots, g_st.offScreen,
+          g_st.teamUnknown, g_st.selfSkip,
+          (double)g_st.dmin, (double)g_st.dmax,
+          (unsigned long long)g_st.aimTarget,
+          cs.liveSlots,
+          (unsigned long long)dHit, (unsigned long long)dMiss,
+          (unsigned long long)dRemap, (unsigned long long)dEvict,
+          (unsigned long long)dNoVict,
+          (unsigned long long)cs.staleDrops, (unsigned long long)cs.orphanDrops,
+          cs.blind, (unsigned long long)cs.sweeps,
+          cs.degradeActive, cs.blockedLastSecond);
+}
+
 - (ESPFrameStats)renderESPWithBuffers:(ESPGeometryBuffers *)buffers
                             viewWidth:(CGFloat)viewWidth
                            viewHeight:(CGFloat)viewHeight
@@ -4302,6 +4406,10 @@ static int      s_countTeamUnknown = 0;
 {
     ESPFrameStats stats = {0, 0, false, NULL};
     stats.aimAssistPath = CGPathCreateMutable();
+    // Before anything can return. The reject paths below are precisely the ones worth
+    // watching -- they are why a match sometimes is not picked up -- and a reporter
+    // sitting after them prints nothing at all while the failure is in progress.
+    EspEmitStatusLine();
 
     g_cacheFrameCounter++;          // Tăng frame counter mỗi lần render (dùng cho cache)
 
@@ -4765,13 +4873,12 @@ static int      s_countTeamUnknown = 0;
     if (capGarbage || countGarbage) {
         if (dictCapLogNow) {
             s_dictCapLog = dictCapNow;
-            NSLog(@"[ESP-DICT] REJECT bad read: dict=0x%llx entries=0x%llx cap=%d dc=%d "
-                  @"(zero=%d huge=%d small=%d sparse=%d dcGarbage=%d) -- frame dropped, "
-                  @"no players walked",
-                  (unsigned long long)playerDict, (unsigned long long)entriesArr,
-                  slotCap, dictCount,
-                  (int)capZero, (int)capTooHuge, (int)capTooSmall,
-                  (int)capTooSparse, (int)countGarbage);
+            g_st.gate = 1 | ((int)capZero) | ((int)capTooHuge << 1) |
+                        ((int)capTooSmall << 2) | ((int)capTooSparse << 3) |
+                        ((int)countGarbage << 4);
+            g_st.dict      = playerDict;
+            g_st.slotCap   = slotCap;
+            g_st.dictCount = dictCount;
         }
         return stats;
     }
@@ -4783,9 +4890,10 @@ static int      s_countTeamUnknown = 0;
     if (dictCount <= 0) {
         if (dictCapLogNow) {
             s_dictCapLog = dictCapNow;
-            NSLog(@"[ESP-DICT] REJECT empty: dict=0x%llx entries=0x%llx cap=%d dc=0 "
-                  @"-- dictionary holds no live entries",
-                  (unsigned long long)playerDict, (unsigned long long)entriesArr, slotCap);
+            g_st.gate      = 2;
+            g_st.dict      = playerDict;
+            g_st.slotCap   = slotCap;
+            g_st.dictCount = dictCount;
         }
         return stats;
     }
@@ -5549,7 +5657,7 @@ static int      s_countTeamUnknown = 0;
         // match, though 99 possible enemies still fits inside it. Not raised here:
         // 128 EspPawnSnap is already ~9KB of stack on the render path and 192 would
         // be ~14KB of the same stack. Counted instead, because a silent drop is
-        // invisible boxes and a counted one is a number in [ESP-COUNT].
+        // invisible boxes and a counted one is a number on the [ESP] status line.
         if (snapN < 128) {
             EspPawnSnap &s = snaps[snapN++];
             s.pawn = PawnObject;
@@ -5579,7 +5687,7 @@ static int      s_countTeamUnknown = 0;
     if (dictClamped) {
         if (dictCapLogNow) {
             s_dictCapLog = dictCapNow;
-            NSLog(@"[ESP-DICT] CLAMPED walk: dict=0x%llx cap=%d dc=%d walk=%d live=%d "
+            NSLog(@"[ESP] !walk-clamped dict=0x%llx cap=%d dc=%d walk=%d live=%d "
                   @"dup=%d snapDrop=%d -- %d of %d slots not read; entries are "
                   @"hash-placed so the players missed are a spread-out subset",
                   (unsigned long long)playerDict, slotCap, dictCount, loopCount,
@@ -6115,18 +6223,30 @@ static int      s_countTeamUnknown = 0;
         //         key, so this is the widest remaining phantom surface)
         // stopLive = the walk ended on dictCount, which is the NORMAL end of a walk
         // drop  = pawns refused because the 128-snapshot buffer was full
-        // The invariant the phantom budget guarantees: live <= read <= dictCount.
-        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d dc=%d walk=%d clamped=%d "
-              @"iter=%d read=%d live=%d dup=%d probe=%d stopLive=%d drop=%d snapN=%d "
-              @"(real=%d, bot=%d) "
-              @"local=0x%llx self=%d off=%d team?=0x%x dmin=%.1f dmax=%.1f",
-              (unsigned long long)match, (unsigned long long)playerDict, slotCap, dictCount,
-              loopCount, dictClamped, dictIters, dictWalkSlots, dictLive, dictDupes,
-              dictValueProbe, dictStopLive, snapDrop, snapN,
-              stats.realCount, stats.botCount,
-              (unsigned long long)myPawnObject, selfSkipped, s_countOffScreen,
-              s_countTeamUnknown,
-              dmin, dmax);
+        g_st.match      = match;
+        g_st.dict       = playerDict;
+        g_st.local      = myPawnObject;
+        g_st.slotCap    = slotCap;
+        g_st.dictCount  = dictCount;
+        g_st.walk       = loopCount;
+        g_st.clamped    = dictClamped;
+        g_st.iters      = dictIters;
+        g_st.readSlots  = dictWalkSlots;
+        g_st.live       = dictLive;
+        g_st.dupes      = dictDupes;
+        g_st.probe      = dictValueProbe;
+        g_st.stopLive   = dictStopLive;
+        g_st.snapDrop   = snapDrop;
+        g_st.snapN      = snapN;
+        g_st.real       = stats.realCount;
+        g_st.bots       = stats.botCount;
+        g_st.offScreen  = s_countOffScreen;
+        g_st.teamUnknown = s_countTeamUnknown;
+        g_st.selfSkip   = selfSkipped;
+        g_st.dmin       = dmin;
+        g_st.dmax       = dmax;
+        g_st.gate       = 0;
+        g_st.aimTarget  = gAimLockTarget;
     }
 
     // Aim target pick on the same fresh matrix as ESP.

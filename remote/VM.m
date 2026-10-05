@@ -198,7 +198,8 @@ static struct VMObject vm_get_object_impl(uint64_t map, uint64_t address, uint64
         // a page that is genuinely gone -- so this used to print once per read
         // for every pointer the stale object graph still pointed at. Four lines
         // is enough to see that it is happening; the count it used to imply is
-        // better read off [DS-TLB] remaps, which is one line a second instead of
+        // better read off remaps on the [ESP] status line, which is one line a second
+        // instead of
         // one per failed lookup.
         static uint32_t s_noEntryLogged = 0;
         if (s_noEntryLogged < 4) {

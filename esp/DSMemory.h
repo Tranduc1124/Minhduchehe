@@ -88,6 +88,21 @@ typedef struct {
 } DSPageCacheDiag;
 DSPageCacheDiag ds_page_cache_diag(void);
 
+// Cumulative page-cache counters, published for the single ESP status line.
+//
+// Cumulative, not per-second: the line's cadence belongs to whoever prints it, so the
+// cache is not also deciding when to be sampled. The caller keeps the previous values
+// and differences them. Nothing here is reset by reading it.
+typedef struct {
+    int      liveSlots;         // resident mappings right now
+    int      blind;             // resident slots with no dead-mapping baseline yet
+    int      blockedLastSecond; // a read path was refused in the previous second
+    int      degradeActive;     // the throttle is currently engaged
+    uint64_t remaps, evicts, hits, misses, novictim;
+    uint64_t staleDrops, orphanDrops, sweeps;
+} DSPageCacheStats;
+void ds_page_cache_stats(DSPageCacheStats *out);
+
 
 #ifdef __cplusplus
 }
