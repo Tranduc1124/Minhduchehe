@@ -5312,6 +5312,37 @@ static void EspEmitStatusLine(void) {
             const bool readsAlive = (CurHP > 0 || isKnocked) && MaxHP > 0;
             if (readsAlive) {
                 s_deadUntilFrame[deadSlot] = 0;
+                // The hold lives in TWO places and this cleared only one of them, so the
+                // lift ended the ban without ending the tombstone.
+                //
+                // markGhostDead writes g_posTrack[PosTrackSlot(pawn)].deadUntilFrame
+                // (above) as well as s_deadUntilFrame[deadSlot]. Three readers consult
+                // the PosTrack copy, and all three refuse to produce a position while it
+                // stands:
+                //
+                //   2351  ResolveHeadWorldPosTracked  -> Vector3{0,0,0}
+                //   2378  ResolveHipWorldPosTracked   -> Vector3{0,0,0}
+                //   2408  EspSmoothDisplayPos          -> Vector3{0,0,0}
+                //
+                // The last one is called at 5609/5610, which is AFTER this point, so a
+                // lifted pawn walked straight into it and had its whole snapshot geometry
+                // replaced by the world origin:
+                //
+                //   5690  !IsZeroVec(bone) is false      -> canAimThisPawn = false
+                //   5670  dis is now the distance to {0,0,0} -> exceeds espDrawLimit
+                //                                                    -> wantDraw = false
+                //
+                // So the lift made this WORSE than having no lift. Without it the pawn
+                // was cleanly banned for the hold and nothing was emitted. With it the
+                // pawn passed the ban and then emitted a garbage snapshot entry for the
+                // rest of the hold: no box, not aimable, while provably alive -- which
+                // is the exact shape of "a live player is missing from ESP and aim".
+                //
+                // Which is what 16423b858 introduced. It fixed a real problem -- a
+                // knocked pawn could never leave the ban because it reads HP 0 -- and
+                // introduced this one by lifting half the state.
+                PosTrack &trLift = g_posTrack[PosTrackSlot(PawnObject)];
+                if (trLift.pawn == PawnObject) trLift.deadUntilFrame = 0;
             } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
                 rej.banned++;
                 continue;
