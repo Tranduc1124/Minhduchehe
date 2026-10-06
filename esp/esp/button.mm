@@ -31,6 +31,23 @@ extern "C" void ToggleSpeedX50(bool enable);
 
 // CÁC BIẾN CHO STREAMER MODE
 @property (nonatomic, strong) CADisplayLink *displayLink;
+
+// What we last pushed into the secure field, NOT what we read back out of it.
+//
+// updateVisibility runs on a CADisplayLink, so it runs every frame, and its old
+// guard was `_secureTextField.secureTextEntry != isStreamer` -- reading back a
+// field UIKit owns and rebuilds internally whenever secureTextEntry changes. The
+// moment those two disagree, the guard stays true forever and every single frame
+// does removeFromSuperview, flips secureTextEntry, forces layoutIfNeeded on the
+// field, re-derives the canvas and re-adds the whole content view.
+//
+// That is an unbounded per-frame re-parent of the entire menu, and it is reached
+// by touching any setting, which is why the UI and the overlay came apart after a
+// toggle rather than the toggle simply not taking.
+//
+// Tracking the intent makes the loop impossible: at most one re-parent per real
+// state change.
+@property (nonatomic, assign) BOOL appliedStreamerMode;
 @property (nonatomic, strong) HTHButtonSecureWrapper *secureTextField;
 @property (nonatomic, strong) UIView *secureCanvas;
 @property (nonatomic, strong) UIView *contentView; // Gói nút vào view này
@@ -96,7 +113,11 @@ extern "C" void ToggleSpeedX50(bool enable);
         _secureTextField.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:_secureTextField];
         
-        _secureTextField.secureTextEntry = ESPPrefsBool(@"StreamerMode", NO);
+        // Recorded, not re-derived: init already applies this value, so if
+        // updateVisibility's intent were left unset it would immediately redo the
+        // whole re-parent once on the first display-link tick.
+        self.appliedStreamerMode = ESPPrefsBool(@"StreamerMode", NO);
+        _secureTextField.secureTextEntry = self.appliedStreamerMode;
         [_secureTextField layoutIfNeeded];
         
         _secureCanvas = _secureTextField.subviews.firstObject ?: _secureTextField;
@@ -144,19 +165,19 @@ extern "C" void ToggleSpeedX50(bool enable);
 
 - (void)updateVisibility {
     BOOL isStreamer = ESPPrefsBool(@"StreamerMode", NO);
-    
-    if (_secureTextField.secureTextEntry != isStreamer) {
-        [_contentView removeFromSuperview];
-        
-        _secureTextField.secureTextEntry = isStreamer;
-        [_secureTextField setNeedsLayout];
-        [_secureTextField layoutIfNeeded];
-        
-        _secureCanvas = _secureTextField.subviews.firstObject ?: _secureTextField;
-        _secureCanvas.userInteractionEnabled = NO;
-        
-        [_secureCanvas addSubview:_contentView];
-    }
+    if (_appliedStreamerMode == isStreamer) return;
+    _appliedStreamerMode = isStreamer;
+
+    [_contentView removeFromSuperview];
+
+    _secureTextField.secureTextEntry = isStreamer;
+    [_secureTextField setNeedsLayout];
+    [_secureTextField layoutIfNeeded];
+
+    _secureCanvas = _secureTextField.subviews.firstObject ?: _secureTextField;
+    _secureCanvas.userInteractionEnabled = NO;
+
+    [_secureCanvas addSubview:_contentView];
 }
 
 - (void)switchChanged:(UISwitch *)sender {
