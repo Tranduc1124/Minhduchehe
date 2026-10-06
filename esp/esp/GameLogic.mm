@@ -466,13 +466,19 @@ static uint64_t ResolveAimAssistStatics(void) {
     if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return 0;
     uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + kAimAssistTypeInfo);
     if (!isVaildPtr(typeInfo)) return 0;
-    uint64_t statics = ReadAddr<uint64_t>(typeInfo + kTypeInfoStatics);
-    if (!isVaildPtr(statics)) {
-        const uint64_t offs[] = {0xB8, 0xB0, 0xC0, 0xA8};
-        for (size_t i = 0; i < 4 && !isVaildPtr(statics); i++) {
-            statics = ReadAddr<uint64_t>(typeInfo + offs[i]);
-        }
-    }
+    // kTypeInfoStatics is Il2CppClass::static_fields. For this game it is +0xB8,
+    // and the very next slot is Il2CppRGCTXData* rgctx_data at +0xC0:
+    //
+    //     struct COW_GameVarDef_c {
+    //         struct COW_GameVarDef_StaticFields* static_fields;  // +0xB8
+    //         Il2CppRGCTXData*                   rgctx_data;     // +0xC0
+    //     };
+    //
+    // The old probe walked {0xB8, 0xB0, 0xC0, 0xA8}, so one failed validation was
+    // enough to hand the writers below a GC metadata block and have them store aim
+    // flags into it. 0xB8 holds at every one of the 62 call sites, so there is
+    // nothing to fall back to. If the read does not validate, patch nothing.
+    const uint64_t statics = ReadAddr<uint64_t>(typeInfo + kTypeInfoStatics);
     return isVaildPtr(statics) ? statics : 0;
 }
 
