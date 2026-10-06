@@ -625,6 +625,50 @@ static struct {
     uint64_t vmo;
     uint64_t vmoEpochMs;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
+
+// Direct-mapped page -> slot accelerator for the hit path.
+//
+// ds_page_local scanned all DS_PAGE_CACHE_SLOTS entries on EVERY read, hit or
+// miss, to find one whose pageVA matched. A read is ~550,000 per second in a
+// survival match, so that is ~140 million slot comparisons per second over an
+// 80-byte struct table of 20 KB, which does not stay in L1 -- and all of it
+// inside g_pageCacheLock, the lock the render thread on the main queue,
+// SilentAimThread and AimLockThreadMain all contend for.
+//
+// This is an accelerator, NOT a replacement. g_pageIndex only ever names a slot
+// that really holds that pageVA; a collision, or an entry cleared by a release
+// that missed its probe, simply falls through to the original scan. Behaviour is
+// identical either way, and the scan is what keeps it that way.
+//
+// Direct-mapped rather than open addressing on purpose: 256 entries over a power
+// of two, and the fallback already exists, so extra buckets would buy nothing.
+//
+// -1 means empty. Every read and write of this array is under g_pageCacheLock,
+// same as g_pageCache itself.
+static int32_t     g_pageIndex[DS_PAGE_CACHE_SLOTS];
+
+static inline int ds_page_index_hash(uint64_t pageVA) {
+    return (int)(pageVA & (uint64_t)(DS_PAGE_CACHE_SLOTS - 1));
+}
+
+static inline void ds_page_index_set(uint64_t pageVA, int slot) {
+    if (slot < 0 || slot >= DS_PAGE_CACHE_SLOTS) return;
+    g_pageIndex[ds_page_index_hash(pageVA)] = (int32_t)slot;
+}
+
+// Drop this slot's index entry if it still names it. The slot's pageVA is read
+// BEFORE the caller clears it, so a slot that is being evicted for a different
+// page drops the right entry. A collision victim leaves another page's index
+// entry pointing at the reused slot; that entry fails its pageVA check and falls
+// back to the scan, which is correct.
+static inline void ds_page_index_drop(int slot) {
+    if (slot < 0 || slot >= DS_PAGE_CACHE_SLOTS) return;
+    const uint64_t pva = g_pageCache[slot].pageVA;
+    if (pva == 0) return;
+    const int h = ds_page_index_hash(pva);
+    if (g_pageIndex[h] == (int32_t)slot) g_pageIndex[h] = -1;
+}
+
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
 static uint64_t g_cacheGeneration = 1;
 static uint64_t g_pageUseCounter = 1;
@@ -676,6 +720,9 @@ static uint64_t g_dsSweepCount = 0;
 static uint64_t g_dsLastSweepMs = 0;
 
 static void ds_page_cache_lock_init(void) {
+    // Every entry starts empty, so a miss is one comparison instead of a scan
+    // through slots nobody has ever populated.
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) g_pageIndex[i] = -1;
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
@@ -702,6 +749,8 @@ static void ds_unlock(void) {
 
 static void ds_release_page_slot_locked(int i) {
     if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) return;
+    // Before the fields are cleared: ds_page_index_drop reads this slot's pageVA.
+    ds_page_index_drop(i);
     if (g_pageCache[i].localAddr) {
         mach_vm_deallocate(mach_task_self_,
                            (mach_vm_address_t)g_pageCache[i].localAddr,
@@ -1087,6 +1136,20 @@ void ds_end_read_transaction(void) {
 // Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
 // Unlocking before vm_map_remote_page raced kwrite_zone_element →
 // "Taking non-sleepable RW lock with preemption enabled".
+// One place that touches a slot on a hit, so the indexed probe and the scan
+// cannot drift apart. Returns the local address, or 0 if this slot is not a live
+// hit -- localAddr 0 means unmapped and pageVA 0 is never a valid remote page, so
+// 0 is unambiguous as "miss".
+static inline uint64_t ds_page_hit(int i) {
+    if (g_pageCache[i].pageVA == 0 || g_pageCache[i].localAddr == 0) return 0;
+    if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
+    g_pageCache[i].lastUse = g_pageUseCounter++;
+    g_pageCache[i].lastUseMs = ds_now_ms();
+    g_pageCache[i].touchedFrame = (uint32_t)g_txnFrameStamp;
+    g_dsHitCount++;
+    return g_pageCache[i].localAddr;
+}
+
 static uint64_t ds_page_local(uint64_t pageVA) {
     ds_lock();
 
@@ -1104,16 +1167,25 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     //
     // So the loop moved up. A hit is served, and only a miss has to wait out the
     // cooldown.
+    // One indexed probe first, then the scan it replaces. The probe cannot answer
+    // wrongly: it only reports a hit when the slot it names really holds this
+    // pageVA, so a stale or colliding entry costs one comparison and falls through.
+    {
+        const int32_t cand = g_pageIndex[ds_page_index_hash(pageVA)];
+        if (cand >= 0 && cand < DS_PAGE_CACHE_SLOTS) {
+            const uint64_t aIndexed = ds_page_hit((int)cand);
+            if (aIndexed) {
+                ds_unlock();
+                return aIndexed;
+            }
+        }
+    }
+
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
-            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
-            g_pageCache[i].lastUse = g_pageUseCounter++;
-            // Stamped on every hit. This is what the TTL is measured against,
-            // so a page the game is reading every frame never ages out.
-            g_pageCache[i].lastUseMs = ds_now_ms();
-            g_pageCache[i].touchedFrame = (uint32_t)g_txnFrameStamp;
-            g_dsHitCount++;
-            uint64_t aHit = g_pageCache[i].localAddr;
+        const uint64_t aHit = ds_page_hit(i);
+        if (aHit) {
+            // Found by scan, so teach the index for next time.
+            ds_page_index_set(pageVA, i);
             ds_unlock();
             return aHit;
         }
@@ -1263,6 +1335,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].pageVA = pageVA;
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
+    ds_page_index_set(pageVA, victim);
     g_pageCache[victim].gen = g_cacheGeneration;
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;
