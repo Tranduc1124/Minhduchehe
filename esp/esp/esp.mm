@@ -765,8 +765,8 @@ static inline Vector3 ResolveAimHeadWorldPos(uint64_t pawn) {
     Vector3 tracked = ResolveHeadWorldPosTracked(pawn);
     if (looksLikeWorldPos(tracked)) return tracked;
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
-    Vector3 head = getPositionExt(getHead(pawn));
-    Vector3 hip = getPositionExt(getHip(pawn));
+    Vector3 head = getHeadWorld(pawn);
+    Vector3 hip = getHipWorld(pawn);
     if (!IsZeroVec(head)) {
         if (!IsZeroVec(hip)) {
             // Reject only obvious garbage (head far below hip / insane distance).
@@ -882,9 +882,9 @@ static inline void SilentFillPrimaryOnly(uint64_t *out, int *outCount) {
 // those shifted the hit point ~1 head-width off and missed near+far.
 static inline Vector3 ResolveSilentHeadWorldPos(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
-    Vector3 head = getPositionExt(getHead(pawn));
+    Vector3 head = getHeadWorld(pawn);
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) {
-        Vector3 hip = getPositionExt(getHip(pawn));
+        Vector3 hip = getHipWorld(pawn);
         if (looksLikeWorldPos(hip)) {
             float dx = head.x - hip.x, dy = head.y - hip.y, dz = head.z - hip.z;
             float d2 = dx*dx + dy*dy + dz*dz;
@@ -896,7 +896,7 @@ static inline Vector3 ResolveSilentHeadWorldPos(uint64_t pawn) {
         }
     }
     // Minimal fallbacks — still no Y pad / root blend.
-    head = getPositionExt(getHead(pawn));
+    head = getHeadWorld(pawn);
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) return head;
     head = ResolveAimHeadWorldPos(pawn);
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) return head;
@@ -922,7 +922,7 @@ static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
     // agreeing.
     Vector3 head = ResolveSilentHeadWorldPos(pawn);
     if (IsZeroVec(head) || !looksLikeWorldPos(head)) return Vector3{0, 0, 0};
-    Vector3 hip = getPositionExt(getHip(pawn));
+    Vector3 hip = getHipWorld(pawn);
     if (looksLikeWorldPos(hip) && !IsZeroVec(hip)) {
         const float t = (posMode == 1) ? 0.14f : 0.52f;
         return Vector3(head.x + (hip.x - head.x) * t,
@@ -1384,7 +1384,7 @@ static Vector3 AimTrackAndLeadEx(uint64_t pawn, Vector3 bodyPos, float distanceM
     if (!tr) return bodyPos;
     if (!looksLikeWorldPos(bodyPos)) return bodyPos;
 
-    Vector3 hip = getPositionExt(getHip(pawn));
+    Vector3 hip = getHipWorld(pawn);
     Vector3 root = ReadPlayerRootTransform(pawn);
     // Prefer network root for velocity on real players (more stable than lagging bones).
     Vector3 motionAnchor = bodyPos;
@@ -1505,8 +1505,8 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     (void)distance;
     if (!isVaildPtr(pawn)) return Vector3{0,0,0};
     // Live head bone first — critical for head lock on remotes.
-    Vector3 liveHead = getPositionExt(getHead(pawn));
-    Vector3 hip = getPositionExt(getHip(pawn));
+    Vector3 liveHead = getHeadWorld(pawn);
+    Vector3 hip = getHipWorld(pawn);
     Vector3 root = ReadPlayerRootTransform(pawn);
     Vector3 head = liveHead;
     bool headOk = false;
@@ -1522,7 +1522,7 @@ Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     }
     if (!headOk) {
         // Ghost-safe: live head/root/mount only — no sticky track invent.
-        head = getPositionExt(getHead(pawn));
+        head = getHeadWorld(pawn);
         if (IsZeroVec(head) || !looksLikeWorldPos(head)) {
             Vector3 mount{};
             if (IsActivelyMounted(pawn, &mount) && looksLikeWorldPos(mount)) {
@@ -1600,7 +1600,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     // Ghost-safe: live aim bone only — never invent from sticky track after death.
     Vector3 bone = GetAimTargetPosMode(targetPawn, aimPosMode, distanceMeters);
     if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
-        Vector3 liveHead = getPositionExt(getHead(targetPawn));
+        Vector3 liveHead = getHeadWorld(targetPawn);
         if (looksLikeWorldPos(liveHead)) bone = liveHead;
     }
     if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
@@ -1614,7 +1614,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     Vector3 from = AimCameraOrigin(localPawn, fromFallback);
     if (IsZeroVec(from) || !looksLikeWorldPos(from)) from = fromFallback;
     if (IsZeroVec(from) || !looksLikeWorldPos(from)) {
-        from = getPositionExt(getHead(localPawn));
+        from = getHeadWorld(localPawn);
     }
     if (IsZeroVec(from) || !looksLikeWorldPos(from)) {
         if (outLastAim) *outLastAim = aimed;
@@ -2176,8 +2176,8 @@ void ClearProBoxScreenForPawn(uint64_t pawn) {
 
 // Pick stable source. Real players: network root XZ + head Y under hard move.
 static inline Vector3 PickStableHeadRaw(uint64_t pawn, PosTrack &tr) {
-    Vector3 head = getPositionExt(getHead(pawn));
-    Vector3 hip  = getPositionExt(getHip(pawn));
+    Vector3 head = getHeadWorld(pawn);
+    Vector3 hip  = getHipWorld(pawn);
     Vector3 root = ReadPlayerRootTransform(pawn);
     Vector3 mount{};
     const bool mounted = IsActivelyMounted(pawn, &mount);
@@ -2312,9 +2312,9 @@ static inline Vector3 PickStableHeadRaw(uint64_t pawn, PosTrack &tr) {
 }
 
 static inline Vector3 PickStableHipRaw(uint64_t pawn, PosTrack &tr) {
-    Vector3 hip  = getPositionExt(getHip(pawn));
+    Vector3 hip  = getHipWorld(pawn);
     Vector3 root = ReadPlayerRootTransform(pawn);
-    Vector3 head = getPositionExt(getHead(pawn));
+    Vector3 head = getHeadWorld(pawn);
     Vector3 mount{};
     const bool mounted = IsActivelyMounted(pawn, &mount);
     if (!tr.hasHip || tr.pawn != pawn) {
@@ -5439,8 +5439,8 @@ static void EspEmitStatusLine(void) {
             ClearProBoxScreenForPawn(PawnObject);
         };
 
-        Vector3 liveHead = getPositionExt(getHead(PawnObject));
-        Vector3 liveHip  = getPositionExt(getHip(PawnObject));
+        Vector3 liveHead = getHeadWorld(PawnObject);
+        Vector3 liveHip  = getHipWorld(PawnObject);
         bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
 
         // ---- A read that did not land is not a pawn that went away.
@@ -6789,7 +6789,7 @@ static void EspEmitStatusLine(void) {
             int lhp = get_CurHP(gAimLockTarget);
             int lmax = get_MaxHP(gAimLockTarget);
             const bool lknock = get_IsKnockedDown(gAimLockTarget, -1);
-            Vector3 liveHeadTarget = getPositionExt(getHead(gAimLockTarget));
+            Vector3 liveHeadTarget = getHeadWorld(gAimLockTarget);
             const bool hasLiveHead = looksLikeWorldPos(liveHeadTarget);
             if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
             const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
@@ -6960,7 +6960,7 @@ static void EspEmitStatusLine(void) {
         int hp = get_CurHP(pawn);
         int maxHp = get_MaxHP(pawn);
         const bool knocked = get_IsKnockedDown(pawn, -1);
-        Vector3 liveHeadCheck = getPositionExt(getHead(pawn));
+        Vector3 liveHeadCheck = getHeadWorld(pawn);
         const bool hasLiveHead = looksLikeWorldPos(liveHeadCheck);
 
         if (hasLiveHead && hp <= 0 && maxHp <= 0) {
@@ -6980,13 +6980,13 @@ static void EspEmitStatusLine(void) {
         // pre-decision check, the silent branch, the camera branch) and the bone it
         // resolves is the same point all three times. What is NOT memoized, and must
         // not be, is the liveness gate above it: liveHeadCheck is a live
-        // getPositionExt(getHead(pawn)) on every call, so a pawn that dies
+        // getHeadWorld(pawn) on every call, so a pawn that dies
         // mid-frame is still caught. Only the redundant re-walk of the chain goes.
         Vector3 bone = (useSilent && !isAimbot && !useAssist)
             ? ResolveSilentAimWorldPosOnce(pawn, aimPosition)
             : GetAimTargetPosModeOnce(pawn, aimPosition, bestDistance);
         if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
-            Vector3 liveHead = getPositionExt(getHead(pawn));
+            Vector3 liveHead = getHeadWorld(pawn);
             if (looksLikeWorldPos(liveHead)) bone = liveHead;
             else {
                 Vector3 liveRoot = ReadPlayerRootTransform(pawn);
@@ -7005,8 +7005,8 @@ static void EspEmitStatusLine(void) {
         if (fabsf(bone.x) < 0.5f && fabsf(bone.z) < 0.5f && fabsf(bone.y) < 2.0f) return false;
         // Collapsed standing body without mount → ghost leftover
         {
-            Vector3 lh = getPositionExt(getHead(pawn));
-            Vector3 lp = getPositionExt(getHip(pawn));
+            Vector3 lh = getHeadWorld(pawn);
+            Vector3 lp = getHipWorld(pawn);
             Vector3 mount{};
             const bool mounted = IsActivelyMounted(pawn, &mount) || looksLikeWorldPos(mount);
             if (!mounted && looksLikeWorldPos(lh) && looksLikeWorldPos(lp) &&

@@ -17,6 +17,8 @@ bool IsAtLobby(uint64_t Moudule_Base);
 uint64_t getTransNode(uint64_t BodyPart);
 uint64_t getHead(uint64_t player);
 uint64_t getHip(uint64_t player);
+Vector3 getHeadWorld(uint64_t player);
+Vector3 getHipWorld(uint64_t player);
 uint64_t getLeftAnkle(uint64_t player);
 uint64_t getRightAnkle(uint64_t player);
 uint64_t getRightToeNode(uint64_t player);

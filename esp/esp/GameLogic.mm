@@ -159,13 +159,25 @@ uint64_t getTransNode(uint64_t BodyPart) {
 //  1) node itself (works if node already has transform layout)
 //  2) node->+0x10 (common ITransformNode -> Transform)
 // Return the pointer that yields a non-zero world position.
-static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
+// outPos, when non-null, receives the world position that PROVED the returned node
+// was good. Resolving which object holds the matrix costs a full getPositionExt
+// walk, and this function did that walk purely as a validity test and threw the
+// answer away -- every caller then walked the same chain again to get it back.
+// Returning it here halves the number of chain walks per bone.
+//
+// Equivalence is exact, not approximate. Each branch returns a node only when that
+// node's own probe was non-zero, and a branch that falls through to `return inner`
+// or `return node` is one whose probe WAS zero -- so a caller's re-walk of the
+// result yields zero there too. Callers that passed outPos = nullptr are unaffected.
+static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset, Vector3 *outPos) {
+    if (outPos) *outPos = Vector3{0, 0, 0};
     if (!isVaildPtr((uintptr_t)player)) return 0;
     uint64_t node = ReadAddr<uint64_t>(player + nodeOffset);
     if (!isVaildPtr((uintptr_t)node)) return 0;
 
     Vector3 direct = getPositionExt(node);
     if (!(direct.x == 0.0f && direct.y == 0.0f && direct.z == 0.0f)) {
+        if (outPos) *outPos = direct;
         return node;
     }
 
@@ -173,6 +185,7 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
     if (isVaildPtr((uintptr_t)inner)) {
         Vector3 via = getPositionExt(inner);
         if (!(via.x == 0.0f && via.y == 0.0f && via.z == 0.0f)) {
+            if (outPos) *outPos = via;
             return inner;
         }
         // Some wrappers nest one more level.
@@ -180,6 +193,7 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
         if (isVaildPtr((uintptr_t)inner2)) {
             Vector3 via2 = getPositionExt(inner2);
             if (!(via2.x == 0.0f && via2.y == 0.0f && via2.z == 0.0f)) {
+                if (outPos) *outPos = via2;
                 return inner2;
             }
         }
@@ -188,53 +202,68 @@ static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset) {
     return node;
 }
 
+// Exactly `getPositionExt(getHead(player))` / `getPositionExt(getHip(player))`,
+// in one chain walk instead of two. The double-walk spelling appeared 21 times in
+// esp.mm; each one paid for getBoneTrans' validity walk and then repeated it.
+Vector3 getHeadWorld(uint64_t player) {
+    Vector3 v{0, 0, 0};
+    getBoneTrans(player, kHeadNode, &v);
+    return v;
+}
+
+Vector3 getHipWorld(uint64_t player) {
+    Vector3 v{0, 0, 0};
+    getBoneTrans(player, kHipNode, &v);
+    return v;
+}
+
 uint64_t getHead(uint64_t player) {
     // FF dump: HeadNode 0x638, next slot 0x640 is HIP (kHipNode).
     // NEVER fall back to +0x8 — that made aim snap head→hip→head (chest jitter while firing).
-    return getBoneTrans(player, kHeadNode);
+    return getBoneTrans(player, kHeadNode, nullptr);
 }
 
 uint64_t getHip(uint64_t player) {
-    return getBoneTrans(player, kHipNode);
+    return getBoneTrans(player, kHipNode, nullptr);
 }
 
 uint64_t getLeftAnkle(uint64_t player) {
-    return getBoneTrans(player, kLeftAnkleNode);
+    return getBoneTrans(player, kLeftAnkleNode, nullptr);
 }
 
 uint64_t getRightAnkle(uint64_t player) {
-    return getBoneTrans(player, kRightAnkleNode);
+    return getBoneTrans(player, kRightAnkleNode, nullptr);
 }
 
 uint64_t getRightToeNode(uint64_t player) {
-    return getBoneTrans(player, kRightToeNode);
+    return getBoneTrans(player, kRightToeNode, nullptr);
 }
 
 uint64_t getLeftToeNode(uint64_t player) {
-    return getBoneTrans(player, kLeftToeNode);
+    return getBoneTrans(player, kLeftToeNode, nullptr);
 }
 uint64_t getLeftShoulder(uint64_t player) {
-    return getBoneTrans(player, kLeftShoulderNode);
+    return getBoneTrans(player, kLeftShoulderNode, nullptr);
 }
 
 uint64_t getLeftElbow(uint64_t player) {
-    return getBoneTrans(player, kLeftElbowNode);
+    return getBoneTrans(player, kLeftElbowNode, nullptr);
 }
 
 uint64_t getLeftHand(uint64_t player) {
-    return getBoneTrans(player, kLeftHandNode);
+    return getBoneTrans(player, kLeftHandNode, nullptr);
 }
 
 uint64_t getRightShoulder(uint64_t player) {
-    return getBoneTrans(player, kRightShoulderNode);
+    return getBoneTrans(player, kRightShoulderNode, nullptr);
 }
 
 uint64_t getRightElbow(uint64_t player) {
-    return getBoneTrans(player, kRightElbowNode);
+    return getBoneTrans(player, kRightElbowNode, nullptr);
 }
 
 uint64_t getRightHand(uint64_t player) {
-    return getBoneTrans(player, kRightHandNode);
+    return getBoneTrans(player, kRightHandNode, nullptr);
 }
 
 bool isLocalTeamMate(uint64_t localPlayer, uint64_t Player) {
