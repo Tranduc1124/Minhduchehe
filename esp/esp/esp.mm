@@ -2876,17 +2876,37 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
         g_awGap = (float)minGap;
         if (fed > 0) {
             g_awFed++;
-            // Watched, never written. Player::SetAimRotation bumps this itself,
-            // unconditionally, before it branches on EnableInternalSetRotation:
+            // One sample was written to the look axis this call, so the counter
+            // advances by exactly one. Not more, not fewer.
+            //
+            // 126cb70a9 removed this write on the reasoning that
+            // Player::SetAimRotation bumps the counter itself:
             //
             //     5637080: add  w8, w8, #0x1
             //     5637084: str  w8, [x19, #0x810]
             //
-            // so with the stick fed the game produces the bump on its own and this
-            // read confirms it rather than manufacturing a second one. Forging it
-            // gave two bumps per aim update against one input sample.
+            // and that with the stick fed the game would produce the bump on its
+            // own. That reasoning was never tested and it is wrong. The device
+            // says otherwise, across nine [AIM-WRITE] lines and about ten seconds
+            // of continuous aiming:
+            //
+            //     fed=1..24  axis=1  stuck=0  ctr=0  cmove=0
+            //
+            // fed climbing is the stick really moving, and cmove never leaving
+            // zero is the counter never moving once. The bump is inside
+            // SetAimRotation, but nothing routes to it: the rotation is written
+            // straight to Player+0x614, so the game never enters that function.
+            // Removing the write therefore left the counter permanently at 0, and
+            // a counter that never advances is itself wrong -- it is the number
+            // the report pairs with each input sample.
+            //
+            // So the counter is ours to maintain, and the only defensible value is
+            // one per sample actually written. It is written after the feed, so a
+            // sample without a matching bump is not possible.
             const uint32_t c = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
-            if (c != g_awCtr) { g_awCtr = c; g_awCtrMoves++; }
+            WriteAddr<uint32_t>(player + kCallSetAimRotationCount, c + 1u);
+            g_awCtr = c + 1u;
+            g_awCtrMoves++;
         } else if (fed == 0) {
             g_awNoop++;
         } else {
