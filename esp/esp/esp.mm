@@ -2641,6 +2641,24 @@ static uint64_t look_axis_for(uint64_t player) {
 // "the aim is not reaching the game", so "the rotation did not move, so there
 // was no delta to express" must not be folded into it -- otherwise a healthy
 // build reports stuck in the double digits every frame and the signal is gone.
+// Whether the displaced stick position is OURS, as opposed to the player's.
+//
+// The paced-out branch releases the stick, and it is the common case: the device log
+// shows starved=74 of calls=92, starved=85 of calls=110, starved=97 of calls=120.
+// Releasing there unconditionally does not merely undo our own write. It writes
+// current back to start and clears m_IsTouched, and clearing m_IsTouched is exactly
+// how the game is told the player lifted their finger. So on 4 frames out of 5 it
+// wiped the player's own touch as well, and the camera stopped responding to the
+// stick -- which is what "dragging the camera turns nothing, sometimes it nudges a
+// little" reports.
+//
+// With this set, a release only runs while the displaced position is still ours. The
+// moment the game takes the axis back, the flag is false and every release is a
+// no-op, so the finger is never contradicted.
+//
+// Declared above drive_look_axis_input because that is where ownership is taken.
+static bool g_lookAxisOurs = false;
+
 static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const Quaternion &next) {
     if (!isVaildPtr(player)) return -1;
     if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return -1;
@@ -2699,6 +2717,8 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
     //
     // delta below is therefore computed against the OLD start, which is the same
     // anchor the game would use for this move, and start is updated after it.
+    // Only now, after every check above has passed, is the displaced position ours.
+    g_lookAxisOurs = true;
     WriteAddr<uint8_t>(axis + kAxisTouched, 1);
     WriteAddr<Vector3>(axis + kAxisStartScreenPos, cur);
     WriteAddr<Vector3>(axis + kAxisCurrentScreenPos, to);
@@ -2740,7 +2760,7 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
 }
 
 // Put the look stick back where the finger left it.
-//
+
 // drive_look_axis_input advances kAxisCurrentScreenPos (axis + 0x6C) and only ever
 // READS kAxisStartScreenPos (axis + 0x60) -- grep over the project shows 0x60 is
 // written nowhere at all. So every feed leaves the stick displaced, and nothing
@@ -2761,6 +2781,10 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
 // and no aim call of ours executing. Ending the aim is not enough; the axis has to
 // be handed back.
 static void release_look_axis_input(uint64_t player) {
+    // Not ours to undo. The game is mid-drag on this axis under the player's finger,
+    // and the two writes this function makes are indistinguishable from the player
+    // letting go. Undoing them here is what took the camera away.
+    if (!g_lookAxisOurs) return;
     if (!isVaildPtr(player)) return;
     if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return;
     uint64_t handler = ReadAddr<uint64_t>(player + kUserControlHandler);
@@ -2769,9 +2793,11 @@ static void release_look_axis_input(uint64_t player) {
     if (!isVaildPtr(axis)) return;
 
     // Cleared FIRST, before any read that can return early below, so a bad read
-    // cannot leave the stick marked held. This is the field that makes
+    // cannot leave the stick marked held. The ownership flag goes first for the same
+    // reason: if the rest of this function bails out, we still hold nothing. This is the field that makes
     // SampleAimInput read the axis at all, so leaving it set is exactly the floating
     // stick and the auto-fire described above drive_look_axis_input.
+    g_lookAxisOurs = false;
     WriteAddr<uint8_t>(axis + kAxisTouched, 0);
 
     Vector3 start = ReadAddr<Vector3>(axis + kAxisStartScreenPos);
