@@ -2726,6 +2726,10 @@ static CFTimeInterval aim_sample_interval(void) {
 // / starved (the write was skipped) / lastGap / lastAng.
 static uint32_t g_awCalls = 0, g_awWrote = 0, g_awStuck = 0, g_awStarved = 0;
 static uint32_t g_awFed = 0, g_awNoop = 0;
+// Observation only, never written: the game's own CallSetAimRotationCount, and how
+// many times it moved while we were running. This is the check for the change below.
+static uint32_t g_awCtr = 0;
+static uint64_t g_awCtrMoves = 0;
 static float    g_awGap = 0.f, g_awAng = 0.f;
 static CFTimeInterval g_awLastLog = 0;
 
@@ -2871,12 +2875,18 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
         s_lastFeed = now;
         g_awGap = (float)minGap;
         if (fed > 0) {
-            // Counter++ is what the report correlates against the sample list.
-            // Only when the stick actually moved: "counter advanced, no input" is
-            // the exact pattern it looks for.
-            uint32_t n = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
-            WriteAddr<uint32_t>(player + kCallSetAimRotationCount, n + 1u);
             g_awFed++;
+            // Watched, never written. Player::SetAimRotation bumps this itself,
+            // unconditionally, before it branches on EnableInternalSetRotation:
+            //
+            //     5637080: add  w8, w8, #0x1
+            //     5637084: str  w8, [x19, #0x810]
+            //
+            // so with the stick fed the game produces the bump on its own and this
+            // read confirms it rather than manufacturing a second one. Forging it
+            // gave two bumps per aim update against one input sample.
+            const uint32_t c = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
+            if (c != g_awCtr) { g_awCtr = c; g_awCtrMoves++; }
         } else if (fed == 0) {
             g_awNoop++;
         } else {
@@ -2887,13 +2897,15 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (now - g_awLastLog >= 1.0) {
         g_awLastLog = now;
         NSLog(@"[AIM-WRITE] calls=%u wrote=%u fed=%u noop=%u stuck=%u starved=%u "
-              @"gap=%.3f ang=%.2f axis=%d tick=%u",
+              @"gap=%.3f ang=%.2f axis=%d tick=%u ctr=%u cmove=%llu",
               g_awCalls, g_awWrote, g_awFed, g_awNoop, g_awStuck, g_awStarved,
               (double)g_awGap, (double)g_awAng,
               isVaildPtr(look_axis_for(player)) ? 1 : 0,
-              (unsigned)(minGap * 60.0));
+              (unsigned)(minGap * 60.0),
+              g_awCtr, (unsigned long long)g_awCtrMoves);
         g_awCalls = g_awWrote = g_awFed = g_awNoop = 0;
         g_awStuck = g_awStarved = 0;
+        g_awCtrMoves = 0;
     }
     // kCheckBufPending (Player+0x624) is NOT ours to set: MarkGGPVerifyCheckBufPending
     // owns it and is driven by the weapon fire path. Writing it from aim was both
