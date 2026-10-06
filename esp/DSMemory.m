@@ -1200,12 +1200,17 @@ void ds_end_read_transaction(void) {
 // Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
 // Unlocking before vm_map_remote_page raced kwrite_zone_element →
 // "Taking non-sleepable RW lock with preemption enabled".
-// One place that touches a slot on a hit, so the indexed probe and the scan
-// cannot drift apart. Returns the local address, or 0 if this slot is not a live
-// hit -- localAddr 0 means unmapped and pageVA 0 is never a valid remote page, so
-// 0 is unambiguous as "miss".
-static inline uint64_t ds_page_hit(int i) {
-    if (g_pageCache[i].pageVA == 0 || g_pageCache[i].localAddr == 0) return 0;
+// One place that touches a slot on a hit, so the indexed probe and the scan cannot
+// drift apart. Returns the local address, or 0 if this slot is not a live hit FOR
+// wantVA.
+//
+// wantVA is the whole point and must not be dropped. The scan calls this for every
+// slot in the table, so a version that only tested pageVA != 0 would touch -- and
+// return -- whichever slot happened to be occupied, handing back another page's
+// mapping for the address that was asked for. wantVA 0 is never a valid remote page
+// and localAddr 0 means unmapped, so 0 is an unambiguous "miss".
+static inline uint64_t ds_page_hit(int i, uint64_t wantVA) {
+    if (g_pageCache[i].pageVA != wantVA || g_pageCache[i].localAddr == 0) return 0;
     if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
     g_pageCache[i].lastUse = g_pageUseCounter++;
     g_pageCache[i].lastUseMs = ds_now_ms();
@@ -1237,7 +1242,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     {
         const int32_t cand = g_pageIndex[ds_page_index_hash(pageVA)];
         if (cand >= 0 && cand < DS_PAGE_CACHE_SLOTS) {
-            const uint64_t aIndexed = ds_page_hit((int)cand);
+            const uint64_t aIndexed = ds_page_hit((int)cand, pageVA);
             if (aIndexed) {
                 ds_unlock();
                 return aIndexed;
@@ -1246,7 +1251,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     }
 
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        const uint64_t aHit = ds_page_hit(i);
+        const uint64_t aHit = ds_page_hit(i, pageVA);
         if (aHit) {
             // Found by scan, so teach the index for next time.
             ds_page_index_set(pageVA, i);
