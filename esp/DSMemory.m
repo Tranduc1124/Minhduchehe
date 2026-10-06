@@ -879,8 +879,29 @@ static int ds_vmo_cmp(const void *a, const void *b) {
 // costs one remap. The reverse cannot happen: the snapshot is read from the live map,
 // so once the game has replaced the object the snapshot names the new one. Being
 // wrong here costs a mapping, never a read.
-static void ds_vmo_sweep_tick(uint64_t nowMs) {
-    if (!K(g_ff_task)) return;
+// Walks the next slice of the map and returns true once a whole pass has been
+// filled. Deliberately runs WITHOUT g_pageCacheLock.
+//
+// This is the syscall-heavy half: DS_VMO_SWEEP_PER_TICK map entries at four kernel
+// reads each, ~1024 setsockopt calls, once per frame. It touches no cache slot
+// whatever -- only the walk cursor, the fill count and g_vmoSnap[build], where
+// build is 1 - g_vmoLive, i.e. the buffer that is NOT the live one. Readers search
+// g_vmoSnap[g_vmoLive], so the slice being filled is never the slice being read.
+//
+// Holding g_pageCacheLock across this made every remote read in the process -- the
+// render thread on the main queue, SilentAimThread, AimLockThreadMain -- queue
+// behind those syscalls once a frame. ds_page_cache_lock_init, the hit scan and the
+// judge below all sit inside that same lock, so its hold time is the whole frame
+// cost.
+//
+// Only the outermost ds_end_read_transaction calls this, and exactly one thread
+// can be that outermost caller, so the cursor and fill count stay single-writer.
+static bool ds_vmo_walk_tick(uint64_t nowMs) {
+    // Every path out of here returns false explicitly. A bare `return;` from a
+    // bool function is undefined, and true would mean "a whole pass is ready" for a
+    // pass holding nothing -- which publishes an empty snapshot and then judges all
+    // 256 live slots as unmapped.
+    if (!K(g_ff_task)) return false;
 
     // Start a pass if none is running. g_vmoCursor == 0 is that state, which is why a
     // completed pass clears it and lets the next tick begin another: the walk is
@@ -899,12 +920,12 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
                 NSLog(@"[ESP] !vmo cannot run: vm_map has %u entries, this build holds %d",
                       nentries, DS_VMO_SNAP_MAX);
             }
-            return;
+            return false;
         }
         g_vmoTotal  = nentries;
         g_vmoFill   = 0;
         g_vmoCursor = kread_ptr(hdr + off_vm_map_header_links_next);
-        if (!K(g_vmoCursor)) return;
+        if (!K(g_vmoCursor)) return false;
     }
 
     const int build = 1 - g_vmoLive;
@@ -926,8 +947,23 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
             g_vmoFill   = 0;
             g_vmoCursor = 0;
         }
-        return;   // mid-pass: the live buffer is untouched and still answering
+        return false;   // mid-pass: the live buffer is untouched and still answering
     }
+
+    return true;
+}
+
+// Publishes the finished snapshot and judges every slot against it. Caller holds
+// g_pageCacheLock, and must only be reached for the build that ds_vmo_walk_tick
+// filled -- which is 1 - g_vmoLive, recomputed here and unchanged, because nothing
+// else writes g_vmoLive.
+//
+// The other half of the old sweep, and free of syscalls: ds_vmo_lookup is a binary
+// search over the published snapshot. It is kept under the lock because it reads and
+// writes g_pageCache and calls ds_release_page_slot_locked.
+static void ds_vmo_publish_and_judge(uint64_t nowMs) {
+    const int build = 1 - g_vmoLive;
+    DSVmoRange *a = g_vmoSnap[build];
 
     // Finished. Sort so lookups are binary, publish it, then judge.
     if (g_vmoFill > 1) {
@@ -999,6 +1035,7 @@ static void ds_vmo_sweep_tick(uint64_t nowMs) {
     }
 }
 
+
 void ds_page_cache_stats(DSPageCacheStats *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -1029,10 +1066,31 @@ void ds_begin_read_transaction(void) {
 }
 
 void ds_end_read_transaction(void) {
+    // Whether this is the outermost transaction is decided under the lock and then
+    // the lock is dropped, because the map walk between here and the judge is
+    // ~1024 kernel reads that touch no cache slot and had no business making every
+    // remote read in the process wait for them.
+    //
+    // Exactly one caller can be the outermost: g_readTxnDepth is only changed under
+    // the lock, and the decrement that reaches zero is done by one thread. That
+    // thread is the only one that walks, which is what keeps the walk cursor and the
+    // fill count single-writer without a second lock.
+    bool outer = false;
     ds_lock();
     if (g_readTxnDepth > 0) g_readTxnDepth--;
+    outer = (g_readTxnDepth == 0);
+    ds_unlock();
+    if (!outer) return;
+
+    const uint64_t sweepNowMs = ds_now_ms();
+
+    // Walks the next slice. No lock, no cache-slot access, no reads from the live
+    // snapshot. Returns true when a whole pass has been filled.
+    const bool passComplete = ds_vmo_walk_tick(sweepNowMs);
+
+    ds_lock();
     // Fl0rk soft-age — never full per-frame flush (that caused RW-lock panics).
-    if (g_readTxnDepth == 0) {
+    {
         // Belt and braces on a path that already runs every frame: a session that
         // pairs begin/end correctly releases a cooldown here even if it never
         // opened a transaction while latched.
@@ -1041,7 +1099,13 @@ void ds_end_read_transaction(void) {
         // inside a read. The alternative -- asking the map per slot, per second --
         // is what made the previous version of this check cost more the more slots a
         // match had.
-        ds_vmo_sweep_tick(ds_now_ms());
+        //
+        // Order is unchanged: the walk above ran first, and only now, with the lock
+        // held and the pass it completed sitting in the buffer, is it published and
+        // judged. The judge needs the lock because it reads and writes g_pageCache
+        // and calls ds_release_page_slot_locked; it costs no syscalls, being a binary
+        // search per slot over the snapshot.
+        if (passComplete) ds_vmo_publish_and_judge(sweepNowMs);
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
             if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
         }
