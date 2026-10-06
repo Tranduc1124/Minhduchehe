@@ -2696,6 +2696,45 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
     return 1;
 }
 
+// Put the look stick back where the finger left it.
+//
+// drive_look_axis_input advances kAxisCurrentScreenPos (axis + 0x6C) and only ever
+// READS kAxisStartScreenPos (axis + 0x60) -- grep over the project shows 0x60 is
+// written nowhere at all. So every feed leaves the stick displaced, and nothing
+// puts it back.
+//
+// That is why the camera keeps turning after the aim has stopped, and why it does
+// so with nothing of ours running: kAxisCurrentScreenPos is documented in
+// GameOffsets.h as "<-- what the game samples", and the game re-derives its own
+// look delta from that position on its own cadence. m_IsTouched is deliberately
+// left alone (see the comment above drive_look_axis_input), so the game has no
+// reason to reset start either -- it only does that on a real touch. The displaced
+// position therefore survives until the user touches the stick themselves.
+//
+// Both fields go back together. Restoring only current would leave the game
+// deriving a non-zero delta from current against its own untouched start.
+//
+// The reported symptom is the camera moving with no target selected, so no write
+// and no aim call of ours executing. Ending the aim is not enough; the axis has to
+// be handed back.
+static void release_look_axis_input(uint64_t player) {
+    if (!isVaildPtr(player)) return;
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return;
+    uint64_t handler = ReadAddr<uint64_t>(player + kUserControlHandler);
+    if (!isVaildPtr(handler)) return;
+    uint64_t axis = look_axis_for(player);
+    if (!isVaildPtr(axis)) return;
+
+    Vector3 start = ReadAddr<Vector3>(axis + kAxisStartScreenPos);
+    if (isnan(start.x) || isnan(start.y) || isnan(start.z)) return;
+    const Vector3 zero{0.f, 0.f, 0.f};
+    WriteAddr<Vector3>(axis + kAxisCurrentScreenPos, start);
+    WriteAddr<Vector3>(axis + kAxisDeltaPos, zero);
+    WriteAddr<Vector3>(axis + kAxisCurrentDeltaValue, zero);
+    WriteAddr<Vector3>(axis + kAxisLastDirection, zero);
+    WriteAddr<float>(axis + kAxisActuallyMovedDistance, 0.f);
+}
+
 // The game samples the look stick every GameVarDef.AimInputSampleIntervalTick
 // ticks, and the report pairs one sample with one CallSetAimRotationCount bump.
 // Rotation has to move at the same cadence as the sample stream or the mismatch
@@ -7264,6 +7303,9 @@ static void EspEmitStatusLine(void) {
     if (!cameraAimActive) {
         update_aim_assist_legit_tuning(false);
         AimLockClear();
+        // The stick position on the axis is our last write, not the game's. Leaving
+        // it displaced is what keeps turning the camera after this returns.
+        release_look_axis_input(myPawnObject);
         gAimLockTarget = 0;
         gAimLockLostFrames = 0;
         s_lastAimPawn = 0;
@@ -7467,6 +7509,7 @@ static void EspEmitStatusLine(void) {
         // Not in camera aim branch — always kill cam lock thread.
         update_aim_assist_legit_tuning(false);
         AimLockClear();
+        release_look_axis_input(myPawnObject);
         if (!silentActive) s_lastAimPawn = 0;
         if (bestTarget == 0) {
             gAimLockTarget = 0;
