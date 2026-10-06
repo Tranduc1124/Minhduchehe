@@ -123,7 +123,7 @@ static inline bool IsZeroVec(const Vector3 &v);
 Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance);
 Quaternion GetRotationToLocation(Vector3 targetLocation, float y_bias, Vector3 myLoc);
 void update_aim_assist_legit_tuning(bool enable);
-static void write_aim_rotations(uint64_t player, const Quaternion &in);
+static void write_aim_rotations(uint64_t player, const Quaternion &out);
 static Vector3 AimTrackAndLead(uint64_t pawn, Vector3 bodyPos, float distanceMeters, bool lockYToBody);
 static Vector3 AimTrackAndLeadEx(uint64_t pawn, Vector3 bodyPos, float distanceMeters, bool lockYToBody, bool bulletLead);
 static inline Vector3 AimCameraOrigin(uint64_t localPawn, const Vector3 &fallback);
@@ -2807,23 +2807,7 @@ static void PatchAimDetectionFlags(bool enable) {
     g_gvdPatched = false;
 }
 
-// Ceiling on how far the aim may move in a single call.
-//
-// Every live path feeds write_aim_rotations a look-at quaternion, not a step, so an
-// unbounded write teleports kAimRotation onto the target: 90-180 degrees inside one
-// frame the moment the target changes. No thumb produces that.
-//
-// It also puts the rotation and the stick out of agreement. drive_look_axis_input
-// clamps the stick into the right drag area before moving it, so past a certain angle
-// the stick saturates while the rotation keeps going the full distance -- the report
-// sees a rotation that moved further than the input behind it accounts for.
-//
-// 14 degrees is about 840 degrees per second at 60Hz: a hard flick, not a snap.
-// Ordinary tracking moves well under it and is untouched; only a target change big
-// enough to be suspicious gets stepped.
-static const float kAimMaxStepDeg = 14.0f;
-
-static void write_aim_rotations(uint64_t player, const Quaternion &in) {
+static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
     g_awCalls++;
 
@@ -2840,21 +2824,6 @@ static void write_aim_rotations(uint64_t player, const Quaternion &in) {
     // unconditional. The hoist was right. The read had to travel with them and did
     // not, which is what killed the input path.
     const Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
-
-    // Step toward the target by at most kAimMaxStepDeg, then use that single clamped
-    // value for the rotation AND the stick, so the two can never disagree about how
-    // far the aim moved. A cold or unusable current rotation writes the target
-    // straight through once, to establish a baseline there is something to step from.
-    Quaternion out = in;
-    const float pn = prev.x * prev.x + prev.y * prev.y + prev.z * prev.z + prev.w * prev.w;
-    if (pn > 0.0001f && !isnan(pn)) {
-        const Quaternion base = Quaternion::Normalized(prev);
-        const float ang = Quaternion::Angle(base, out);
-        if (!isnan(ang) && ang > kAimMaxStepDeg) {
-            out = Quaternion::Normalized(Quaternion::Slerp(base, out, kAimMaxStepDeg / ang));
-        }
-    }
-    if (isnan(out.x) || isnan(out.y) || isnan(out.z) || isnan(out.w)) return;
     g_awAng = Quaternion::Angle(prev, out);
     if (isnan(g_awAng)) g_awAng = 0.f;
 
