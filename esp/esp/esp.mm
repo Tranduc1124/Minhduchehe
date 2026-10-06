@@ -1653,7 +1653,6 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
         }
     }
     write_aim_rotations(localPawn, outQ);
-    write_aim_rotations(localPawn, outQ);
     AimSyncFireHit(localPawn, from, aimed);
 
     static int s_lookLiveLog = 0;
@@ -7619,8 +7618,18 @@ bool get_IsFiring(uint64_t player) {
     int src = 0;
 
     // 1) StartFireState enum (when offset is valid).
+    // StartFireStateIsActive, not the 0..9 range this used to test.
+    //
+    // The range admitted kStartFireReady (1), kStartFireCancel (4) and
+    // kStartFireWarmup (5) -- all inside > 0 && <= 9 -- so Ready and Cancel both set
+    // kFireSrcEnum, which is in kFireSrcDecidable and therefore makes get_IsFiring
+    // return true. Warmup is genuinely firing; Ready and Cancel are not.
+    //
+    // StartFireStateIsActive was written for exactly this and listed the states that
+    // really are a shot. It had one occurrence in the project: its own definition.
+    // Never called, like set_aim and AimLockSetQuat in this same region.
     int startFire = ReadAddr<int>(player + kIsFiring);
-    if (startFire > 0 && startFire <= 9) {
+    if (StartFireStateIsActive(startFire)) {
         src |= kFireSrcEnum;
     }
     int startFireAlt = ReadAddr<int>(player + 0x1C14);
