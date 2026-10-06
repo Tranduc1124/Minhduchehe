@@ -4083,7 +4083,14 @@ static inline uint64_t ESPPhaseNowUS(void) {
         ds_begin_read_transaction();
         ESPFrameStats stats = [self renderESPWithBuffers:&buffers viewWidth:viewWidth viewHeight:viewHeight matrixVpWidth:matrixVpW matrixVpHeight:matrixVpH screenCenter:screenCenter];
         const uint64_t tPhase1 = ESPPhaseNowUS();
+        // ds_end_read_transaction is where ds_vmo_sweep_tick runs, and it runs
+        // inside g_pageCacheLock: DS_VMO_SWEEP_PER_TICK entries, four kernel reads
+        // each, while every remote read in the process waits on that lock. It was
+        // previously entirely outside the measured window, so `read=` could read
+        // healthy while this was where the frame went. Measured now, separately.
+        const uint64_t tDsEnd0 = ESPPhaseNowUS();
         ds_end_read_transaction();
+        const uint64_t tDsEnd1 = ESPPhaseNowUS();
         g_hbLastReal = stats.realCount;
         g_hbLastBot  = stats.botCount;
 
@@ -4257,21 +4264,33 @@ static inline uint64_t ESPPhaseNowUS(void) {
             static uint64_t s_phUS = 0;
             static uint32_t s_phFrames = 0;
             static uint64_t s_phRender = 0, s_phLayer = 0, s_phPush = 0;
+            static uint64_t s_phDsEnd = 0, s_phDsEndMax = 0;
             s_phFrames++;
             s_phRender  += (tPhase1 - tPhase0);
+            s_phDsEnd   += (tDsEnd1 - tDsEnd0);
+            if ((tDsEnd1 - tDsEnd0) > s_phDsEndMax) s_phDsEndMax = (tDsEnd1 - tDsEnd0);
             s_phLayer   += (tPhase2 - tPhase1);
             s_phPush    += (tPhase3 - tPhase2);
             if (tPhase3 > s_phUS + 1000000ULL) {
                 const uint32_t n = s_phFrames ? s_phFrames : 1;
-                NSLog(@"[PUSH-PHASE] fps=%u read=%.2fms layer=%.2fms push=%.2fms total=%.2fms",
+                // dsend = ds_end_read_transaction, which carries the vm_map sweep.
+                // dsendmax = its worst single frame in the second, which is what the
+                // hang looks like: one frame holding the page-cache lock long enough
+                // to stall every reader.
+                NSLog(@"[PUSH-PHASE] fps=%u read=%.2fms dsend=%.2fms dsendmax=%.2fms "
+                      @"layer=%.2fms push=%.2fms total=%.2fms",
                       (unsigned)s_phFrames,
                       (double)s_phRender / (double)n / 1000.0,
+                      (double)s_phDsEnd / (double)n / 1000.0,
+                      (double)s_phDsEndMax / 1000.0,
                       (double)s_phLayer / (double)n / 1000.0,
                       (double)s_phPush / (double)n / 1000.0,
-                      (double)(s_phRender + s_phLayer + s_phPush) / (double)n / 1000.0);
+                      (double)(s_phRender + s_phDsEnd + s_phLayer + s_phPush) / (double)n / 1000.0);
                 s_phUS = tPhase3;
                 s_phFrames = 0;
                 s_phRender = s_phLayer = s_phPush = 0;
+                s_phDsEnd = 0;
+                s_phDsEndMax = 0;
             }
         }
     }
