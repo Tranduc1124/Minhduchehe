@@ -577,6 +577,25 @@ static inline Vector3 ReadPlayerRootTransform(uint64_t pawn) {
 static inline bool IsActivelyMounted(uint64_t pawn, Vector3 *outMountPos = nullptr) {
     if (outMountPos) *outMountPos = Vector3{0, 0, 0};
     if (!isVaildPtr(pawn)) return false;
+
+    // LAZY BODY RESOLUTION.
+    //
+    // root/head/hip/live/bonesDead/bonesCollapsed cost five transform chains --
+    // about 90 remote reads -- and every single consumer of them sits inside one
+    // of the two branches below. The old order resolved all five, then found no
+    // vehicle and no strop, and returned false having read nothing it used.
+    // On a survival map that is nearly every pawn, so it was ~90 wasted reads per
+    // pawn per frame, ~9,000 a frame at 100 players, roughly 16% of the whole
+    // read budget, spent re-deriving chains already walked earlier this frame.
+    //
+    // Two pointer reads now decide whether the body is needed at all. strop is
+    // still only read when vehicle is 0, which is what the old control flow did
+    // for free: the vehicle branch returns unconditionally, so ReadStropIAmOn
+    // was unreachable whenever a vehicle pointer was set.
+    uint64_t vehicle = ReadVehicleIAmIn(pawn);
+    uint64_t strop = vehicle ? 0 : ReadStropIAmOn(pawn);
+    if (!vehicle && !strop) return false;
+
     Vector3 root = ReadPlayerRootTransform(pawn);
     Vector3 head = tryTransformPos(getHead(pawn));
     Vector3 hip  = tryTransformPos(getHip(pawn));
@@ -587,7 +606,6 @@ static inline bool IsActivelyMounted(uint64_t pawn, Vector3 *outMountPos = nullp
     const bool bonesCollapsed = looksLikeWorldPos(head) && looksLikeWorldPos(hip) &&
                                 Vector3::Distance(head, hip) < 0.22f;
 
-    uint64_t vehicle = ReadVehicleIAmIn(pawn);
     if (vehicle) {
         Vector3 vp = ResolveVehicleWorldPos(vehicle);
         const bool haveVp = looksLikeWorldPos(vp);
@@ -630,7 +648,8 @@ static inline bool IsActivelyMounted(uint64_t pawn, Vector3 *outMountPos = nullp
         return true;
     }
 
-    uint64_t strop = ReadStropIAmOn(pawn);
+    // vehicle is 0 here -- its branch returns unconditionally -- and we returned
+    // early above unless strop was set, so strop is valid from here on.
     if (strop) {
         Vector3 sp = ResolveStropWorldPos(strop);
         if (looksLikeWorldPos(live)) {
