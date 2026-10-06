@@ -237,6 +237,7 @@ void RenderESPForPawnEx(
     void *callbackContext,
     uint64_t PawnObject,
     int CurHP,
+    int MaxHP,
     float dis,
     float *matrix,
     float layerWidth,

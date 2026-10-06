@@ -6410,7 +6410,7 @@ static void EspEmitStatusLine(void) {
                 hipP.y -= s.treatAsVehicle ? 1.05f : 0.85f;
             }
             RenderESPForPawnEx(buffers, ESPViewAddTextCallback, ESPViewAddImageCallback,
-                               (__bridge void *)self, s.pawn, s.curHP, s.dis, matrixData,
+                               (__bridge void *)self, s.pawn, s.curHP, s.maxHP, s.dis, matrixData,
                                (float)viewWidth, (float)viewHeight, (float)matrixVpWidth, (float)matrixVpHeight,
                                s.head.x, s.head.y, s.head.z,
                                hipP.x, hipP.y, hipP.z,

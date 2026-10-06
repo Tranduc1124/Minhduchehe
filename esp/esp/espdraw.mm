@@ -302,6 +302,7 @@ static void ESPRenderPawnCore(
     void *callbackContext,
     uint64_t PawnObject,
     int CurHP,
+    int MaxHP,
     float dis,
     float *matrix,
     float layerWidth,
@@ -316,7 +317,15 @@ static void ESPRenderPawnCore(
     if (dis > 400.0f || !buffers || !matrix || !PawnObject || dis < 1.0f) return;
     if (headX == 0.0f && headY == 0.0f && headZ == 0.0f) return;
 
-    int MaxHP = get_MaxHP(PawnObject);
+    // MaxHP arrives from the collect loop, which has already read it off the same
+    // DataPool. This used to be a fresh get_MaxHP walk here, so the draw pass paid a
+    // full pool traversal per drawn pawn for a value the caller was holding three
+    // arguments away -- and it is per drawn pawn, so it scaled with exactly the thing
+    // that gets heavier as more visuals are switched on. That is why the full set of
+    // options cost noticeably more than a subset did.
+    //
+    // The range check stays: it now validates a passed value rather than a fresh read,
+    // and a bad MaxHP gives a nonsense health bar either way.
     if (MaxHP <= 0 || MaxHP > 2000) MaxHP = 200;
 
     const bool isKnocked = (isKnockedFlag != 0);
@@ -662,6 +671,7 @@ void RenderESPForPawnEx(
     void *callbackContext,
     uint64_t PawnObject,
     int CurHP,
+    int MaxHP,
     float dis,
     float *matrix,
     float layerWidth,
@@ -674,7 +684,7 @@ void RenderESPForPawnEx(
     int isKnockedFlag
 ) {
     ESPRenderPawnCore(buffers, textCallback, imageCallback, callbackContext,
-                      PawnObject, CurHP, dis, matrix,
+                      PawnObject, CurHP, MaxHP, dis, matrix,
                       layerWidth, layerHeight, matrixVpWidth, matrixVpHeight,
                       headX, headY, headZ,
                       hipX, hipY, hipZ,
