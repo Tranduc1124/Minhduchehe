@@ -1671,7 +1671,7 @@ void set_aim(uint64_t player, Quaternion rotation, float speed, int mode, bool f
 void set_aim_legit(uint64_t player, Quaternion rotation, float targetDistance);
 void update_aim_assist_legit_tuning(bool enable);
 bool get_IsBot(uint64_t player);
-bool get_IsKnockedDown(uint64_t player);
+bool get_IsKnockedDown(uint64_t player, int curHpHint);
 bool get_IsBeingRescued(uint64_t player);
 bool get_IsFiring(uint64_t player);
 bool get_IsScoping(uint64_t player);
@@ -5281,14 +5281,18 @@ static void EspEmitStatusLine(void) {
             // Bot bit rarely changes — refresh occasionally.
             c.isBot = get_IsBot(PawnObject);
         }
-        c.isKnocked = get_IsKnockedDown(PawnObject);
         // Read both ways: the value, and whether it was a value at all. HP is the
         // only thing this loop uses to decide a player is dead, and a failed read
         // is indistinguishable from a zero HP unless somebody asks.
+        //
+        // get_IsKnockedDown opens with its own get_CurHP walk, so it used to be a
+        // second, discarded walk of the value read two lines below it. Ordering
+        // HP first lets the hint carry the same number instead of re-reading it.
         bool hpReadOk = get_CurHPOk(PawnObject, &c.curHP);
         const bool maxReadOk = get_MaxHPOk(PawnObject, &c.maxHP);
         if (!hpReadOk) c.curHP = get_CurHP(PawnObject);
         if (!maxReadOk) c.maxHP = get_MaxHP(PawnObject);
+        c.isKnocked = get_IsKnockedDown(PawnObject, hpReadOk ? c.curHP : -1);
         c.frame     = g_cacheFrameCounter;
 
         if (isEspCheckVisible && (cacheMiss || (g_cacheFrameCounter & 1) == 0)) {
@@ -6784,7 +6788,7 @@ static void EspEmitStatusLine(void) {
             // Ghost: require MaxHP>0 + live bone — never sticky-track invent.
             int lhp = get_CurHP(gAimLockTarget);
             int lmax = get_MaxHP(gAimLockTarget);
-            const bool lknock = get_IsKnockedDown(gAimLockTarget);
+            const bool lknock = get_IsKnockedDown(gAimLockTarget, -1);
             Vector3 liveHeadTarget = getPositionExt(getHead(gAimLockTarget));
             const bool hasLiveHead = looksLikeWorldPos(liveHeadTarget);
             if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
@@ -6955,7 +6959,7 @@ static void EspEmitStatusLine(void) {
         if (!isVaildPtr(pawn)) return false;
         int hp = get_CurHP(pawn);
         int maxHp = get_MaxHP(pawn);
-        const bool knocked = get_IsKnockedDown(pawn);
+        const bool knocked = get_IsKnockedDown(pawn, -1);
         Vector3 liveHeadCheck = getPositionExt(getHead(pawn));
         const bool hasLiveHead = looksLikeWorldPos(liveHeadCheck);
 
@@ -7434,9 +7438,14 @@ bool get_IsBot(uint64_t player) {
     return ReadAddr<uint8_t>(player + (uint64_t)kIsClientBot) != 0;
 }
 
-bool get_IsKnockedDown(uint64_t player) {
+// curHpHint >= 0 means the caller already read this player's CurHP, which is the
+// case everywhere in the render loop. It saves a whole ReadDataPoolVarOk walk --
+// 6 reads on the fast path, up to 153 when the pool walk has to probe every
+// offset -- whose result was thrown away one line later. -1 means "not known" and
+// restores the original read, so any caller without a value in hand is unaffected.
+bool get_IsKnockedDown(uint64_t player, int curHpHint) {
     if (!isVaildPtr(player)) return false;
-    if (get_CurHP(player) <= 0) return false;
+    if ((curHpHint >= 0 ? curHpHint : get_CurHP(player)) <= 0) return false;
     if (ReadAddr<uint8_t>(player + kKnocked) != 0) return true;
 
     uint64_t phx = ReadAddr<uint64_t>(player + kMyPhysXData);
