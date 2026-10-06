@@ -2638,14 +2638,18 @@ static uint64_t look_axis_for(uint64_t player) {
 // (axis + 0x4C) and m_IsUserControlChanged (handler + 0x78). Forcing those on
 // would make the game believe the stick is held — floating stick, auto fire.
 // The position alone is what gets sampled.
-static bool drive_look_axis_input(uint64_t player, const Quaternion &prev, const Quaternion &next) {
-    if (!isVaildPtr(player)) return false;
-    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return false;
+// Three outcomes, not two. g_awStuck is the number that has to be able to say
+// "the aim is not reaching the game", so "the rotation did not move, so there
+// was no delta to express" must not be folded into it -- otherwise a healthy
+// build reports stuck in the double digits every frame and the signal is gone.
+static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const Quaternion &next) {
+    if (!isVaildPtr(player)) return -1;
+    if (Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) return -1;
 
     uint64_t handler = ReadAddr<uint64_t>(player + kUserControlHandler);
-    if (!isVaildPtr(handler)) return false;
+    if (!isVaildPtr(handler)) return -1;
     uint64_t axis = look_axis_for(player);
-    if (!isVaildPtr(axis)) return false;
+    if (!isVaildPtr(axis)) return -1;
 
     Vector3 e0 = Quaternion::ToEuler(prev);
     Vector3 e1 = Quaternion::ToEuler(next);
@@ -2655,7 +2659,7 @@ static bool drive_look_axis_input(uint64_t player, const Quaternion &prev, const
     float dPitch = e1.x - e0.x;
     if (dPitch > 180.f) dPitch -= 360.f;
     if (dPitch < -180.f) dPitch += 360.f;
-    if (fabsf(dYaw) < 0.0001f && fabsf(dPitch) < 0.0001f) return false;
+    if (fabsf(dYaw) < 0.0001f && fabsf(dPitch) < 0.0001f) return 0;
 
     CGSize scr = [UIScreen mainScreen].bounds.size;
     float sw = (float)scr.width, sh = (float)scr.height;
@@ -2669,7 +2673,7 @@ static bool drive_look_axis_input(uint64_t player, const Quaternion &prev, const
 
     Vector3 cur   = ReadAddr<Vector3>(axis + kAxisCurrentScreenPos);
     Vector3 start = ReadAddr<Vector3>(axis + kAxisStartScreenPos);
-    if (isnan(cur.x) || isnan(cur.y) || isnan(cur.z)) return false;
+    if (isnan(cur.x) || isnan(cur.y) || isnan(cur.z)) return -1;
     if (isnan(start.x) || isnan(start.y) || isnan(start.z)) start = cur;
 
     Vector3 to = cur;
@@ -2689,7 +2693,7 @@ static bool drive_look_axis_input(uint64_t player, const Quaternion &prev, const
     WriteAddr<Vector3>(axis + kAxisCurrentDeltaValue, step);
     WriteAddr<Vector3>(axis + kAxisLastDirection, step);
     WriteAddr<float>(axis + kAxisActuallyMovedDistance, moved);
-    return true;
+    return 1;
 }
 
 // The game samples the look stick every GameVarDef.AimInputSampleIntervalTick
@@ -2721,6 +2725,7 @@ static CFTimeInterval aim_sample_interval(void) {
 // of a guess. calls / wrote / stuck (the stick axis could not be resolved or fed)
 // / starved (the write was skipped) / lastGap / lastAng.
 static uint32_t g_awCalls = 0, g_awWrote = 0, g_awStuck = 0, g_awStarved = 0;
+static uint32_t g_awFed = 0, g_awNoop = 0;
 static float    g_awGap = 0.f, g_awAng = 0.f;
 static CFTimeInterval g_awLastLog = 0;
 
@@ -2825,6 +2830,22 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
     g_awCalls++;
 
+    // Sample the game's current rotation BEFORE overwriting it below.
+    //
+    // drive_look_axis_input turns (next - prev) into a stick movement, so prev has
+    // to be the rotation the game is actually showing. Read it after the writes and
+    // it reads back as `out`: the delta collapses to zero, the stick is never fed,
+    // and CallSetAimRotationCount never advances. The camera still turns, because
+    // the camera follows kCurrentAimRotation -- which is exactly the shape this
+    // path exists to avoid, a rotation that moves with no input sample behind it.
+    //
+    // 8471a6db67 hoisted the three rotation writes above this read so they would be
+    // unconditional. The hoist was right. The read had to travel with them and did
+    // not, which is what killed the input path.
+    const Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
+    g_awAng = Quaternion::Angle(prev, out);
+    if (isnan(g_awAng)) g_awAng = 0.f;
+
     // Rotation FIRST and unconditional: this is the write the camera follows.
     WriteAddr<Quaternion>(player + kAimRotation, out);        // 0x614
     WriteAddr<Quaternion>(player + kAimRotationAux, out);     // 0x628 ResetAux copy
@@ -2846,18 +2867,18 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (minGap > 0.0 && s_lastFeed != 0.0 && (now - s_lastFeed) < minGap) {
         g_awStarved++;
     } else {
-        Quaternion prev = ReadAddr<Quaternion>(player + kAimRotation);
-        g_awAng = Quaternion::Angle(prev, out);
-        if (isnan(g_awAng)) g_awAng = 0.f;
-        const bool fed = drive_look_axis_input(player, prev, out);
+        const int fed = drive_look_axis_input(player, prev, out);
         s_lastFeed = now;
         g_awGap = (float)minGap;
-        if (fed) {
+        if (fed > 0) {
             // Counter++ is what the report correlates against the sample list.
             // Only when the stick actually moved: "counter advanced, no input" is
             // the exact pattern it looks for.
             uint32_t n = ReadAddr<uint32_t>(player + kCallSetAimRotationCount);
             WriteAddr<uint32_t>(player + kCallSetAimRotationCount, n + 1u);
+            g_awFed++;
+        } else if (fed == 0) {
+            g_awNoop++;
         } else {
             g_awStuck++;
         }
@@ -2865,12 +2886,14 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
 
     if (now - g_awLastLog >= 1.0) {
         g_awLastLog = now;
-        NSLog(@"[AIM-WRITE] calls=%u wrote=%u stuck=%u starved=%u gap=%.3f ang=%.2f "
-              @"axis=%d tick=%u",
-              g_awCalls, g_awWrote, g_awStuck, g_awStarved, (double)g_awGap, (double)g_awAng,
+        NSLog(@"[AIM-WRITE] calls=%u wrote=%u fed=%u noop=%u stuck=%u starved=%u "
+              @"gap=%.3f ang=%.2f axis=%d tick=%u",
+              g_awCalls, g_awWrote, g_awFed, g_awNoop, g_awStuck, g_awStarved,
+              (double)g_awGap, (double)g_awAng,
               isVaildPtr(look_axis_for(player)) ? 1 : 0,
               (unsigned)(minGap * 60.0));
-        g_awCalls = g_awWrote = g_awStuck = g_awStarved = 0;
+        g_awCalls = g_awWrote = g_awFed = g_awNoop = 0;
+        g_awStuck = g_awStarved = 0;
     }
     // kCheckBufPending (Player+0x624) is NOT ours to set: MarkGGPVerifyCheckBufPending
     // owns it and is driven by the weapon fire path. Writing it from aim was both
