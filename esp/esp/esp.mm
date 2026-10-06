@@ -2687,13 +2687,28 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
     Vector3 delta(to.x - start.x, to.y - start.y, 0.f);
     float moved = sqrtf(step.x * step.x + step.y * step.y);
 
+    // m_StartScreenPos (axis + 0x60) advances to the position we are leaving, so
+    // after this write current - start is exactly the step and not the running sum
+    // of every step since the axis was first touched.
+    //
+    // It was never written before this. m_IsTouched is set in this function, and
+    // once the game is actually reading the axis, an anchor that never moves means
+    // current - start is permanently non-zero the moment the stick is displaced even
+    // by one pixel. The game then derives a look delta from a stick that is sitting
+    // still, and the camera keeps turning with no aim running.
+    //
+    // delta below is therefore computed against the OLD start, which is the same
+    // anchor the game would use for this move, and start is updated after it.
+    WriteAddr<uint8_t>(axis + kAxisTouched, 1);
+    WriteAddr<Vector3>(axis + kAxisStartScreenPos, cur);
     WriteAddr<Vector3>(axis + kAxisCurrentScreenPos, to);
     WriteAddr<Vector3>(axis + kAxisDeltaPos, delta);
     WriteAddr<Vector3>(axis + kAxisCurrentDeltaValue, step);
     WriteAddr<Vector3>(axis + kAxisLastDirection, step);
     WriteAddr<float>(axis + kAxisActuallyMovedDistance, moved);
 
-    // m_IsTouched (+0x4B) is the gate that makes the game READ what we just wrote.
+    // m_IsTouched (+0x4B) is written above, together with the anchor it is read
+    // against.
     //
     // SampleAimInput, the function that samples the stick and feeds the report,
     // branches on it and samples a constant when it is clear:
@@ -2719,9 +2734,8 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
     // drive_look_axis_input warns about.
     //
     // Only m_IsTouched. m_IsActuallyMoved (+0x4C) is left alone: nothing on the
-    // sampling path reads it, and setting it is the part most likely to be taken as
-    // a deliberate drag rather than a position report.
-    WriteAddr<uint8_t>(axis + kAxisTouched, 1);
+    // drag rather than a position report. Written above, next to the anchor it
+    // is read against.
     return 1;
 }
 
@@ -2943,6 +2957,16 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
         s_lastFeed = 0.0;
     }
     if (minGap > 0.0 && s_lastFeed != 0.0 && (now - s_lastFeed) < minGap) {
+        // Paced out this frame: no sample, so the stick must not hold a position
+        // either. The device log shows this is the common case by a wide margin --
+        // starved=74 of calls=92, and starved=97 of calls=120 -- because the
+        // rotation writes are not paced while the feed is. Without this the stick
+        // stays displaced and marked touched between feeds, which is the "camera I
+        // cannot turn, and it keeps pulling the fire button" report.
+        //
+        // Consistent with what the game sees: the rotation does not change on these
+        // frames either, so a zero delta here is what a real idle frame looks like.
+        release_look_axis_input(player);
         g_awStarved++;
     } else {
         const int fed = drive_look_axis_input(player, prev, out);
