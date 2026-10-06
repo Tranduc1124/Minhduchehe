@@ -7646,7 +7646,29 @@ bool get_IsFiring(uint64_t player) {
     }
 
     // 3) PRI fire status (var 21).
-    if (GetDataUInt16(player, kPriVarFire) != 0) {
+    //
+    // Corroborating only, never deciding on its own. This probe goes through
+    // ReadDataPoolVarOk, and for varID > 1 that function does no range validation
+    // at all -- GameLogic.mm ends it with:
+    //
+    //     } else {
+    //         if (outValue) *outValue = i32;
+    //         return true;
+    //     }
+    //
+    // so "!= 0" here means any nonzero int32 sitting in that pool slot, and a
+    // nonzero value that persists reads as firing indefinitely. kFireSrcPri is in
+    // kFireSrcDecidable, so on its own it holds get_IsFiring true forever.
+    //
+    // With TriggerMode = Both that is a camera that never gives the look back:
+    // shouldActivate = (isFiring || isScoping) and isFiring cannot go false.
+    //
+    // kFireSrcEnum now goes through StartFireStateIsActive and kFireSrcPrep is a
+    // uint8 flag at a field offset, so both of those are sources that can go false.
+    // PRI is counted only when one of them already agrees. It stays in the mask so
+    // g_fireSrcMask still shows it for the log, it just cannot carry the decision.
+    if ((src & (kFireSrcEnum | kFireSrcPrep)) != 0 &&
+        GetDataUInt16(player, kPriVarFire) != 0) {
         src |= kFireSrcPri;
     }
 
