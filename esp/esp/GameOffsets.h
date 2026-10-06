@@ -498,6 +498,9 @@ uintptr_t GameTargetModuleBase(void);
 #define kAxisCurrentDeltaValue        0x54   // Vector3
 #define kAxisStartScreenPos           0x60   // Vector3
 #define kAxisCurrentScreenPos         0x6C   // Vector3  <-- what the game samples
+// Gate on the sampling path. SampleAimInput reads m_CurrentScreenPos only when this
+// is 1, and samples a constant when it is not -- see esp.mm drive_look_axis_input.
+#define kAxisTouched                  0x4B   // bool m_IsTouched
 #define kAxisActuallyMovedDistance    0x88   // float
 #define kAxisType                     0x98   // EAxisDataType (int): Right == 1
 

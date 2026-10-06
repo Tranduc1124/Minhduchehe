@@ -2692,6 +2692,36 @@ static int drive_look_axis_input(uint64_t player, const Quaternion &prev, const 
     WriteAddr<Vector3>(axis + kAxisCurrentDeltaValue, step);
     WriteAddr<Vector3>(axis + kAxisLastDirection, step);
     WriteAddr<float>(axis + kAxisActuallyMovedDistance, moved);
+
+    // m_IsTouched (+0x4B) is the gate that makes the game READ what we just wrote.
+    //
+    // SampleAimInput, the function that samples the stick and feeds the report,
+    // branches on it and samples a constant when it is clear:
+    //
+    //     6b58684: ldrb w8, [x8, #0x4b]   ; m_AxisData[1].m_IsTouched
+    //     6b58690: cmp  w8, #0x1
+    //     6b58694: b.ne 0x6b5870c         ; not touched -> constant, ours ignored
+    //     ...
+    //     6b586c4: add  x8, x9, #0x6c      ; m_CurrentScreenPos, reached only above
+    //     6b58704: ldr  s0, [x9]           ; our value
+    //
+    // Every write this function made was therefore inert. It moved the stick on
+    // screen, which is the "the fire button is being dragged sideways" report, and
+    // the game never sampled any of it. The rotation still moved, because it comes
+    // from the direct writes to Player+0x614 and +0x1A8C with no sample behind it.
+    // Rotation moving with no input is the shape the report correlates on, and no
+    // other change in this file can produce a sample. This is the only thing that
+    // can.
+    //
+    // Set here, cleared in release_look_axis_input. That pairing is the entire
+    // safety story: held exactly while the aim is writing, never otherwise. Leaving
+    // it set is the floating stick and the auto-fire the comment above
+    // drive_look_axis_input warns about.
+    //
+    // Only m_IsTouched. m_IsActuallyMoved (+0x4C) is left alone: nothing on the
+    // sampling path reads it, and setting it is the part most likely to be taken as
+    // a deliberate drag rather than a position report.
+    WriteAddr<uint8_t>(axis + kAxisTouched, 1);
     return 1;
 }
 
@@ -2723,6 +2753,12 @@ static void release_look_axis_input(uint64_t player) {
     if (!isVaildPtr(handler)) return;
     uint64_t axis = look_axis_for(player);
     if (!isVaildPtr(axis)) return;
+
+    // Cleared FIRST, before any read that can return early below, so a bad read
+    // cannot leave the stick marked held. This is the field that makes
+    // SampleAimInput read the axis at all, so leaving it set is exactly the floating
+    // stick and the auto-fire described above drive_look_axis_input.
+    WriteAddr<uint8_t>(axis + kAxisTouched, 0);
 
     Vector3 start = ReadAddr<Vector3>(axis + kAxisStartScreenPos);
     if (isnan(start.x) || isnan(start.y) || isnan(start.z)) return;
