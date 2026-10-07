@@ -254,8 +254,6 @@ void ESPSyncFromPrefs(void);
 
 void ESPSetAimBehindWallLive(bool behindWall);
 
-void ToggleSpeedX50(bool enable);
-
 #ifdef __cplusplus
 }
 // C++ only — Vector3 cannot be in extern "C".

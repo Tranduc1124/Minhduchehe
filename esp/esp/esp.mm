@@ -2490,59 +2490,6 @@ static inline float Clamp01f(float v) {
     return v;
 }
 
-static std::vector<mach_vm_address_t> g_patchedAddresses;
-
-extern "C" void ToggleSpeedX50(bool enable) {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        pid_t pid = (pid_t)GameTargetProcessPid();
-        if (pid <= 0) return;
-
-        task_t target_task = 0;
-        if (task_for_pid(mach_task_self(), pid, &target_task) != KERN_SUCCESS) {
-            NSLog(@"[HTH Cheat] LỖI: Không lấy được quyền task_for_pid!");
-            return;
-        }
-
-        uint64_t originalVal = 4397530849764387586ULL; 
-        uint64_t hackedVal   = 4397530849740000000ULL; 
-
-        if (enable) {
-            g_patchedAddresses.clear(); 
-            mach_vm_address_t address = 0x100000000;
-            mach_vm_size_t size = 0;
-            vm_region_basic_info_data_64_t info;
-            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t object_name;
-            
-            while (mach_vm_region(target_task, &address, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name) == KERN_SUCCESS) {
-                if (address > 0x160000000) break; 
-                if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) {
-                    uint8_t *buffer = (uint8_t *)malloc(size);
-                    mach_vm_size_t bytesRead = 0;
-                    if (mach_vm_read_overwrite(target_task, address, size, (mach_vm_address_t)buffer, &bytesRead) == KERN_SUCCESS) {
-                        for (size_t i = 0; i <= bytesRead - 8; i += 4) {
-                            uint64_t currentValue = *(uint64_t *)(buffer + i);
-                            if (currentValue == originalVal) {
-                                mach_vm_address_t exactWriteAddress = address + i;
-                                mach_vm_write(target_task, exactWriteAddress, (vm_offset_t)&hackedVal, sizeof(hackedVal));
-                                g_patchedAddresses.push_back(exactWriteAddress);
-                            }
-                        }
-                    }
-                    free(buffer);
-                }
-                address += size;
-            }
-        } else {
-            if (g_patchedAddresses.empty()) return;
-            for (mach_vm_address_t savedAddr : g_patchedAddresses) {
-                mach_vm_write(target_task, savedAddr, (vm_offset_t)&originalVal, sizeof(originalVal));
-            }
-            g_patchedAddresses.clear();
-        }
-    });
-}
-
 // A quaternion is four floats. Its first eight bytes are two components, and a
 // normalised one has both inside [-1, 1], so the pair reads as a 64-bit value
 // that is either zero or a denormal-looking float pattern.

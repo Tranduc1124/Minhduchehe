@@ -9,7 +9,6 @@
 extern "C" void ESPSyncFromPrefs(void); // Khai báo hàm đồng bộ từ prefs bị thiếu
 // --------------------------------------------------------
 
-extern "C" void ToggleSpeedX50(bool enable);
 
 @interface HTHButtonSecureWrapper : UITextField
 @end

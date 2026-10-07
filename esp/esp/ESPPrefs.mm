@@ -179,7 +179,7 @@ static void ESPPrefsLoadIfNeeded(void) {
         NSArray<NSString *> *seedKeys = @[
             @"MenuLayoutStyle", @"AppLanguageIsEnglish", @"AppLanguage", @"AppThemeMode",
             @"AppAccentColor", @"AppAccentMode", @"AppAccentColorR", @"AppAccentColorG", @"AppAccentColorB", @"AppAccentColorMode",
-            @"EnableHaptic", @"StreamerMode", @"SpeedX50",
+            @"EnableHaptic", @"StreamerMode",
             @"Speed", @"SpeedValue",
             @"FastReload", @"FastReloadSpeed",
             @"AntiBanMax", @"AutoCleanRAMPeriodic", @"AutoVarCleanBeforeHUD", @"AntiCrashRAM",
@@ -248,7 +248,6 @@ static BOOL IsGlobalKey(NSString *key) {
             @"AppAccentColorMode",
             @"EnableHaptic",
             @"StreamerMode",
-                        @"SpeedX50",
             @"Speed",
             @"SpeedValue",
             @"FastReload",

@@ -8,7 +8,6 @@
 #import <objc/runtime.h>
 #include "../oxorany/oxorany_include.h"
 
-extern "C" void ToggleSpeedX50(bool enable);
 
 // Wide horizontal panel + left side navigation (ported from minhduc-menu-ui-upgraded)
 static const CGFloat kPanelWidth = 600.0f;
@@ -2094,7 +2093,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 ESPPrefsSetFloat(@(oxorany("TriggerMode")), 3.0f);
 
                 ESPPrefsSetBool(@(oxorany("StreamerMode")), NO);
-                ESPPrefsSetBool(@(oxorany("SpeedX50")), NO);
 
                 int currentPos = (int)ESPPrefsFloat(@(oxorany("AimPos")), 0.0f);
                 if (currentPos > 1) {
@@ -2293,10 +2291,6 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         }
 
         ESPSyncFromPrefs();
-
-        if ([key isEqualToString:@(oxorany("SpeedX50"))]) {
-            ToggleSpeedX50(sender.on);
-        }
 
         if ((int)ESPPrefsFloat(@(oxorany("MenuLayoutStyle")), 0) == 1) {
             [self hideExternalAimButton];
