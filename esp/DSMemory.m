@@ -1062,6 +1062,27 @@ void ds_begin_read_transaction(void) {
     // un-latched by the time its first read lands.
     ds_expire_degrade_locked();
     g_readTxnDepth++;
+    // The frame stamp was declared and read and written, but never advanced. It sat
+    // at 1 for the life of the process, so every slot that had ever been used
+    // carried touchedFrame == 1 and the victim picker -- which skips any slot whose
+    // touchedFrame matches the current stamp, to avoid evicting a page this frame
+    // has already read -- skipped all 256 of them unconditionally.
+    //
+    // The consequence is not a slow cache, it is a frozen one. The table fills, the
+    // empty-slot loop finds nothing, the LRU loop finds no candidate, and the
+    // function returns 0. Every read of a page outside the resident 256 then fails
+    // isVaildPtr forever: those pawns do not draw and do not resolve, which is the
+    // "nothing happens for a while" half. The only remaining way a slot comes back
+    // is the TTL evictor, capped at DS_MAX_EVICT_PER_TXN per transaction, and it
+    // cannot touch the hot slots at all because their lastUseMs is always fresh. So
+    // recovery is a slow drip of four slots per frame against a set that needs to
+    // rotate around fifty to a hundred players -- and each of those four costs a
+    // vm_map_remote_page under g_pageCacheLock. That is the "then it lurches" half.
+    //
+    // Bumped only on the outermost open, so it means "the frame running right now".
+    // ds_begin_read_transaction has exactly one call site and it is unconditional
+    // once per frame, which is what makes this the frame boundary.
+    if (g_readTxnDepth == 1) g_txnFrameStamp++;
     ds_unlock();
 }
 
