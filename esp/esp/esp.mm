@@ -1081,6 +1081,31 @@ static void SilentAimThread(uint64_t localPlayer) {
             }
         } else {
             g_lastAimingInfo = 0;
+            // With no target there is nothing to write, so spinning here is pure
+            // waste: yield() in a loop like this one never blocks, it just hands
+            // the rest of the quantum back and immediately runs again, and on
+            // Darwin it keeps consuming that quantum whenever nothing else is
+            // runnable at the same priority.
+            //
+            // The thread is started by SilentAimSetTarget and only ever stopped by
+            // SilentAimStop, which runs when Silent is switched OFF. Clearing the
+            // target -- the target died, walked behind cover, or the match simply
+            // has nobody in range -- does not stop it. So once the thread has been
+            // started in a session it burned a core for the rest of it whenever
+            // the user was not actively aiming at someone, which is most of the
+            // match: heat, and heat is throttle, and throttle is the game stutter
+            // the user reports around aim. The aim-lock thread in this same file
+            // sleeps in exactly this situation for exactly this reason.
+            //
+            // No correctness cost, and that is not an assumption: this branch is
+            // taken only when g_silentHasTarget is false, and the one thing it
+            // does is a plain store. The setter (SilentAimSetTarget) writes the
+            // first direction itself on the same call that sets the flag, so a
+            // just-locked target has already been written by the time this thread
+            // is awake; the worker takes over the hammer ≤4ms later. 4ms matches
+            // the active cadence of AimLockThreadMain.
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            continue;
         }
         std::this_thread::yield();
     }
