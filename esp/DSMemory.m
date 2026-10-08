@@ -648,7 +648,15 @@ static struct {
 static int32_t     g_pageIndex[DS_PAGE_CACHE_SLOTS];
 
 static inline int ds_page_index_hash(uint64_t pageVA) {
-    return (int)(pageVA & (uint64_t)(DS_PAGE_CACHE_SLOTS - 1));
+    // The page offset must be shifted out before any bits are taken, and that is
+    // not a style choice. pageVA is masked to a PAGE_SIZE boundary, and PAGE_SIZE
+    // is 0x4000 (PAGE_SHIFT 14), so its low fourteen bits are always zero:
+    // `pageVA & 0xFF` returned 0 for every page that was ever probed. Every page
+    // wrote bucket 0 of g_pageIndex, every entry but the most recently indexed
+    // one missed the probe, and the miss fell straight to the 256-slot scan this
+    // probe exists to replace -- on every read, under g_pageCacheLock, which the
+    // render thread, SilentAimThread and AimLockThreadMain all contend for.
+    return (int)((pageVA >> PAGE_SHIFT) & (uint64_t)(DS_PAGE_CACHE_SLOTS - 1));
 }
 
 static inline void ds_page_index_set(uint64_t pageVA, int slot) {
