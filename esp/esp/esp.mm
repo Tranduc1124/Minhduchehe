@@ -4469,6 +4469,28 @@ static void EspEmitStatusLine(void) {
     CGMutablePathRef aNumOPath  = CGPathCreateMutable();
     CGMutablePathRef aNumRPath  = CGPathCreateMutable();
 
+    // The grey name card that outlives the match it belongs to.
+    //
+    // These four layers are the only geometry whose path is assigned at the end
+    // of this function and nowhere else. updateFrame nils the other layers
+    // through MenuViewApplyPath whenever their dirty flag is false, but these
+    // four are not in that list, so every early return below -- lobby, loading,
+    // an unreadable dictionary, no live entries -- left them holding the last
+    // in-match paths. The push then re-serialised the stale plate out of
+    // alertNumBGLayer by KVC on every frame: on the way out of a match,
+    // SBClearESPNameLayers cleared the SpringBoard half once, and the next
+    // frame's push put it straight back. That is the report -- the grey card
+    // stays on screen after the match, with no name on it.
+    //
+    // Cleared here rather than in updateFrame because this is the frame's own
+    // boundary: anything this function does not rebuild for the frame must not
+    // be left over from the previous one. The end of the function still assigns
+    // whatever the frame actually built.
+    self.alertNumBGLayer.path = nil;
+    self.alertNumGreenLayer.path = nil;
+    self.alertNumOrangeLayer.path = nil;
+    self.alertNumRedLayer.path = nil;
+
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
         DIAG_EARLY(@"no-base");
         return stats;
