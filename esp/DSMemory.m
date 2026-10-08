@@ -512,6 +512,23 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // transactions keeps the port deallocations apart in time.
 #define DS_MAX_EVICT_PER_TXN 4
 
+// Upper bound on mappings the sweep judge tears down in one pass, for the same
+// reason one level up. ds_vmo_publish_and_judge runs under g_pageCacheLock, and
+// ds_release_page_slot_locked deallocates a memory entry and a port, so a pass
+// that surfaced a whole region going away used to hold the lock across up to
+// DS_PAGE_CACHE_SLOTS pairs of those. The frame that was reading when the pass
+// completed waited the whole batch out, which is a hitch that arrives on the
+// sweep's schedule and clears by itself -- the same "freezes for a moment, then
+// catches up" the TTL evictor was already bounded against.
+//
+// A slot past the bound is judged again on the next pass and still dropped
+// then, because the mismatch that put it in this set cannot heal: the vmo the
+// slot carries is the one that was live when it was mapped, and the map has
+// moved on. The pass completes in a couple of hundred milliseconds normally, so
+// the surplus costs one more cycle at most and the lock is never held across
+// more than this many deallocations.
+#define DS_MAX_VMO_DROP_PER_PASS 16
+
 // ---------------------------------------------------------------------------
 // The one failure nothing else can see: a mapping of a page the game has freed.
 //
@@ -985,6 +1002,7 @@ static void ds_vmo_publish_and_judge(uint64_t nowMs) {
     g_vmoCursor     = 0;   // next tick starts the following pass
 
     uint32_t dropped = 0, judged = 0, armed = 0, orphaned = 0, blind = 0;
+    uint32_t deferred = 0;
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         if (!g_pageCache[i].localAddr) continue;
         if (g_pageCache[i].vmo == 0) blind++;
@@ -1008,6 +1026,12 @@ static void ds_vmo_publish_and_judge(uint64_t nowMs) {
                 // bytes behind it are whatever the allocator put there next. Keeping it
                 // is a slot that serves reads forever -- a valid pointer, matching on
                 // pageVA, with no timeout on a pointer.
+                //
+                // Released only while the pass is under its teardown bound; the rest
+                // go with a deferral and are judged again next pass. See
+                // DS_MAX_VMO_DROP_PER_PASS for why the bound exists and why a
+                // deferral is safe here.
+                if (dropped + orphaned >= DS_MAX_VMO_DROP_PER_PASS) { deferred++; continue; }
                 orphaned++;
                 ds_release_page_slot_locked(i);
             }
@@ -1017,6 +1041,7 @@ static void ds_vmo_publish_and_judge(uint64_t nowMs) {
         if (now != g_pageCache[i].vmo) {
             // Either a different object backs the address now, or the map has no entry
             // covering it and the page is gone.
+            if (dropped + orphaned >= DS_MAX_VMO_DROP_PER_PASS) { deferred++; continue; }
             dropped++;
             ds_release_page_slot_locked(i);
         }
@@ -1033,9 +1058,16 @@ static void ds_vmo_publish_and_judge(uint64_t nowMs) {
         // Cycle time is the number that matters here: it is how long a dead mapping
         // can be served before this notices. sweepMs is how long ago the previous pass
         // finished.
+        //
+        // deferred is the slots the bound pushed to the next pass. It is printed
+        // rather than left implicit because it is the cost of the bound: a deferred
+        // slot serves its stale page for one more cycle, so a nonzero deferred with
+        // a cycle time that stays in the hundreds of milliseconds is the bound
+        // working, and deferred stuck high with a long cycle is the bound set too
+        // low for the teardown rate.
         NSLog(@"[ESP] !vmo dropped %u dead and %u orphaned mapping(s) "
-              @"(judged %u, armed %u, blind %u, map=%u, cycle=%llums)",
-              dropped, orphaned, judged, armed, blindNow, g_vmoTotal,
+              @"(judged %u, armed %u, blind %u, deferred %u, map=%u, cycle=%llums)",
+              dropped, orphaned, judged, armed, blindNow, deferred, g_vmoTotal,
               (unsigned long long)(nowMs - g_dsLastSweepMs));
         g_dsLastSweepMs = nowMs;
     } else {
