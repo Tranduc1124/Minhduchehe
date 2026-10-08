@@ -100,6 +100,11 @@ typedef struct {
     int      degradeActive;     // the throttle is currently engaged
     uint64_t remaps, evicts, hits, misses, novictim;
     uint64_t staleDrops, orphanDrops, sweeps;
+    // Map failures a completed pass proved were dead addresses, excluded from the
+    // degrade streak. See the classification in ds_page_local: this is the number
+    // that says the exclusion is doing something rather than the streak simply
+    // never being reached.
+    uint64_t deadAddrMiss;
 } DSPageCacheStats;
 void ds_page_cache_stats(DSPageCacheStats *out);
 

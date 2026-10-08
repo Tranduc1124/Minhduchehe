@@ -707,6 +707,10 @@ static pthread_mutex_t g_pageCacheLock;
 static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
 static int g_readTxnDepth = 0;
 static uint64_t g_consecutiveMapFailures = 0;
+// Map failures excluded from that streak because a completed map pass proved the
+// address is dead. Counted so the classification is visible on the device instead
+// of only showing up as the degrade line getting quieter.
+static uint64_t g_dsDeadAddrMissCount = 0;
 static bool g_degraded = false;
 // Wall clock at which the degrade is retried. Zero while not degraded.
 static uint64_t g_degradedUntilMs = 0;
@@ -1105,6 +1109,7 @@ void ds_page_cache_stats(DSPageCacheStats *out) {
     out->staleDrops  = g_dsStaleDropCount;
     out->orphanDrops = g_dsOrphanDropCount;
     out->sweeps      = g_dsSweepCount;
+    out->deadAddrMiss = g_dsDeadAddrMissCount;
 }
 
 void ds_begin_read_transaction(void) {
@@ -1440,13 +1445,47 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         }
     }
 
-    // Hold lock through remap — Fl0rk does not drop lock around map.
+    // Hold lock through remap — Fl0rk does not remove lock around map.
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
         if (page.port) {
             mach_port_deallocate(mach_task_self_, (mach_port_name_t)page.port);
         }
-        g_consecutiveMapFailures++;
+        // A failed map is two different events sharing one return value, and the
+        // streak below must not be a count of both.
+        //
+        // VM.m says it plainly at the three ways vm_map_remote_page can fail: a
+        // lookup for an address the game has already freed is "an expected event at
+        // a match boundary". Pawn dies, bone chain released, object torn down -- the
+        // object graph still points there for a frame or two, so a run of three
+        // dead addresses in a row is normal under a fight, not a kernel refusing to
+        // map.
+        //
+        // The other event is the kernel declining to hand over a live page. That is
+        // the one the degrade exists for, and it is the one that runs in bursts.
+        // Counting a dead address towards it turns a normal moment into a 250ms
+        // blackout of every cold read in the process -- which is the ESP going
+        // still, the aim having nothing to resolve against, and both coming back on
+        // their own when the cooldown expires. That is the report, to the letter.
+        //
+        // The discriminator needs no new machinery: ds_vmo_lookup answers exactly
+        // "does the completed map pass cover this address, and with what object".
+        // known && object == 0 is positive proof the whole map was walked and
+        // nothing covers the page -- the same test the sweep judge uses to release
+        // an orphan slot. A slot the pass has not answered for (known == false, or
+        // object != 0) leaves the streak as before, so a kernel that is genuinely
+        // refusing still latches.
+        bool addrKnownDead = false;
+        {
+            bool known = false;
+            const uint64_t covered = ds_vmo_lookup(pageVA, &known);
+            addrKnownDead = (known && covered == 0);
+        }
+        if (addrKnownDead) {
+            g_dsDeadAddrMissCount++;
+        } else {
+            g_consecutiveMapFailures++;
+        }
         if (g_consecutiveMapFailures >= DS_FAIL_DEGRADE_THRESHOLD) {
             g_degraded = true;
             g_degradedUntilMs = ds_now_ms() + DS_DEGRADE_COOLDOWN_MS;

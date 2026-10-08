@@ -4425,7 +4425,7 @@ static void EspEmitStatusLine(void) {
           @"noAnchor=%d collapsed=%d noBone=%d noHead=%d origin=%d headFar=%d "
           @"far=%d near=%d hpZero=%d} "
           @"cache{slots=%d hit=%llu miss=%llu remap=%llu evict=%llu novictim=%llu "
-          @"stale=%llu orphan=%llu blind=%d sweeps=%llu deg=%d blk=%d}",
+          @"stale=%llu orphan=%llu dead=%llu blind=%d sweeps=%llu deg=%d blk=%d}",
           g_st.gate,
           (unsigned long long)g_st.match, (unsigned long long)g_st.dict,
           (unsigned long long)g_st.local,
@@ -4444,6 +4444,7 @@ static void EspEmitStatusLine(void) {
           (unsigned long long)dRemap, (unsigned long long)dEvict,
           (unsigned long long)dNoVict,
           (unsigned long long)cs.staleDrops, (unsigned long long)cs.orphanDrops,
+          (unsigned long long)cs.deadAddrMiss,
           cs.blind, (unsigned long long)cs.sweeps,
           cs.degradeActive, cs.blockedLastSecond);
 }
