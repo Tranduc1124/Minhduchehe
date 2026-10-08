@@ -975,6 +975,20 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
         return false;   // mid-pass: the live buffer is untouched and still answering
     }
 
+    // Sorted here, outside g_pageCacheLock, and that placement is the same fix as the
+    // walk being outside it. The judge used to sort this buffer after taking the lock,
+    // so once a pass the render thread, SilentAimThread and AimLockThreadMain all
+    // queued behind a qsort of up to DS_VMO_SNAP_MAX entries while the buffer was being
+    // ordered. Nothing here needs the lock: the buffer being sorted is 1 - g_vmoLive,
+    // i.e. the one no lookup reads, and the walk cursor and fill count are single
+    // writer by construction (only the outermost transaction calls this). The lock is
+    // taken after this returns, and publishing g_vmoLive under it is what makes the
+    // sort visible to the readers -- so a lookup can never observe a half-sorted
+    // buffer.
+    if (g_vmoFill > 1) {
+        qsort(a, g_vmoFill, sizeof(DSVmoRange), ds_vmo_cmp);
+    }
+
     return true;
 }
 
@@ -988,12 +1002,9 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
 // writes g_pageCache and calls ds_release_page_slot_locked.
 static void ds_vmo_publish_and_judge(uint64_t nowMs) {
     const int build = 1 - g_vmoLive;
-    DSVmoRange *a = g_vmoSnap[build];
 
-    // Finished. Sort so lookups are binary, publish it, then judge.
-    if (g_vmoFill > 1) {
-        qsort(a, g_vmoFill, sizeof(DSVmoRange), ds_vmo_cmp);
-    }
+    // Finished. Sorted by ds_vmo_walk_tick, outside the lock, before this was called.
+    // Publishing g_vmoLive here is what makes it the buffer every lookup answers from.
     g_vmoLive       = build;
     g_vmoLiveCount  = g_vmoFill;
     g_vmoLiveEpochMs = (uint32_t)nowMs;
