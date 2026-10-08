@@ -4490,11 +4490,6 @@ static void EspEmitStatusLine(void) {
 
     g_cacheFrameCounter++;          // Tăng frame counter mỗi lần render (dùng cho cache)
 
-    CGMutablePathRef aNumBGPath = CGPathCreateMutable();
-    CGMutablePathRef aNumGPath  = CGPathCreateMutable();
-    CGMutablePathRef aNumOPath  = CGPathCreateMutable();
-    CGMutablePathRef aNumRPath  = CGPathCreateMutable();
-
     // The grey name card that outlives the match it belongs to.
     //
     // These four layers are the only geometry whose path is assigned at the end
@@ -5954,17 +5949,29 @@ static void EspEmitStatusLine(void) {
     // then project + draw ESP + pick aim. One matrix for the whole project pass.
     // -------------------------------------------------------------------------
     if (!GetViewMatrixInto(camera, matrixData)) {
-        // Paths allocated above — free before early out (matrix unavailable this frame).
-        CGPathRelease(aNumBGPath);
-        CGPathRelease(aNumGPath);
-        CGPathRelease(aNumOPath);
-        CGPathRelease(aNumRPath);
         if (stats.aimAssistPath) {
             CGPathRelease(stats.aimAssistPath);
             stats.aimAssistPath = NULL;
         }
         return stats;
     }
+
+    // The edge-marker and name-plate paths. Allocated here rather than at the top of
+    // the function because this is the first point they can be used: the draw pass
+    // below is what fills them and the publish at the end is what hands them over.
+    //
+    // Everything between the top and this line returns early -- no base, lobby,
+    // loading, an unreadable dictionary, no live entries, no matrix -- and every one
+    // of those returns used to leak all four, because they were created before the
+    // first check and released only on the matrix path and at the end. A session
+    // sitting in the lobby with the ESP on returns on most frames, so the leak ran
+    // at frame rate for as long as the lobby lasted. Four CGMutablePaths is small,
+    // but it is unbounded in time and this is the same class of defect as the grey
+    // plate: state created for a frame that the frame never reaches the cleanup for.
+    CGMutablePathRef aNumBGPath = CGPathCreateMutable();
+    CGMutablePathRef aNumGPath  = CGPathCreateMutable();
+    CGMutablePathRef aNumOPath  = CGPathCreateMutable();
+    CGMutablePathRef aNumRPath  = CGPathCreateMutable();
     // Crowded-match LOD: when many enemies, skip heavy Pro extras for far targets.
     // Keeps Lite/Pro box lock smooth under 30+ players.
     const int crowdN = snapN;
