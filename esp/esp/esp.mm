@@ -995,22 +995,16 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (!isVaildPtr(localPawn) || IsZeroVec(targetPos)) return 0;
     int wrote = 0;
 
-    if (isVaildPtr(g_silentCachedInfo)) {
-        if (SilentWriteAimingDir(g_silentCachedInfo, targetPos, fromLoc)) {
-            wrote++;
-            g_lastAimingInfo = g_silentCachedInfo;
-        } else if (!isVaildPtr(g_silentCachedInfo)) {
-            g_silentCachedInfo = 0;
-        }
-    }
-
+    // Resolve the AimingInfo fresh every write. The old cached fast path kept
+    // a pointer that could be recycled by the game; writing a direction into a
+    // recycled object is the kind of corruption that shows up as random speed
+    // or movement glitches.
     uint64_t offs[2];
     int n = 0;
     SilentFillPrimaryOnly(offs, &n);
     for (int i = 0; i < n; i++) {
         uint64_t aimingInfo = ReadAddr<uint64_t>(localPawn + offs[i]);
         if (!isVaildPtr(aimingInfo)) continue;
-        g_silentCachedInfo = aimingInfo;
         if (SilentWriteAimingDir(aimingInfo, targetPos, fromLoc)) {
             g_lastAimingInfo = aimingInfo;
             wrote++;
@@ -1069,6 +1063,11 @@ static void SilentAimThread(uint64_t localPlayer) {
             }
         } else {
             g_lastAimingInfo = 0;
+            // No target: do not spin a full core. The old yield-only loop kept
+            // burning a quantum whenever the thread had nothing to write, which
+            // is most of the match and shows up as heat/throttle/stutter.
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            continue;
         }
         std::this_thread::yield();
     }
@@ -6642,6 +6641,17 @@ static void EspEmitStatusLine(void) {
                     bestAnyTarget = PawnObject;
                     bestAnyHead = pickHead;
                 }
+            }
+            // Silent does not need the crosshair raycast to hit: keep an
+            // FOV candidate even when GameClearLosToEnemy says the crosshair
+            // is not on the enemy. The silent apply gate then uses the soft
+            // wall-off visibility check.
+            if (!posLos && (useSilent || silentSphereOnly) && score < bestAnyScore) {
+                bestAnyScore = score;
+                bestAnyDist = dis;
+                bestAnyVis = true;
+                bestAnyTarget = PawnObject;
+                bestAnyHead = pickHead;
             }
         }
     }

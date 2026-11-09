@@ -18,7 +18,7 @@ static const CGFloat kAuxButtonSize = 46.0f;
 static const CGFloat kAuxGap = 8.0f;
 static const CGFloat kQuickLogoSize = 64.0f;
 static const CGFloat kQuickPanelWidth = 320.0f;
-static const CGFloat kQuickPanelHeight = 190.0f;
+static const CGFloat kQuickPanelHeight = 230.0f;
 
 // =======================================================
 // LỚP CANVAS ẨN ĐỂ LÀM STREAMER MODE CHO ICON MENU
@@ -43,9 +43,11 @@ static const CGFloat kQuickPanelHeight = 190.0f;
 @property (nonatomic, strong) UIButton *quickCloseButton;
 @property (nonatomic, strong) UISwitch *quickBoxSwitch;
 @property (nonatomic, strong) UILabel *quickStatusLabel;
+@property (nonatomic, strong) UILabel *quickFovLabel;
+@property (nonatomic, strong) UISlider *quickFovSlider;
 @property (nonatomic, assign) BOOL quickPanelVisible;
 @property (nonatomic, assign) BOOL touchOnQuickLogo, quickLogoDragging;
-@property (nonatomic, assign) BOOL touchOnQuickClose, touchOnQuickSwitch, touchOnQuickPanel;
+@property (nonatomic, assign) BOOL touchOnQuickClose, touchOnQuickSwitch, touchOnQuickPanel, touchOnQuickSlider;
 @property (nonatomic, assign) CGPoint quickLogoDragStartCenter;
 @property (nonatomic, assign) CGPoint quickLogoDragStartPoint;
 
@@ -83,6 +85,7 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _touchOnQuickClose = NO;
     _touchOnQuickSwitch = NO;
     _touchOnQuickPanel = NO;
+    _touchOnQuickSlider = NO;
     
     _buttonDragging = NO;
     _aimbotButtonDragging = NO;
@@ -315,11 +318,26 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _quickBoxSwitch.userInteractionEnabled = NO;
     [_quickPanel addSubview:_quickBoxSwitch];
 
-    _quickStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 118.0f, kQuickPanelWidth - 40.0f, 52.0f)];
+    _quickStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 112.0f, kQuickPanelWidth - 40.0f, 36.0f)];
     _quickStatusLabel.textColor = [UIColor colorWithWhite:0.62f alpha:1.0f];
     _quickStatusLabel.font = [UIFont systemFontOfSize:13.0f weight:UIFontWeightRegular];
     _quickStatusLabel.numberOfLines = 2;
     [_quickPanel addSubview:_quickStatusLabel];
+
+    _quickFovLabel = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 154.0f, 60.0f, 20.0f)];
+    _quickFovLabel.text = @"FOV";
+    _quickFovLabel.textColor = [UIColor colorWithWhite:0.80f alpha:1.0f];
+    _quickFovLabel.font = [UIFont systemFontOfSize:13.0f weight:UIFontWeightSemibold];
+    [_quickPanel addSubview:_quickFovLabel];
+
+    _quickFovSlider = [[UISlider alloc] initWithFrame:CGRectMake(20.0f, 176.0f, kQuickPanelWidth - 40.0f, 30.0f)];
+    _quickFovSlider.minimumValue = 5.0f;
+    _quickFovSlider.maximumValue = 190.0f;
+    _quickFovSlider.value = ESPPrefsFloat(@"FovSize", 120.0f);
+    _quickFovSlider.minimumTrackTintColor = [UIColor colorWithRed:0.20f green:0.85f blue:0.40f alpha:1.0f];
+    _quickFovSlider.maximumTrackTintColor = [UIColor colorWithWhite:0.30f alpha:1.0f];
+    _quickFovSlider.userInteractionEnabled = NO;
+    [_quickPanel addSubview:_quickFovSlider];
 
     _quickPanelVisible = NO;
     [self refreshQuickMenu];
@@ -341,6 +359,10 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     if (!_quickBoxSwitch || !_quickStatusLabel) return;
     BOOL boxOn = ESPPrefsBool(@"Box", YES);
     [_quickBoxSwitch setOn:boxOn animated:NO];
+    float fov = ESPPrefsFloat(@"FovSize", 120.0f);
+    if (fov < 5.0f) fov = 120.0f;
+    if (fov > 190.0f) fov = 190.0f;
+    [_quickFovSlider setValue:fov animated:NO];
 
     BOOL connected = (get_pid_by_name("FreeFire") > 0);
     NSString *state = boxOn ? @"bật" : @"tắt";
@@ -376,6 +398,18 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     ESPSyncFromPrefs();
     [self refreshQuickMenu];
     [self refreshAllButtonTitles];
+}
+
+- (void)updateQuickFovAtPoint:(CGPoint)local {
+    CGRect track = [_quickPanel convertRect:_quickFovSlider.frame toView:self];
+    CGFloat t = (local.x - CGRectGetMinX(track)) / MAX(CGRectGetWidth(track), 1.0f);
+    t = MIN(MAX(t, 0.0f), 1.0f);
+    float value = 5.0f + t * (190.0f - 5.0f);
+    ESPPrefsSetFloat(@"FovSize", value);
+    ESPPrefsSetFloat(@"Fov", value);
+    ESPPrefsSync();
+    ESPSyncFromPrefs();
+    [_quickFovSlider setValue:value animated:NO];
 }
 
 - (void)updateVisibility {
@@ -606,8 +640,10 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     BOOL insideQuickPanel = quickVisible && CGRectContainsPoint(_quickPanel.frame, local);
     CGRect quickCloseRect = _quickCloseButton ? [_quickPanel convertRect:_quickCloseButton.frame toView:self] : CGRectZero;
     CGRect quickSwitchRect = _quickBoxSwitch ? [_quickPanel convertRect:_quickBoxSwitch.frame toView:self] : CGRectZero;
+    CGRect quickSliderRect = _quickFovSlider ? [_quickPanel convertRect:_quickFovSlider.frame toView:self] : CGRectZero;
     BOOL insideQuickClose = quickVisible && CGRectContainsPoint(CGRectInset(quickCloseRect, -8.0f, -8.0f), local);
     BOOL insideQuickSwitch = quickVisible && CGRectContainsPoint(CGRectInset(quickSwitchRect, -12.0f, -12.0f), local);
+    BOOL insideQuickSlider = quickVisible && CGRectContainsPoint(CGRectInset(quickSliderRect, -8.0f, -12.0f), local);
 
     if (_presentedModMenu) {
         CGPoint inMenuView = [self convertPoint:local toView:_presentedModMenu.view];
@@ -660,6 +696,11 @@ static const CGFloat kQuickPanelHeight = 190.0f;
             }
             if (insideQuickSwitch) {
                 _touchOnQuickSwitch = YES; _trackingPointerId = pointerId;
+                return YES;
+            }
+            if (insideQuickSlider) {
+                _touchOnQuickSlider = YES; _trackingPointerId = pointerId;
+                [self updateQuickFovAtPoint:local];
                 return YES;
             }
             if (insideQuickPanel) {
@@ -720,15 +761,25 @@ static const CGFloat kQuickPanelHeight = 190.0f;
                 [CATransaction commit];
                 return YES;
             }
+            if (_touchOnQuickSlider && pointerId == _trackingPointerId) {
+                [self updateQuickFovAtPoint:local];
+                [CATransaction commit];
+                return YES;
+            }
             [CATransaction commit];
-            return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel;
+            return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel || _touchOnQuickSlider;
         }
         case UITouchPhaseEnded:
         case UITouchPhaseCancelled: {
             if (_trackingPointerId == -1) return NO;
             if (pointerId != _trackingPointerId) {
                 if (phase == UITouchPhaseCancelled) [self resetTouchTrackingState];
-                return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel;
+                return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel || _touchOnQuickSlider;
+            }
+
+            if (_touchOnQuickSlider) {
+                [self resetTouchTrackingState];
+                return YES;
             }
 
             if (_touchOnQuickPanel) {
