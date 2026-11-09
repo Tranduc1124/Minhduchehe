@@ -402,15 +402,15 @@ static inline bool AimTargetVisibleForWallOff(uint64_t player) {
     return true; // geometric FOV path decides real lock
 }
 
-// Silent visibility: wall-ON always passes; wall-OFF uses the same geometric
-// LOS as camera aim. The old stub returned false whenever wall-through was
-// off, which made Silent appear to require Aim Behind Wall.
+// Silent visibility: wall-ON always passes; wall-OFF uses the soft visibility
+// helper, NOT GameClearLosToEnemy. The geometric helper is sampled from the
+// crosshair weapon raycast, so using it here made Silent require the crosshair
+// to be near the enemy. Silent picks anywhere in the FOV; wall-off only rejects
+// the ice-wall soft target.
 static inline bool AimTargetVisibleStrictForSilent(uint64_t localPawn, uint64_t player) {
     if (AimThroughAnyCoverNow()) return true;
-    if (!isVaildPtr(localPawn) || !isVaildPtr(player)) return false;
-    extern int aimPosition;
-    Vector3 bone = GetAimTargetPosMode(player, aimPosition, 0.0f);
-    return GameClearLosToEnemy(localPawn, player, bone);
+    (void)localPawn;
+    return AimTargetVisibleForWallOff(player);
 }
 
 // Read a Unity Transform / ITransformNode world position via getPositionExt.
