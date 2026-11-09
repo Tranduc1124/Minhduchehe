@@ -1670,6 +1670,7 @@ bool isBox = YES; bool isBone = YES; bool isHealth = YES;
 int boxMode = 0; 
 bool isName = YES; bool isDis = YES; bool isLine = YES;
 bool g_espCrowdNameLOD = false;
+bool g_espCrowdNoLines = false;
 bool isEspBot = NO; bool isWeapon = NO; bool isCount = YES; 
 bool isAlert360 = NO; 
 bool isAlertNum = NO; 
@@ -5959,6 +5960,7 @@ static void EspEmitStatusLine(void) {
     // shipping name and distance text for targets beyond 60m once 28+ pawns are
     // in the snapshot.
     g_espCrowdNameLOD = veryCrowded;
+    g_espCrowdNoLines = veryCrowded;
     // Re-sample matrix once more right before project when many targets — collect
     // pass can take several ms and cam has already moved (stick-then-snap feel).
     if (crowded) {

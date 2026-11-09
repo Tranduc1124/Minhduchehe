@@ -484,7 +484,7 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     // LINE
     // ---------------------------------------------------------
-    if (isLine) {
+    if (isLine && !g_espCrowdNoLines) {
         CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
         CGPoint boxTopCenter = CGPointMake(centerX, y);
 
@@ -522,7 +522,7 @@ static void ESPRenderPawnCore(
     // một bề mặt: path chỉ đi sang SpringBoard. Bỏ đi là một thay đổi hành
     // vi không ai yêu cầu, nên nó ở lại.
     // ---------------------------------------------------------
-    const bool crowdSkipText = g_espCrowdNameLOD && dis > 60.0f;
+    const bool crowdSkipText = g_espCrowdNameLOD && dis > 25.0f;
     NSString *plateName = nil;
     if (isName && !crowdSkipText) {
         plateName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;

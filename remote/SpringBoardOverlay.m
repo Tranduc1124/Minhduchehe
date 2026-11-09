@@ -53,13 +53,13 @@
 // as before, just on the other side of the boundary, and it held the rate at
 // 35fps while the frame cost 10ms and the loop ran at 60. 8000us is roughly
 // half a frame, which leaves no boundary to fall on.
-#define SB_MIN_PUBLISH_INTERVAL_US 8000ULL
+#define SB_MIN_PUBLISH_INTERVAL_US 16000ULL
 // Hard ceiling on remote draw calls per publish. A crowded match can emit one
 // polyline call per name glyph outline; without a ceiling the publish floods
 // SpringBoard's main thread and the overlay lags or the session dies. Boxes and
 // health bars are batched as rectangles and stay cheap; the cap only drops the
 // extra text/limb subpaths after the budget is spent.
-#define SB_MAX_CALLS 96
+#define SB_MAX_CALLS 32
 
 // Startup diagnostics.
 //
