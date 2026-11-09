@@ -54,6 +54,12 @@
 // 35fps while the frame cost 10ms and the loop ran at 60. 8000us is roughly
 // half a frame, which leaves no boundary to fall on.
 #define SB_MIN_PUBLISH_INTERVAL_US 8000ULL
+// Hard ceiling on remote draw calls per publish. A crowded match can emit one
+// polyline call per name glyph outline; without a ceiling the publish floods
+// SpringBoard's main thread and the overlay lags or the session dies. Boxes and
+// health bars are batched as rectangles and stay cheap; the cap only drops the
+// extra text/limb subpaths after the budget is spent.
+#define SB_MAX_CALLS 96
 
 // Startup diagnostics.
 //
@@ -2716,6 +2722,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // addLines with count=1, which renders nothing).
                 if (rn < 4) continue;
                 subpaths++;
+                if (calls >= SB_MAX_CALLS) {
+                    // Budget spent: keep the frame bounded instead of queuing
+                    // hundreds of SpringBoard calls. nTrunc is in the census log.
+                    nTrunc++;
+                    continue;
+                }
 
                 const int np = rn / 2;
                 // This backstop is only about a misrouted run, and it reads dstPath

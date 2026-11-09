@@ -1669,6 +1669,7 @@ bool isESP2 = NO;
 bool isBox = YES; bool isBone = YES; bool isHealth = YES;
 int boxMode = 0; 
 bool isName = YES; bool isDis = YES; bool isLine = YES;
+bool g_espCrowdNameLOD = false;
 bool isEspBot = NO; bool isWeapon = NO; bool isCount = YES; 
 bool isAlert360 = NO; 
 bool isAlertNum = NO; 
@@ -5953,6 +5954,11 @@ static void EspEmitStatusLine(void) {
     const int crowdN = snapN;
     const bool crowded = crowdN >= 18;
     const bool veryCrowded = crowdN >= 28;
+    // Far names are the expensive part of a crowded frame: each glyph outline
+    // becomes a SpringBoard polyline call. Keep boxes/HP for everyone, but stop
+    // shipping name and distance text for targets beyond 60m once 28+ pawns are
+    // in the snapshot.
+    g_espCrowdNameLOD = veryCrowded;
     // Re-sample matrix once more right before project when many targets — collect
     // pass can take several ms and cam has already moved (stick-then-snap feel).
     if (crowded) {

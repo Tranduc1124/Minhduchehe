@@ -522,13 +522,14 @@ static void ESPRenderPawnCore(
     // một bề mặt: path chỉ đi sang SpringBoard. Bỏ đi là một thay đổi hành
     // vi không ai yêu cầu, nên nó ở lại.
     // ---------------------------------------------------------
+    const bool crowdSkipText = g_espCrowdNameLOD && dis > 60.0f;
     NSString *plateName = nil;
-    if (isName) {
+    if (isName && !crowdSkipText) {
         plateName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (plateName.length == 0) plateName = nil;
     }
     NSString *plateDis = nil;
-    if (isDis) {
+    if (isDis && !crowdSkipText) {
         plateDis = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
         if (plateDis.length == 0) plateDis = nil;
     }
