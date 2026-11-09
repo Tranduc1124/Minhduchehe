@@ -10,8 +10,6 @@
 #import "KeepAlive.h"
 #import "HUDHelper.h"
 #import "SpringBoardOverlay.h"
-#import "MDLicenseGate.h"
-#import "APIClient/APIClient.h"
 #import "../KernelBoot.h"
 
 // The custom accent picker is gone, but an install that used it has
@@ -35,7 +33,6 @@ static void MDResetAccentPrefs(void) {
 
 @implementation MainApplicationDelegate {
     UITabBarController *_tabController;
-    UIViewController *_lockController;
 }
 
 - (void)themeDidChange {
@@ -119,43 +116,23 @@ static void MDResetAccentPrefs(void) {
                                                  name:MDThemeDidChangeNotification
                                                object:nil];
 
-    // License gate: the window opens on the lock screen and only swaps to the
-    // tab bar once the SDK reports a fresh signed lease. AutoBoot and the
-    // exploit run after authorization, never before it.
-    // __typeof__ not typeof: the project compiles .mm with -std=c++17, and
-    // strict mode rejects the GNU typeof spelling.
-    __weak __typeof__(self) weakSelf = self;
-    _lockController = [MDLicenseGate lockViewController];
-    self.window.rootViewController = _lockController;
+    _tabController = [self buildMainTabController];
+    MDThemeApplyToTabBar(_tabController.tabBar);
+    self.window.rootViewController = _tabController;
     [self.window makeKeyAndVisible];
 
-    [MDLicenseGate startWithAuthorized:^{
-        __strong __typeof__(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        strongSelf->_tabController = [strongSelf buildMainTabController];
-        MDThemeApplyToTabBar(strongSelf->_tabController.tabBar);
-        strongSelf.window.rootViewController = strongSelf->_tabController;
-        // No removeFromParent: the lock screen was never added as a child, and
-        // replacing window.rootViewController is what releases it.
-        strongSelf->_lockController = nil;
-        if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
-            [MDLog appendLine:@"RUN Preparing the exploit at launch."];
-            kernelBootStartKernelOnly();
-        }
-    } terminal:^(NSString *message) {
-        [MDLog appendLine:[NSString stringWithFormat:@"LICENSE %@", message]];
-    }];
+    if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
+        [MDLog appendLine:@"RUN Preparing the exploit at launch."];
+        kernelBootStartKernelOnly();
+    }
     return YES;
 }
 
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey,id> *)options {
-    // The license gate finishes key activation through a return URL: the web
-    // flow opens minhduc://... and the SDK matches it against its pending
-    // callback. Without this handler the key never confirms and the app stays
-    // on the lock screen.
     (void)app;
+    (void)url;
     (void)options;
-    return APIClientHandleOpenURL(url);
+    return NO;
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {

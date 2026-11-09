@@ -60,12 +60,6 @@ $(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIK
 $(APPLICATION_NAME)_PRIVATE_FRAMEWORKS += BackBoardServices GraphicsServices SpringBoardServices IOSurface
 $(APPLICATION_NAME)_LIBRARIES += z compression
 
-# --- Tserver license SDK (vendor/APIClient: libAPIClient.a + APIClient.h) ---
-# force_load keeps the SDK gate alive under -dead_strip; the two-file vendor
-# package is the only SDK surface this app uses.
-$(APPLICATION_NAME)_LDFLAGS += -ObjC -force_load $(THEOS_PROJECT_DIR)/vendor/APIClient/libAPIClient.a -Wl,-undefined,dynamic_lookup
-
-
 $(APPLICATION_NAME)_CODESIGN_FLAGS += -Sapp/layout/entitlements.plist
 $(APPLICATION_NAME)_RESOURCE_DIRS = ./app/layout/Resources ./app/Font
 
