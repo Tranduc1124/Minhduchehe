@@ -402,11 +402,15 @@ static inline bool AimTargetVisibleForWallOff(uint64_t player) {
     return true; // geometric FOV path decides real lock
 }
 
-// Silent only when wall-through is ON.
-static inline bool AimTargetVisibleStrictForSilent(uint64_t player) {
+// Silent visibility: wall-ON always passes; wall-OFF uses the same geometric
+// LOS as camera aim. The old stub returned false whenever wall-through was
+// off, which made Silent appear to require Aim Behind Wall.
+static inline bool AimTargetVisibleStrictForSilent(uint64_t localPawn, uint64_t player) {
     if (AimThroughAnyCoverNow()) return true;
-    (void)player;
-    return false;
+    if (!isVaildPtr(localPawn) || !isVaildPtr(player)) return false;
+    extern int aimPosition;
+    Vector3 bone = GetAimTargetPosMode(player, aimPosition, 0.0f);
+    return GameClearLosToEnemy(localPawn, player, bone);
 }
 
 // Read a Unity Transform / ITransformNode world position via getPositionExt.
@@ -1041,7 +1045,7 @@ static void SilentAimThread(uint64_t localPlayer) {
         }
 
         if (hasTarget && isVaildPtr(lp)) {
-            if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(enemy)) {
+            if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(lp, enemy)) {
                 SilentAimClearTarget();
                 g_lastAimingInfo = 0;
                 std::this_thread::yield();
@@ -1072,7 +1076,7 @@ static void SilentAimThread(uint64_t localPlayer) {
 
 static void SilentAimSetTarget(uint64_t localPlayer, uint64_t enemy, const Vector3 &bonePos, const Vector3 &fromLoc, int posMode) {
     if (!isVaildPtr(localPlayer) || IsZeroVec(bonePos)) return;
-    if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(enemy)) {
+    if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(localPlayer, enemy)) {
         SilentAimClearTarget();
         return;
     }
@@ -3244,6 +3248,9 @@ void ESPSyncFromPrefs(void) {
     // up), so the two can never disagree about what the number means.
     if (aimFov < 5.0f)   aimFov = 120.0f;
     if (aimFov > 190.0f) aimFov = 190.0f;
+    // Silent gates on aimFov; make the ring the same number so it is not a
+    // picture of a different radius.
+    if (isAimSilent) fovSize = aimFov;
 
     // Prefer AimDistance. Migrate old builds that stored aim range under "Distance" as a float > 1.
     aimDistance = ESPPrefsFloat(@"AimDistance", -1.0f);
@@ -5006,8 +5013,10 @@ static void EspEmitStatusLine(void) {
     const bool useSphereAim = useAim180 || useAim360;
     const bool silentSphereOnly = useSilent && !isAimbot && !useAssist;
 
-    // FOV gate when Aimbot FOV mode; Assist-only uses assist radius; stacked → FOV.
-    const float aimFovSq = (isAimbot && !useSphereAim) ? (aimFov * aimFov) : 0.0f;
+    const bool silentFovGate = useSilent && !isAimbot && !useAssist;
+    // FOV gate when Aimbot FOV mode or Silent; Assist-only uses assist radius.
+    // Silent must follow the FOV slider, not the old fixed 150 fallback.
+    const float aimFovSq = ((isAimbot && !useSphereAim) || silentFovGate) ? (aimFov * aimFov) : 0.0f;
     const float assistRadius = fminf(fmaxf(viewHeight * 0.12f, 48.f), 140.f);
     const float assistRadiusSq = assistRadius * assistRadius;
     const float safeAimDistance = fmaxf(aimDistance, 1.0f);
@@ -6540,11 +6549,18 @@ static void EspEmitStatusLine(void) {
                 } else if (isAimbot) {
                     float fovSq = aimFovSq > 1.f ? aimFovSq : (150.f * 150.f);
                     inRange = inFront && (distSq <= fovSq);
-                } else if (useAssistOnly || useSilent || silentSphereOnly) {
-                    float rSq = fmaxf(assistRadiusSq, aimFovSq > 1.f ? aimFovSq : (150.f * 150.f));
-                    inRange = inFront && (distSq <= rSq);
+                } else if (useSilent || silentSphereOnly) {
+                    float fovSq = aimFovSq > 1.f ? aimFovSq : (aimFov * aimFov);
+                    inRange = inFront && (distSq <= fovSq);
+                } else if (useAssistOnly) {
+                    inRange = inFront && (distSq <= assistRadiusSq);
                 }
-            } else if (useSilent || (isAimbot && useAim360) || silentSphereOnly) {
+            } else if (useSilent || silentSphereOnly) {
+                // Wall-through still honors the FOV radius: the slider is the
+                // promise, wall-on only removes the line-of-sight veto.
+                float fovSq = aimFovSq > 1.f ? aimFovSq : (aimFov * aimFov);
+                inRange = inFront && (distSq <= fovSq);
+            } else if (isAimbot && useAim360) {
                 inRange = true;
             } else if (isAimbot && useAim180) {
                 inRange = inFront;
@@ -6574,7 +6590,7 @@ static void EspEmitStatusLine(void) {
                 }
             } else {
                 float fovSq = fmaxf(aimFovSq > 1.f ? aimFovSq : safeAimFovSq, 1.f);
-                float rangeNorm = isAimbot
+                float rangeNorm = (isAimbot || useSilent)
                     ? (distSq / fovSq)
                     : (distSq / fmaxf(assistRadiusSq, 1.f));
                 if (isAimbot || (useAssist && !useAssistOnly)) {
@@ -7201,7 +7217,7 @@ static void EspEmitStatusLine(void) {
     // refresh bone + origin mỗi 4 burst để viên trúng viên.
     // ============================================================
     if (silentActive && bestTarget != 0 && AimTargetStillValid(bestTarget) &&
-        (allowThroughWall || AimTargetVisibleStrictForSilent(bestTarget))) {
+        (allowThroughWall || AimTargetVisibleStrictForSilent(myPawnObject, bestTarget))) {
         Vector3 silentBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
         if (!IsZeroVec(silentBone) && bestDistance >= 0.15f) {
             SilentAimSetTarget(myPawnObject, bestTarget, silentBone, myLocation, aimPosition);

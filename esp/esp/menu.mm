@@ -141,8 +141,8 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     [_secureCanvas bringSubviewToFront:_menuButton];
     [_secureCanvas bringSubviewToFront:_aimbotButton];
     [_secureCanvas bringSubviewToFront:_aimPosButton];
-    [_secureCanvas bringSubviewToFront:_quickLogoButton];
-    if (_quickPanelVisible) [_secureCanvas bringSubviewToFront:_quickPanel];
+    [self bringSubviewToFront:_quickLogoButton];
+    if (_quickPanelVisible) [self bringSubviewToFront:_quickPanel];
     
     if (_presentedModMenu.view.superview == self) {
         [self bringSubviewToFront:_presentedModMenu.view];
@@ -280,7 +280,7 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _quickLogoButton.titleLabel.font = [UIFont boldSystemFontOfSize:12.0f];
     _quickLogoButton.titleLabel.adjustsFontSizeToFitWidth = YES;
     _quickLogoButton.titleLabel.minimumScaleFactor = 0.6f;
-    [_secureCanvas addSubview:_quickLogoButton];
+    [self addSubview:_quickLogoButton];
 
     _quickPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kQuickPanelWidth, kQuickPanelHeight)];
     _quickPanel.backgroundColor = [UIColor colorWithRed:0.11f green:0.11f blue:0.12f alpha:0.97f];
@@ -288,7 +288,7 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _quickPanel.clipsToBounds = YES;
     _quickPanel.userInteractionEnabled = NO;
     _quickPanel.hidden = YES;
-    [_secureCanvas addSubview:_quickPanel];
+    [self addSubview:_quickPanel];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 16.0f, 200.0f, 34.0f)];
     title.text = @"MINDO";
@@ -355,7 +355,7 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _quickPanelVisible = !_quickPanelVisible;
     _quickPanel.hidden = !_quickPanelVisible;
     if (_quickPanelVisible) {
-        [_secureCanvas bringSubviewToFront:_quickPanel];
+        [self bringSubviewToFront:_quickPanel];
         [self refreshQuickMenu];
     }
 }
@@ -397,8 +397,8 @@ static const CGFloat kQuickPanelHeight = 190.0f;
         [_secureCanvas addSubview:_menuButton];
         [_secureCanvas addSubview:_aimbotButton];
         [_secureCanvas addSubview:_aimPosButton];
-        [_secureCanvas addSubview:_quickLogoButton];
-        [_secureCanvas addSubview:_quickPanel];
+        [self addSubview:_quickLogoButton];
+        [self addSubview:_quickPanel];
     }
     [self refreshButtonVisibility];
 }
@@ -451,6 +451,12 @@ static const CGFloat kQuickPanelHeight = 190.0f;
         return;
     }
 
+    if (ESPPrefsBool(@"StreamerMode", NO)) {
+        _quickLogoButton.hidden = YES;
+        [self hideQuickPanel];
+        return;
+    }
+
     BOOL hideMenu = ESPPrefsBool(@"HideMenu1", NO);
     int menuStyle = (int)ESPPrefsFloat(@"MenuLayoutStyle", 0.0f); // 0 Pro, 1 Lite
 
@@ -492,8 +498,8 @@ static const CGFloat kQuickPanelHeight = 190.0f;
     _quickLogoButton.alpha = 1.0f;
     [self clampButton:_quickLogoButton size:CGSizeMake(kQuickLogoSize, kQuickLogoSize)];
     if (_secureCanvas && _quickLogoButton) {
-        [_secureCanvas bringSubviewToFront:_quickLogoButton];
-        if (_quickPanelVisible && _quickPanel) [_secureCanvas bringSubviewToFront:_quickPanel];
+        [self bringSubviewToFront:_quickLogoButton];
+        if (_quickPanelVisible && _quickPanel) [self bringSubviewToFront:_quickPanel];
     }
 }
 
