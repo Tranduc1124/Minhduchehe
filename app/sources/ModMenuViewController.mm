@@ -1,6 +1,7 @@
 #import "ModMenuViewController.h"
 #import "esp.h"
 #import "ESPPrefs.h"
+#import "AimbotMaintenance.h"
 #import "menu.h"
 #import "mahoa.h"
 #import <UIKit/UIKit.h>
@@ -2043,6 +2044,21 @@ typedef NS_ENUM(NSInteger, MenuTab) {
     if (prefsKey) {
         // Master aim type dropdown: exactly one of Aimbot / Assist / Legit.
         if ([prefsKey isEqualToString:@(oxorany("AimTypeMode"))]) {
+            if (idx == 0) {
+                // Aimbot is under maintenance: do not select it, and leave the
+                // aim master off so the menu cannot look armed.
+                AimbotShowMaintenanceAlert();
+                ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
+                ESPPrefsSetBool(@(oxorany("AimAssist")), NO);
+                ESPPrefsSetBool(@(oxorany("AimLegit")), NO);
+                ESPPrefsSetBool(@(oxorany("AimMaster")), NO);
+                ESPPrefsSetFloat(prefsKey, 1.0f);
+                [self updateSegmentedRowVisual:row selectedIndex:1];
+                ESPPrefsSync();
+                ESPSyncFromPrefs();
+                if (self.currentTab == MenuTabAimbot) [self loadTabContent:self.currentTab];
+                return;
+            }
             ESPPrefsSetFloat(prefsKey, (float)idx);
             ESPPrefsSetBool(@(oxorany("AimMaster")), YES);
             if (idx == 0) {
@@ -2233,9 +2249,18 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 if (type > 2) type = 2;
                 ESPPrefsSetFloat(@(oxorany("AimTypeMode")), (float)type);
                 if (type == 0) {
-                    ESPPrefsSetBool(@(oxorany("Aimbot")), YES);
+                    // Aimbot is under maintenance: keep the master switch off
+                    // instead of leaving it ON with no active aim mode.
+                    AimbotShowMaintenanceAlert();
+                    ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
                     ESPPrefsSetBool(@(oxorany("AimAssist")), NO);
                     ESPPrefsSetBool(@(oxorany("AimLegit")), NO);
+                    ESPPrefsSetBool(@(oxorany("AimMaster")), NO);
+                    sender.on = NO;
+                    ESPPrefsSync();
+                    ESPSyncFromPrefs();
+                    if (self.currentTab == MenuTabAimbot) [self loadTabContent:self.currentTab];
+                    return;
                 } else if (type == 1) {
                     ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
                     ESPPrefsSetBool(@(oxorany("AimAssist")), YES);
@@ -2258,10 +2283,15 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             }
         } else if ([key isEqualToString:@(oxorany("Aimbot"))]) {
             if (sender.on) {
-                ESPPrefsSetBool(@(oxorany("AimMaster")), YES);
-                ESPPrefsSetFloat(@(oxorany("AimTypeMode")), 0.0f);
-                ESPPrefsSetBool(@(oxorany("AimAssist")), NO);
-                ESPPrefsSetBool(@(oxorany("AimLegit")), NO);
+                // Aimbot is under maintenance; refuse the switch and leave it off.
+                AimbotShowMaintenanceAlert();
+                ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
+                ESPPrefsSetBool(@(oxorany("AimMaster")), NO);
+                sender.on = NO;
+                ESPPrefsSync();
+                ESPSyncFromPrefs();
+                if (self.currentTab == MenuTabAimbot) [self loadTabContent:self.currentTab];
+                return;
             } else {
                 ESPPrefsSetFloat(@(oxorany("AimSphereMode")), 0.0f);
                 ESPPrefsSetBool(@(oxorany("Aim360")), NO);

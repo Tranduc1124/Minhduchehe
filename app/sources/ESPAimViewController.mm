@@ -2,6 +2,7 @@
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "ESPPrefs.h"
+#import "AimbotMaintenance.h"
 #import "esp.h"
 
 #pragma mark - Switch row
@@ -707,6 +708,21 @@ static float ESPRowClamp(float v, float lo, float hi) {
         int type = (int)ESPPrefsFloat(@"AimTypeMode", 0.0f);
         if (type < 0) type = 0;
         if (type > 1) type = 1;
+        if (isOn && type == 0) {
+            // Aimbot is under maintenance: refuse the master switch and leave
+            // it visibly off instead of on with no active aim mode.
+            AimbotShowMaintenanceAlert();
+            ESPPrefsSetBoolLive(@"AimMaster", NO);
+            ESPPrefsSetBool(@"Aimbot", NO);
+            ESPPrefsSetBool(@"AimAssist", NO);
+            ESPPrefsSetBool(@"AimLegit", NO);
+            ESPPrefsSetBool(@"AimSilent", NO);
+            ESPPrefsSetFloat(@"AimSphereMode", 0.0f);
+            ESPPrefsSync();
+            ESPSyncFromPrefs();
+            [self reloadAimSection];
+            return;
+        }
         ESPPrefsSetBool(@"Aimbot", isOn && type == 0);
         ESPPrefsSetBool(@"AimAssist", isOn && type == 1);
         ESPPrefsSetBool(@"AimLegit", NO);
@@ -740,6 +756,21 @@ static float ESPRowClamp(float v, float lo, float hi) {
     ESPPrefsSetFloat(key, (float)idx);
 
     if ([key isEqualToString:@"AimTypeMode"]) {
+        if (idx == 0) {
+            // Aimbot is under maintenance: keep the selector on Assist and
+            // leave the aim master off.
+            AimbotShowMaintenanceAlert();
+            ESPPrefsSetFloat(key, 1.0f);
+            sender.selectedSegmentIndex = 1;
+            ESPPrefsSetBool(@"Aimbot", NO);
+            ESPPrefsSetBool(@"AimAssist", NO);
+            ESPPrefsSetBool(@"AimLegit", NO);
+            ESPPrefsSetBool(@"AimMaster", NO);
+            ESPPrefsSync();
+            ESPSyncFromPrefs();
+            [self reloadAimSection];
+            return;
+        }
         // Aimbot or Aim Assist. Silent is deliberately not an option here:
         // esp.mm treats it as an independent pipeline that works on its own or
         // on top of either, so it is a switch below rather than a third choice.

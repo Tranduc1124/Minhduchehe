@@ -4079,7 +4079,9 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // circle for a mode that does not use one. The app's ESP/AIM screen
         // already turns the ring off when Aim Type is switched to Assist, so this
         // is the same rule enforced on the engine side where it cannot be skipped.
-        const BOOL fovBoundsAim = isShowFovCircle && isAimbot && aimSphereMode == 0;
+        // Silent has no sphere mode, so the ring is its only range guide.
+        // Draw it when silent is on as well as when Aimbot is in FOV mode.
+        const BOOL fovBoundsAim = isShowFovCircle && (isAimSilent || (isAimbot && aimSphereMode == 0));
         BOOL hasFov = RenderFOVCirclePath(fovPath, viewWidth, viewHeight,
                                           fovBoundsAim, fovSize);
         self.fovLayer.path = hasFov ? fovPath : nil;

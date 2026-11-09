@@ -4,6 +4,9 @@
 
 #import "ESPPrefs.h"
 #import "esp.h"
+#import "AimbotMaintenance.h"
+
+#include <sys/types.h>
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -13,6 +16,9 @@ static const CGFloat kMenuButtonSize = 56.0f;
 static const CGFloat kAccentR = 1.0f, kAccentG = 0.35f, kAccentB = 0.2f;
 static const CGFloat kAuxButtonSize = 46.0f;
 static const CGFloat kAuxGap = 8.0f;
+static const CGFloat kQuickLogoSize = 64.0f;
+static const CGFloat kQuickPanelWidth = 320.0f;
+static const CGFloat kQuickPanelHeight = 190.0f;
 
 // =======================================================
 // LỚP CANVAS ẨN ĐỂ LÀM STREAMER MODE CHO ICON MENU
@@ -31,6 +37,17 @@ static const CGFloat kAuxGap = 8.0f;
 @property (nonatomic, strong) UIButton *menuButton;
 @property (nonatomic, strong) UIButton *aimbotButton;
 @property (nonatomic, strong) UIButton *aimPosButton;
+
+@property (nonatomic, strong) UIButton *quickLogoButton;
+@property (nonatomic, strong) UIView *quickPanel;
+@property (nonatomic, strong) UIButton *quickCloseButton;
+@property (nonatomic, strong) UISwitch *quickBoxSwitch;
+@property (nonatomic, strong) UILabel *quickStatusLabel;
+@property (nonatomic, assign) BOOL quickPanelVisible;
+@property (nonatomic, assign) BOOL touchOnQuickLogo, quickLogoDragging;
+@property (nonatomic, assign) BOOL touchOnQuickClose, touchOnQuickSwitch, touchOnQuickPanel;
+@property (nonatomic, assign) CGPoint quickLogoDragStartCenter;
+@property (nonatomic, assign) CGPoint quickLogoDragStartPoint;
 
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, strong) HTHIconSecureWrapper *secureTextField;
@@ -62,10 +79,15 @@ static const CGFloat kAuxGap = 8.0f;
     _touchOnButton = NO;
     _touchOnAimbotButton = NO;
     _touchOnAimPosButton = NO;
+    _touchOnQuickLogo = NO;
+    _touchOnQuickClose = NO;
+    _touchOnQuickSwitch = NO;
+    _touchOnQuickPanel = NO;
     
     _buttonDragging = NO;
     _aimbotButtonDragging = NO;
     _aimPosButtonDragging = NO;
+    _quickLogoDragging = NO;
     
     _trackingPointerId = -1;
 }
@@ -96,19 +118,31 @@ static const CGFloat kAuxGap = 8.0f;
     if (!self.didApplyInitialLayoutForSize && w > 32.0f && h > 32.0f) {
         self.didApplyInitialLayoutForSize = YES;
         [self loadMenuButtonPosition];
+        [self loadQuickLogoPosition];
         [self refreshAllButtonTitles];
+        [self refreshQuickMenu];
         
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(refreshAllButtonTitles) name:@"AimPosChangedNotification" object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(refreshAllButtonTitles) name:NSUserDefaultsDidChangeNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(refreshQuickMenu) name:NSUserDefaultsDidChangeNotification object:nil];
     }
     
     [self clampButton:_menuButton size:CGSizeMake(kMenuButtonSize, kMenuButtonSize)];
     [self clampButton:_aimbotButton size:CGSizeMake(kAuxButtonSize, kAuxButtonSize)];
     [self clampButton:_aimPosButton size:CGSizeMake(kAuxButtonSize, kAuxButtonSize)];
+    [self clampButton:_quickLogoButton size:CGSizeMake(kQuickLogoSize, kQuickLogoSize)];
+    if (_quickPanel) {
+        _quickPanel.frame = CGRectMake((w - kQuickPanelWidth) * 0.5f,
+                                       (h - kQuickPanelHeight) * 0.5f,
+                                       kQuickPanelWidth,
+                                       kQuickPanelHeight);
+    }
     
     [_secureCanvas bringSubviewToFront:_menuButton];
     [_secureCanvas bringSubviewToFront:_aimbotButton];
     [_secureCanvas bringSubviewToFront:_aimPosButton];
+    [_secureCanvas bringSubviewToFront:_quickLogoButton];
+    if (_quickPanelVisible) [_secureCanvas bringSubviewToFront:_quickPanel];
     
     if (_presentedModMenu.view.superview == self) {
         [self bringSubviewToFront:_presentedModMenu.view];
@@ -151,6 +185,7 @@ static const CGFloat kAuxGap = 8.0f;
         _secureCanvas.userInteractionEnabled = NO;
         
         [self setupMenuButton];
+        [self setupQuickMenu];
         
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateVisibility)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -224,12 +259,133 @@ static const CGFloat kAuxGap = 8.0f;
     [self refreshAllButtonTitles];
 }
 
+// -------------------------------------------------------------
+// Quick MINDO menu: logo toggles a small ESP Box panel.
+// The HUD delivers touches manually through handleTouchAtWindowPoint,
+// so the panel is visual-only (userInteractionEnabled = NO) and the
+// hit zones are checked by frame in that handler.
+// -------------------------------------------------------------
+- (void)setupQuickMenu {
+    _quickLogoButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _quickLogoButton.frame = CGRectMake(20, 100, kQuickLogoSize, kQuickLogoSize);
+    _quickLogoButton.backgroundColor = [UIColor blackColor];
+    _quickLogoButton.layer.cornerRadius = kQuickLogoSize * 0.5f;
+    _quickLogoButton.clipsToBounds = YES;
+    _quickLogoButton.layer.borderWidth = 1.0f;
+    _quickLogoButton.layer.borderColor = [UIColor colorWithWhite:1.0f alpha:0.18f].CGColor;
+    _quickLogoButton.userInteractionEnabled = NO;
+
+    [_quickLogoButton setTitle:@"MINDO" forState:UIControlStateNormal];
+    [_quickLogoButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _quickLogoButton.titleLabel.font = [UIFont boldSystemFontOfSize:12.0f];
+    _quickLogoButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _quickLogoButton.titleLabel.minimumScaleFactor = 0.6f;
+    [_secureCanvas addSubview:_quickLogoButton];
+
+    _quickPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kQuickPanelWidth, kQuickPanelHeight)];
+    _quickPanel.backgroundColor = [UIColor colorWithRed:0.11f green:0.11f blue:0.12f alpha:0.97f];
+    _quickPanel.layer.cornerRadius = 18.0f;
+    _quickPanel.clipsToBounds = YES;
+    _quickPanel.userInteractionEnabled = NO;
+    _quickPanel.hidden = YES;
+    [_secureCanvas addSubview:_quickPanel];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 16.0f, 200.0f, 34.0f)];
+    title.text = @"MINDO";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont boldSystemFontOfSize:26.0f];
+    [_quickPanel addSubview:title];
+
+    _quickCloseButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _quickCloseButton.frame = CGRectMake(kQuickPanelWidth - 44.0f, 12.0f, 32.0f, 32.0f);
+    [_quickCloseButton setTitle:@"\u2715" forState:UIControlStateNormal];
+    [_quickCloseButton setTitleColor:[UIColor colorWithWhite:0.85f alpha:1.0f] forState:UIControlStateNormal];
+    _quickCloseButton.titleLabel.font = [UIFont systemFontOfSize:20.0f weight:UIFontWeightMedium];
+    _quickCloseButton.userInteractionEnabled = NO;
+    [_quickPanel addSubview:_quickCloseButton];
+
+    UILabel *boxLabel = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 76.0f, 180.0f, 28.0f)];
+    boxLabel.text = @"ESP Box";
+    boxLabel.textColor = [UIColor whiteColor];
+    boxLabel.font = [UIFont systemFontOfSize:18.0f weight:UIFontWeightSemibold];
+    [_quickPanel addSubview:boxLabel];
+
+    _quickBoxSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(kQuickPanelWidth - 20.0f - 51.0f, 70.0f, 51.0f, 31.0f)];
+    _quickBoxSwitch.onTintColor = [UIColor colorWithRed:0.20f green:0.85f blue:0.40f alpha:1.0f];
+    _quickBoxSwitch.userInteractionEnabled = NO;
+    [_quickPanel addSubview:_quickBoxSwitch];
+
+    _quickStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20.0f, 118.0f, kQuickPanelWidth - 40.0f, 52.0f)];
+    _quickStatusLabel.textColor = [UIColor colorWithWhite:0.62f alpha:1.0f];
+    _quickStatusLabel.font = [UIFont systemFontOfSize:13.0f weight:UIFontWeightRegular];
+    _quickStatusLabel.numberOfLines = 2;
+    [_quickPanel addSubview:_quickStatusLabel];
+
+    _quickPanelVisible = NO;
+    [self refreshQuickMenu];
+}
+
+- (void)loadQuickLogoPosition {
+    CGFloat x = ESPPrefsFloat(@"FloatingQuickBtnX", 0.0f);
+    CGFloat y = ESPPrefsFloat(@"FloatingQuickBtnY", 0.0f);
+    if (x > 0.0f || y > 0.0f) {
+        _quickLogoButton.frame = CGRectMake(x, y, kQuickLogoSize, kQuickLogoSize);
+    } else {
+        CGFloat h = CGRectGetHeight(self.bounds);
+        _quickLogoButton.frame = CGRectMake(20.0f, MAX(20.0f, h - kQuickLogoSize - 20.0f),
+                                            kQuickLogoSize, kQuickLogoSize);
+    }
+}
+
+- (void)refreshQuickMenu {
+    if (!_quickBoxSwitch || !_quickStatusLabel) return;
+    BOOL boxOn = ESPPrefsBool(@"Box", YES);
+    [_quickBoxSwitch setOn:boxOn animated:NO];
+
+    BOOL connected = (get_pid_by_name("FreeFire") > 0);
+    NSString *state = boxOn ? @"bật" : @"tắt";
+    if (!connected) {
+        _quickStatusLabel.text = [NSString stringWithFormat:@"ESP Box đang %@ - chưa kết nối game", state];
+    } else {
+        _quickStatusLabel.text = [NSString stringWithFormat:@"ESP Box đang %@.", state];
+    }
+}
+
+- (void)toggleQuickPanel {
+    _quickPanelVisible = !_quickPanelVisible;
+    _quickPanel.hidden = !_quickPanelVisible;
+    if (_quickPanelVisible) {
+        [_secureCanvas bringSubviewToFront:_quickPanel];
+        [self refreshQuickMenu];
+    }
+}
+
+- (void)hideQuickPanel {
+    _quickPanelVisible = NO;
+    _quickPanel.hidden = YES;
+}
+
+- (void)toggleQuickBox {
+    BOOL on = !ESPPrefsBool(@"Box", YES);
+    ESPPrefsSetBool(@"Box", on);
+    if (on) {
+        int menuStyle = (int)ESPPrefsFloat(@"MenuLayoutStyle", 0.0f);
+        ESPPrefsSetBool((menuStyle == 1) ? @"EnableESP2" : @"EnableESP", YES);
+    }
+    ESPPrefsSync();
+    ESPSyncFromPrefs();
+    [self refreshQuickMenu];
+    [self refreshAllButtonTitles];
+}
+
 - (void)updateVisibility {
     BOOL isStreamer = ESPPrefsBool(@"StreamerMode", NO);
     if (_secureTextField.secureTextEntry != isStreamer) {
         [_menuButton removeFromSuperview];
         [_aimbotButton removeFromSuperview];
         [_aimPosButton removeFromSuperview];
+        [_quickLogoButton removeFromSuperview];
+        [_quickPanel removeFromSuperview];
         
         _secureTextField.secureTextEntry = isStreamer;
         [_secureTextField setNeedsLayout];
@@ -241,6 +397,8 @@ static const CGFloat kAuxGap = 8.0f;
         [_secureCanvas addSubview:_menuButton];
         [_secureCanvas addSubview:_aimbotButton];
         [_secureCanvas addSubview:_aimPosButton];
+        [_secureCanvas addSubview:_quickLogoButton];
+        [_secureCanvas addSubview:_quickPanel];
     }
     [self refreshButtonVisibility];
 }
@@ -288,6 +446,8 @@ static const CGFloat kAuxGap = 8.0f;
         _menuButton.hidden = YES;
         _aimbotButton.hidden = YES;
         _aimPosButton.hidden = YES;
+        _quickLogoButton.hidden = YES;
+        [self hideQuickPanel];
         return;
     }
 
@@ -298,6 +458,8 @@ static const CGFloat kAuxGap = 8.0f;
         _menuButton.hidden = YES;
         _aimbotButton.hidden = YES;
         _aimPosButton.hidden = YES;
+        _quickLogoButton.hidden = YES;
+        [self hideQuickPanel];
         return;
     }
 
@@ -324,6 +486,14 @@ static const CGFloat kAuxGap = 8.0f;
         [_secureCanvas bringSubviewToFront:_menuButton];
         [_secureCanvas bringSubviewToFront:_aimbotButton];
         [_secureCanvas bringSubviewToFront:_aimPosButton];
+    }
+
+    _quickLogoButton.hidden = NO;
+    _quickLogoButton.alpha = 1.0f;
+    [self clampButton:_quickLogoButton size:CGSizeMake(kQuickLogoSize, kQuickLogoSize)];
+    if (_secureCanvas && _quickLogoButton) {
+        [_secureCanvas bringSubviewToFront:_quickLogoButton];
+        if (_quickPanelVisible && _quickPanel) [_secureCanvas bringSubviewToFront:_quickPanel];
     }
 }
 
@@ -373,6 +543,8 @@ static const CGFloat kAuxGap = 8.0f;
     _menuButton.hidden = YES;
     _aimbotButton.hidden = YES;
     _aimPosButton.hidden = YES;
+    _quickLogoButton.hidden = YES;
+    [self hideQuickPanel];
 }
 
 - (void)dismissModMenu {
@@ -422,6 +594,15 @@ static const CGFloat kAuxGap = 8.0f;
     BOOL insideAim = !_aimbotButton.hidden && CGRectContainsPoint(CGRectInset(_aimbotButton.frame, -kInset, -kInset), local);
     BOOL insideAimPos = !_aimPosButton.hidden && CGRectContainsPoint(CGRectInset(_aimPosButton.frame, -kInset, -kInset), local);
 
+    BOOL quickVisible = _quickPanelVisible && !_quickPanel.hidden && !menuGloballyOff;
+    BOOL insideQuickLogo = !menuGloballyOff && !_quickLogoButton.hidden &&
+        CGRectContainsPoint(CGRectInset(_quickLogoButton.frame, -kInset, -kInset), local);
+    BOOL insideQuickPanel = quickVisible && CGRectContainsPoint(_quickPanel.frame, local);
+    CGRect quickCloseRect = _quickCloseButton ? [_quickPanel convertRect:_quickCloseButton.frame toView:self] : CGRectZero;
+    CGRect quickSwitchRect = _quickBoxSwitch ? [_quickPanel convertRect:_quickBoxSwitch.frame toView:self] : CGRectZero;
+    BOOL insideQuickClose = quickVisible && CGRectContainsPoint(CGRectInset(quickCloseRect, -8.0f, -8.0f), local);
+    BOOL insideQuickSwitch = quickVisible && CGRectContainsPoint(CGRectInset(quickSwitchRect, -12.0f, -12.0f), local);
+
     if (_presentedModMenu) {
         CGPoint inMenuView = [self convertPoint:local toView:_presentedModMenu.view];
         // Only consume when the floating panel (or a control on it) handles the touch.
@@ -459,6 +640,25 @@ static const CGFloat kAuxGap = 8.0f;
                 _touchOnAimPosButton = YES; _aimPosButtonDragging = NO; _trackingPointerId = pointerId;
                 _aimPosDragStartCenter = _aimPosButton.center; // Lưu tọa độ gốc
                 _aimPosDragStartPoint = local;
+                return YES;
+            }
+            if (insideQuickLogo && !_touchOnQuickLogo) {
+                _touchOnQuickLogo = YES; _quickLogoDragging = NO; _trackingPointerId = pointerId;
+                _quickLogoDragStartCenter = _quickLogoButton.center;
+                _quickLogoDragStartPoint = local;
+                return YES;
+            }
+            if (insideQuickClose) {
+                _touchOnQuickClose = YES; _trackingPointerId = pointerId;
+                return YES;
+            }
+            if (insideQuickSwitch) {
+                _touchOnQuickSwitch = YES; _trackingPointerId = pointerId;
+                return YES;
+            }
+            if (insideQuickPanel) {
+                _touchOnQuickPanel = YES;
+                _trackingPointerId = pointerId;
                 return YES;
             }
             return NO;
@@ -503,15 +703,56 @@ static const CGFloat kAuxGap = 8.0f;
                 [CATransaction commit];
                 return YES;
             }
+            if (_touchOnQuickLogo && pointerId == _trackingPointerId) {
+                CGFloat dx = local.x - _quickLogoDragStartPoint.x;
+                CGFloat dy = local.y - _quickLogoDragStartPoint.y;
+                if (!_quickLogoDragging && (fabs(dx) + fabs(dy) > kDragThreshold)) _quickLogoDragging = YES;
+                if (_quickLogoDragging) {
+                    _quickLogoButton.center = CGPointMake(_quickLogoDragStartCenter.x + dx, _quickLogoDragStartCenter.y + dy);
+                    [self clampButton:_quickLogoButton size:CGSizeMake(kQuickLogoSize, kQuickLogoSize)];
+                }
+                [CATransaction commit];
+                return YES;
+            }
             [CATransaction commit];
-            return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton;
+            return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel;
         }
         case UITouchPhaseEnded:
         case UITouchPhaseCancelled: {
             if (_trackingPointerId == -1) return NO;
             if (pointerId != _trackingPointerId) {
                 if (phase == UITouchPhaseCancelled) [self resetTouchTrackingState];
-                return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton;
+                return _touchOnButton || _touchOnAimbotButton || _touchOnAimPosButton || _touchOnQuickLogo || _touchOnQuickClose || _touchOnQuickSwitch || _touchOnQuickPanel;
+            }
+
+            if (_touchOnQuickPanel) {
+                [self resetTouchTrackingState];
+                return YES;
+            }
+
+            if (_touchOnQuickLogo) {
+                BOOL wasDrag = _quickLogoDragging;
+                [self resetTouchTrackingState];
+                if (wasDrag) {
+                    ESPPrefsSetFloat(@"FloatingQuickBtnX", _quickLogoButton.frame.origin.x);
+                    ESPPrefsSetFloat(@"FloatingQuickBtnY", _quickLogoButton.frame.origin.y);
+                    ESPPrefsSync();
+                } else {
+                    [self toggleQuickPanel];
+                }
+                return YES;
+            }
+
+            if (_touchOnQuickClose) {
+                [self resetTouchTrackingState];
+                [self hideQuickPanel];
+                return YES;
+            }
+
+            if (_touchOnQuickSwitch) {
+                [self resetTouchTrackingState];
+                [self toggleQuickBox];
+                return YES;
             }
 
             if (_touchOnAimbotButton) {
@@ -523,9 +764,17 @@ static const CGFloat kAuxGap = 8.0f;
                     ESPPrefsSync();
                 } else {
                     BOOL on = ESPPrefsBool(@"Aimbot", NO);
-                    ESPPrefsSetBool(@"Aimbot", !on);
-                    [self refreshAllButtonTitles];
-                    ESPSyncFromPrefs();
+                    if (!on) {
+                        // Aimbot is disabled in this build. Show the notice and
+                        // leave the button off instead of flipping the pref on.
+                        AimbotShowMaintenanceAlert();
+                        [self refreshAllButtonTitles];
+                        ESPSyncFromPrefs();
+                    } else {
+                        ESPPrefsSetBool(@"Aimbot", NO);
+                        [self refreshAllButtonTitles];
+                        ESPSyncFromPrefs();
+                    }
                 }
                 return YES;
             }
