@@ -160,20 +160,36 @@ mach_port_t get_task_for_PID(pid_t pid)
 pid_t get_pid_by_name(const char *keyword)
 {
     int count = proc_listallpids(NULL, 0);
-    pid_t pids[count];
-    proc_listallpids(pids, sizeof(pids));
+    if (count <= 0) {
+        return -1;
+    }
 
+    // Clang on the macos-15 runner rejects C++ variable-length arrays under
+    // -Werror, so the pid buffer is allocated instead of declared as pids[count].
+    pid_t *pids = (pid_t *)malloc((size_t)count * sizeof(pid_t));
+    if (!pids) {
+        return -1;
+    }
+
+    int actual = proc_listallpids(pids, (int)((size_t)count * sizeof(pid_t)));
+    if (actual > 0) {
+        count = actual;
+    }
+
+    pid_t found = -1;
     for (int i = 0; i < count; i++)
     {
         char name[1000];
         proc_name(pids[i], name, sizeof(name));
         if (strstr(name, keyword) != NULL)
         {
-            return pids[i];
+            found = pids[i];
+            break;
         }
     }
 
-    return -1;
+    free(pids);
+    return found;
 }
 
 task_t get_task_by_pid(pid_t pid)
