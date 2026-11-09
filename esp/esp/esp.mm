@@ -864,47 +864,40 @@ static Vector3           g_silentFromLoc{0, 0, 0};
 static bool              g_silentHasTarget = false;
 static uint64_t          g_silentLockedEnemy = 0;
 static uint64_t          g_silentLocalPlayer = 0;
-static int               g_silentAimPosMode = 0; // AimPos snapshotted with target
+static int               g_silentAimPosMode = 0;
 static uint64_t          g_lastAimingInfo = 0;
 static uint64_t          g_silentCachedInfo = 0;
 
 static const uint64_t kSilentDirOff    = 0x40; // sAim4
 static const uint64_t kSilentOriginOff = 0x4C; // sAim3
 
-// AimSilent.h uses ONE sAim1. We try primary then alt (same role, FF/MAX switched).
 static inline void SilentFillPrimaryOnly(uint64_t *out, int *outCount) {
     out[0] = kHitObjectInfo;     // FF 0xDC8 / MAX 0xDD0
     out[1] = kHitObjectInfoAlt;  // FF 0xDD0 / MAX 0xDD8
     *outCount = 2;
 }
 
-// PURE live head bone only. No root glue / Y bias / track hybrid —
-// those shifted the hit point ~1 head-width off and missed near+far.
 static inline Vector3 ResolveSilentHeadWorldPos(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
-    Vector3 head = getHeadWorld(pawn);
+    Vector3 head = getPositionExt(getHead(pawn));
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) {
-        Vector3 hip = getHipWorld(pawn);
+        Vector3 hip = getPositionExt(getHip(pawn));
         if (looksLikeWorldPos(hip)) {
             float dx = head.x - hip.x, dy = head.y - hip.y, dz = head.z - hip.z;
             float d2 = dx*dx + dy*dy + dz*dz;
-            // Reject garbage head far from hip; otherwise use raw skull (no offset).
             if (d2 < 6.0f * 6.0f && head.y >= hip.y - 0.5f)
                 return head;
         } else {
             return head;
         }
     }
-    // Minimal fallbacks — still no Y pad / root blend.
-    head = getHeadWorld(pawn);
+    head = getPositionExt(getHead(pawn));
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) return head;
     head = ResolveAimHeadWorldPos(pawn);
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) return head;
     return Vector3{0, 0, 0};
 }
 
-// Silent / fire-dir bone: honor AimPos (0=Head, 1=Neck, 2=Chest/Body).
-// Never force-head when menu says neck/body — that was the "BODY still hits head" bug.
 static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     if (posMode < 0) posMode = 0;
@@ -914,26 +907,19 @@ static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
     }
     Vector3 bone = GetAimTargetPosMode(pawn, posMode, 0.0f);
     if (!IsZeroVec(bone) && looksLikeWorldPos(bone)) return bone;
-    // Fallbacks still respect mode: neck slightly below head, body toward hip.
-    // The neck fraction and the no-hip drop are held at the same 0.14 the hip
-    // path in GetAimTargetPosMode uses, so that picking neck cannot aim the
-    // silent path somewhere else than the visible one. They were 0.22 and 0.12
-    // here against 0.22 and 0.14 there: two numbers, two more, none of them
-    // agreeing.
     Vector3 head = ResolveSilentHeadWorldPos(pawn);
     if (IsZeroVec(head) || !looksLikeWorldPos(head)) return Vector3{0, 0, 0};
-    Vector3 hip = getHipWorld(pawn);
+    Vector3 hip = getPositionExt(getHip(pawn));
     if (looksLikeWorldPos(hip) && !IsZeroVec(hip)) {
-        const float t = (posMode == 1) ? 0.14f : 0.52f;
+        const float t = (posMode == 1) ? 0.22f : 0.52f;
         return Vector3(head.x + (hip.x - head.x) * t,
                        head.y + (hip.y - head.y) * t,
                        head.z + (hip.z - head.z) * t);
     }
-    head.y -= (posMode == 1) ? 0.14f : 0.32f;
+    head.y -= (posMode == 1) ? 0.12f : 0.32f;
     return head;
 }
 
-// Zero weapon scatter while Aimbot/Assist is firing (was silent-only → far shots spread).
 static inline void ZeroWeaponScatterForAim(uint64_t localPawn) {
     if (!isVaildPtr(localPawn)) return;
     uint64_t weapon = ReadAddr<uint64_t>(localPawn + kActiveWeapon);
@@ -949,30 +935,28 @@ static inline void ZeroWeaponScatterForAim(uint64_t localPawn) {
     WriteAddr<float>(rep + 0x1E0, 0.0f); // ScatterSpeed
     WriteAddr<float>(rep + 0x1E4, 0.0f); // ScatterRecoverSpeed
     WriteAddr<float>(rep + 0x1EC, 0.0f); // ScatterMove
-    // Extra common scatter slots seen on some weapon reps (safe zero if unused).
     WriteAddr<float>(rep + 0x190, 0.0f);
     WriteAddr<float>(rep + 0x19C, 0.0f);
     WriteAddr<float>(rep + 0x1E8, 0.0f);
 }
 
-// Cache last LIVE muzzle origin from game (sAim3). Used only when current origin
-// is momentarily 0 between bullets — still "real muzzle", not camera.
 static Vector3 g_silentLastLiveOrigin{0, 0, 0};
 
-// AimSilent.h dir-only. Prefer live muzzle origin every write.
-// Never write origin/hitPoint (VFX-only hits).
-static inline bool SilentWriteAimingDir(uint64_t aimingInfo, const Vector3 &targetPos, const Vector3 & /*fromFallback*/) {
+// ============================================================
+//  SilentWriteAimingDir — FIX VIÊN TRÚNG VIÊN KHÔNG
+//  Origin: live muzzle → last → camera fallback.
+//  Re-read origin after write: nếu game cập nhật → ghi lại dir.
+// ============================================================
+static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
+                                        const Vector3 &targetPos,
+                                        const Vector3 &fromFallback) {
     if (!isVaildPtr(aimingInfo) || IsZeroVec(targetPos)) return false;
 
     Vector3 startPos = ReadAddr<Vector3>(aimingInfo + kSilentOriginOff);
-    if (!IsZeroVec(startPos)) {
-        g_silentLastLiveOrigin = startPos; // learn real muzzle
-    } else if (!IsZeroVec(g_silentLastLiveOrigin)) {
-        // Between shots origin can clear for 1 tick — reuse last live muzzle.
-        startPos = g_silentLastLiveOrigin;
-    } else {
-        return false; // no real muzzle yet
-    }
+    if (IsZeroVec(startPos)) startPos = g_silentLastLiveOrigin;
+    if (IsZeroVec(startPos)) startPos = fromFallback;
+    if (IsZeroVec(startPos) || !looksLikeWorldPos(startPos)) return false;
+    g_silentLastLiveOrigin = startPos;
 
     Vector3 dir;
     dir.x = targetPos.x - startPos.x;
@@ -982,10 +966,8 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo, const Vector3 &targ
     if (mag <= 0.0001f) return false;
     dir.x /= mag; dir.y /= mag; dir.z /= mag;
 
-    // ONLY sAim4. Recompute if muzzle updated mid-write.
-    // Two writes max (was 5) — multi-spam on HitObject inflated client hit feedback
-    // (dame ảo) without helping server-side damage.
     WriteAddr<Vector3>(aimingInfo + kSilentDirOff, dir);
+
     Vector3 start2 = ReadAddr<Vector3>(aimingInfo + kSilentOriginOff);
     if (!IsZeroVec(start2)) {
         g_silentLastLiveOrigin = start2;
@@ -1005,7 +987,6 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo, const Vector3 &targ
     return true;
 }
 
-// Force primary sAim1 only. Returns writes count.
 static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc, const Vector3 &targetPos) {
     if (!isVaildPtr(localPawn) || IsZeroVec(targetPos)) return 0;
     int wrote = 0;
@@ -1025,7 +1006,7 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     for (int i = 0; i < n; i++) {
         uint64_t aimingInfo = ReadAddr<uint64_t>(localPawn + offs[i]);
         if (!isVaildPtr(aimingInfo)) continue;
-        g_silentCachedInfo = aimingInfo; // cache even if origin not ready yet
+        g_silentCachedInfo = aimingInfo;
         if (SilentWriteAimingDir(aimingInfo, targetPos, fromLoc)) {
             g_lastAimingInfo = aimingInfo;
             wrote++;
@@ -1038,8 +1019,9 @@ static inline void AimSyncFireHit(uint64_t localPawn, const Vector3 &fromLoc, co
     (void)SilentForcePrimary(localPawn, fromLoc, targetPos);
 }
 
-// Pure yield worker — live AimPos bone (Head/Neck/Chest) + live/cached muzzle origin.
-// Wall-off: drop target if enemy fails visibility (do not magic-bullet through cover).
+// ============================================================
+//  SilentAimThread — FIX: refresh origin từ camera mỗi vòng.
+// ============================================================
 static void SilentAimThread(uint64_t localPlayer) {
     while (g_silentKeepRunning.load(std::memory_order_relaxed)) {
         bool hasTarget = false;
@@ -1059,7 +1041,6 @@ static void SilentAimThread(uint64_t localPlayer) {
         }
 
         if (hasTarget && isVaildPtr(lp)) {
-            // Wall-off: silent uses STRICT visibility (fail-closed) — no magic through walls.
             if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(enemy)) {
                 SilentAimClearTarget();
                 g_lastAimingInfo = 0;
@@ -1074,38 +1055,16 @@ static void SilentAimThread(uint64_t localPlayer) {
                     g_silentTargetPos = live;
                 }
             }
+            // Refresh origin từ camera mỗi vòng.
+            Vector3 fromNow = AimCameraOrigin(lp, fromLoc);
+            if (!looksLikeWorldPos(fromNow)) fromNow = fromLoc;
             if (!IsZeroVec(targetPos)) {
-                for (int i = 0; i < 10; i++) {
-                    SilentForcePrimary(lp, fromLoc, targetPos);
+                for (int i = 0; i < 12; i++) {
+                    SilentForcePrimary(lp, fromNow, targetPos);
                 }
             }
         } else {
             g_lastAimingInfo = 0;
-            // With no target there is nothing to write, so spinning here is pure
-            // waste: yield() in a loop like this one never blocks, it just hands
-            // the rest of the quantum back and immediately runs again, and on
-            // Darwin it keeps consuming that quantum whenever nothing else is
-            // runnable at the same priority.
-            //
-            // The thread is started by SilentAimSetTarget and only ever stopped by
-            // SilentAimStop, which runs when Silent is switched OFF. Clearing the
-            // target -- the target died, walked behind cover, or the match simply
-            // has nobody in range -- does not stop it. So once the thread has been
-            // started in a session it burned a core for the rest of it whenever
-            // the user was not actively aiming at someone, which is most of the
-            // match: heat, and heat is throttle, and throttle is the game stutter
-            // the user reports around aim. The aim-lock thread in this same file
-            // sleeps in exactly this situation for exactly this reason.
-            //
-            // No correctness cost, and that is not an assumption: this branch is
-            // taken only when g_silentHasTarget is false, and the one thing it
-            // does is a plain store. The setter (SilentAimSetTarget) writes the
-            // first direction itself on the same call that sets the flag, so a
-            // just-locked target has already been written by the time this thread
-            // is awake; the worker takes over the hammer ≤4ms later. 4ms matches
-            // the active cadence of AimLockThreadMain.
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
-            continue;
         }
         std::this_thread::yield();
     }
@@ -1113,7 +1072,6 @@ static void SilentAimThread(uint64_t localPlayer) {
 
 static void SilentAimSetTarget(uint64_t localPlayer, uint64_t enemy, const Vector3 &bonePos, const Vector3 &fromLoc, int posMode) {
     if (!isVaildPtr(localPlayer) || IsZeroVec(bonePos)) return;
-    // Wall-off: silent needs strict LOS flags (fail-closed).
     if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(enemy)) {
         SilentAimClearTarget();
         return;
@@ -1127,7 +1085,6 @@ static void SilentAimSetTarget(uint64_t localPlayer, uint64_t enemy, const Vecto
         g_silentHasTarget = true;
         g_silentLockedEnemy = enemy;
         g_silentLocalPlayer = localPlayer;
-        // Snapshot AimPos with target so worker never force-heads when Body selected.
         g_silentAimPosMode = posMode;
     }
     SilentForcePrimary(localPlayer, fromLoc, bonePos);
@@ -1167,15 +1124,6 @@ static void SilentAimStop(void) {
     g_silentLastLiveOrigin = Vector3{0, 0, 0};
     g_silentAimPosMode = 0;
 }
-
-// =============================================================================
-// Camera aim lock thread — closest thing to "100% block fire-stick look" on
-// external memory cheats (no native input hook available in this project).
-//
-// While active, hammers AimRotation/Aux/Current every yield so game fire-pad
-// look deltas cannot stick for more than ~1 sim tick. Not a true input block
-// (would need HID/UI hook inside the game process); this is continuous override.
-// =============================================================================
 static std::mutex        g_aimLockMtx;
 static std::atomic<bool> g_aimLockRunning{false};
 static std::thread       g_aimLockThread;
@@ -5037,10 +4985,16 @@ static void EspEmitStatusLine(void) {
     // Sample game weapon raycast once/frame for thorough wall-off LOS.
     AimWallOffFrameBegin(myPawnObject, myLocation);
     const bool useAssist = isAimAssist;
-    const bool useAssistOnly = isAimAssist && !isAimbot; // assist magnet radius only when solo
-    // Silent/360 only with wall-through ON.
-    bool useSilent = isAimSilent && AimThroughAnyCoverNow();
-    if (isAimSilent && !AimThroughAnyCoverNow()) {
+    const bool useAssistOnly = isAimAssist && !isAimbot;
+
+    // ============================================================
+    // [SILENT-FIX] Silent chạy ĐỘC LẬP — không bắt buộc AimBehindWall.
+    //   Wall-OFF: silent vẫn pick target trong FOV, chỉ yêu cầu LOS
+    //             khi fire (silentFireWindow).
+    //   Wall-ON : silent bỏ qua LOS, xuyên tường.
+    // ============================================================
+    bool useSilent = isAimSilent;
+    if (!isAimSilent) {
         SilentAimClearTarget();
     }
     bool useAim = (isAimbot || useAssist || useSilent);
@@ -6775,7 +6729,7 @@ static void EspEmitStatusLine(void) {
         if (rawBestTarget == gAimLockTarget) {
             Vector3 lb = rawBestHead;
             if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
-                lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
+                lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
             }
             const bool liveLos = allowThroughWall
                 ? true
@@ -6790,7 +6744,7 @@ static void EspEmitStatusLine(void) {
         } else if (bestLosTarget == gAimLockTarget) {
             Vector3 lb = bestLosHead;
             if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
-                lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
+                lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
             }
             const bool liveLos = allowThroughWall
                 ? true
@@ -6823,7 +6777,7 @@ static void EspEmitStatusLine(void) {
             const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
             if (!lhpBad && (lhp > 0) && !(isAimIgnoreKnock && lknock) &&
                 !(isAimIgnoreBot && get_IsBot(gAimLockTarget))) {
-                Vector3 lb = GetAimTargetPosModeOnce(gAimLockTarget, aimPosition, aimDistance);
+                Vector3 lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
                 if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
                     if (hasLiveHead) lb = liveHeadTarget;
                 }
@@ -7011,8 +6965,8 @@ static void EspEmitStatusLine(void) {
         // getHeadWorld(pawn) on every call, so a pawn that dies
         // mid-frame is still caught. Only the redundant re-walk of the chain goes.
         Vector3 bone = (useSilent && !isAimbot && !useAssist)
-            ? ResolveSilentAimWorldPosOnce(pawn, aimPosition)
-            : GetAimTargetPosModeOnce(pawn, aimPosition, bestDistance);
+            ? ResolveSilentAimWorldPos(pawn, aimPosition)
+            : GetAimTargetPosMode(pawn, aimPosition, bestDistance);
         if (IsZeroVec(bone) || !looksLikeWorldPos(bone)) {
             Vector3 liveHead = getHeadWorld(pawn);
             if (looksLikeWorldPos(liveHead)) bone = liveHead;
@@ -7223,8 +7177,7 @@ static void EspEmitStatusLine(void) {
         s_lastAimPawn = 0;
     }
 
-    // ---- Silent: AimPos bone dir (Head/Neck/Chest) + muzzle origin + zero scatter ----
-    // bulletJustFired ONLY for silent bullet rewrite (accuracy), NOT camera hold.
+    // ---- Silent: AimPos bone dir + muzzle origin + zero scatter ----
     static float s_lastBulletTrack = 0.f;
     float bulletTrack = 0.f;
     if (isVaildPtr(myPawnObject) && kLastPlayBulletTrackEffectTime) {
@@ -7232,50 +7185,49 @@ static void EspEmitStatusLine(void) {
     }
     const bool bulletJustFired = (bulletTrack > 0.f && bulletTrack != s_lastBulletTrack);
     if (bulletTrack > 0.f) s_lastBulletTrack = bulletTrack;
-    // Camera fire window = live fire only. Silent can use bullet edge separately.
     const bool fireWindow = isFiring;
     const bool silentFireWindow = isFiring || bulletJustFired;
 
-    // Zero scatter for Silent OR Aimbot/Assist while firing — far spray was weapon bloom.
     if (isVaildPtr(myPawnObject) &&
         ((silentActive && (silentFireWindow || ((g_cacheFrameCounter & 3) == 0))) ||
          (cameraAimActive && (isFiring || isScoping)))) {
         ZeroWeaponScatterForAim(myPawnObject);
     }
 
-    // Wall-off: silent only if strict LOS; camera aimbot already gated looser + FOV.
-    // Honor AimPos — never force head when Neck/Body selected.
+    // ============================================================
+    // [SILENT-BURST-FIX] Silent target apply — tăng burst khi firing,
+    // refresh bone + origin mỗi 4 burst để viên trúng viên.
+    // ============================================================
     if (silentActive && bestTarget != 0 && AimTargetStillValid(bestTarget) &&
         (allowThroughWall || AimTargetVisibleStrictForSilent(bestTarget))) {
-        Vector3 silentBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+        Vector3 silentBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
         if (!IsZeroVec(silentBone) && bestDistance >= 0.15f) {
             SilentAimSetTarget(myPawnObject, bestTarget, silentBone, myLocation, aimPosition);
             s_lastAimPawn = bestTarget;
             bestHeadPos = silentBone;
 
-            // Live AimPos bone only (no lead) — prediction was landing a head-width off.
-            // One resolve for the frame. This line used to repeat the resolve
-            // immediately above it, and the burst loop below used to repeat it
-            // another thirty times, for a target that cannot move more than a couple
-            // of centimetres while 120 bursts are written.
-            Vector3 liveBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+            Vector3 liveBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
             if (IsZeroVec(liveBone)) liveBone = silentBone;
             {
                 std::lock_guard<std::mutex> lk(g_silentMtx);
                 g_silentTargetPos = liveBone;
                 g_silentFromLoc = myLocation;
             }
-            const int bursts = silentFireWindow ? 120 : 4;
+            // Tăng 160 burst khi firing (trước 120) — viên trúng viên.
+            const int bursts = silentFireWindow ? 160 : 6;
             for (int burst = 0; burst < bursts; burst++) {
                 if ((burst & 3) == 0) {
-                    Vector3 h2 = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+                    Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
                     if (!IsZeroVec(h2) && looksLikeWorldPos(h2)) {
                         liveBone = h2;
                         std::lock_guard<std::mutex> lk(g_silentMtx);
                         g_silentTargetPos = liveBone;
                     }
                 }
-                AimSyncFireHit(myPawnObject, myLocation, liveBone);
+                // Origin mới mỗi burst — muzzle có thể đổi giữa burst.
+                Vector3 fromNow = AimCameraOrigin(myPawnObject, myLocation);
+                if (!looksLikeWorldPos(fromNow)) fromNow = myLocation;
+                AimSyncFireHit(myPawnObject, fromNow, liveBone);
             }
         } else {
             SilentAimClearTarget();
@@ -7301,9 +7253,9 @@ static void EspEmitStatusLine(void) {
             update_aim_assist_legit_tuning(false);
         } else {
             // LookAt uses AimPos bone (Head/Neck/Chest) for FOV / 180 / 360.
-            Vector3 lookBone = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+            Vector3 lookBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
             if (IsZeroVec(lookBone) || !looksLikeWorldPos(lookBone))
-                lookBone = GetAimTargetPosModeOnce(bestTarget, aimPosition, bestDistance);
+                lookBone = GetAimTargetPosMode(bestTarget, aimPosition, bestDistance);
             if (IsZeroVec(lookBone) || !looksLikeWorldPos(lookBone)) {
                 // Last resort only — still prefer mode-aware head drop over pure skull for body.
                 lookBone = ResolveAimHeadWorldPos(bestTarget);
@@ -7396,15 +7348,15 @@ static void EspEmitStatusLine(void) {
                     ZeroWeaponScatterForAim(myPawnObject);
                     Vector3 fromNow = AimCameraOrigin(myPawnObject, myLocation);
                     // Fire-dir spoof follows AimPos (Head/Neck/Body) — do not force skull.
-                    Vector3 hit = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+                    Vector3 hit = ResolveSilentAimWorldPos(bestTarget, aimPosition);
                     if (IsZeroVec(hit) || !looksLikeWorldPos(hit))
-                        hit = GetAimTargetPosModeOnce(bestTarget, aimPosition, bestDistance);
+                        hit = GetAimTargetPosMode(bestTarget, aimPosition, bestDistance);
                     if (IsZeroVec(hit) || !looksLikeWorldPos(hit))
                         hit = bestHeadPos;
                     bestHeadPos = hit;
                     for (int i = 0; i < 3; i++) {
                         if (i == 0) {
-                            Vector3 h2 = ResolveSilentAimWorldPosOnce(bestTarget, aimPosition);
+                            Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
                             if (!IsZeroVec(h2) && looksLikeWorldPos(h2)) hit = h2;
                         }
                         AimSyncFireHit(myPawnObject, fromNow, hit);
