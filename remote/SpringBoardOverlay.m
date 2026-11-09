@@ -59,7 +59,7 @@
 // SpringBoard's main thread and the overlay lags or the session dies. Boxes and
 // health bars are batched as rectangles and stay cheap; the cap only drops the
 // extra text/limb subpaths after the budget is spent.
-#define SB_MAX_CALLS 32
+#define SB_MAX_CALLS 64
 
 // Startup diagnostics.
 //
@@ -919,7 +919,20 @@ static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
     // The marker is what makes the bucket decidable: draw the snapline layers,
     // drop the rest.
     int emitted = 0;
+    // Names first. They are the most call-hungry layer (one polyline per glyph
+    // outline), and the old order put them after the geometry, so a crowded
+    // frame spent the whole call budget on snaplines and dropped every name.
+    // Boxes and HP are rectangles and still flush in the batch at the end.
+    int layerOrder[SB_SHAPE_KEY_COUNT];
+    int orderCount = 0;
+    layerOrder[orderCount++] = SB_NAME_BG_INDEX;
+    layerOrder[orderCount++] = SB_NAME_TEXT_INDEX;
     for (int i = 0; i < SB_SHAPE_KEY_COUNT; i++) {
+        if (i == SB_NAME_BG_INDEX || i == SB_NAME_TEXT_INDEX) continue;
+        layerOrder[orderCount++] = i;
+    }
+    for (int oi = 0; oi < orderCount; oi++) {
+        const int i = layerOrder[oi];
         // Slot 16 is the counter's text layer, which is sampled through
         // sb_text_path and not through KVC, so it has no key here.
         if (!kShapeKeys[i]) continue;
@@ -2544,6 +2557,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint8_t  tPts[64];
             uint32_t tPtsN[64];
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
+            // Calls spent on optional polylines only. Name glyphs and rectangles
+            // do not count: a name subpath that is dropped is a missing name, and
+            // a rectangle joins the CGPathAddRects batch at the end of the
+            // publish. The ceiling exists to shed snaplines and limbs, not the
+            // two things the ESP is actually read for.
+            int optionalCalls = 0;
             while (i < len) {
                 // 2048 doubles is 1024 points per subpath. The largest shape in
                 // this overlay is the FOV ring at 73 straight points; a head
@@ -2722,7 +2741,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // addLines with count=1, which renders nothing).
                 if (rn < 4) continue;
                 subpaths++;
-                if (calls >= SB_MAX_CALLS) {
+                // Names are never truncated. Every player's name is built into
+                // the two name paths, so the call ceiling was dropping whole
+                // names in a crowded match: the budget ran out on the first
+                // players and every later name lost its glyphs. The ceiling now
+                // counts optional polylines only, and rectangles never enter it.
+                const int runIsName = (runLayer == SB_NAME_BG_INDEX ||
+                                       runLayer == SB_NAME_TEXT_INDEX);
+                if (!runIsName && optionalCalls >= SB_MAX_CALLS) {
                     // Budget spent: keep the frame bounded instead of queuing
                     // hundreds of SpringBoard calls. nTrunc is in the census log.
                     nTrunc++;
@@ -2871,13 +2897,13 @@ void SBRemotePushESPFrame(UIView *espView) {
                         if (curLayer >= 6 && curLayer <= 8) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
                             dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
-                            calls++; drawn++;
+                            calls++; drawn++; optionalCalls++;
                         }
 #if SB_DRAW_BONES
                         else if (curLayer >= 3 && curLayer <= 5) {
                             remote_write(ptsBuf, run, (size_t)rn * 8);
                             dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
-                            calls++; drawn++;
+                            calls++; drawn++; optionalCalls++;
                         }
 #endif
                     }
@@ -2911,6 +2937,7 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
                 remote_write(ptsBuf, run, (size_t)rn * 8);
 dlsym_remote("CGPathAddLines", dstPath, 0, ptsBuf, np, 0,0,0,0);
                 calls++; drawn++;
+                if (!runIsName) optionalCalls++;
             }
 
             if (rectDoubles >= 4) {

@@ -155,9 +155,6 @@ extern bool isBone;
 extern bool isHealth;
 extern bool isName;
 extern bool isDis;
-// Crowded-match LOD: skip name/distance glyph paths for far players. Set by
-// the draw pass when 28+ pawns are in the snapshot.
-extern bool g_espCrowdNameLOD;
 // Crowded-match LOD: drop snaplines so the call budget goes to boxes/HP.
 extern bool g_espCrowdNoLines;
 extern bool isLine;
