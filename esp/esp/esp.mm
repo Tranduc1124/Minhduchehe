@@ -3213,7 +3213,14 @@ void ESPSyncFromPrefs(void) {
     isAimRage = ESPPrefsBool(@"AimRage", NO);
     // Aimbot + Aim Assist can run together (share target priority / AimPos).
     // Only Legit is exclusive vs hard LookAt (soft Slerp fights Aimbot).
-    isAimbot    = ESPPrefsBool(@"Aimbot", NO);
+    // Aimbot is disabled in this build (maintenance). Clear a stale ON value
+    // from an older install once, then keep the engine flag false regardless
+    // of what the pref says. The UI setter also refuses Aimbot=YES and shows
+    // the maintenance notice, so this is the second line of defence.
+    if (ESPPrefsBool(@"Aimbot", NO)) {
+        ESPPrefsSetBool(@"Aimbot", NO);
+    }
+    isAimbot    = NO;
     isAimAssist = ESPPrefsBool(@"AimAssist", NO);
     isKillGameAA = ESPPrefsBool(@"KillGameAA", YES);
     isAimLegit  = ESPPrefsBool(@"AimLegit", NO);

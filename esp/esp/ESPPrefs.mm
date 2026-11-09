@@ -1,4 +1,5 @@
 #import "ESPPrefs.h"
+#import "AimbotMaintenance.h"
 #import <Foundation/Foundation.h>
 
 // Fixed suite + file so settings survive restart / reinstall of tipa better than
@@ -392,6 +393,18 @@ static void ESPPrefsSetValueEx(NSString *key, id value, BOOL schedulePersist) {
     ESPPrefsLoadIfNeeded();
 
     NSString *realKey = ResolveKey(key);
+
+    // Aimbot is disabled in this build. Refuse the write at the single point
+    // every setter funnels through, so no UI path (ModMenu, ESPAim, floating
+    // AIM button) can arm the camera pipeline behind the maintenance notice.
+    // The key may be Lite-suffixed by ResolveKey, so both forms are checked.
+    if (value != nil && value != [NSNull null] &&
+        ([realKey isEqualToString:@"Aimbot"] || [realKey isEqualToString:@"Aimbot_Lite"]) &&
+        ([value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSString class]]) &&
+        [value boolValue]) {
+        AimbotShowMaintenanceAlert();
+        value = @NO;
+    }
 
     @synchronized (gCache) {
         if (value != nil && value != [NSNull null]) {

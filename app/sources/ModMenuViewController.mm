@@ -1151,10 +1151,13 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         // Keep prefs exclusive when opening tab (old builds could stack).
         if (aimMasterOn) {
             if (aimTypeSel == 0) {
-                if (!aimbotOn) ESPPrefsSetBool(@(oxorany("Aimbot")), YES);
+                // Aimbot is under maintenance: opening the tab must not re-arm
+                // it. Turn the whole aim master off instead of writing Aimbot=YES.
+                if (aimbotOn) ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
                 if (aimAssistOn) ESPPrefsSetBool(@(oxorany("AimAssist")), NO);
                 if (aimLegitOn) ESPPrefsSetBool(@(oxorany("AimLegit")), NO);
-                aimbotOn = YES; aimAssistOn = NO; aimLegitOn = NO;
+                aimbotOn = NO; aimAssistOn = NO; aimLegitOn = NO;
+                aimMasterOn = NO;
             } else if (aimTypeSel == 1) {
                 if (aimbotOn) ESPPrefsSetBool(@(oxorany("Aimbot")), NO);
                 if (!aimAssistOn) ESPPrefsSetBool(@(oxorany("AimAssist")), YES);
