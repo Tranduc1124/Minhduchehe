@@ -970,6 +970,11 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
     if (mag <= 0.0001f) return false;
     dir.x /= mag; dir.y /= mag; dir.z /= mag;
 
+    // The game's bullet collision uses the hit point at +0x28, not only the
+    // direction. When the crosshair was on the ground, the stale hit point kept
+    // the shot on the ground and Silent appeared to do nothing. Move the hit
+    // point with the direction so a downward/ground target is actually hit.
+    WriteAddr<Vector3>(aimingInfo + kGmpHitPointOff, targetPos);
     WriteAddr<Vector3>(aimingInfo + kSilentDirOff, dir);
 
     Vector3 start2 = ReadAddr<Vector3>(aimingInfo + kSilentOriginOff);
