@@ -486,11 +486,16 @@ static void ESPRenderPawnCore(
     // ---------------------------------------------------------
     if (isLine && !g_espCrowdNoLines) {
         CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
-        CGPoint boxTopCenter = CGPointMake(centerX, y);
+        // The line ends on whatever is the topmost part of the target card. With
+        // names on, that is the bottom edge of the name plate (which sits on the
+        // top edge of the health bar), so the line touches the name instead of
+        // stopping at the box and leaving the plate floating above it. With names
+        // off there is no plate and the line goes to the box top, as before.
+        CGPoint lineEnd = CGPointMake(centerX, isName ? (y - barGap - barH) : y);
 
-        if (isKnocked) { ESPAddFanRay(buffers->snaplineKnockedPath, lineStart, boxTopCenter, &buffers->snaplineKnockedFanStarted); buffers->snaplineKnockedDirty = true; }
-        else if (isBot) { ESPAddFanRay(buffers->snaplineBotPath, lineStart, boxTopCenter, &buffers->snaplineBotFanStarted); buffers->snaplineBotDirty = true; }
-        else { ESPAddFanRay(buffers->snaplinePath, lineStart, boxTopCenter, &buffers->snaplineFanStarted); buffers->snaplineDirty = true; }
+        if (isKnocked) { ESPAddFanRay(buffers->snaplineKnockedPath, lineStart, lineEnd, &buffers->snaplineKnockedFanStarted); buffers->snaplineKnockedDirty = true; }
+        else if (isBot) { ESPAddFanRay(buffers->snaplineBotPath, lineStart, lineEnd, &buffers->snaplineBotFanStarted); buffers->snaplineBotDirty = true; }
+        else { ESPAddFanRay(buffers->snaplinePath, lineStart, lineEnd, &buffers->snaplineFanStarted); buffers->snaplineDirty = true; }
     }
 
     // ---------------------------------------------------------
@@ -571,8 +576,10 @@ static void ESPRenderPawnCore(
 
         // Width is barFullLen -- the health bar's full length, not its health-
         // scaled fill and not boxWidth -- so the card sits exactly as wide as the
-        // bar it belongs to. Anchored on the bar's left edge (x) for the same
-        // reason, and grown symmetrically so the bar and the card share a centre.
+        // bar it belongs to. Both are centred on centerX now. The bar used to be
+        // anchored at the box's left edge (x) while being 18% longer than the box,
+        // so its centre sat 0.09*boxWidth to the right of the box centre and the
+        // plate, which followed the bar's centre, was visibly off to the right.
         //
         // The charsW floor stays. It is not a contradiction of "as wide as the
         // bar": at range the bar is a few points long and a name cannot be drawn
@@ -583,7 +590,7 @@ static void ESPRenderPawnCore(
         // glyphs go in.
         const CGFloat charsW = (CGFloat)plateName.length * nameSize * 0.62f + 8.0f;
         const CGFloat plateW = (barFullLen > charsW) ? barFullLen : charsW;
-        const CGRect plate = CGRectMake(x - (plateW - barFullLen) * 0.5f,
+        const CGRect plate = CGRectMake(centerX - plateW * 0.5f,
                                         plateBottom - plateH, plateW, plateH);
 
         // CGPathAddRect, not CGPathAddEllipseInRect: four distinct corners is
@@ -652,9 +659,14 @@ static void ESPRenderPawnCore(
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
         const CGFloat barW = barFullLen * healthRatio;
         const CGFloat barTop = y - barGap - barH;
+        // The full-length track is centred on the box, and the fill grows from
+        // its left edge. Anchoring the track at the box's left edge put its
+        // centre to the right of the box centre, which is what dragged the name
+        // plate off centre with it.
+        const CGFloat barLeft = centerX - barFullLen * 0.5f;
 
         CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                      CGRectMake(x, barTop, barW, barH));
+                      CGRectMake(barLeft, barTop, barW, barH));
         buffers->hpFillGreenDirty = true;
     }
 }

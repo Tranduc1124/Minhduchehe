@@ -53,7 +53,11 @@
 // as before, just on the other side of the boundary, and it held the rate at
 // 35fps while the frame cost 10ms and the loop ran at 60. 8000us is roughly
 // half a frame, which leaves no boundary to fall on.
-#define SB_MIN_PUBLISH_INTERVAL_US 16000ULL
+// Device log 2026-11-10: attHz 45-60, skipHz 16-22 at this gate. The timer's
+// 2ms leeway makes many intervals shorter than 16ms, so the gate itself was
+// throwing away a sixth of the frames while a publish averaged 8-13ms. 14ms
+// passes every 60Hz frame and still bounds the publish interval.
+#define SB_MIN_PUBLISH_INTERVAL_US 14000ULL
 // Hard ceiling on remote draw calls per publish. A crowded match can emit one
 // polyline call per name glyph outline; without a ceiling the publish floods
 // SpringBoard's main thread and the overlay lags or the session dies. Boxes and
@@ -2732,6 +2736,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
                                              rectDoubles / 4, 0, 0,0,0);
                                 calls++; drawn++;
+                                rectCalls++;
                                 rectDoubles = 0;
                             }
                             dstLayer = curLayer;
