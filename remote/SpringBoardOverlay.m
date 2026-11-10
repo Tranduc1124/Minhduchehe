@@ -366,6 +366,26 @@ static uint64_t g_sbNextPublishUS = 0;
 static uint32_t g_sbLastSubpaths = 0;
 static uint64_t g_sbLastCalls = 0;
 
+// [SB-PUSH2] window accumulators. The 1 Hz [SB-PUSH] line reports one publish;
+// these carry every publish in the window so the breakdown is an average and
+// not the one frame that happened to land on the log tick.
+static uint64_t g_sbWinMergeUS = 0;
+static uint64_t g_sbWinCopyUS = 0;
+static uint64_t g_sbWinMergeWasteUS = 0;
+static uint64_t g_sbWinDispUS = 0;
+static uint64_t g_sbWinLockUS = 0;
+static uint64_t g_sbWinSetupUS = 0;
+static uint64_t g_sbWinDecodeUS = 0;
+static uint64_t g_sbWinPresentUS = 0;
+static uint64_t g_sbWinPubUS = 0;
+static uint64_t g_sbWinPubMaxUS = 0;
+static uint64_t g_sbWinCalls = 0;
+static uint64_t g_sbWinNameCalls = 0;
+static uint64_t g_sbWinNameSub = 0;
+static uint64_t g_sbWinRectCalls = 0;
+static uint64_t g_sbWinOptionalCalls = 0;
+static uint64_t g_sbWinNTrunc = 0;
+
 // Index 0 to 15 are the geometry layers. 16 is the white filled text layer and is
 // NOT in here: it is sampled straight from the app's statusLayer through sb_text_path
 // rather than through KVC, because it is text and not a shape the app draws.
@@ -2317,7 +2337,16 @@ void SBRemotePushESPFrame(UIView *espView) {
     // back to 5s on the first publish that completes, which is inside
     // drawn>0, and that is where it belongs.
     g_sbLastPublishUS = tGate;
-    if (!mergePaths(espView, sb_text_glyph_path_for_frame(espView), ops)) {
+    // The merge is serialised on the caller's thread, which is the game's frame
+    // timer. It is timed separately because it is the only part of the publish
+    // that can stall the game itself; the remote work below runs on a global
+    // queue. mergeUS is carried into the async block so [SB-PUSH2] can report
+    // it per publish and the wasted merges can be counted.
+    const uint64_t tMerge0 = now_us();
+    CGPathRef textPath = sb_text_glyph_path_for_frame(espView);
+    const BOOL haveFrame = mergePaths(espView, textPath, ops);
+    const uint64_t mergeUS = now_us() - tMerge0;
+    if (!haveFrame) {
         g_sbSummarySkips++;
         return;
     }
@@ -2331,25 +2360,39 @@ void SBRemotePushESPFrame(UIView *espView) {
         // period of 16.6ms the flag should be free again in time, and a
         // bdrops that climbs says it is not.
         g_sbBusyDrops++;
+        g_sbWinMergeWasteUS += mergeUS;
         g_sbSummarySkips++;
         return;
     }
     const uint64_t tAcquire = now_us();
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+    // The copy is also on the caller's thread. NSMutableData copy is a full
+    // memcpy of the serialised frame, and it is the last main-thread cost before
+    // the publish moves to the global queue.
+    const uint64_t tCopy0 = now_us();
     NSData *frameBytes = [ops copy];
+    const uint64_t copyUS = now_us() - tCopy0;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t tPubStart = now_us();
+        // Time between handing the frame to the queue and this block actually
+        // running. A large value means the global queue is saturated, which is
+        // a different cause from a slow publish and has a different fix.
+        const uint64_t dispUS = tPubStart - tAcquire;
         // The transport for the whole publish, and for the text thread when it
         // gets a turn. @finally rather than a pair of unlocks on the error paths,
         // because this body has several returns and a lock left held on any of
         // them would freeze the text thread permanently.
         pthread_mutex_lock(&g_sbIoLock);
+        // Time spent waiting behind the text thread or another publish. This is
+        // inside the publish cost but is not remote-call cost.
+        const uint64_t lockUS = now_us() - tPubStart;
         @try {
             if (!remote_call_has_local_state() || !remote_call_current_success()) return;
             if (!r_is_objc_ptr(g_sbShape)) return;
 
+            const uint64_t tSetup0 = now_us();
             // Which operation poisons the session. g_RC_success is cleared by
             // every failed remote operation, and init_remote_call reporting
             // success does not mean the session works: the device log shows
@@ -2375,6 +2418,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint64_t rpNameBg = 0;
             uint64_t rpNameText = 0;
             const int okAfterBuf = remote_call_current_success() ? 1 : 0;
+            // Everything from the first path lookup to here is transport setup:
+            // persistentPath, ptsBuffer, the counter's path and the two name
+            // paths. It is separate from the decode loop because a slow setup
+            // means the path objects are expensive to reach, not that there are
+            // too many subpaths.
+            const uint64_t setupUS = now_us() - tSetup0;
             if (!okBefore || !rp || !ptsBuf || !okAfterBuf || !okAfterPath) {
                 static uint64_t s_probeUS = 0;
                 uint64_t tP = now_us();
@@ -2408,6 +2457,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             }
             g_sbConsecFail = 0;
 
+            const uint64_t tDecode0 = now_us();
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;
 
@@ -2557,6 +2607,12 @@ void SBRemotePushESPFrame(UIView *espView) {
             uint8_t  tPts[64];
             uint32_t tPtsN[64];
             uint32_t nTrunc = 0;     // subpaths cut at the point cap
+            // Per-publish breakdown for [SB-PUSH2]. nameSub/nameCalls are the
+            // two name layers only; rectCalls is the number of CGPathAddRects
+            // batches, not the number of rectangles inside them.
+            uint32_t nameSub = 0;
+            uint32_t nameCalls = 0;
+            uint32_t rectCalls = 0;
             // Calls spent on optional polylines only. Name glyphs and rectangles
             // do not count: a name subpath that is dropped is a missing name, and
             // a rectangle joins the CGPathAddRects batch at the end of the
@@ -2748,6 +2804,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 // counts optional polylines only, and rectangles never enter it.
                 const int runIsName = (runLayer == SB_NAME_BG_INDEX ||
                                        runLayer == SB_NAME_TEXT_INDEX);
+                if (runIsName) nameSub++;
                 if (!runIsName && optionalCalls >= SB_MAX_CALLS) {
                     // Budget spent: keep the frame bounded instead of queuing
                     // hundreds of SpringBoard calls. nTrunc is in the census log.
@@ -2915,6 +2972,7 @@ void SBRemotePushESPFrame(UIView *espView) {
 dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
                                      rectDoubles / 4, 0, 0,0,0);
                         calls++; drawn++;
+                        rectCalls++;
                         rectDoubles = 0;
                     }
                     rectBuf[rectDoubles++] = rx;
@@ -2938,13 +2996,20 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
 dlsym_remote("CGPathAddLines", dstPath, 0, ptsBuf, np, 0,0,0,0);
                 calls++; drawn++;
                 if (!runIsName) optionalCalls++;
+                else nameCalls++;
             }
 
             if (rectDoubles >= 4) {
                 remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
 dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                 calls++; drawn++;
+                rectCalls++;
             }
+            // The decode loop is over. Everything below is setPath:/present, and
+            // the two are reported separately because the loop scales with the
+            // subpath count while setPath is a fixed handful of crossings.
+            const uint64_t decodeUS = now_us() - tDecode0;
+            const uint64_t tPresent0 = now_us();
 
             // The counter's path goes to its own layer. One call, and the main
             // thread fills a path instead of laying out a string, which is the
@@ -3110,12 +3175,36 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
 
             if (drawn > 0) {
                 sb_invoke_cached_main_raw();
+                // Present is everything after the decode loop: the off edges,
+                // the setPath: hand-offs and this invoke. It does not scale with
+                // the subpath count, so a large present against a small decode
+                // means the layers, not the geometry, are the cost.
+                const uint64_t presentUS = now_us() - tPresent0;
+                const uint64_t pubUS = now_us() - tPubStart;
 
                 g_sbSummaryUpdates++;
                 g_sbLastPublishUS = now_us();
                 g_sbRearmBackoffUS = 5000000ULL;   // healthy again, reset backoff
                 g_sbLastSubpaths = subpaths;
                 g_sbLastCalls = calls;
+                // Window totals for [SB-PUSH2]. Every completed publish adds
+                // here; the 1 Hz log divides by the number of publishes in the
+                // window, so the line is an average and not one lucky frame.
+                g_sbWinMergeUS += mergeUS;
+                g_sbWinCopyUS += copyUS;
+                g_sbWinDispUS += dispUS;
+                g_sbWinLockUS += lockUS;
+                g_sbWinSetupUS += setupUS;
+                g_sbWinDecodeUS += decodeUS;
+                g_sbWinPresentUS += presentUS;
+                g_sbWinPubUS += pubUS;
+                if (pubUS > g_sbWinPubMaxUS) g_sbWinPubMaxUS = pubUS;
+                g_sbWinCalls += calls;
+                g_sbWinNameCalls += nameCalls;
+                g_sbWinNameSub += nameSub;
+                g_sbWinRectCalls += rectCalls;
+                g_sbWinOptionalCalls += optionalCalls;
+                g_sbWinNTrunc += nTrunc;
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
                 // Compare p0/p1 against the app-side [PUSH] scr values. If app scr
                 // moves but these do not, the hand-off is dropping frames; if both
@@ -3125,6 +3214,16 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                     static uint64_t s_sbLogUS = 0;
                     static uint64_t s_winStartUS = 0;
                     static uint64_t s_winUpd = 0, s_winDrops = 0, s_winHoldUS = 0;
+                    static uint64_t s_winAtt = 0, s_winSkip = 0;
+                    static uint64_t s_winMerge = 0, s_winMergeWaste = 0;
+                    static uint64_t s_winCopy = 0;
+                    static uint64_t s_winDisp = 0, s_winLock = 0, s_winSetup = 0;
+                    static uint64_t s_winDecode = 0, s_winPresent = 0;
+                    static uint64_t s_winPub = 0;
+                    static uint64_t s_winCalls = 0, s_winNameCalls = 0;
+                    static uint64_t s_winNameSub = 0, s_winRectCalls = 0;
+                    static uint64_t s_winOptionalCalls = 0;
+                    static uint64_t s_winNTrunc = 0;
                     uint64_t nowS = now_us();
                     if (nowS - s_winStartUS >= 1000000ULL) {
                         // One timer, and the window is measured rather than
@@ -3155,10 +3254,47 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                         uint64_t updWin = g_sbSummaryUpdates - s_winUpd;
                         uint64_t holdSumMS = (g_sbHoldUS - s_winHoldUS) / 1000ULL;
                         uint64_t holdAvgMS = updWin ? holdSumMS / updWin : 0;
+                        // Window deltas for [SB-PUSH2]. Snapshot, subtract, then
+                        // remember the totals; the counters are monotonic so a
+                        // missed log tick cannot make a negative rate.
+                        const uint64_t dMerge      = g_sbWinMergeUS - s_winMerge;
+                        const uint64_t dCopy       = g_sbWinCopyUS - s_winCopy;
+                        const uint64_t dMergeWaste = g_sbWinMergeWasteUS - s_winMergeWaste;
+                        const uint64_t dDisp       = g_sbWinDispUS - s_winDisp;
+                        const uint64_t dLock       = g_sbWinLockUS - s_winLock;
+                        const uint64_t dSetup      = g_sbWinSetupUS - s_winSetup;
+                        const uint64_t dDecode     = g_sbWinDecodeUS - s_winDecode;
+                        const uint64_t dPresent    = g_sbWinPresentUS - s_winPresent;
+                        const uint64_t dPub        = g_sbWinPubUS - s_winPub;
+                        const uint64_t dCalls      = g_sbWinCalls - s_winCalls;
+                        const uint64_t dNameCalls  = g_sbWinNameCalls - s_winNameCalls;
+                        const uint64_t dNameSub    = g_sbWinNameSub - s_winNameSub;
+                        const uint64_t dRectCalls  = g_sbWinRectCalls - s_winRectCalls;
+                        const uint64_t dOptionalCalls = g_sbWinOptionalCalls - s_winOptionalCalls;
+                        const uint64_t dNTrunc     = g_sbWinNTrunc - s_winNTrunc;
+                        const uint64_t attWin      = g_sbSummaryAttempts - s_winAtt;
+                        const uint64_t skipWin     = g_sbSummarySkips - s_winSkip;
                         s_winStartUS = nowS;
                         s_winUpd = g_sbSummaryUpdates;
                         s_winDrops = g_sbBusyDrops;
                         s_winHoldUS = g_sbHoldUS;
+                        s_winAtt = g_sbSummaryAttempts;
+                        s_winSkip = g_sbSummarySkips;
+                        s_winMerge = g_sbWinMergeUS;
+                        s_winCopy = g_sbWinCopyUS;
+                        s_winMergeWaste = g_sbWinMergeWasteUS;
+                        s_winDisp = g_sbWinDispUS;
+                        s_winLock = g_sbWinLockUS;
+                        s_winSetup = g_sbWinSetupUS;
+                        s_winDecode = g_sbWinDecodeUS;
+                        s_winPresent = g_sbWinPresentUS;
+                        s_winPub = g_sbWinPubUS;
+                        s_winCalls = g_sbWinCalls;
+                        s_winNameCalls = g_sbWinNameCalls;
+                        s_winNameSub = g_sbWinNameSub;
+                        s_winRectCalls = g_sbWinRectCalls;
+                        s_winOptionalCalls = g_sbWinOptionalCalls;
+                        s_winNTrunc = g_sbWinNTrunc;
                         s_sbLogUS = nowS + 1000000ULL;
                         // ms = wall time of one whole publish. Divided by calls it
                         // gives the per-remote-call cost, which is the number that
@@ -3169,13 +3305,20 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                         //                   only fix the geometry.
                         // Until this is measured, both are guesses.
                         uint64_t pubMS = (now_us() - tPubStart) / 1000ULL;
-                        NSLog(@"[SB-PUSH] hz=%.1f bdropsHz=%.1f win=%llums calls=%llu "
+                        // attHz and skipHz are the gate picture around hz: a
+                        // timer firing at 60 with hz=30 and attHz=60 means every
+                        // other attempt is dropped, while hz=30 attHz=30 means
+                        // the frame loop itself is only running at 30.
+                        const double attHz  = (double)attWin * 1e6 / (double)winUS;
+                        const double skipHz = (double)skipWin * 1e6 / (double)winUS;
+                        NSLog(@"[SB-PUSH] hz=%.1f attHz=%.1f skipHz=%.1f bdropsHz=%.1f "
+                              @"win=%llums calls=%llu "
                               @"ms=%llu holdavg=%llums holdsum=%llums ups=%llu "
                               @"att=%llu skip=%llu argmiss=%llu "
                               @"sub=%u rect=%u limb=%u mergedSub=%u trunc=%u "
                               @"pts2=%d pts3=%d pts4=%d pts58=%d pts932=%d pts33=%d "
                               @"maxPts=%d nBig=%d",
-                              hz, bdropHz,
+                              hz, attHz, skipHz, bdropHz,
                               (unsigned long long)(winUS / 1000ULL),
                               (unsigned long long)g_sbLastCalls,
                               (unsigned long long)pubMS,
@@ -3189,6 +3332,51 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
                               g_sbSubpathCount, nTrunc,
                               c2, c3, c4, c5to8, c9to32, c33p,
                               maxPts, nBig);
+                        // [SB-PUSH2] breaks the publish into the phases that can
+                        // each be the bottleneck. Read it like this:
+                        //   pubavg > 16.7ms      -> cannot hold 60 Hz, whatever
+                        //                           the phases say.
+                        //   merge large          -> the game's main thread is
+                        //                           paying for CGPathApply; the
+                        //                           overlay cannot fix this by
+                        //                           dropping remote calls.
+                        //   mergewaste large     -> merges are being thrown
+                        //                           away because a publish was
+                        //                           still in flight.
+                        //   disp/lock large      -> the publish thread is not
+                        //                           starting on time, or the text
+                        //                           thread holds the transport.
+                        //   decode large         -> subpath count is the cost;
+                        //                           us/call says whether one
+                        //                           crossing is expensive.
+                        //   present large        -> setPath:/layer work, not
+                        //                           geometry.
+                        const double n = updWin ? (double)updWin : 1.0;
+                        const uint64_t dDecodeCalls = dNameCalls + dOptionalCalls + dRectCalls;
+                        NSLog(@"[SB-PUSH2] n=%llu pubavg=%.2fms pubmax=%.2fms "
+                              @"merge=%.2fms copy=%.2fms mergewaste=%.1fms/s disp=%.2fms "
+                              @"lock=%.2fms setup=%.2fms decode=%.2fms present=%.2fms "
+                              @"us/call=%.3f calls=%.1f decalls=%.1f namecalls=%.1f "
+                              @"namesub=%.1f rectcalls=%.1f trunc=%.1f",
+                              (unsigned long long)updWin,
+                              (double)dPub / n / 1000.0,
+                              (double)g_sbWinPubMaxUS / 1000.0,
+                              (double)dMerge / n / 1000.0,
+                              (double)dCopy / n / 1000.0,
+                              (double)dMergeWaste * 1000.0 / (double)winUS,
+                              (double)dDisp / n / 1000.0,
+                              (double)dLock / n / 1000.0,
+                              (double)dSetup / n / 1000.0,
+                              (double)dDecode / n / 1000.0,
+                              (double)dPresent / n / 1000.0,
+                              (double)dDecode / (double)(dDecodeCalls ? dDecodeCalls : 1),
+                              (double)dCalls / n,
+                              (double)dDecodeCalls / n,
+                              (double)dNameCalls / n,
+                              (double)dNameSub / n,
+                              (double)dRectCalls / n,
+                              (double)dNTrunc / n);
+                        g_sbWinPubMaxUS = 0;
                     }
                 }
                 // The old "[SBOverlay] 15fps" line is gone. It fired every 64
