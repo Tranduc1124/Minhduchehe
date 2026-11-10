@@ -139,6 +139,7 @@ bool remote_read_internal(uint64_t src, void *dst, uint64_t size);
 bool remote_write_internal(uint64_t dst, const void *src, uint64_t size);
 int destroy_remote_call_internal(void);
 void abandon_remote_call_internal(void);
+static NSArray<NSNumber *> *collect_all_task_threads(uint64_t taskAddr);
 
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
@@ -1564,9 +1565,34 @@ void abandon_remote_call_internal(void) {
     // reachable, and destroy_remote_call() releases them on the proper teardown.
     // The crossing stays poisoned: only a completed init makes that thread worth
     // hijacking again.
+    //
+    // The synthetic call thread is exactly that case, and it is the common one.
+    // It lives inside the target and is parked on the 0x401 sentinel between
+    // crossings: it faults, we reply with the same state, it faults again. Every
+    // one of those faults is delivered to the second exception port, so that port
+    // is the only thing standing between "the thread is blocked in the kernel" and
+    // "SpringBoard takes an unhandled EXC_BAD_ACCESS and dies".
+    //
+    // Dropping the port's receive right does not make the thread go away. The
+    // kernel has nowhere to deliver the next fault, so it escalates it, and the
+    // thread takes SIGBUS at pc = 0x401. That is the crash in the SpringBoard IPS
+    // of 2026-11-10 15:36:52: SIGBUS, EXC_BAD_ACCESS, pc = 0x401, and the
+    // faulting thread is the pthread_create'd one -- our synthetic call thread.
+    //
+    // abandon does no SB-side IPC on purpose, because the caller believes the
+    // task is gone, so the thread cannot be killed here. The port stays armed
+    // instead. The cost is two mach ports and one blocked thread per abandoned
+    // session, which is nothing next to SpringBoard being dead and needing a
+    // respawn.
+    if (g_RC_callThreadAddr && g_RC_taskAddr) {
+        g_RC_wedgeKeepPorts = true;
+        NSLog(@"[PUSH-KEEP] abandon: synthetic call thread 0x%llx may still be inside the target — keeping both exception ports armed",
+              (unsigned long long)g_RC_callThreadAddr);
+    }
     if (g_RC_wedgeKeepPorts) {
         printf("[%s:%d] wedged trojan — keeping both exception ports alive and armed\n",
                __FUNCTION__, __LINE__);
+        NSLog(@"[PUSH-KEEP] abandon: keeping both exception ports alive and armed (wedged trojan)");
     } else {
         destroy_exception_port(g_RC_firstExceptionPort);
         destroy_exception_port(g_RC_secondExceptionPort);
@@ -1607,6 +1633,46 @@ int destroy_remote_call(void) {
     return res;
 }
 
+// Is the synthetic call thread still linked into the target's thread list?
+//
+// The thread lives inside the target (SpringBoard) and sits parked on one of our
+// sentinels between crossings: it faults at 0x401, we reply with the same state,
+// it faults at 0x401 again. Those faults are delivered to the second exception
+// port, so that port is the only thing between "the thread is blocked in the
+// kernel" and "SpringBoard takes an unhandled EXC_BAD_ACCESS and dies".
+//
+// The answer comes from the target's own task_struct, read through the kernel
+// read primitive. A thread that is still linked into the task is still inside
+// SpringBoard, and destroying the ports while it is there is the SIGBUS at
+// pc=0x401 that the crash report shows.
+//
+// An empty list means the target is gone -- the thread died with it -- or that
+// the read missed. The second case is the dangerous one, so an empty list is
+// only believed after a second, independent scan agrees.
+static bool rc_synthetic_thread_still_in_target(uint64_t taskAddr, uint64_t threadAddr)
+{
+    if (!taskAddr || !threadAddr) return false;
+
+    for (int attempt = 0; attempt < 25; attempt++) {
+        clear_remote_shmem_cache();
+        NSArray<NSNumber *> *threads = collect_all_task_threads(taskAddr);
+        bool found = false;
+        for (NSNumber *n in threads) {
+            if (n.unsignedLongLongValue == threadAddr) { found = true; break; }
+        }
+        if (!found) {
+            // One clean scan is not proof on its own. If the next scan agrees,
+            // the thread is really gone.
+            if (attempt == 0) { usleep(20000); continue; }
+            return false;
+        }
+        // Still there. The unwind that pthread_exit started needs a moment to
+        // finish before it leaves the task's thread list.
+        usleep(20000);
+    }
+    return true;
+}
+
 int destroy_remote_call_internal(void) {
     if (g_RC_vphoneBridge) {
         g_RC_vphoneBridge = false;
@@ -1644,9 +1710,38 @@ int destroy_remote_call_internal(void) {
         } else {
             do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
         }
+        // pthread_exit never returns, so a thread that really took it cannot
+        // fault at 0x401 again and the ports are free to go. But "really took
+        // it" is not something the call above reports: the cleanup form returns
+        // 0 whether the crossing landed or wait1 timed out, and in the timeout
+        // case the thread is still parked on 0x301 with the second exception
+        // port as its only way back out.
+        //
+        // So ask the target instead of trusting the call. Its thread list is
+        // the ground truth, and a thread that is still linked into the task is
+        // still inside SpringBoard.
+        if (g_RC_callThreadAddr && g_RC_taskAddr &&
+            rc_synthetic_thread_still_in_target(g_RC_taskAddr, g_RC_callThreadAddr)) {
+            g_RC_wedgeKeepPorts = true;
+            NSLog(@"[PUSH-KEEP] destroy: synthetic thread 0x%llx is still inside the target after pthread_exit — keeping both exception ports armed",
+                  (unsigned long long)g_RC_callThreadAddr);
+        }
     }
     else {
-        restore_trojan_thread(&g_RC_originalState);
+        // The hijacked thread is restored here and the first exception port is
+        // how it gets its original state back. When the restore fails the thread
+        // stays parked on 0x101 inside SpringBoard, so that port has to stay
+        // armed for it -- same crash, other sentinel.
+        //
+        // A session that is already wedged is not retried: the restore has
+        // already failed once, it costs the full restore timeout, and the
+        // outcome does not change. What matters is that the ports survive.
+        if (g_RC_wedgeKeepPorts) {
+            NSLog(@"[PUSH-KEEP] destroy: session already wedged — skipping the restore, keeping both exception ports armed");
+        } else if (!restore_trojan_thread(&g_RC_originalState)) {
+            g_RC_wedgeKeepPorts = true;
+            NSLog(@"[PUSH-KEEP] destroy: restore_trojan_thread failed — the hijacked thread is still parked — keeping both exception ports armed");
+        }
     }
 
     // Same rule as abandon: a thread that is still parked on a sentinel needs its
@@ -1655,6 +1750,10 @@ int destroy_remote_call_internal(void) {
     if (g_RC_wedgeKeepPorts) {
         printf("[%s:%d] wedged trojan — keeping both exception ports alive and armed\n",
                __FUNCTION__, __LINE__);
+        NSLog(@"[PUSH-KEEP] destroy: keeping both exception ports alive and armed (wedged trojan)");
+        // Nulled, not destroyed: the receive right stays in this task, so the
+        // port stays armed for a thread that may still fault into it. Destroying
+        // it is what turns the next fault into a SIGBUS in SpringBoard.
         g_RC_firstExceptionPort = MACH_PORT_NULL;
         g_RC_secondExceptionPort = MACH_PORT_NULL;
     } else {
