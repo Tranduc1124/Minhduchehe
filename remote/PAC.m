@@ -179,6 +179,26 @@ static uint64_t g_pacMissKeyB = 0;
 static uint64_t g_pacMissAddr = 0;
 static uint64_t g_pacMissMod = 0;
 static uint64_t g_pacAtUS = 0;
+// The five key fields of the last miss and of the last entry that was
+// stored. They are printed side by side, so which one differs is visible
+// without having to reason about it.
+static uint64_t g_pacMissNow[5] = {0,0,0,0,0};
+static uint64_t g_pacStored[5] = {0,0,0,0,0};
+
+// The part of the modifier that identifies what is being signed.
+//
+// The modifier is the string discriminator blended with the thread's
+// diversifier, and the blend keeps the discriminator's high bits and takes
+// the diversifier's low ones. Only the high bits say which string it is,
+// "pc" or "lr"; the rest is the diversifier, and the diversifier is not
+// stable from one fault to the next.
+//
+// It cannot matter whether it is stable: the engine has been signing every
+// fault with whatever diversifier came with it, thousands of times a second,
+// and the target has accepted every one of them. So the key keeps the
+// discriminator and drops the diversifier, and the signature that comes back
+// is one the target has already accepted for this address.
+#define PAC_MODIFIER_KEEP 0xFFFF000000000000ULL
 
 static uint64_t pac_now_us(void)
 {
@@ -188,16 +208,25 @@ static uint64_t pac_now_us(void)
 }
 
 static void pac_report(uint64_t nowUS)
-{    if (nowUS - g_pacAtUS < 1000000ULL) return;
+{
+    if (nowUS - g_pacAtUS < 1000000ULL) return;
     g_pacAtUS = nowUS;
-    NSLog(@"[PUSH-PAC] calls=%llu hits=%llu missSP=%llu missKeyA=%llu missKeyB=%llu missAddr=%llu missMod=%llu",
+    NSLog(@"[PUSH-PAC] calls=%llu hits=%llu mSp=%llu mKeyA=%llu mKeyB=%llu mAddr=%llu mMod=%llu "
+          @"now(sp=%llx kA=%llx kB=%llx addr=%llx mod=%llx) "
+          @"ent(sp=%llx kA=%llx kB=%llx addr=%llx mod=%llx)",
           (unsigned long long)g_pacCalls,
           (unsigned long long)g_pacHits,
           (unsigned long long)g_pacMissSp,
           (unsigned long long)g_pacMissKeyA,
           (unsigned long long)g_pacMissKeyB,
           (unsigned long long)g_pacMissAddr,
-          (unsigned long long)g_pacMissMod);
+          (unsigned long long)g_pacMissMod,
+          (unsigned long long)g_pacMissNow[0], (unsigned long long)g_pacMissNow[1],
+          (unsigned long long)g_pacMissNow[2], (unsigned long long)g_pacMissNow[3],
+          (unsigned long long)g_pacMissNow[4],
+          (unsigned long long)g_pacStored[0], (unsigned long long)g_pacStored[1],
+          (unsigned long long)g_pacStored[2], (unsigned long long)g_pacStored[3],
+          (unsigned long long)g_pacStored[4]);
     g_pacCalls = 0;
     g_pacHits = 0;
     g_pacMissSp = 0;
@@ -234,6 +263,8 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
         return -1;
     }
     uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
+    // The diversifier is dropped from the key. See PAC_MODIFIER_KEEP.
+    const uint64_t modKey = modifier & PAC_MODIFIER_KEEP;
 
     pthread_mutex_lock(&g_pacSigLock);
     uint64_t mSp = 0, mKeyA = 0, mKeyB = 0, mAddr = 0, mMod = 0;
@@ -246,9 +277,9 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
         if (e->keyA == keyA) mKeyA++;
         if (e->keyB == keyB) mKeyB++;
         if (e->address == address) mAddr++;
-        if (e->modifier == modifier) mMod++;
+        if (e->modifier == modKey) mMod++;
         if (e->sp == sp && e->keyA == keyA && e->keyB == keyB &&
-            e->address == address && e->modifier == modifier) {
+            e->address == address && e->modifier == modKey) {
             hit = true;
             hitValue = e->signedValue;
             break;
@@ -267,6 +298,11 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     g_pacMissKeyB = mKeyB;
     g_pacMissAddr = mAddr;
     g_pacMissMod = mMod;
+    g_pacMissNow[0] = sp;
+    g_pacMissNow[1] = keyA;
+    g_pacMissNow[2] = keyB;
+    g_pacMissNow[3] = address;
+    g_pacMissNow[4] = modifier;
     pac_report(pac_now_us());
 
     // The stack is cleared on every run, not only on the first: the kernel
@@ -355,8 +391,13 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     e->keyA = keyA;
     e->keyB = keyB;
     e->address = address;
-    e->modifier = modifier;
+    e->modifier = modKey;
     e->signedValue = signedAddress;
+    g_pacStored[0] = sp;
+    g_pacStored[1] = keyA;
+    g_pacStored[2] = keyB;
+    g_pacStored[3] = address;
+    g_pacStored[4] = modifier;
     pthread_mutex_unlock(&g_pacSigLock);
 
     pac_cleanup(pacThread, exceptionPort, stack);
