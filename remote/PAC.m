@@ -15,7 +15,6 @@
 #import <dlfcn.h>
 #import <pthread.h>
 #import <mach/mach.h>
-#import <mach/mach_time.h>
 
 extern bool gIsPACSupported;
 
@@ -88,152 +87,8 @@ void pac_cleanup(mach_port_t pacThread, mach_port_t exceptionPort, void *stack)
         mach_port_deallocate(mach_task_self_, pacThread);
     }
     destroy_exception_port(exceptionPort);
-    // The stack is not freed here. It is the one the pacia gadget runs on and
-    // it lives for the life of the process, so that the address it sits at
-    // does not change from one signature to the next.
-    (void)stack;
-}
-
-// The stack the pacia gadget runs on.
-//
-// It used to be allocated and freed around every single signature. The
-// address the allocator handed back was usually the same one every time, so
-// the signatures were the same, and it was recomputed thousands of times a
-// second anyway. Now it is allocated once and kept, so the address is fixed
-// and the signature of a given pair of inputs is fixed too.
-//
-// The address is the one the old code allocated on its first call, and the
-// allocator gave that same block back on every call after it, so the
-// signatures that come out are the ones the engine has been producing all
-// along.
-//
-// The stack is still cleared before every run: the kernel pushes the
-// exception frame onto it, and the gadget's RET has to find a zero there to
-// fault where the catcher expects it.
-static void *g_pacStack = NULL;
-
-static void *pac_stack(void)
-{
-    if (!g_pacStack) {
-        g_pacStack = malloc(0x4000);
-        if (g_pacStack) memset(g_pacStack, 0, 0x4000);
-    }
-    return g_pacStack;
-}
-
-// The signature of one (address, modifier) pair.
-//
-// PACIA is a pure function of the value it signs, the modifier, the SP it runs
-// with, and the two PAC keys of the thread it runs in. The crossing engine
-// signs the same handful of values thousands of times a second: the program
-// counter of the function being called, and the 0x401 return sentinel.
-//
-// Computing one costs a thread, an exception port and a 16KB stack, and all
-// three are created and torn down again for the sake of a single instruction.
-// At 55 crossings a frame and 50 frames a second that is roughly eleven
-// thousand thread creations and eleven thousand mach ports a second, and it
-// is what the "pac" bucket of the crossing cost log is made of: 86 to 127
-// microseconds on every crossing, a third of the whole thing.
-//
-// The cache key is everything the signature depends on, including the stack
-// address, so a hit returns exactly what a fresh computation would have
-// returned. The stack address is in the key because PACIA uses the SP as its
-// context, and because the allocator hands back the same block every time: if
-// it ever hands back a different one, the signature is different and the
-// cache misses rather than returning the wrong value.
-//
-// The keys are read from the target thread on every call, not cached, so a
-// target that respawns under different keys misses the cache instead of
-// signing with keys that are no longer its own.
-#define PAC_SIG_SLOTS 64
-typedef struct {
-    uint8_t  used;
-    uint64_t sp;
-    uint64_t keyA;
-    uint64_t keyB;
-    uint64_t address;
-    uint64_t modifier;
-    uint64_t signedValue;
-} PacSigEntry;
-static PacSigEntry g_pacSig[PAC_SIG_SLOTS];
-static int g_pacSigNext = 0;
-static pthread_mutex_t g_pacSigLock = PTHREAD_MUTEX_INITIALIZER;
-
-// What the cache is seeing.
-//
-// A miss on every call means one of the key's fields changes every time, and
-// the fields are not equally likely: the address and the modifier change when
-// the engine signs a different value, which is normal, while the stack, the
-// keys and the modifier of the same value should not change at all.
-//
-// So a miss counts, over the entries in the cache, how many of them match on
-// each field separately. The field with no match is the one that moved, and
-// the line says so. Without this the only symptom is that the pac bucket of
-// the crossing cost log does not go down, which says what is wrong but not
-// where.
-static uint64_t g_pacCalls = 0;
-static uint64_t g_pacHits = 0;
-static uint64_t g_pacMissSp = 0;
-static uint64_t g_pacMissKeyA = 0;
-static uint64_t g_pacMissKeyB = 0;
-static uint64_t g_pacMissAddr = 0;
-static uint64_t g_pacMissMod = 0;
-static uint64_t g_pacAtUS = 0;
-// The five key fields of the last miss and of the last entry that was
-// stored. They are printed side by side, so which one differs is visible
-// without having to reason about it.
-static uint64_t g_pacMissNow[5] = {0,0,0,0,0};
-static uint64_t g_pacStored[5] = {0,0,0,0,0};
-
-// The part of the modifier that identifies what is being signed.
-//
-// The modifier is the string discriminator blended with the thread's
-// diversifier, and the blend keeps the discriminator's high bits and takes
-// the diversifier's low ones. Only the high bits say which string it is,
-// "pc" or "lr"; the rest is the diversifier, and the diversifier is not
-// stable from one fault to the next.
-//
-// It cannot matter whether it is stable: the engine has been signing every
-// fault with whatever diversifier came with it, thousands of times a second,
-// and the target has accepted every one of them. So the key keeps the
-// discriminator and drops the diversifier, and the signature that comes back
-// is one the target has already accepted for this address.
-#define PAC_MODIFIER_KEEP 0xFFFF000000000000ULL
-
-static uint64_t pac_now_us(void)
-{
-    static mach_timebase_info_data_t tb = {0};
-    if (tb.denom == 0) mach_timebase_info(&tb);
-    return (mach_absolute_time() * tb.numer / tb.denom) / 1000ULL;
-}
-
-static void pac_report(uint64_t nowUS)
-{
-    if (nowUS - g_pacAtUS < 1000000ULL) return;
-    g_pacAtUS = nowUS;
-    NSLog(@"[PUSH-PAC] calls=%llu hits=%llu mSp=%llu mKeyA=%llu mKeyB=%llu mAddr=%llu mMod=%llu "
-          @"now(sp=%llx kA=%llx kB=%llx addr=%llx mod=%llx) "
-          @"ent(sp=%llx kA=%llx kB=%llx addr=%llx mod=%llx)",
-          (unsigned long long)g_pacCalls,
-          (unsigned long long)g_pacHits,
-          (unsigned long long)g_pacMissSp,
-          (unsigned long long)g_pacMissKeyA,
-          (unsigned long long)g_pacMissKeyB,
-          (unsigned long long)g_pacMissAddr,
-          (unsigned long long)g_pacMissMod,
-          (unsigned long long)g_pacMissNow[0], (unsigned long long)g_pacMissNow[1],
-          (unsigned long long)g_pacMissNow[2], (unsigned long long)g_pacMissNow[3],
-          (unsigned long long)g_pacMissNow[4],
-          (unsigned long long)g_pacStored[0], (unsigned long long)g_pacStored[1],
-          (unsigned long long)g_pacStored[2], (unsigned long long)g_pacStored[3],
-          (unsigned long long)g_pacStored[4]);
-    g_pacCalls = 0;
-    g_pacHits = 0;
-    g_pacMissSp = 0;
-    g_pacMissKeyA = 0;
-    g_pacMissKeyB = 0;
-    g_pacMissAddr = 0;
-    g_pacMissMod = 0;
+    if (stack)
+        free(stack);
 }
 
 uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifier) {
@@ -253,62 +108,6 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     
     uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
     uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
-
-    // The stack comes first, before the thread and the port, because the
-    // stack address is part of the signature and the lookup needs to know it.
-    // It is the same stack, at the same address, on every call.
-    void* stack = pac_stack();
-    if (!stack) {
-        printf("[%s:%d] pac stack allocation failed\n", __FUNCTION__, __LINE__);
-        return -1;
-    }
-    uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
-    // The diversifier is dropped from the key. See PAC_MODIFIER_KEEP.
-    const uint64_t modKey = modifier & PAC_MODIFIER_KEEP;
-
-    pthread_mutex_lock(&g_pacSigLock);
-    uint64_t mSp = 0, mKeyA = 0, mKeyB = 0, mAddr = 0, mMod = 0;
-    bool hit = false;
-    uint64_t hitValue = 0;
-    for (int i = 0; i < PAC_SIG_SLOTS; i++) {
-        const PacSigEntry *e = &g_pacSig[i];
-        if (!e->used) continue;
-        if (e->sp == sp) mSp++;
-        if (e->keyA == keyA) mKeyA++;
-        if (e->keyB == keyB) mKeyB++;
-        if (e->address == address) mAddr++;
-        if (e->modifier == modKey) mMod++;
-        if (e->sp == sp && e->keyA == keyA && e->keyB == keyB &&
-            e->address == address && e->modifier == modKey) {
-            hit = true;
-            hitValue = e->signedValue;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_pacSigLock);
-
-    g_pacCalls++;
-    if (hit) {
-        g_pacHits++;
-        pac_report(pac_now_us());
-        return hitValue;
-    }
-    g_pacMissSp = mSp;
-    g_pacMissKeyA = mKeyA;
-    g_pacMissKeyB = mKeyB;
-    g_pacMissAddr = mAddr;
-    g_pacMissMod = mMod;
-    g_pacMissNow[0] = sp;
-    g_pacMissNow[1] = keyA;
-    g_pacMissNow[2] = keyB;
-    g_pacMissNow[3] = address;
-    g_pacMissNow[4] = modifier;
-    pac_report(pac_now_us());
-
-    // The stack is cleared on every run, not only on the first: the kernel
-    // pushes the exception frame onto it, and the gadget's RET has to find a
-    // zero there to fault where the catcher is listening.
-    memset(stack, 0, 0x4000);
     
     mach_port_t pacThread = MACH_PORT_NULL;
     kern_return_t kr = thread_create(mach_task_self_, &pacThread);
@@ -316,6 +115,10 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
         printf("[%s:%d] thread_create failed, kr = %s (0x%x)\n", __FUNCTION__, __LINE__, mach_error_string(kr), kr);
         return -1;
     }
+    
+    void* stack = malloc(0x4000);
+    memset(stack, 0, 0x4000);
+    uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
     
     arm_thread_state64_internal state;
     memset(&state, 0, sizeof(state));
@@ -380,25 +183,6 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     }
     
     uint64_t signedAddress = exc.threadState.__x[16];
-
-    // Remember it. The next call for the same value, with the same keys and
-    // the same stack, gets the same signature and skips the whole thread.
-    pthread_mutex_lock(&g_pacSigLock);
-    PacSigEntry *e = &g_pacSig[g_pacSigNext];
-    g_pacSigNext = (g_pacSigNext + 1) % PAC_SIG_SLOTS;
-    e->used = 1;
-    e->sp = sp;
-    e->keyA = keyA;
-    e->keyB = keyB;
-    e->address = address;
-    e->modifier = modKey;
-    e->signedValue = signedAddress;
-    g_pacStored[0] = sp;
-    g_pacStored[1] = keyA;
-    g_pacStored[2] = keyB;
-    g_pacStored[3] = address;
-    g_pacStored[4] = modifier;
-    pthread_mutex_unlock(&g_pacSigLock);
 
     pac_cleanup(pacThread, exceptionPort, stack);
     

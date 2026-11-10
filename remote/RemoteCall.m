@@ -1426,6 +1426,40 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return 0;
     }
 
+    // The fault has to be one of our sentinels.
+    //
+    // The synthetic thread is parked on 0x301 when it is created and on 0x401
+    // between calls, so the only faults that belong to this engine are those
+    // two addresses. A fault anywhere else means the thread faulted on its own
+    // -- inside the function that was called, or on a pointer that was not
+    // valid.
+    //
+    // Replying to such a fault would resume the thread from a state that
+    // belongs to a different call, and it would execute at an address nobody
+    // chose. That is a dead SpringBoard: the crash of 2026-11-10 18:30:31 is
+    // exactly that, a fault at a PC with a stray bit in it, which the kernel
+    // answers with SIGKILL and "Invalid Page".
+    //
+    // So the sentinel is checked. A fault that is not one of them poisons the
+    // crossing instead of being replied to: the session stops, the overlay
+    // goes quiet, and the process that draws the overlay stays alive.
+    {
+        const uint64_t faultPC = native_strip(exc.threadState.__pc);
+        if (faultPC != FAKE_PC_TROJAN && faultPC != FAKE_LR_TROJAN) {
+            RC_DIAG("stable/%s wait1 UNEXPECTED fault pc=0x%llx (expected 0x%x or 0x%x) — poisoning the crossing",
+                    name ?: "(addr-call)",
+                    (unsigned long long)faultPC,
+                    (unsigned)FAKE_PC_TROJAN,
+                    (unsigned)FAKE_LR_TROJAN);
+            g_RC_crossingPoisoned = true;
+            // The thread is still in there, parked on whatever it faulted on,
+            // and the ports are the only way it can be reached. Keep them.
+            g_RC_wedgeKeepPorts = true;
+            g_RC_success = false;
+            return 0;
+        }
+    }
+
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
     exc.threadState.__x[2] = x2;
