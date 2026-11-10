@@ -72,6 +72,19 @@ uint64_t r_ivar_value(uint64_t obj, const char *ivarName);
 uint64_t r_dlsym_call(int timeout, const char *fnName,
                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+// The same call, for a function whose return value nobody reads.
+//
+// The function still runs to completion in the target. What is saved is the
+// wait for its return fault and the reply that re-parks the thread, which is
+// one exception round trip per call. The state left behind is the same one a
+// waited call leaves: one pending fault at the sentinel, thread parked.
+//
+// Use it only where the return value is genuinely ignored. A call whose
+// result is read must use r_dlsym_call, or the value it returns is the
+// previous call's.
+uint64_t r_dlsym_call_void(const char *fnName,
+                           uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 
 // Copies the UTF-8 bytes of a remote NSString into a local C buffer (NUL
 // terminated, truncated to outLen-1). Returns true only if at least one

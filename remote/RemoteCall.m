@@ -96,7 +96,10 @@ static void rc_note_call_cost(uint64_t tStart, uint64_t tW1, uint64_t tSign) {
     s_ccRestUS = (s_ccN && total / s_ccN < win / s_ccN)
         ? (win - total) : 0;   // wall time in the call minus the parts we timed
     s_ccAtUS = now;
-    NSLog(@"[SB-CALL] n=%llu per=%lluus w1=%lluus pac=%lluus w2=%lluus rest=%lluus win=%llums",
+    // PUSH-CALL, not SB-CALL. The tag is the only thing that decides whether
+    // this line survives the log filter, and the filter that matters here is
+    // the one on PUSH. A cost breakdown nobody can see is not a measurement.
+    NSLog(@"[PUSH-CALL] n=%llu per=%lluus w1=%lluus pac=%lluus w2=%lluus rest=%lluus win=%llums",
           (unsigned long long)s_ccN,
           (unsigned long long)(s_ccN ? win / s_ccN : 0),
           (unsigned long long)(s_ccN ? s_ccW1US / s_ccN : 0),
@@ -1208,7 +1211,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &exc.threadState);
 
-    if (timeout < 0) {
+    // Only the cleanup spelling skips the wait here. The temp path runs on the
+    // hijacked thread during init, and its crossings are not mixed with the
+    // synthetic thread's, so there is nothing to gain from skipping the wait
+    // and a lot to lose: the trojan thread is the one the restore depends on.
+    if (timeout == RC_TIMEOUT_CLEANUP) {
         printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
         return 0;
     }
@@ -1243,7 +1250,10 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
     pthread_mutex_lock(&g_universal_ipc_mutex);
     uint64_t res = 0;
     if (g_RC_vphoneBridge) {
-        if (timeout >= 0)
+        // RC_TIMEOUT_CLEANUP skips the call entirely: the thread is being
+        // killed. RC_TIMEOUT_NORET still makes the call, it just does not read
+        // the return value, so it must not be skipped here.
+        if (timeout != RC_TIMEOUT_CLEANUP)
             res = rc_vphone_bridge_call(2, 0, name, x0, x1, x2, x3, x4, x5, x6, x7);
         pthread_mutex_unlock(&g_universal_ipc_mutex);
         return res;
@@ -1352,7 +1362,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
 {
     if (g_RC_vphoneBridge) {
-        if (timeout < 0) return 0;
+        if (timeout == RC_TIMEOUT_CLEANUP) return 0;
         if (rc_vphone_bridge_unsafe_addr_call_name(name)) {
             printf("[VPHONE-BRIDGE] blocked unsafe addr-call name=%s addr=%#llx\n",
                    name ?: "(null)", pcAddr);
@@ -1433,7 +1443,28 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
-        printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
+        // The caller does not want the return value. Two reasons a call lands
+        // here, and they differ in what is left behind.
+        //
+        // RC_TIMEOUT_CLEANUP is pthread_exit: the function never returns, the
+        // thread is gone, and nothing is pending afterwards.
+        //
+        // RC_TIMEOUT_NORET is an ordinary function whose return value nobody
+        // reads. The thread runs it now and faults at 0x401 when it returns,
+        // and that fault stays in the port for the next crossing to pick up.
+        // The state left behind is the one a waited call leaves as well: one
+        // pending fault at 0x401, thread parked, nothing to clean up.
+        //
+        // What is saved is the second delivery. A waited call pays for the
+        // function's own return fault and then for the reply that re-parks
+        // the thread, which faults a second time so the next call has
+        // something to pick up. Not waiting leaves the return fault pending
+        // instead, and the next call picks that up. One delivery per call
+        // instead of two, with the same end state either way.
+        if (timeout == RC_TIMEOUT_CLEANUP) {
+            printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
+        }
+        rc_note_call_cost(tCallStart, tW1Done, tSignDone);
         return 0;
     }
 

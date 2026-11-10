@@ -119,6 +119,28 @@ uint64_t r_dlsym_call(int timeout, const char *fnName,
     return r_call_stable(timeout, fnName, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
+// A call whose return value nobody reads.
+//
+// It goes through the same engine with RC_TIMEOUT_NORET, which replies with
+// the new program counter and does not wait for the return fault. The fault
+// stays in the port and the next crossing picks it up, so the thread is
+// parked in exactly the same state a waited call leaves it in, and the call
+// costs one exception delivery instead of two.
+//
+// The timeout argument is deliberately absent: the engine derives the wait
+// from the floor (10s) when the timeout is negative, so there is nothing for
+// a caller to tune here.
+uint64_t r_dlsym_call_void(const char *fnName,
+                           uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    pthread_mutex_lock(&gRemoteCallLock);
+    uint64_t ret = do_remote_call_stable(RC_TIMEOUT_NORET, fnName,
+                                          a0, a1, a2, a3, a4, a5, a6, a7);
+    pthread_mutex_unlock(&gRemoteCallLock);
+    return ret;
+}
+
 // remote_write() goes through the vm_map_entry hijack, so it can silently land
 // in a stale alias and leave the target's real page untouched. Nothing about its
 // return value tells us that, and a NULL objc_getClass() looks exactly the same

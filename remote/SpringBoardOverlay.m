@@ -102,6 +102,11 @@ static uint64_t g_sbPersistentPath = 0;
 static uint64_t g_sbPathRing[SB_PATH_HOLD_FRAMES] = {0};
 static int g_sbPathRingAt = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
+// How far into the point buffer the publish has written. Every set of points
+// gets its own region, because the calls that are not waited for would
+// otherwise have their points overwritten before the target reads them. See
+// sb_pts_reserve.
+static uint64_t g_sbPtsOffset = 0;
 // How many presents were skipped because the path pointer never reached the
 // target. Zero means remote_write has not silently lost one; anything else means
 // the flicker has a cause and it is not the geometry.
@@ -427,6 +432,30 @@ static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t 
         NSLog(@"[PUSH-DLSYM] %s broke the session (fn=%p)", fn, (const void *)fn);
     }
     return r;
+}
+
+// A remote call whose return value nobody reads.
+//
+// The publish makes 40 to 55 CoreGraphics crossings and the name glyphs are
+// most of them. Each one used to pay for two exception round trips: the
+// function's own return fault, and then the reply that re-parks the thread,
+// which faults a second time so the next call has something to pick up.
+//
+// Not waiting for the return leaves that fault pending instead, and the next
+// crossing picks it up. The thread ends up parked in exactly the state a
+// waited call leaves it in -- one pending fault at the 0x401 sentinel -- so
+// this changes the cost and not the mechanism.
+//
+// Only for calls whose result is genuinely ignored. A call whose result is
+// read has to stay on dlsym_remote, or it reads the previous call's value
+// instead of its own.
+static void dlsym_remote_void(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
+                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    const int okBefore = remote_call_current_success() ? 1 : 0;
+    (void)r_dlsym_call_void(fn, a0, a1, a2, a3, a4, a5, a6, a7);
+    if (okBefore && !remote_call_current_success()) {
+        NSLog(@"[PUSH-DLSYM] %s broke the session (fn=%p)", fn, (const void *)fn);
+    }
 }
 
 static uint64_t now_us(void) {
@@ -1038,6 +1067,10 @@ static void sb_forget_local_paint_state(void) {
     g_sbTextArgBuf = 0;
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
+    // The point buffer died with the session, so the bump into it starts over.
+    // A new session gets a new buffer and the old offset would point past its
+    // end.
+    g_sbPtsOffset = 0;
     // The remote session is going away, so the path it was holding is not ours to
     // release later. Clearing it here also puts the off edge back to "nothing is
     // showing", so a rearmed overlay that starts with the counter off does not try
@@ -1096,10 +1129,48 @@ static uint64_t persistentPath(void) {
     return g_sbPersistentPath;
 }
 
+// The point buffer in the target, and the bump pointer into it.
+//
+// The buffer holds every set of points one publish hands to CoreGraphics. It
+// used to be 64KB and every call reused the same place in it, which was safe
+// only because every call was waited for: the target read the points after
+// the reply, and the next write could not happen until that call had
+// returned.
+//
+// The calls that do not need a return value are not waited for, and that
+// breaks the reuse. The target reads the points after the reply, so a write
+// that follows the reply can land in the buffer the target has not read yet,
+// and the path is then built from the wrong points: the name comes out as
+// another name's glyphs, or as noise.
+//
+// So every set of points gets its own region, and a region is only recycled
+// after a waited call has proved that the calls before it have returned. The
+// buffer holds several publishes, so the recycling is rare.
+#define SB_PTS_CAPACITY (512 * 1024)
+
 static uint64_t ptsBuffer(void) {
     if (g_sbMirrorPtsBuf) return g_sbMirrorPtsBuf;
-    g_sbMirrorPtsBuf = dlsym_remote("malloc", 65536, 0,0,0,0,0,0,0);
+    g_sbMirrorPtsBuf = dlsym_remote("malloc", SB_PTS_CAPACITY, 0,0,0,0,0,0,0);
     return g_sbMirrorPtsBuf;
+}
+
+// Reserve room for one set of points and return where it goes, or 0 when the
+// request cannot be satisfied.
+//
+// Out of room means the buffer has to be recycled, and recycling is only
+// allowed once everything written into it has been read. A waited call is
+// that proof: its wait1 consumes the pending fault of the last call that was
+// not waited for, and a call cannot leave a pending fault before it has
+// returned. So one waited call, and the buffer is free again.
+static uint64_t sb_pts_reserve(size_t bytes) {
+    if (bytes > SB_PTS_CAPACITY) return 0;
+    if (g_sbPtsOffset + bytes > SB_PTS_CAPACITY) {
+        (void)dlsym_remote("getpid", 0,0,0,0,0,0,0,0);
+        g_sbPtsOffset = 0;
+    }
+    const uint64_t addr = ptsBuffer() + g_sbPtsOffset;
+    g_sbPtsOffset += bytes;
+    return addr;
 }
 
 static BOOL sb_ensure_setpath_invocation(void) {
@@ -2537,7 +2608,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             // Retire the path that fell out of the hold window, not the one the
             // previous present used.
             if (g_sbPathRing[g_sbPathRingAt]) {
-                dlsym_remote("CGPathRelease", g_sbPathRing[g_sbPathRingAt], 0,0,0,0,0,0,0);
+                dlsym_remote_void("CGPathRelease", g_sbPathRing[g_sbPathRingAt], 0,0,0,0,0,0,0);
                 g_sbPathRing[g_sbPathRingAt] = 0;
             }
             g_sbPathRing[g_sbPathRingAt] = freshPath;
@@ -2687,7 +2758,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 textPathReady = 1;
                                 if (r_is_objc_ptr(rpT)) {
                                     if (r_is_objc_ptr(g_sbTextPath)) {
-                                        dlsym_remote("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
+                                        dlsym_remote_void("CGPathRelease", g_sbTextPath, 0,0,0,0,0,0,0);
                                         calls += 1;
                                     }
                                     g_sbTextPath = 0;
@@ -2706,7 +2777,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 nameBgReady = 1;
                                 if (r_is_objc_ptr(g_sbNameBgShape)) {
                                     if (r_is_objc_ptr(g_sbNameBgPath)) {
-                                        dlsym_remote("CGPathRelease", g_sbNameBgPath, 0,0,0,0,0,0,0);
+                                        dlsym_remote_void("CGPathRelease", g_sbNameBgPath, 0,0,0,0,0,0,0);
                                         calls += 1;
                                     }
                                     g_sbNameBgPath = 0;
@@ -2719,7 +2790,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                                 nameTextReady = 1;
                                 if (r_is_objc_ptr(g_sbNameTextShape)) {
                                     if (r_is_objc_ptr(g_sbNameTextPath)) {
-                                        dlsym_remote("CGPathRelease", g_sbNameTextPath, 0,0,0,0,0,0,0);
+                                        dlsym_remote_void("CGPathRelease", g_sbNameTextPath, 0,0,0,0,0,0,0);
                                         calls += 1;
                                     }
                                     g_sbNameTextPath = 0;
@@ -2732,9 +2803,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                             // switch, or a batch begun on one layer would finish
                             // into the next one's path.
                             if (rectDoubles >= 4) {
-                                remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-                                dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
-                                             rectDoubles / 4, 0, 0,0,0);
+                                uint64_t rectDst = sb_pts_reserve((size_t)rectDoubles * 8);
+                                if (rectDst) {
+                                    remote_write(rectDst, rectBuf, (size_t)rectDoubles * 8);
+                                    dlsym_remote_void("CGPathAddRects", dstPath, 0, rectDst,
+                                                     rectDoubles / 4, 0, 0,0,0);
+                                }
                                 calls++; drawn++;
                                 rectCalls++;
                                 rectDoubles = 0;
@@ -2957,14 +3031,20 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // back alongside the snapline. It also cost two remote
                         // calls each and took the frame from 15 calls to 115.
                         if (curLayer >= 6 && curLayer <= 8) {
-                            remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            uint64_t segDst = sb_pts_reserve((size_t)rn * 8);
+                            if (segDst) {
+                                remote_write(segDst, run, (size_t)rn * 8);
+                                dlsym_remote_void("CGPathAddLines", rp, 0, segDst, 2, 0,0,0,0);
+                            }
                             calls++; drawn++; optionalCalls++;
                         }
 #if SB_DRAW_BONES
                         else if (curLayer >= 3 && curLayer <= 5) {
-                            remote_write(ptsBuf, run, (size_t)rn * 8);
-                            dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 2, 0,0,0,0);
+                            uint64_t segDst = sb_pts_reserve((size_t)rn * 8);
+                            if (segDst) {
+                                remote_write(segDst, run, (size_t)rn * 8);
+                                dlsym_remote_void("CGPathAddLines", rp, 0, segDst, 2, 0,0,0,0);
+                            }
                             calls++; drawn++; optionalCalls++;
                         }
 #endif
@@ -2973,9 +3053,12 @@ void SBRemotePushESPFrame(UIView *espView) {
 
                 if (isRect) {
                     if (rectDoubles + 4 > (int)(sizeof(rectBuf)/sizeof(rectBuf[0]))) {
-                        remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
-                                     rectDoubles / 4, 0, 0,0,0);
+                        uint64_t rectDst2 = sb_pts_reserve((size_t)rectDoubles * 8);
+                        if (rectDst2) {
+                            remote_write(rectDst2, rectBuf, (size_t)rectDoubles * 8);
+                            dlsym_remote_void("CGPathAddRects", dstPath, 0, rectDst2,
+                                         rectDoubles / 4, 0, 0,0,0);
+                        }
                         calls++; drawn++;
                         rectCalls++;
                         rectDoubles = 0;
@@ -2997,16 +3080,22 @@ dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf,
                 // begins a new subpath at its first point, so separate calls
                 // never join: that is what the old single-polyline version got
                 // wrong and produced chords across the screen.
-                remote_write(ptsBuf, run, (size_t)rn * 8);
-dlsym_remote("CGPathAddLines", dstPath, 0, ptsBuf, np, 0,0,0,0);
+                uint64_t polyDst = sb_pts_reserve((size_t)rn * 8);
+                if (polyDst) {
+                    remote_write(polyDst, run, (size_t)rn * 8);
+                    dlsym_remote_void("CGPathAddLines", dstPath, 0, polyDst, np, 0,0,0,0);
+                }
                 calls++; drawn++;
                 if (!runIsName) optionalCalls++;
                 else nameCalls++;
             }
 
             if (rectDoubles >= 4) {
-                remote_write(ptsBuf, rectBuf, (size_t)rectDoubles * 8);
-dlsym_remote("CGPathAddRects", dstPath, 0, ptsBuf, rectDoubles / 4, 0,0,0,0);
+                uint64_t rectDst3 = sb_pts_reserve((size_t)rectDoubles * 8);
+                if (rectDst3) {
+                    remote_write(rectDst3, rectBuf, (size_t)rectDoubles * 8);
+                    dlsym_remote_void("CGPathAddRects", dstPath, 0, rectDst3, rectDoubles / 4, 0,0,0,0);
+                }
                 calls++; drawn++;
                 rectCalls++;
             }

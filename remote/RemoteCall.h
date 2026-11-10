@@ -64,6 +64,33 @@ extern uint64_t g_RC_targetProcOverride;
 int init_remote_call(const char* process, bool useMigFilterBypass);
 int init_remote_call_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
 int init_remote_call_original_thread_only_with_first_exception_timeout(const char* process, bool useMigFilterBypass, int firstExceptionTimeoutMS);
+// Timeout sentinels for the crossing engine.
+//
+// A negative timeout tells the engine that the caller does not want the return
+// value of the call.
+//
+// RC_TIMEOUT_CLEANUP is the original spelling and it also means "this call
+// ends the thread": the function is pthread_exit, which never returns, so
+// nothing is left waiting for a return fault.
+//
+// RC_TIMEOUT_NORET is the same skip with that meaning removed. The function
+// runs, returns, and faults at the sentinel; that fault is left in the port
+// for the NEXT crossing to pick up. The end state is identical to the one a
+// waited call leaves behind -- one pending fault at 0x401, thread parked --
+// so the two spellings can be mixed freely in one session.
+//
+// The reason it is worth having: a crossing that waits for its return pays
+// for two exception round trips, not one. The first is the function's own
+// return. The second is the reply that re-parks the thread, which makes it
+// fault again so the next call has something to pick up. A crossing that does
+// not wait leaves the return fault pending instead, and the next call picks
+// that up: same state, one delivery instead of two.
+//
+// The publish makes 40 to 55 of these, so this is the difference between a
+// publish that fits inside a 60 Hz frame and one that does not.
+#define RC_TIMEOUT_CLEANUP (-1)
+#define RC_TIMEOUT_NORET   (-2)
+
 uint64_t do_remote_call_stable(int timeout, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
 uint64_t do_remote_call_stable_addr(int timeout, uint64_t pcAddr, const char *name, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7);
 void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr);
