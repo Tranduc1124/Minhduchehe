@@ -91,6 +91,44 @@ void pac_cleanup(mach_port_t pacThread, mach_port_t exceptionPort, void *stack)
         free(stack);
 }
 
+// The signature of one (address, modifier) pair.
+//
+// PACIA is a pure function of the value it signs, the modifier, the SP it runs
+// with, and the two PAC keys of the thread it runs in. The crossing engine
+// signs the same handful of values thousands of times a second: the program
+// counter of the function being called, and the 0x401 return sentinel.
+//
+// Computing one costs a thread, an exception port and a 16KB stack, and all
+// three are created and torn down again for the sake of a single instruction.
+// At 55 crossings a frame and 50 frames a second that is roughly eleven
+// thousand thread creations and eleven thousand mach ports a second, and it
+// is what the "pac" bucket of the crossing cost log is made of: 86 to 127
+// microseconds on every crossing, a third of the whole thing.
+//
+// The cache key is everything the signature depends on, including the stack
+// address, so a hit returns exactly what a fresh computation would have
+// returned. The stack address is in the key because PACIA uses the SP as its
+// context, and because the allocator hands back the same block every time: if
+// it ever hands back a different one, the signature is different and the
+// cache misses rather than returning the wrong value.
+//
+// The keys are read from the target thread on every call, not cached, so a
+// target that respawns under different keys misses the cache instead of
+// signing with keys that are no longer its own.
+#define PAC_SIG_SLOTS 64
+typedef struct {
+    uint8_t  used;
+    uint64_t sp;
+    uint64_t keyA;
+    uint64_t keyB;
+    uint64_t address;
+    uint64_t modifier;
+    uint64_t signedValue;
+} PacSigEntry;
+static PacSigEntry g_pacSig[PAC_SIG_SLOTS];
+static int g_pacSigNext = 0;
+static pthread_mutex_t g_pacSigLock = PTHREAD_MUTEX_INITIALIZER;
+
 uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifier) {
     if(!gIsPACSupported)
         return address;
@@ -108,17 +146,41 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     
     uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
     uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
+
+    // The stack comes first, before the thread and the port, because the
+    // stack address is part of the signature and the lookup needs to know it.
+    // The allocation is the same size, in the same place in the sequence, as
+    // it was before the cache existed, so the address the allocator hands back
+    // is the same one it handed back then.
+    void* stack = malloc(0x4000);
+    if (!stack) {
+        printf("[%s:%d] malloc failed\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
+    uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
+
+    pthread_mutex_lock(&g_pacSigLock);
+    for (int i = 0; i < PAC_SIG_SLOTS; i++) {
+        const PacSigEntry *e = &g_pacSig[i];
+        if (e->used && e->sp == sp && e->keyA == keyA && e->keyB == keyB &&
+            e->address == address && e->modifier == modifier) {
+            const uint64_t hit = e->signedValue;
+            pthread_mutex_unlock(&g_pacSigLock);
+            free(stack);
+            return hit;
+        }
+    }
+    pthread_mutex_unlock(&g_pacSigLock);
+
+    memset(stack, 0, 0x4000);
     
     mach_port_t pacThread = MACH_PORT_NULL;
     kern_return_t kr = thread_create(mach_task_self_, &pacThread);
     if(kr != KERN_SUCCESS) {
         printf("[%s:%d] thread_create failed, kr = %s (0x%x)\n", __FUNCTION__, __LINE__, mach_error_string(kr), kr);
+        free(stack);
         return -1;
     }
-    
-    void* stack = malloc(0x4000);
-    memset(stack, 0, 0x4000);
-    uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
     
     arm_thread_state64_internal state;
     memset(&state, 0, sizeof(state));
@@ -183,6 +245,20 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     }
     
     uint64_t signedAddress = exc.threadState.__x[16];
+
+    // Remember it. The next call for the same value, with the same keys and
+    // the same stack, gets the same signature and skips the whole thread.
+    pthread_mutex_lock(&g_pacSigLock);
+    PacSigEntry *e = &g_pacSig[g_pacSigNext];
+    g_pacSigNext = (g_pacSigNext + 1) % PAC_SIG_SLOTS;
+    e->used = 1;
+    e->sp = sp;
+    e->keyA = keyA;
+    e->keyB = keyB;
+    e->address = address;
+    e->modifier = modifier;
+    e->signedValue = signedAddress;
+    pthread_mutex_unlock(&g_pacSigLock);
 
     pac_cleanup(pacThread, exceptionPort, stack);
     
