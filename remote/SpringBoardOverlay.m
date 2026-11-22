@@ -36,8 +36,6 @@
 #  import <IOSurface/IOSurfaceRef.h>
 // Function prototypes from IOSurface SPI (not in public header umbrella)
 extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern uint32_t      IOSurfaceGetID(IOSurfaceRef surface);
-extern IOSurfaceRef  IOSurfaceLookupFromID(uint32_t surfaceID);
 extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
@@ -48,8 +46,6 @@ extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
 // IOSurfaceRef.h not found at all — declare everything
 typedef void * IOSurfaceRef;
 extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern uint32_t      IOSurfaceGetID(IOSurfaceRef surface);
-extern IOSurfaceRef  IOSurfaceLookupFromID(uint32_t surfaceID);
 extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
@@ -2140,7 +2136,11 @@ int SBoardStartOverlay(void) {
             uint32_t surfID = (uint32_t)surfID64;
             NSLog(@"[SB-IOS] surfID=%u from SB", (unsigned)surfID);
 
-            IOSurfaceRef appSurf = (surfID != 0) ? IOSurfaceLookupFromID(surfID) : NULL;
+            // IOSurfaceLookupFromID not in SDK tbd -- resolve via dlsym at runtime
+            typedef IOSurfaceRef (*_lookup_t)(uint32_t);
+            static _lookup_t _lookup_fn = NULL;
+            if (!_lookup_fn) _lookup_fn = (_lookup_t)dlsym(RTLD_DEFAULT, "IOSurfaceLookupFromID");
+            IOSurfaceRef appSurf = (_lookup_fn && surfID != 0) ? _lookup_fn(surfID) : NULL;
             NSLog(@"[SB-IOS] appSurf=%p surfID=%u", (void *)appSurf, (unsigned)surfID);
 
             if (appSurf) {
