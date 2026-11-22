@@ -12,10 +12,10 @@ static NSString *const kGameIdFF = @"ff";
 static NSString *const kGameIdFFMax = @"ffmax";
 
 // Free Fire THG — from D:\Download\dump ff thg (current season)
-// TypeInfo (script.json): GameFacade 0xC012848, KBCJOEFJEFJ(AimAssist) 0xC015B80
+// TypeInfo (script.json, 1.134.1): GameFacade 0xBB4D150, IILKFCMKIBG(AimAssist) 0xBB4E780, GameVarDef 0xBB4D1F8
 // NOTE: field offsets often stay same across hotfixes; TypeInfo almost always moves.
 static const GameOffsets kOffsetsFF = {
-    .GameFacadeTypeInfo = 0xBB46A50, // 1.132.1: DSGames:FF_GAMEFACADE_CLASS
+    .GameFacadeTypeInfo = 0xBB4D150, // 1.134.1: COW.GameFacade_TypeInfo (script.json)
     .TypeInfoStatics = 0xB8,
     .CurrentGame = 0x0,
     .CurrentMatchGame = 0x8,
@@ -65,10 +65,10 @@ static const GameOffsets kOffsetsFF = {
     .AimSampleHead = 0xB0,       // m_aimInputSampleHead (1458231)
     .AimSampleFilled = 0xB4,     // m_aimInputSampleFilled (1458232)
     .AimSampleTickCounter = 0xB8, // m_aimInputSampleTickCounter (1458233)
-    .AimAssistTypeInfo = 0xBB48080, // 1.132.1: IILKFCMKIBG::.cctor ARM64 ADRP/ADD at 0x63B815C/0x63B8160
+    .AimAssistTypeInfo = 0xBB4E780, // 1.134.1: COW.GamePlay.IILKFCMKIBG_TypeInfo (script.json)
     .AaStaticKnolgmjlcef = 0x24,
     .AaStaticNfkcllpalej = 0x28,
-    .GameVarDefTypeInfo = 0xBB46AF8, // 1.132.1: adrp x22,#0xbb46000 / add x22,#0xaf8 (SampleAimInput 0x6B58518)
+    .GameVarDefTypeInfo = 0xBB4D1F8, // 1.134.1: COW.GameVarDef_TypeInfo (script.json)
     .GvdEnableCheckBuf = 0x458C,       // dump.cs GameVarDef.EnableCheckBuf — AC 0x5632eec ldrb cmp #1
     .GvdEnableAimInputSample = 0x458D, // dump.cs — SampleAimInput 0x6b58534 ldrb cmp #1
     .GvdAimInputSampleCount = 0x4590,  // dump.cs — FillAimInputSamples 0x6b58a28 ldr cmp #1
