@@ -1602,13 +1602,11 @@ static void sb_iosurface_probe(uint64_t containerLayer, double bounds[4]) {
         return;
     }
 
-    // Helper: NSNumber numberWithInt:
-    uint64_t nW    = r_msg2_main_raw(NSNum, "numberWithInt:", &W,  8, NULL,0,NULL,0,NULL,0);
-    uint64_t nH    = r_msg2_main_raw(NSNum, "numberWithInt:", &H,  8, NULL,0,NULL,0,NULL,0);
-    double bpe = 4.0;
-    uint64_t nBPE  = r_msg2_main_raw(NSNum, "numberWithInt:", &bpe,8, NULL,0,NULL,0,NULL,0);
-    double pf = 0x42475241;  // 'BGRA'
-    uint64_t nPF   = r_msg2_main_raw(NSNum, "numberWithInt:", &pf, 8, NULL,0,NULL,0,NULL,0);
+    // numberWithInteger: passes the value in x0 (register), no raw struct needed.
+    uint64_t nW   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)(int)W,   0,0,0);
+    uint64_t nH   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)(int)H,   0,0,0);
+    uint64_t nBPE = r_msg2_main(NSNum, "numberWithInteger:", 4,                  0,0,0);
+    uint64_t nPF  = r_msg2_main(NSNum, "numberWithInteger:", 0x42475241u,         0,0,0);
 
     // Keys as NSStrings
     uint64_t kW   = r_nsstr_retained("IOSurfaceWidth");
@@ -1642,7 +1640,7 @@ static void sb_iosurface_probe(uint64_t containerLayer, double bounds[4]) {
 
     // Lock the surface, remote_read its base address, fill red, unlock.
     // IOSurface lock/unlock: flags=0 for read+write CPU access.
-    uint64_t lockRet = dlsym_remote("IOSurfaceLock", surf, 0, 0, 0,0,0,0,0);
+    uint64_t lockRet = dlsym_remote("IOSurfaceLock", surf, 0/*options*/, 0/*seed*/, 0,0,0,0,0);
     uint64_t baseAddr = dlsym_remote("IOSurfaceGetBaseAddress", surf, 0,0,0,0,0,0,0);
     NSLog(@"[SB-IOS] surf=0x%llx lock=%llu base=0x%llx",
           (unsigned long long)surf,
@@ -1664,7 +1662,7 @@ static void sb_iosurface_probe(uint64_t containerLayer, double bounds[4]) {
             remote_write(baseAddr + (uint64_t)off * 4, buf, (uint64_t)n * 4);
         }
     }
-    dlsym_remote("IOSurfaceUnlock", surf, 0, 0, 0,0,0,0,0);
+    dlsym_remote("IOSurfaceUnlock", surf, 0/*options*/, 0/*seed*/, 0,0,0,0,0);
 
     // Add a CALayer with contents = surface on top of everything
     uint64_t probeLay = r_msg2_main(r_class("CALayer"), "layer", 0,0,0,0);
@@ -2205,7 +2203,10 @@ int SBoardStartOverlay(void) {
     // a busy transport, and does nothing. Restarting it per session would mean a
     // thread per rearm, and a rearm loop is exactly what must not accumulate.
 #if SB_IOSURFACE_PROBE
-    sb_iosurface_probe(cLayer2, bounds);
+    {
+        uint64_t _probeCL = r_msg2_main(container, "layer", 0,0,0,0);
+        sb_iosurface_probe(_probeCL, bounds);
+    }
 #endif
     sb_text_thread_start();
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
