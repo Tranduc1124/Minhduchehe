@@ -28,9 +28,13 @@
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
-// IOSurface SPI — header absent from public SDK, declare symbols directly.
-// Framework is linked via PRIVATE_FRAMEWORKS in Makefile.app.
-typedef CFTypeRef IOSurfaceRef;
+// IOSurface SPI — framework linked, header absent from public SDK umbrella.
+// IOSurfaceRef.h IS in the SDK (IOSurface.framework/Headers/IOSurfaceRef.h)
+// but is not auto-included. Import it directly. If it is not found either,
+// fall back to an opaque pointer. We already know the framework links.
+#if __has_include(<IOSurface/IOSurfaceRef.h>)
+#  import <IOSurface/IOSurfaceRef.h>
+// Function prototypes from IOSurface SPI (not in public header umbrella)
 extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
 extern mach_port_t   IOSurfaceCreateMachPort(IOSurfaceRef surface);
 extern IOSurfaceRef  IOSurfaceLookupFromMachPort(mach_port_t port);
@@ -40,6 +44,19 @@ extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
 extern size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
 extern size_t        IOSurfaceGetWidth(IOSurfaceRef surface);
 extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
+#else
+// IOSurfaceRef.h not found at all — declare everything
+typedef void * IOSurfaceRef;
+extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
+extern mach_port_t   IOSurfaceCreateMachPort(IOSurfaceRef surface);
+extern IOSurfaceRef  IOSurfaceLookupFromMachPort(mach_port_t port);
+extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetWidth(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
+#endif
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
@@ -3814,7 +3831,8 @@ void SBRemotePushESPFrame(UIView *espView) {
             __sync_lock_release(&s_remoteBusy);
         }
     });
-}
+} // end #else CGPath block
+} // end SBRemotePushESPFrame
 #endif // SB_IOSURFACE_RENDER
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
