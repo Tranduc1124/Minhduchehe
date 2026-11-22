@@ -28,6 +28,7 @@
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
+#import <IOSurface/IOSurface.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
@@ -94,9 +95,18 @@
 // as the contents of a new CALayer, verify the top of the screen turns red.
 // Pass → one setContents: call per frame is viable.
 // Fail → log "[SB-IOS] fail surf=0 / crash" and leave the CGPath path as-is.
-#define SB_IOSURFACE_PROBE 1
+#define SB_IOSURFACE_PROBE 0
+// IOSurface direct rendering engine.
+// When enabled, app draws ESP geometry onto a shared IOSurface each frame;
+// SB reads the pixels via layer.contents — 0 RemoteCall/frame after setup.
+// Falls back to CGPath engine if IOSurfaceCreate or port transfer fails.
+#define SB_IOSURFACE_RENDER 1
 
 static BOOL g_sbOverlayOn = NO;
+#if SB_IOSURFACE_RENDER
+static IOSurfaceRef g_iosSurface = NULL;
+static CGFloat g_iosLandW = 0, g_iosLandH = 0;
+#endif
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
@@ -2057,6 +2067,57 @@ int SBoardStartOverlay(void) {
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
+#if SB_IOSURFACE_RENDER
+    {
+        // Create IOSurface in app process and share to SB via mach port.
+        // bounds[2] = portrait width (e.g. 390), bounds[3] = portrait height (e.g. 844).
+        // IOSurface in portrait orientation; app draws landscape then transforms.
+        int iosW = (int)bounds[2];
+        int iosH = (int)bounds[3];
+        NSDictionary *iosProps = @{
+            @"IOSurfaceWidth":           @(iosW),
+            @"IOSurfaceHeight":          @(iosH),
+            @"IOSurfaceBytesPerElement": @(4),
+            @"IOSurfacePixelFormat":     @((uint32_t)0x42475241u),
+        };
+        IOSurfaceRef iosSurf = IOSurfaceCreate((CFDictionaryRef)iosProps);
+        if (iosSurf) {
+            // landscape W x H is portrait H x W
+            g_iosLandW = (bounds[2] > bounds[3]) ? bounds[2] : bounds[3];
+            g_iosLandH = (bounds[2] > bounds[3]) ? bounds[3] : bounds[2];
+
+            mach_port_t surfPort = IOSurfaceCreateMachPort(iosSurf);
+            if (surfPort != MACH_PORT_NULL) {
+                uint64_t sbSurf = dlsym_remote("IOSurfaceLookupFromMachPort",
+                                               (uint64_t)surfPort, 0,0,0,0,0,0,0);
+                mach_port_deallocate(mach_task_self(), surfPort);
+
+                if (r_is_objc_ptr(sbSurf)) {
+                    // Switch the main shape layer to IOSurface pixel content
+                    r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
+                    uint64_t gravStr = r_nsstr_retained("resize");
+                    if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
+                    // Clear any stale stroke/fill — pixels come from the surface now
+                    r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
+                    r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
+                    g_iosSurface = iosSurf;
+                    NSLog(@"[SB-IOS] RENDER active surf=0x%llx sbSurf=0x%llx W=%d H=%d",
+                          (unsigned long long)iosSurf,
+                          (unsigned long long)sbSurf, iosW, iosH);
+                } else {
+                    NSLog(@"[SB-IOS] IOSurfaceLookupFromMachPort failed — CGPath fallback");
+                    CFRelease(iosSurf);
+                }
+            } else {
+                NSLog(@"[SB-IOS] IOSurfaceCreateMachPort failed — CGPath fallback");
+                CFRelease(iosSurf);
+            }
+        } else {
+            NSLog(@"[SB-IOS] IOSurfaceCreate failed W=%d H=%d — CGPath fallback", iosW, iosH);
+        }
+    }
+#endif
+
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
     if (r_is_objc_ptr(key)) {
         dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
@@ -2284,7 +2345,130 @@ static void sb_text_thread_start(void) {
     }
 }
 
+#if SB_IOSURFACE_RENDER
+// Draw all ESP geometry directly onto the IOSurface pixel buffer.
+// No remote calls — shared memory, CA reads pixels at vsync.
+// espView is the in-app ESP_View whose CAShapeLayer.path fields hold
+// current geometry; we read them on the caller's thread (game main queue),
+// same thread that writes them, so no extra lock is needed.
+static void sb_ios_render_frame(UIView *espView) {
+    if (!g_iosSurface || !espView) return;
+
+    size_t iosW = IOSurfaceGetWidth(g_iosSurface);
+    size_t iosH = IOSurfaceGetHeight(g_iosSurface);
+
+    if (IOSurfaceLock(g_iosSurface, 0, nil) != 0) return;
+
+    void   *base = IOSurfaceGetBaseAddress(g_iosSurface);
+    size_t  bpr  = IOSurfaceGetBytesPerRow(g_iosSurface);
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(base, iosW, iosH, 8, bpr, cs,
+        (CGBitmapInfo)(kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst));
+    CGColorSpaceRelease(cs);
+    if (!ctx) { IOSurfaceUnlock(g_iosSurface, 0, nil); return; }
+
+    // Clear to transparent
+    CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)iosW, (CGFloat)iosH));
+
+    // Transform: ESP_View draws in landscape (landW x landH points).
+    // IOSurface is portrait (iosW = landH, iosH = landW).
+    // We need: portrait_x = landscape_y, portrait_y = landH - landscape_x
+    // CGContext origin is bottom-left, so apply:
+    //   1. scale(1,-1), translate(0,-iosH): flip Y so origin is top-left
+    //   2. rotate -pi/2: maps (lx,ly) -> (ly, -lx)
+    //   3. translate(-landH, 0): shift so portrait_y >= 0
+    // Combined CTM puts landscape drawing coordinates into portrait IOSurface.
+    CGContextTranslateCTM(ctx, 0.0, (CGFloat)iosH);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
+    CGContextRotateCTM(ctx, (CGFloat)(-M_PI_2));
+    CGContextTranslateCTM(ctx, -(CGFloat)g_iosLandH, 0.0);
+
+    // Layer draw order: back to front, matches configureRenderingLayers zPos order
+    typedef struct { const char *key; BOOL filled; } LayerSpec;
+    static const LayerSpec kLayers[] = {
+        { "bgFillBlackLayer",     YES },
+        { "snaplineKnockedLayer", NO  },
+        { "snaplineBotLayer",     NO  },
+        { "snaplineLayer",        NO  },
+        { "boneKnockedLayer",     NO  },
+        { "boneBotLayer",         NO  },
+        { "boneLayer",            NO  },
+        { "boxKnockedLayer",      NO  },
+        { "boxBotLayer",          NO  },
+        { "boxLayer",             NO  },
+        { "hpFillRedLayer",       YES },
+        { "hpFillOrangeLayer",    YES },
+        { "hpFillGreenLayer",     YES },
+        { "alertLayer",           NO  },
+        { "fovLayer",             NO  },
+        { "aimAssistLayer",       NO  },
+        { "alertNumBGLayer",      YES },
+        { "alertNumGreenLayer",   YES },
+        { "alertNumOrangeLayer",  YES },
+        { "alertNumRedLayer",     YES },
+        { "nameTextLayer",        YES },
+        { NULL, NO }
+    };
+
+    for (int i = 0; kLayers[i].key != NULL; i++) {
+        NSString *key = [NSString stringWithUTF8String:kLayers[i].key];
+        if (![espView respondsToSelector:NSSelectorFromString(key)]) continue;
+        id val = [espView valueForKey:key];
+        if (![val isKindOfClass:[CAShapeLayer class]]) continue;
+        CAShapeLayer *sl = (CAShapeLayer *)val;
+        CGPathRef p = sl.path;
+        if (!p || CGPathIsEmpty(p)) continue;
+
+        CGContextSaveGState(ctx);
+        CGContextSetLineWidth(ctx, sl.lineWidth > 0.0f ? sl.lineWidth : 1.0f);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextAddPath(ctx, p);
+
+        if (kLayers[i].filled) {
+            if (sl.fillColor) CGContextSetFillColorWithColor(ctx, sl.fillColor);
+            else              CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
+            CGContextFillPath(ctx);
+        } else {
+            if (sl.strokeColor) CGContextSetStrokeColorWithColor(ctx, sl.strokeColor);
+            else                CGContextSetRGBStrokeColor(ctx, 1, 1, 1, 1);
+            CGContextStrokePath(ctx);
+        }
+        CGContextRestoreGState(ctx);
+    }
+
+    CGContextRelease(ctx);
+    IOSurfaceUnlock(g_iosSurface, 0, nil);
+}
+#endif
 void SBRemotePushESPFrame(UIView *espView) {
+#if SB_IOSURFACE_RENDER
+    if (!g_sbOverlayOn) {
+        if (!g_sbBuilding && g_sbEverOn && now_us() > g_sbRearmAfterUS) {
+            g_sbRearmAfterUS = now_us() + 3000000ULL;
+            g_sbConsecFail = 0;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (SBoardStartOverlay() == 0) {
+                    NSLog(@"[PUSH-REARM] overlay rebuilt");
+                }
+            });
+        }
+        return;
+    }
+    if (!espView || !g_iosSurface) return;
+
+    const uint64_t t = now_us();
+    if (t < g_sbNextPublishUS) return;
+    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+    g_sbLastPublishUS = t;
+    g_sbSummaryAttempts++;
+    g_sbSummaryUpdates++;
+
+    sb_ios_render_frame(espView);
+    // Counter text still goes via RemoteCall text thread (~1/sec), no change needed.
+    return;
+#else
     if (!g_sbOverlayOn) {
         // Rebuild it instead of staying dead. This is the whole fix for the
         // "ESP paints once and then freezes" report: the old code cleared
@@ -3620,6 +3804,7 @@ void SBRemotePushESPFrame(UIView *espView) {
         }
     });
 }
+#endif // SB_IOSURFACE_RENDER
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 
