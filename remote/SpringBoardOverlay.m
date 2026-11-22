@@ -94,7 +94,7 @@
 // as the contents of a new CALayer, verify the top of the screen turns red.
 // Pass → one setContents: call per frame is viable.
 // Fail → log "[SB-IOS] fail surf=0 / crash" and leave the CGPath path as-is.
-#define SB_IOSURFACE_PROBE 0
+#define SB_IOSURFACE_PROBE 1
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
