@@ -1,4 +1,4 @@
-//
+﻿//
 //  SpringBoardOverlay.m — Fl0rk DrawView: EXTRA trojan thread + 15fps
 //
 //  Fl0rk RemoteCallSession initWithProcess: defaults originalThreadOnly=NO
@@ -87,6 +87,14 @@
 // Off by default; the limb count is logged either way so the cost of turning
 // it on is visible before it is turned on.
 #define SB_DRAW_BONES 0
+
+// IOSurface path probe.
+//
+// Falsifiable test: create a 60-pt red IOSurface in the SB process, set it
+// as the contents of a new CALayer, verify the top of the screen turns red.
+// Pass → one setContents: call per frame is viable.
+// Fail → log "[SB-IOS] fail surf=0 / crash" and leave the CGPath path as-is.
+#define SB_IOSURFACE_PROBE 0
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
@@ -1566,6 +1574,119 @@ static void sb_cost_probe(void) {
     }
 }
 
+// IOSurface probe.
+//
+// Creates a 60pt-tall IOSurface in the SB process, fills it red, sets it
+// as `contents` on a new CALayer added to containerLayer, then logs whether
+// SB accepted the surface (surf != 0 and layer added).
+//
+// Falsifiable:
+//   Pass  → [SB-IOS] PASS surf=0x<non-zero>  — screen's top 60px turn red
+//   Fail  → [SB-IOS] FAIL surf=0             — IOSurface not supported this way
+//
+// Behind SB_IOSURFACE_PROBE, off by default. Runs once at overlay start.
+// Does NOT clean up the red layer — the probe stays visible until the app
+// is killed so we can see it without racing the render loop.
+#if SB_IOSURFACE_PROBE
+static void sb_iosurface_probe(uint64_t containerLayer, double bounds[4]) {
+    double W = bounds[2];  // portrait width, e.g. 390
+    double H = 60.0;       // 60pt tall strip at top of screen
+
+    // Build the properties dict in SB: {IOSurfaceWidth, IOSurfaceHeight,
+    // IOSurfaceBytesPerElement, IOSurfacePixelFormat}
+    // pixelFormat 'BGRA' = 0x42475241 (little-endian ARGB in CA)
+    uint64_t NSNum = r_class("NSNumber");
+    uint64_t NSDic = r_class("NSMutableDictionary");
+    if (!r_is_objc_ptr(NSNum) || !r_is_objc_ptr(NSDic)) {
+        NSLog(@"[SB-IOS] FAIL: cannot get NSNumber/NSMutableDictionary in SB");
+        return;
+    }
+
+    // Helper: NSNumber numberWithInt:
+    uint64_t nW    = r_msg2_main_raw(NSNum, "numberWithInt:", &W,  8, NULL,0,NULL,0,NULL,0);
+    uint64_t nH    = r_msg2_main_raw(NSNum, "numberWithInt:", &H,  8, NULL,0,NULL,0,NULL,0);
+    double bpe = 4.0;
+    uint64_t nBPE  = r_msg2_main_raw(NSNum, "numberWithInt:", &bpe,8, NULL,0,NULL,0,NULL,0);
+    double pf = 0x42475241;  // 'BGRA'
+    uint64_t nPF   = r_msg2_main_raw(NSNum, "numberWithInt:", &pf, 8, NULL,0,NULL,0,NULL,0);
+
+    // Keys as NSStrings
+    uint64_t kW   = r_nsstr_retained("IOSurfaceWidth");
+    uint64_t kH   = r_nsstr_retained("IOSurfaceHeight");
+    uint64_t kBPE = r_nsstr_retained("IOSurfaceBytesPerElement");
+    uint64_t kPF  = r_nsstr_retained("IOSurfacePixelFormat");
+
+    uint64_t dict = r_msg2_main(r_msg2_main(NSDic, "alloc", 0,0,0,0),
+                                "init", 0,0,0,0);
+    if (!r_is_objc_ptr(dict)) {
+        NSLog(@"[SB-IOS] FAIL: cannot create dict in SB");
+        return;
+    }
+    if (r_is_objc_ptr(nW)   && r_is_objc_ptr(kW))   r_msg2_main(dict, "setObject:forKey:", nW,   kW,   0,0);
+    if (r_is_objc_ptr(nH)   && r_is_objc_ptr(kH))   r_msg2_main(dict, "setObject:forKey:", nH,   kH,   0,0);
+    if (r_is_objc_ptr(nBPE) && r_is_objc_ptr(kBPE)) r_msg2_main(dict, "setObject:forKey:", nBPE, kBPE, 0,0);
+    if (r_is_objc_ptr(nPF)  && r_is_objc_ptr(kPF))  r_msg2_main(dict, "setObject:forKey:", nPF,  kPF,  0,0);
+
+    // Create IOSurface in SB
+    uint64_t IOSCls = r_class("IOSurface");
+    uint64_t surf = 0;
+    if (r_is_objc_ptr(IOSCls) && r_is_objc_ptr(dict)) {
+        surf = r_msg2_main(r_msg2_main(IOSCls, "alloc", 0,0,0,0),
+                           "initWithProperties:", dict, 0,0,0);
+    }
+    if (!r_is_objc_ptr(surf)) {
+        NSLog(@"[SB-IOS] FAIL surf=0 (IOSurface class=%d dict=%d)",
+              (int)r_is_objc_ptr(IOSCls), (int)r_is_objc_ptr(dict));
+        return;
+    }
+
+    // Lock the surface, remote_read its base address, fill red, unlock.
+    // IOSurface lock/unlock: flags=0 for read+write CPU access.
+    uint64_t lockRet = dlsym_remote("IOSurfaceLock", surf, 0, 0, 0,0,0,0,0);
+    uint64_t baseAddr = dlsym_remote("IOSurfaceGetBaseAddress", surf, 0,0,0,0,0,0,0);
+    NSLog(@"[SB-IOS] surf=0x%llx lock=%llu base=0x%llx",
+          (unsigned long long)surf,
+          (unsigned long long)lockRet,
+          (unsigned long long)baseAddr);
+
+    if (baseAddr) {
+        int pixW = (int)W;
+        int pixH = (int)H;
+        int npix = pixW * pixH;
+        // BGRA red: B=0x00 G=0x00 R=0xFF A=0xFF → 0xFF0000FF
+        uint32_t red = 0xFF0000FF;
+        // Fill in chunks via remote_write
+        int chunk = 1024;
+        uint32_t buf[1024];
+        for (int i = 0; i < chunk; i++) buf[i] = red;
+        for (int off = 0; off < npix; off += chunk) {
+            int n = (off + chunk <= npix) ? chunk : (npix - off);
+            remote_write(baseAddr + (uint64_t)off * 4, buf, (uint64_t)n * 4);
+        }
+    }
+    dlsym_remote("IOSurfaceUnlock", surf, 0, 0, 0,0,0,0,0);
+
+    // Add a CALayer with contents = surface on top of everything
+    uint64_t probeLay = r_msg2_main(r_class("CALayer"), "layer", 0,0,0,0);
+    if (r_is_objc_ptr(probeLay) && r_is_objc_ptr(containerLayer)) {
+        double probeFrame[4] = { 0.0, 0.0, W, H };
+        r_msg2_main_raw(probeLay, "setFrame:", probeFrame, 32, NULL,0,NULL,0,NULL,0);
+        double pz = 200.0;
+        r_msg2_main_raw(probeLay, "setZPosition:", &pz, 8, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(probeLay, "setContents:", surf, 0,0,0);
+        r_msg2_main(containerLayer, "addSublayer:", probeLay, 0,0,0);
+        NSLog(@"[SB-IOS] PASS surf=0x%llx base=0x%llx layer=0x%llx — top 60px should be red",
+              (unsigned long long)surf,
+              (unsigned long long)baseAddr,
+              (unsigned long long)probeLay);
+    } else {
+        NSLog(@"[SB-IOS] FAIL: CALayer probe layer=%d container=%d",
+              (int)r_is_objc_ptr(probeLay),
+              (int)r_is_objc_ptr(containerLayer));
+    }
+}
+#endif
+
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (g_sbOverlayOn || g_sbBuilding) { pthread_mutex_unlock(&g_sbLock); return 0; }
@@ -2083,6 +2204,9 @@ int SBoardStartOverlay(void) {
     // The text thread outlives any single session: it wakes, finds no session or
     // a busy transport, and does nothing. Restarting it per session would mean a
     // thread per rearm, and a rearm loop is exactly what must not accumulate.
+#if SB_IOSURFACE_PROBE
+    sb_iosurface_probe(cLayer2, bounds);
+#endif
     sb_text_thread_start();
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
           win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
