@@ -1,4 +1,4 @@
-#import "esp.h"
+﻿#import "esp.h"
 #import "GameLogic.h"
 #import "mahoa.h"
 #import <CoreGraphics/CoreGraphics.h>
@@ -528,7 +528,7 @@ static void ESPRenderPawnCore(
     // vi không ai yêu cầu, nên nó ở lại.
     // ---------------------------------------------------------
     NSString *plateName = nil;
-    if (isName) {
+    if (isName && dis <= 100.0f) {
         plateName = (isEspBot && isBot) ? NSSENCRYPT("BOT") : Name;
         if (plateName.length == 0) plateName = nil;
     }
