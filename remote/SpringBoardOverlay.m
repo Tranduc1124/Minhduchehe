@@ -2097,53 +2097,67 @@ int SBoardStartOverlay(void) {
 
 #if SB_IOSURFACE_RENDER
     {
-        // Create IOSurface in app process and share to SB via mach port.
-        // bounds[2] = portrait width (e.g. 390), bounds[3] = portrait height (e.g. 844).
-        // IOSurface in portrait orientation; app draws landscape then transforms.
+        // Create IOSurface in SB process (not app) so SB sandbox can access it.
+        // App gets its local ref via IOSurfaceLookupFromID using the kernel-global ID.
         int iosW = (int)bounds[2];
         int iosH = (int)bounds[3];
-        NSDictionary *iosProps = @{
-            @"IOSurfaceWidth":           @(iosW),
-            @"IOSurfaceHeight":          @(iosH),
-            @"IOSurfaceBytesPerElement": @(4),
-            @"IOSurfacePixelFormat":     @((uint32_t)0x42475241u),
-        };
-        IOSurfaceRef iosSurf = IOSurfaceCreate((CFDictionaryRef)iosProps);
-        if (iosSurf) {
-            // landscape W x H is portrait H x W
-            g_iosLandW = (bounds[2] > bounds[3]) ? bounds[2] : bounds[3];
-            g_iosLandH = (bounds[2] > bounds[3]) ? bounds[3] : bounds[2];
+        g_iosLandW = (bounds[2] > bounds[3]) ? bounds[2] : bounds[3];
+        g_iosLandH = (bounds[2] > bounds[3]) ? bounds[3] : bounds[2];
 
-            // IOSurfaceGetID returns a kernel-global uint32_t; IOSurfaceLookupFromID
-            // in SB resolves the same surface by that ID without any port transfer.
-            uint32_t surfID = IOSurfaceGetID(iosSurf);
-            NSLog(@"[SB-IOS] surfID=%u", (unsigned)surfID);
-            if (surfID != 0) {
-                uint64_t sbSurf = dlsym_remote("IOSurfaceLookupFromID",
-                                               (uint64_t)surfID, 0,0,0,0,0,0,0);
-                if (r_is_objc_ptr(sbSurf)) {
-                    // Switch the main shape layer to IOSurface pixel content
-                    r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
-                    uint64_t gravStr = r_nsstr_retained("resize");
-                    if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
-                    // Clear any stale stroke/fill -- pixels come from the surface now
-                    r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
-                    r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
-                    g_iosSurface = iosSurf;
-                    NSLog(@"[SB-IOS] RENDER active surf=0x%llx sbSurf=0x%llx surfID=%u W=%d H=%d",
-                          (unsigned long long)iosSurf,
-                          (unsigned long long)sbSurf, (unsigned)surfID, iosW, iosH);
-                } else {
-                    NSLog(@"[SB-IOS] IOSurfaceLookupFromID failed sbSurf=0x%llx -- CGPath fallback",
-                          (unsigned long long)sbSurf);
-                    CFRelease(iosSurf);
-                }
+        // Build props dict in SB via RemoteCall
+        uint64_t NSNum = r_class("NSNumber");
+        uint64_t NSDic = r_class("NSMutableDictionary");
+        uint64_t nW   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)iosW, 0,0,0);
+        uint64_t nH   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)iosH, 0,0,0);
+        uint64_t nBPE = r_msg2_main(NSNum, "numberWithInteger:", 4,              0,0,0);
+        uint64_t nPF  = r_msg2_main(NSNum, "numberWithInteger:", 0x42475241u,    0,0,0);
+        uint64_t kW   = r_nsstr_retained("IOSurfaceWidth");
+        uint64_t kH   = r_nsstr_retained("IOSurfaceHeight");
+        uint64_t kBPE = r_nsstr_retained("IOSurfaceBytesPerElement");
+        uint64_t kPF  = r_nsstr_retained("IOSurfacePixelFormat");
+        uint64_t dict = r_msg2_main(r_msg2_main(NSDic, "alloc", 0,0,0,0), "init", 0,0,0,0);
+        if (r_is_objc_ptr(dict)) {
+            if (r_is_objc_ptr(nW)   && r_is_objc_ptr(kW))   r_msg2_main(dict, "setObject:forKey:", nW,   kW,   0,0);
+            if (r_is_objc_ptr(nH)   && r_is_objc_ptr(kH))   r_msg2_main(dict, "setObject:forKey:", nH,   kH,   0,0);
+            if (r_is_objc_ptr(nBPE) && r_is_objc_ptr(kBPE)) r_msg2_main(dict, "setObject:forKey:", nBPE, kBPE, 0,0);
+            if (r_is_objc_ptr(nPF)  && r_is_objc_ptr(kPF))  r_msg2_main(dict, "setObject:forKey:", nPF,  kPF,  0,0);
+        }
+
+        // Create IOSurface in SB
+        uint64_t IOSCls = r_class("IOSurface");
+        uint64_t sbSurf = 0;
+        if (r_is_objc_ptr(IOSCls) && r_is_objc_ptr(dict)) {
+            sbSurf = r_msg2_main(r_msg2_main(IOSCls, "alloc", 0,0,0,0),
+                                 "initWithProperties:", dict, 0,0,0);
+        }
+        NSLog(@"[SB-IOS] sbSurf=0x%llx IOSCls=%d dict=%d",
+              (unsigned long long)sbSurf,
+              (int)r_is_objc_ptr(IOSCls), (int)r_is_objc_ptr(dict));
+
+        if (r_is_objc_ptr(sbSurf)) {
+            // Get kernel-global ID from SB, then lookup in app process
+            uint64_t surfID64 = dlsym_remote("IOSurfaceGetID", sbSurf, 0,0,0,0,0,0,0);
+            uint32_t surfID = (uint32_t)surfID64;
+            NSLog(@"[SB-IOS] surfID=%u from SB", (unsigned)surfID);
+
+            IOSurfaceRef appSurf = (surfID != 0) ? IOSurfaceLookupFromID(surfID) : NULL;
+            NSLog(@"[SB-IOS] appSurf=%p surfID=%u", (void *)appSurf, (unsigned)surfID);
+
+            if (appSurf) {
+                // Set SB layer contents to the SB-owned surface
+                r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
+                uint64_t gravStr = r_nsstr_retained("resize");
+                if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
+                r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
+                r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
+                g_iosSurface = appSurf;
+                NSLog(@"[SB-IOS] RENDER active appSurf=%p sbSurf=0x%llx surfID=%u W=%d H=%d",
+                      (void *)appSurf, (unsigned long long)sbSurf, (unsigned)surfID, iosW, iosH);
             } else {
-                NSLog(@"[SB-IOS] IOSurfaceGetID=0 -- CGPath fallback");
-                CFRelease(iosSurf);
+                NSLog(@"[SB-IOS] app IOSurfaceLookupFromID failed surfID=%u -- CGPath fallback", (unsigned)surfID);
             }
         } else {
-            NSLog(@"[SB-IOS] IOSurfaceCreate failed W=%d H=%d — CGPath fallback", iosW, iosH);
+            NSLog(@"[SB-IOS] IOSurface create in SB failed -- CGPath fallback");
         }
     }
 #endif
