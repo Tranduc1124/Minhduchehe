@@ -3831,9 +3831,8 @@ void SBRemotePushESPFrame(UIView *espView) {
             __sync_lock_release(&s_remoteBusy);
         }
     });
-} // end #else CGPath block
-} // end SBRemotePushESPFrame
 #endif // SB_IOSURFACE_RENDER
+} // SBRemotePushESPFrame
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 
