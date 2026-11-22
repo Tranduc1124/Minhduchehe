@@ -128,8 +128,17 @@ extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
 
 static BOOL g_sbOverlayOn = NO;
 #if SB_IOSURFACE_RENDER
-static IOSurfaceRef g_iosSurface = NULL;
-static CGFloat g_iosLandW = 0, g_iosLandH = 0;
+static BOOL     g_iosReady     = NO;   // set when sbBaseAddr is valid
+static uint64_t g_iosSbBase    = 0;    // IOSurface base address in SB process
+static size_t   g_iosBpr       = 0;    // bytes per row
+static int      g_iosW         = 0;    // surface width (portrait)
+static int      g_iosH         = 0;    // surface height (portrait)
+static CGFloat  g_iosLandW     = 0;    // landscape width  (= portrait H)
+static CGFloat  g_iosLandH     = 0;    // landscape height (= portrait W)
+static void    *g_iosLocalBuf  = NULL; // malloc'd local draw buffer (app process)
+static size_t   g_iosLocalSize = 0;
+// Keep IOSurfaceRef NULL -- surface lives in SB, we write via remote_write
+static IOSurfaceRef g_iosSurface = NULL; // unused, kept for HB log compat
 #endif
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
@@ -2131,30 +2140,35 @@ int SBoardStartOverlay(void) {
               (int)r_is_objc_ptr(IOSCls), (int)r_is_objc_ptr(dict));
 
         if (r_is_objc_ptr(sbSurf)) {
-            // Get kernel-global ID from SB, then lookup in app process
-            uint64_t surfID64 = dlsym_remote("IOSurfaceGetID", sbSurf, 0,0,0,0,0,0,0);
-            uint32_t surfID = (uint32_t)surfID64;
-            NSLog(@"[SB-IOS] surfID=%u from SB", (unsigned)surfID);
+            // Get base address and bytes-per-row from SB directly.
+            // App draws into local malloc buffer, remote_write to sbBase each frame.
+            uint64_t sbBase = dlsym_remote("IOSurfaceGetBaseAddress", sbSurf, 0,0,0,0,0,0,0);
+            uint64_t sbBpr  = dlsym_remote("IOSurfaceGetBytesPerRow", sbSurf, 0,0,0,0,0,0,0);
+            NSLog(@"[SB-IOS] sbBase=0x%llx sbBpr=%llu", (unsigned long long)sbBase, (unsigned long long)sbBpr);
 
-            // IOSurfaceLookupFromID not in SDK tbd -- resolve via dlsym at runtime
-            typedef IOSurfaceRef (*_lookup_t)(uint32_t);
-            static _lookup_t _lookup_fn = NULL;
-            if (!_lookup_fn) _lookup_fn = (_lookup_t)dlsym(RTLD_DEFAULT, "IOSurfaceLookupFromID");
-            IOSurfaceRef appSurf = (_lookup_fn && surfID != 0) ? _lookup_fn(surfID) : NULL;
-            NSLog(@"[SB-IOS] appSurf=%p surfID=%u", (void *)appSurf, (unsigned)surfID);
-
-            if (appSurf) {
-                // Set SB layer contents to the SB-owned surface
-                r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
-                uint64_t gravStr = r_nsstr_retained("resize");
-                if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
-                r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
-                r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
-                g_iosSurface = appSurf;
-                NSLog(@"[SB-IOS] RENDER active appSurf=%p sbSurf=0x%llx surfID=%u W=%d H=%d",
-                      (void *)appSurf, (unsigned long long)sbSurf, (unsigned)surfID, iosW, iosH);
+            if (sbBase && sbBpr) {
+                size_t bufSize = (size_t)sbBpr * (size_t)iosH;
+                void *localBuf = malloc(bufSize);
+                if (localBuf) {
+                    r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
+                    uint64_t gravStr = r_nsstr_retained("resize");
+                    if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
+                    r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
+                    r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
+                    g_iosSbBase    = sbBase;
+                    g_iosBpr       = (size_t)sbBpr;
+                    g_iosW         = iosW;
+                    g_iosH         = iosH;
+                    g_iosLocalBuf  = localBuf;
+                    g_iosLocalSize = bufSize;
+                    g_iosReady     = YES;
+                    NSLog(@"[SB-IOS] RENDER active sbBase=0x%llx bpr=%zu W=%d H=%d bufSize=%zu",
+                          (unsigned long long)sbBase, (size_t)sbBpr, iosW, iosH, bufSize);
+                } else {
+                    NSLog(@"[SB-IOS] malloc %zu failed -- CGPath fallback", bufSize);
+                }
             } else {
-                NSLog(@"[SB-IOS] app IOSurfaceLookupFromID failed surfID=%u -- CGPath fallback", (unsigned)surfID);
+                NSLog(@"[SB-IOS] IOSurfaceGetBaseAddress=0 -- CGPath fallback");
             }
         } else {
             NSLog(@"[SB-IOS] IOSurface create in SB failed -- CGPath fallback");
@@ -2396,21 +2410,18 @@ static void sb_text_thread_start(void) {
 // current geometry; we read them on the caller's thread (game main queue),
 // same thread that writes them, so no extra lock is needed.
 static void sb_ios_render_frame(UIView *espView) {
-    if (!g_iosSurface || !espView) return;
+    if (!g_iosReady || !espView) return;
 
-    size_t iosW = IOSurfaceGetWidth(g_iosSurface);
-    size_t iosH = IOSurfaceGetHeight(g_iosSurface);
-
-    if (IOSurfaceLock(g_iosSurface, 0, nil) != 0) return;
-
-    void   *base = IOSurfaceGetBaseAddress(g_iosSurface);
-    size_t  bpr  = IOSurfaceGetBytesPerRow(g_iosSurface);
+    size_t iosW = (size_t)g_iosW;
+    size_t iosH = (size_t)g_iosH;
+    size_t bpr  = g_iosBpr;
+    void  *base = g_iosLocalBuf;
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(base, iosW, iosH, 8, bpr, cs,
         (CGBitmapInfo)(kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst));
     CGColorSpaceRelease(cs);
-    if (!ctx) { IOSurfaceUnlock(g_iosSurface, 0, nil); return; }
+    if (!ctx) return;
 
     // Clear to transparent
     CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)iosW, (CGFloat)iosH));
@@ -2483,7 +2494,8 @@ static void sb_ios_render_frame(UIView *espView) {
     }
 
     CGContextRelease(ctx);
-    IOSurfaceUnlock(g_iosSurface, 0, nil);
+    // Write local buffer to SB IOSurface memory in one shot
+    remote_write(g_iosSbBase, base, g_iosLocalSize);
 }
 #endif
 void SBRemotePushESPFrame(UIView *espView) {
@@ -2508,15 +2520,15 @@ void SBRemotePushESPFrame(UIView *espView) {
         uint64_t tNow = now_us();
         if (tNow > s_iosHB) {
             s_iosHB = tNow + 1000000ULL;
-            NSLog(@"[SB-IOS-HB] on=%d surf=%p iosSurf=%p",
+            NSLog(@"[SB-IOS-HB] on=%d ready=%d sbBase=0x%llx",
                   (int)g_sbOverlayOn,
-                  (void *)g_iosSurface,
-                  (void *)g_iosSurface);
+                  (int)g_iosReady,
+                  (unsigned long long)g_iosSbBase);
         }
     }
 
     // If IOSurface setup succeeded, draw via pixel buffer (0 RemoteCall/frame).
-    if (g_iosSurface) {
+    if (g_iosReady) {
         const uint64_t t = now_us();
         if (t < g_sbNextPublishUS) return;
         g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
