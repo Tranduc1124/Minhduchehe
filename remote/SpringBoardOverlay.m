@@ -36,8 +36,8 @@
 #  import <IOSurface/IOSurfaceRef.h>
 // Function prototypes from IOSurface SPI (not in public header umbrella)
 extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern mach_port_t   IOSurfaceCreateMachPort(IOSurfaceRef surface);
-extern IOSurfaceRef  IOSurfaceLookupFromMachPort(mach_port_t port);
+extern uint32_t      IOSurfaceGetID(IOSurfaceRef surface);
+extern IOSurfaceRef  IOSurfaceLookupFromID(uint32_t surfaceID);
 extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
@@ -48,8 +48,8 @@ extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
 // IOSurfaceRef.h not found at all — declare everything
 typedef void * IOSurfaceRef;
 extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern mach_port_t   IOSurfaceCreateMachPort(IOSurfaceRef surface);
-extern IOSurfaceRef  IOSurfaceLookupFromMachPort(mach_port_t port);
+extern uint32_t      IOSurfaceGetID(IOSurfaceRef surface);
+extern IOSurfaceRef  IOSurfaceLookupFromID(uint32_t surfaceID);
 extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
@@ -2114,30 +2114,32 @@ int SBoardStartOverlay(void) {
             g_iosLandW = (bounds[2] > bounds[3]) ? bounds[2] : bounds[3];
             g_iosLandH = (bounds[2] > bounds[3]) ? bounds[3] : bounds[2];
 
-            mach_port_t surfPort = IOSurfaceCreateMachPort(iosSurf);
-            if (surfPort != MACH_PORT_NULL) {
-                uint64_t sbSurf = dlsym_remote("IOSurfaceLookupFromMachPort",
-                                               (uint64_t)surfPort, 0,0,0,0,0,0,0);
-                mach_port_deallocate(mach_task_self(), surfPort);
-
+            // IOSurfaceGetID returns a kernel-global uint32_t; IOSurfaceLookupFromID
+            // in SB resolves the same surface by that ID without any port transfer.
+            uint32_t surfID = IOSurfaceGetID(iosSurf);
+            NSLog(@"[SB-IOS] surfID=%u", (unsigned)surfID);
+            if (surfID != 0) {
+                uint64_t sbSurf = dlsym_remote("IOSurfaceLookupFromID",
+                                               (uint64_t)surfID, 0,0,0,0,0,0,0);
                 if (r_is_objc_ptr(sbSurf)) {
                     // Switch the main shape layer to IOSurface pixel content
                     r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
                     uint64_t gravStr = r_nsstr_retained("resize");
                     if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
-                    // Clear any stale stroke/fill — pixels come from the surface now
+                    // Clear any stale stroke/fill -- pixels come from the surface now
                     r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
                     r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
                     g_iosSurface = iosSurf;
-                    NSLog(@"[SB-IOS] RENDER active surf=0x%llx sbSurf=0x%llx W=%d H=%d",
+                    NSLog(@"[SB-IOS] RENDER active surf=0x%llx sbSurf=0x%llx surfID=%u W=%d H=%d",
                           (unsigned long long)iosSurf,
-                          (unsigned long long)sbSurf, iosW, iosH);
+                          (unsigned long long)sbSurf, (unsigned)surfID, iosW, iosH);
                 } else {
-                    NSLog(@"[SB-IOS] IOSurfaceLookupFromMachPort failed — CGPath fallback");
+                    NSLog(@"[SB-IOS] IOSurfaceLookupFromID failed sbSurf=0x%llx -- CGPath fallback",
+                          (unsigned long long)sbSurf);
                     CFRelease(iosSurf);
                 }
             } else {
-                NSLog(@"[SB-IOS] IOSurfaceCreateMachPort failed — CGPath fallback");
+                NSLog(@"[SB-IOS] IOSurfaceGetID=0 -- CGPath fallback");
                 CFRelease(iosSurf);
             }
         } else {
