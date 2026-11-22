@@ -28,7 +28,18 @@
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
-#import <IOSurface/IOSurface.h>
+// IOSurface SPI — header absent from public SDK, declare symbols directly.
+// Framework is linked via PRIVATE_FRAMEWORKS in Makefile.app.
+typedef CFTypeRef IOSurfaceRef;
+extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
+extern mach_port_t   IOSurfaceCreateMachPort(IOSurfaceRef surface);
+extern IOSurfaceRef  IOSurfaceLookupFromMachPort(mach_port_t port);
+extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetWidth(IOSurfaceRef surface);
+extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
