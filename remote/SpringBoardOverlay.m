@@ -2484,19 +2484,35 @@ void SBRemotePushESPFrame(UIView *espView) {
         }
         return;
     }
-    if (!espView || !g_iosSurface) return;
+    if (!espView) return;
 
-    const uint64_t t = now_us();
-    if (t < g_sbNextPublishUS) return;
-    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
-    g_sbLastPublishUS = t;
-    g_sbSummaryAttempts++;
-    g_sbSummaryUpdates++;
+    // Heartbeat: 1Hz regardless of surface state so we know if we reach here.
+    {
+        static uint64_t s_iosHB = 0;
+        uint64_t tNow = now_us();
+        if (tNow > s_iosHB) {
+            s_iosHB = tNow + 1000000ULL;
+            NSLog(@"[SB-IOS-HB] on=%d surf=%p iosSurf=%p",
+                  (int)g_sbOverlayOn,
+                  (void *)g_iosSurface,
+                  (void *)g_iosSurface);
+        }
+    }
 
-    sb_ios_render_frame(espView);
-    // Counter text still goes via RemoteCall text thread (~1/sec), no change needed.
-    return;
-#else
+    // If IOSurface setup succeeded, draw via pixel buffer (0 RemoteCall/frame).
+    if (g_iosSurface) {
+        const uint64_t t = now_us();
+        if (t < g_sbNextPublishUS) return;
+        g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+        g_sbLastPublishUS = t;
+        g_sbSummaryAttempts++;
+        g_sbSummaryUpdates++;
+        sb_ios_render_frame(espView);
+        return;
+    }
+    // IOSurface not available — fall through to CGPath engine below.
+    NSLog(@"[SB-IOS] g_iosSurface=NULL — falling through to CGPath");
+    // CGPath fallback (compiled always when SB_IOSURFACE_RENDER=1):
     if (!g_sbOverlayOn) {
         // Rebuild it instead of staying dead. This is the whole fix for the
         // "ESP paints once and then freezes" report: the old code cleared
