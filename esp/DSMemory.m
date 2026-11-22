@@ -213,10 +213,13 @@ int ds_attach(void) {
         return -1;
     }
 
-    const char *names[] = { "FreeFire", "FreeFireMAX", "GarenaFreeFire", "Freefire", "freefire" };
+    // proc_find_by_name uses strcmp (exact, MAXCOMLEN). The current bundle's
+    // executable is "FreeFireVN", which does NOT match "FreeFire". Keep the old
+    // names as fallback for builds/older versions whose comm is shorter.
+    const char *names[] = { "FreeFireVN", "FreeFire", "FreeFireMAX", "GarenaFreeFire", "Freefire", "freefire" };
     uint64_t p = 0;
     const char *foundName = NULL;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
         p = proc_find_by_name(names[i]);
         // is_kaddr_valid(p + off), not K(p). proc_find_by_name answers "not
         // found" with (uint64_t)-1, and K() is a plain `>` against

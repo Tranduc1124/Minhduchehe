@@ -20,7 +20,7 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restric
 
 // PID_PATH same as HUDApp.mm writes
 #ifndef PID_PATH
-#define PID_PATH @"/var/mobile/Library/Caches/vn.vng.freefireth.pid"
+#define PID_PATH @"/var/mobile/Library/Caches/com.garena.ffvn.pid"
 #endif
 
 int HUDSpawnChild(void) {

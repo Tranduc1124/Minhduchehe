@@ -51,8 +51,8 @@ else
 # macOS: use real SDK headers if present; otherwise our minimal stubs
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD)/utils/xpc -I$(PWD)/utils/fileport
 endif
-$(APPLICATION_NAME)_CFLAGS += -DNOTIFY_DESTROY_HUD="\"vn.vng.freefireth.hud.destroy\""
-$(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/vn.vng.freefireth.pid\""
+$(APPLICATION_NAME)_CFLAGS += -DNOTIFY_DESTROY_HUD="\"com.garena.ffvn.hud.destroy\""
+$(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/com.garena.ffvn.pid\""
 $(APPLICATION_NAME)_CCFLAGS += -std=c++17
 $(APPLICATION_NAME)_OBJCFLAGS += -fobjc-arc
 
