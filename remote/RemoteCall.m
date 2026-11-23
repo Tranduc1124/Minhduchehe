@@ -52,7 +52,7 @@ extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, 
 #define __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR 0x8
 
 // from pe_main.js
-#define SHMEM_CACHE_SIZE                256
+#define SHMEM_CACHE_SIZE                512
 #define FAKE_PC_TROJAN_CREATOR          0x101
 #define FAKE_LR_TROJAN_CREATOR          0x201
 #define FAKE_PC_TROJAN                  0x301
