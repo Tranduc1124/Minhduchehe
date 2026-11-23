@@ -2153,6 +2153,7 @@ int SBoardStartOverlay(void) {
                     r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
                     uint64_t gravStr = r_nsstr_retained("resize");
                     if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
+                    r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
                     r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
                     r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
                     g_iosSbBase    = sbBase;
@@ -2426,18 +2427,13 @@ static void sb_ios_render_frame(UIView *espView) {
     // Clear to transparent
     CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)iosW, (CGFloat)iosH));
 
-    // Transform: ESP_View draws in landscape (landW x landH points).
-    // IOSurface is portrait (iosW = landH, iosH = landW).
-    // We need: portrait_x = landscape_y, portrait_y = landH - landscape_x
-    // CGContext origin is bottom-left, so apply:
-    //   1. scale(1,-1), translate(0,-iosH): flip Y so origin is top-left
-    //   2. rotate -pi/2: maps (lx,ly) -> (ly, -lx)
-    //   3. translate(-landH, 0): shift so portrait_y >= 0
-    // Combined CTM puts landscape drawing coordinates into portrait IOSurface.
-    CGContextTranslateCTM(ctx, 0.0, (CGFloat)iosH);
-    CGContextScaleCTM(ctx, 1.0, -1.0);
-    CGContextRotateCTM(ctx, (CGFloat)(-M_PI_2));
-    CGContextTranslateCTM(ctx, -(CGFloat)g_iosLandH, 0.0);
+    // Transform landscape ESP coords (lx,ly) → portrait IOSurface CG coords.
+    // IOSurface: iosW=landH=390 wide, iosH=landW=844 tall, CGContext origin=bottom-left.
+    // Screen portrait (top-left): px=ly, py=landW-lx.
+    // CGContext (bottom-left): ctx_x=ly, ctx_y=lx  (since iosH=landW cancels).
+    // Matrix: swap axes: a=0 b=1 c=1 d=0 tx=0 ty=0.
+    CGAffineTransform t = CGAffineTransformMake(0.0, 1.0, 1.0, 0.0, 0.0, 0.0);
+    CGContextConcatCTM(ctx, t);
 
     // Layer draw order: back to front, matches configureRenderingLayers zPos order
     typedef struct { const char *key; BOOL filled; } LayerSpec;
