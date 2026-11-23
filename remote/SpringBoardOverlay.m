@@ -1,4 +1,4 @@
-﻿//
+//
 //  SpringBoardOverlay.m — Fl0rk DrawView: EXTRA trojan thread + 15fps
 //
 //  Fl0rk RemoteCallSession initWithProcess: defaults originalThreadOnly=NO
@@ -28,31 +28,6 @@
 #import <pthread.h>
 #import <string.h>
 #import <mach/mach_time.h>
-// IOSurface SPI — framework linked, header absent from public SDK umbrella.
-// IOSurfaceRef.h IS in the SDK (IOSurface.framework/Headers/IOSurfaceRef.h)
-// but is not auto-included. Import it directly. If it is not found either,
-// fall back to an opaque pointer. We already know the framework links.
-#if __has_include(<IOSurface/IOSurfaceRef.h>)
-#  import <IOSurface/IOSurfaceRef.h>
-// Function prototypes from IOSurface SPI (not in public header umbrella)
-extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
-extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
-extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetWidth(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
-#else
-// IOSurfaceRef.h not found at all — declare everything
-typedef void * IOSurfaceRef;
-extern IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-extern kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
-extern kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
-extern void *        IOSurfaceGetBaseAddress(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetWidth(IOSurfaceRef surface);
-extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
-#endif
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
 // 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
@@ -113,33 +88,7 @@ extern size_t        IOSurfaceGetHeight(IOSurfaceRef surface);
 // it on is visible before it is turned on.
 #define SB_DRAW_BONES 0
 
-// IOSurface path probe.
-//
-// Falsifiable test: create a 60-pt red IOSurface in the SB process, set it
-// as the contents of a new CALayer, verify the top of the screen turns red.
-// Pass → one setContents: call per frame is viable.
-// Fail → log "[SB-IOS] fail surf=0 / crash" and leave the CGPath path as-is.
-#define SB_IOSURFACE_PROBE 0
-// IOSurface direct rendering engine.
-// When enabled, app draws ESP geometry onto a shared IOSurface each frame;
-// SB reads the pixels via layer.contents — 0 RemoteCall/frame after setup.
-// Falls back to CGPath engine if IOSurfaceCreate or port transfer fails.
-#define SB_IOSURFACE_RENDER 1
-
 static BOOL g_sbOverlayOn = NO;
-#if SB_IOSURFACE_RENDER
-static BOOL     g_iosReady     = NO;   // set when sbBaseAddr is valid
-static uint64_t g_iosSbBase    = 0;    // IOSurface base address in SB process
-static size_t   g_iosBpr       = 0;    // bytes per row
-static int      g_iosW         = 0;    // surface width (portrait)
-static int      g_iosH         = 0;    // surface height (portrait)
-static CGFloat  g_iosLandW     = 0;    // landscape width  (= portrait H)
-static CGFloat  g_iosLandH     = 0;    // landscape height (= portrait W)
-static void    *g_iosLocalBuf  = NULL; // malloc'd local draw buffer (app process)
-static size_t   g_iosLocalSize = 0;
-// Keep IOSurfaceRef NULL -- surface lives in SB, we write via remote_write
-static IOSurfaceRef g_iosSurface = NULL; // unused, kept for HB log compat
-#endif
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
@@ -1617,117 +1566,6 @@ static void sb_cost_probe(void) {
     }
 }
 
-// IOSurface probe.
-//
-// Creates a 60pt-tall IOSurface in the SB process, fills it red, sets it
-// as `contents` on a new CALayer added to containerLayer, then logs whether
-// SB accepted the surface (surf != 0 and layer added).
-//
-// Falsifiable:
-//   Pass  → [SB-IOS] PASS surf=0x<non-zero>  — screen's top 60px turn red
-//   Fail  → [SB-IOS] FAIL surf=0             — IOSurface not supported this way
-//
-// Behind SB_IOSURFACE_PROBE, off by default. Runs once at overlay start.
-// Does NOT clean up the red layer — the probe stays visible until the app
-// is killed so we can see it without racing the render loop.
-#if SB_IOSURFACE_PROBE
-static void sb_iosurface_probe(uint64_t containerLayer, double bounds[4]) {
-    double W = bounds[2];  // portrait width, e.g. 390
-    double H = 60.0;       // 60pt tall strip at top of screen
-
-    // Build the properties dict in SB: {IOSurfaceWidth, IOSurfaceHeight,
-    // IOSurfaceBytesPerElement, IOSurfacePixelFormat}
-    // pixelFormat 'BGRA' = 0x42475241 (little-endian ARGB in CA)
-    uint64_t NSNum = r_class("NSNumber");
-    uint64_t NSDic = r_class("NSMutableDictionary");
-    if (!r_is_objc_ptr(NSNum) || !r_is_objc_ptr(NSDic)) {
-        NSLog(@"[SB-IOS] FAIL: cannot get NSNumber/NSMutableDictionary in SB");
-        return;
-    }
-
-    // numberWithInteger: passes the value in x0 (register), no raw struct needed.
-    uint64_t nW   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)(int)W,   0,0,0);
-    uint64_t nH   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)(int)H,   0,0,0);
-    uint64_t nBPE = r_msg2_main(NSNum, "numberWithInteger:", 4,                  0,0,0);
-    uint64_t nPF  = r_msg2_main(NSNum, "numberWithInteger:", 0x42475241u,         0,0,0);
-
-    // Keys as NSStrings
-    uint64_t kW   = r_nsstr_retained("IOSurfaceWidth");
-    uint64_t kH   = r_nsstr_retained("IOSurfaceHeight");
-    uint64_t kBPE = r_nsstr_retained("IOSurfaceBytesPerElement");
-    uint64_t kPF  = r_nsstr_retained("IOSurfacePixelFormat");
-
-    uint64_t dict = r_msg2_main(r_msg2_main(NSDic, "alloc", 0,0,0,0),
-                                "init", 0,0,0,0);
-    if (!r_is_objc_ptr(dict)) {
-        NSLog(@"[SB-IOS] FAIL: cannot create dict in SB");
-        return;
-    }
-    if (r_is_objc_ptr(nW)   && r_is_objc_ptr(kW))   r_msg2_main(dict, "setObject:forKey:", nW,   kW,   0,0);
-    if (r_is_objc_ptr(nH)   && r_is_objc_ptr(kH))   r_msg2_main(dict, "setObject:forKey:", nH,   kH,   0,0);
-    if (r_is_objc_ptr(nBPE) && r_is_objc_ptr(kBPE)) r_msg2_main(dict, "setObject:forKey:", nBPE, kBPE, 0,0);
-    if (r_is_objc_ptr(nPF)  && r_is_objc_ptr(kPF))  r_msg2_main(dict, "setObject:forKey:", nPF,  kPF,  0,0);
-
-    // Create IOSurface in SB
-    uint64_t IOSCls = r_class("IOSurface");
-    uint64_t surf = 0;
-    if (r_is_objc_ptr(IOSCls) && r_is_objc_ptr(dict)) {
-        surf = r_msg2_main(r_msg2_main(IOSCls, "alloc", 0,0,0,0),
-                           "initWithProperties:", dict, 0,0,0);
-    }
-    if (!r_is_objc_ptr(surf)) {
-        NSLog(@"[SB-IOS] FAIL surf=0 (IOSurface class=%d dict=%d)",
-              (int)r_is_objc_ptr(IOSCls), (int)r_is_objc_ptr(dict));
-        return;
-    }
-
-    // Lock the surface, remote_read its base address, fill red, unlock.
-    // IOSurface lock/unlock: flags=0 for read+write CPU access.
-    uint64_t lockRet = dlsym_remote("IOSurfaceLock", surf, 0/*options*/, 0/*seed*/, 0,0,0,0,0);
-    uint64_t baseAddr = dlsym_remote("IOSurfaceGetBaseAddress", surf, 0,0,0,0,0,0,0);
-    NSLog(@"[SB-IOS] surf=0x%llx lock=%llu base=0x%llx",
-          (unsigned long long)surf,
-          (unsigned long long)lockRet,
-          (unsigned long long)baseAddr);
-
-    if (baseAddr) {
-        int pixW = (int)W;
-        int pixH = (int)H;
-        int npix = pixW * pixH;
-        // BGRA red: B=0x00 G=0x00 R=0xFF A=0xFF → 0xFF0000FF
-        uint32_t red = 0xFF0000FF;
-        // Fill in chunks via remote_write
-        int chunk = 1024;
-        uint32_t buf[1024];
-        for (int i = 0; i < chunk; i++) buf[i] = red;
-        for (int off = 0; off < npix; off += chunk) {
-            int n = (off + chunk <= npix) ? chunk : (npix - off);
-            remote_write(baseAddr + (uint64_t)off * 4, buf, (uint64_t)n * 4);
-        }
-    }
-    dlsym_remote("IOSurfaceUnlock", surf, 0/*options*/, 0/*seed*/, 0,0,0,0,0);
-
-    // Add a CALayer with contents = surface on top of everything
-    uint64_t probeLay = r_msg2_main(r_class("CALayer"), "layer", 0,0,0,0);
-    if (r_is_objc_ptr(probeLay) && r_is_objc_ptr(containerLayer)) {
-        double probeFrame[4] = { 0.0, 0.0, W, H };
-        r_msg2_main_raw(probeLay, "setFrame:", probeFrame, 32, NULL,0,NULL,0,NULL,0);
-        double pz = 200.0;
-        r_msg2_main_raw(probeLay, "setZPosition:", &pz, 8, NULL,0,NULL,0,NULL,0);
-        r_msg2_main(probeLay, "setContents:", surf, 0,0,0);
-        r_msg2_main(containerLayer, "addSublayer:", probeLay, 0,0,0);
-        NSLog(@"[SB-IOS] PASS surf=0x%llx base=0x%llx layer=0x%llx — top 60px should be red",
-              (unsigned long long)surf,
-              (unsigned long long)baseAddr,
-              (unsigned long long)probeLay);
-    } else {
-        NSLog(@"[SB-IOS] FAIL: CALayer probe layer=%d container=%d",
-              (int)r_is_objc_ptr(probeLay),
-              (int)r_is_objc_ptr(containerLayer));
-    }
-}
-#endif
-
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (g_sbOverlayOn || g_sbBuilding) { pthread_mutex_unlock(&g_sbLock); return 0; }
@@ -2100,83 +1938,6 @@ int SBoardStartOverlay(void) {
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
-#if SB_IOSURFACE_RENDER
-    {
-        // Create IOSurface in SB process (not app) so SB sandbox can access it.
-        // App gets its local ref via IOSurfaceLookupFromID using the kernel-global ID.
-        int iosW = (int)bounds[2];
-        int iosH = (int)bounds[3];
-        g_iosLandW = (bounds[2] > bounds[3]) ? bounds[2] : bounds[3];
-        g_iosLandH = (bounds[2] > bounds[3]) ? bounds[3] : bounds[2];
-
-        // Build props dict in SB via RemoteCall
-        uint64_t NSNum = r_class("NSNumber");
-        uint64_t NSDic = r_class("NSMutableDictionary");
-        uint64_t nW   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)iosW, 0,0,0);
-        uint64_t nH   = r_msg2_main(NSNum, "numberWithInteger:", (uint64_t)iosH, 0,0,0);
-        uint64_t nBPE = r_msg2_main(NSNum, "numberWithInteger:", 4,              0,0,0);
-        uint64_t nPF  = r_msg2_main(NSNum, "numberWithInteger:", 0x42475241u,    0,0,0);
-        uint64_t kW   = r_nsstr_retained("IOSurfaceWidth");
-        uint64_t kH   = r_nsstr_retained("IOSurfaceHeight");
-        uint64_t kBPE = r_nsstr_retained("IOSurfaceBytesPerElement");
-        uint64_t kPF  = r_nsstr_retained("IOSurfacePixelFormat");
-        uint64_t dict = r_msg2_main(r_msg2_main(NSDic, "alloc", 0,0,0,0), "init", 0,0,0,0);
-        if (r_is_objc_ptr(dict)) {
-            if (r_is_objc_ptr(nW)   && r_is_objc_ptr(kW))   r_msg2_main(dict, "setObject:forKey:", nW,   kW,   0,0);
-            if (r_is_objc_ptr(nH)   && r_is_objc_ptr(kH))   r_msg2_main(dict, "setObject:forKey:", nH,   kH,   0,0);
-            if (r_is_objc_ptr(nBPE) && r_is_objc_ptr(kBPE)) r_msg2_main(dict, "setObject:forKey:", nBPE, kBPE, 0,0);
-            if (r_is_objc_ptr(nPF)  && r_is_objc_ptr(kPF))  r_msg2_main(dict, "setObject:forKey:", nPF,  kPF,  0,0);
-        }
-
-        // Create IOSurface in SB
-        uint64_t IOSCls = r_class("IOSurface");
-        uint64_t sbSurf = 0;
-        if (r_is_objc_ptr(IOSCls) && r_is_objc_ptr(dict)) {
-            sbSurf = r_msg2_main(r_msg2_main(IOSCls, "alloc", 0,0,0,0),
-                                 "initWithProperties:", dict, 0,0,0);
-        }
-        NSLog(@"[SB-IOS] sbSurf=0x%llx IOSCls=%d dict=%d",
-              (unsigned long long)sbSurf,
-              (int)r_is_objc_ptr(IOSCls), (int)r_is_objc_ptr(dict));
-
-        if (r_is_objc_ptr(sbSurf)) {
-            // Get base address and bytes-per-row from SB directly.
-            // App draws into local malloc buffer, remote_write to sbBase each frame.
-            uint64_t sbBase = dlsym_remote("IOSurfaceGetBaseAddress", sbSurf, 0,0,0,0,0,0,0);
-            uint64_t sbBpr  = dlsym_remote("IOSurfaceGetBytesPerRow", sbSurf, 0,0,0,0,0,0,0);
-            NSLog(@"[SB-IOS] sbBase=0x%llx sbBpr=%llu", (unsigned long long)sbBase, (unsigned long long)sbBpr);
-
-            if (sbBase && sbBpr) {
-                size_t bufSize = (size_t)sbBpr * (size_t)iosH;
-                void *localBuf = malloc(bufSize);
-                if (localBuf) {
-                    r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
-                    uint64_t gravStr = r_nsstr_retained("resize");
-                    if (r_is_objc_ptr(gravStr)) r_msg2_main(shape, "setContentsGravity:", gravStr, 0,0,0);
-                    r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
-                    r_msg2_main(shape, "setStrokeColor:", 0, 0,0,0);
-                    r_msg2_main(shape, "setFillColor:",   0, 0,0,0);
-                    g_iosSbBase    = sbBase;
-                    g_iosBpr       = (size_t)sbBpr;
-                    g_iosW         = iosW;
-                    g_iosH         = iosH;
-                    g_iosLocalBuf  = localBuf;
-                    g_iosLocalSize = bufSize;
-                    g_iosReady     = YES;
-                    NSLog(@"[SB-IOS] RENDER active sbBase=0x%llx bpr=%zu W=%d H=%d bufSize=%zu",
-                          (unsigned long long)sbBase, (size_t)sbBpr, iosW, iosH, bufSize);
-                } else {
-                    NSLog(@"[SB-IOS] malloc %zu failed -- CGPath fallback", bufSize);
-                }
-            } else {
-                NSLog(@"[SB-IOS] IOSurfaceGetBaseAddress=0 -- CGPath fallback");
-            }
-        } else {
-            NSLog(@"[SB-IOS] IOSurface create in SB failed -- CGPath fallback");
-        }
-    }
-#endif
-
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
     if (r_is_objc_ptr(key)) {
         dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
@@ -2322,12 +2083,6 @@ int SBoardStartOverlay(void) {
     // The text thread outlives any single session: it wakes, finds no session or
     // a busy transport, and does nothing. Restarting it per session would mean a
     // thread per rearm, and a rearm loop is exactly what must not accumulate.
-#if SB_IOSURFACE_PROBE
-    {
-        uint64_t _probeCL = r_msg2_main(container, "layer", 0,0,0,0);
-        sb_iosurface_probe(_probeCL, bounds);
-    }
-#endif
     sb_text_thread_start();
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
           win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
@@ -2404,139 +2159,7 @@ static void sb_text_thread_start(void) {
     }
 }
 
-#if SB_IOSURFACE_RENDER
-// Draw all ESP geometry directly onto the IOSurface pixel buffer.
-// No remote calls — shared memory, CA reads pixels at vsync.
-// espView is the in-app ESP_View whose CAShapeLayer.path fields hold
-// current geometry; we read them on the caller's thread (game main queue),
-// same thread that writes them, so no extra lock is needed.
-static void sb_ios_render_frame(UIView *espView) {
-    if (!g_iosReady || !espView) return;
-
-    size_t iosW = (size_t)g_iosW;
-    size_t iosH = (size_t)g_iosH;
-    size_t bpr  = g_iosBpr;
-    void  *base = g_iosLocalBuf;
-
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(base, iosW, iosH, 8, bpr, cs,
-        (CGBitmapInfo)(kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst));
-    CGColorSpaceRelease(cs);
-    if (!ctx) return;
-
-    // Clear to transparent
-    CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)iosW, (CGFloat)iosH));
-
-    // Transform landscape ESP coords (lx,ly) → portrait IOSurface CG coords.
-    // IOSurface: iosW=landH=390 wide, iosH=landW=844 tall, CGContext origin=bottom-left.
-    // Screen portrait (top-left): px=ly, py=landW-lx.
-    // CGContext (bottom-left): ctx_x=ly, ctx_y=lx  (since iosH=landW cancels).
-    // Matrix: swap axes: a=0 b=1 c=1 d=0 tx=0 ty=0.
-    CGAffineTransform t = CGAffineTransformMake(0.0, 1.0, 1.0, 0.0, 0.0, 0.0);
-    CGContextConcatCTM(ctx, t);
-
-    // Layer draw order: back to front, matches configureRenderingLayers zPos order
-    typedef struct { const char *key; BOOL filled; } LayerSpec;
-    static const LayerSpec kLayers[] = {
-        { "bgFillBlackLayer",     YES },
-        { "snaplineKnockedLayer", NO  },
-        { "snaplineBotLayer",     NO  },
-        { "snaplineLayer",        NO  },
-        { "boneKnockedLayer",     NO  },
-        { "boneBotLayer",         NO  },
-        { "boneLayer",            NO  },
-        { "boxKnockedLayer",      NO  },
-        { "boxBotLayer",          NO  },
-        { "boxLayer",             NO  },
-        { "hpFillRedLayer",       YES },
-        { "hpFillOrangeLayer",    YES },
-        { "hpFillGreenLayer",     YES },
-        { "alertLayer",           NO  },
-        { "fovLayer",             NO  },
-        { "aimAssistLayer",       NO  },
-        { "alertNumBGLayer",      YES },
-        { "alertNumGreenLayer",   YES },
-        { "alertNumOrangeLayer",  YES },
-        { "alertNumRedLayer",     YES },
-        { "nameTextLayer",        YES },
-        { NULL, NO }
-    };
-
-    for (int i = 0; kLayers[i].key != NULL; i++) {
-        NSString *key = [NSString stringWithUTF8String:kLayers[i].key];
-        if (![espView respondsToSelector:NSSelectorFromString(key)]) continue;
-        id val = [espView valueForKey:key];
-        if (![val isKindOfClass:[CAShapeLayer class]]) continue;
-        CAShapeLayer *sl = (CAShapeLayer *)val;
-        CGPathRef p = sl.path;
-        if (!p || CGPathIsEmpty(p)) continue;
-
-        CGContextSaveGState(ctx);
-        CGContextSetLineWidth(ctx, sl.lineWidth > 0.0f ? sl.lineWidth : 1.0f);
-        CGContextSetLineJoin(ctx, kCGLineJoinRound);
-        CGContextSetLineCap(ctx, kCGLineCapRound);
-        CGContextAddPath(ctx, p);
-
-        if (kLayers[i].filled) {
-            if (sl.fillColor) CGContextSetFillColorWithColor(ctx, sl.fillColor);
-            else              CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
-            CGContextFillPath(ctx);
-        } else {
-            if (sl.strokeColor) CGContextSetStrokeColorWithColor(ctx, sl.strokeColor);
-            else                CGContextSetRGBStrokeColor(ctx, 1, 1, 1, 1);
-            CGContextStrokePath(ctx);
-        }
-        CGContextRestoreGState(ctx);
-    }
-
-    CGContextRelease(ctx);
-    // Write local buffer to SB IOSurface memory in one shot
-    remote_write(g_iosSbBase, base, g_iosLocalSize);
-}
-#endif
 void SBRemotePushESPFrame(UIView *espView) {
-#if SB_IOSURFACE_RENDER
-    if (!g_sbOverlayOn) {
-        if (!g_sbBuilding && g_sbEverOn && now_us() > g_sbRearmAfterUS) {
-            g_sbRearmAfterUS = now_us() + 3000000ULL;
-            g_sbConsecFail = 0;
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                if (SBoardStartOverlay() == 0) {
-                    NSLog(@"[PUSH-REARM] overlay rebuilt");
-                }
-            });
-        }
-        return;
-    }
-    if (!espView) return;
-
-    // Heartbeat: 1Hz regardless of surface state so we know if we reach here.
-    {
-        static uint64_t s_iosHB = 0;
-        uint64_t tNow = now_us();
-        if (tNow > s_iosHB) {
-            s_iosHB = tNow + 1000000ULL;
-            NSLog(@"[SB-IOS-HB] on=%d ready=%d sbBase=0x%llx",
-                  (int)g_sbOverlayOn,
-                  (int)g_iosReady,
-                  (unsigned long long)g_iosSbBase);
-        }
-    }
-
-    // If IOSurface setup succeeded, draw via pixel buffer (0 RemoteCall/frame).
-    if (g_iosReady) {
-        const uint64_t t = now_us();
-        if (t < g_sbNextPublishUS) return;
-        g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
-        g_sbLastPublishUS = t;
-        g_sbSummaryAttempts++;
-        g_sbSummaryUpdates++;
-        sb_ios_render_frame(espView);
-        return;
-    }
-    // IOSurface not available — fall through to CGPath engine below.
-    NSLog(@"[SB-IOS] g_iosSurface=NULL — falling through to CGPath");
-    // CGPath fallback (compiled always when SB_IOSURFACE_RENDER=1):
     if (!g_sbOverlayOn) {
         // Rebuild it instead of staying dead. This is the whole fix for the
         // "ESP paints once and then freezes" report: the old code cleared
@@ -3871,8 +3494,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             __sync_lock_release(&s_remoteBusy);
         }
     });
-#endif // SB_IOSURFACE_RENDER
-} // SBRemotePushESPFrame
+}
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 
