@@ -3971,12 +3971,3 @@ void SBoardStopOverlay(void) {
         sb_forget_local_paint_state();
     }
 }
-
-void SBoardOverlaySetHidden(BOOL hidden) {
-    pthread_mutex_lock(&g_sbLock);
-    uint64_t win = g_sbWin;
-    pthread_mutex_unlock(&g_sbLock);
-    if (!r_is_objc_ptr(win)) return;
-    if (!remote_call_has_local_state()) return;
-    r_msg2_main(win, "setHidden:", hidden ? 1 : 0, 0,0,0);
-}

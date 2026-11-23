@@ -138,8 +138,6 @@ static void MDResetAccentPrefs(void) {
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     // KeepAlive must survive audio interruptions / media-server resets.
     [[KeepAlive shared] start];
-    // Unhide overlay when game returns to foreground.
-    SBoardOverlaySetHidden(NO);
     dispatch_async(dispatch_get_main_queue(), ^{
         ESPPrefsSync();
         MDThemeLoadFromPrefs();
@@ -150,8 +148,6 @@ static void MDResetAccentPrefs(void) {
 - (void)applicationDidEnterBackground:(UIApplication *)application {
     // Re-assert silent audio + bg task so process is not jetsammed.
     [[KeepAlive shared] start];
-    // Hide overlay so app switcher / homescreen touches work normally.
-    SBoardOverlaySetHidden(YES);
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {
