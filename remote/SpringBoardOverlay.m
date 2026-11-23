@@ -88,7 +88,39 @@
 // it on is visible before it is turned on.
 #define SB_DRAW_BONES 0
 
+// IOSurface direct rendering engine.
+//
+// Renders the entire frame (boxes, health bars, snaplines, FOV, name plates,
+// name glyphs, and the red enemy counter) into a local CGBitmapContext at
+// 1.5x scale (fits well inside RemoteCall's 256-page / 4MB shmem cache with
+// zero LRU evictions), writes only the dirty page range to the IOSurface in
+// SpringBoard, and triggers one cached async setContents: invocation so
+// CoreAnimation's render server re-composites the surface on every frame.
+// Falls back cleanly to the CGPath engine if IOSurface setup fails.
+#define SB_IOSURFACE_RENDER 1
+
 static BOOL g_sbOverlayOn = NO;
+#if SB_IOSURFACE_RENDER
+static BOOL     g_iosReady       = NO;
+static uint64_t g_iosSbSurf      = 0;    // IOSurface ObjC object in SB process
+static uint64_t g_iosSbBase      = 0;    // IOSurface base address in SB process
+static size_t   g_iosBpr         = 0;    // bytes per row
+static int      g_iosW           = 0;    // surface pixel width (portrait)
+static int      g_iosH           = 0;    // surface pixel height (portrait)
+static double   g_iosScale       = 1.5;  // pixel scale factor (1.5x -> ~182 pages < 256 cache)
+static CGFloat  g_iosLandW       = 0;    // landscape width in points (= portrait H)
+static CGFloat  g_iosLandH       = 0;    // landscape height in points (= portrait W)
+static void    *g_iosLocalBuf    = NULL; // malloc'd local draw buffer (app process)
+static size_t   g_iosLocalSize   = 0;
+static CGContextRef g_iosCtx     = NULL; // persistent CGBitmapContext over g_iosLocalBuf
+static size_t   g_iosPrevMinOff  = 0;    // dirty byte range of the previous frame
+static size_t   g_iosPrevMaxOff  = 0;
+static int      g_iosWasEmpty    = 1;    // 1 when the surface in SB is already transparent
+static uint64_t g_sbSetContentsInv      = 0;
+static uint64_t g_sbSetContentsArgBuf   = 0;
+static uint64_t g_sbClearContentsInv    = 0;
+static uint64_t g_sbClearContentsArgBuf = 0;
+#endif
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
@@ -899,7 +931,11 @@ static void sb_text_send(int slot, NSString *text,
 // The counter's outline as it stands, or NULL when it should not be drawn. Cached
 // by string and size, so CoreText runs on a change and not on a frame.
 static CGPathRef sb_text_glyph_path_for_frame(UIView *espView) {
+#if SB_IOSURFACE_RENDER
+    if (!g_sbTextShape && !g_iosReady) return NULL;
+#else
     if (!g_sbTextShape) return NULL;
+#endif
     if (!ESPPrefsBool(@"Count", YES)) return NULL;
 
     id sl = [espView valueForKey:@"statusLayer"];
@@ -1097,6 +1133,30 @@ static void sb_forget_local_paint_state(void) {
         g_sbNameInv[i] = 0;
         g_sbNameArgBuf[i] = 0;
     }
+#if SB_IOSURFACE_RENDER
+    if (r_is_objc_ptr(g_sbSetContentsInv) && remote_call_has_local_state()) {
+        r_msg2(g_sbSetContentsInv, "release", 0,0,0,0);
+    }
+    if (g_sbSetContentsArgBuf && remote_call_has_local_state()) {
+        dlsym_remote("free", g_sbSetContentsArgBuf, 0,0,0,0,0,0,0);
+    }
+    if (r_is_objc_ptr(g_sbClearContentsInv) && remote_call_has_local_state()) {
+        r_msg2(g_sbClearContentsInv, "release", 0,0,0,0);
+    }
+    if (g_sbClearContentsArgBuf && remote_call_has_local_state()) {
+        dlsym_remote("free", g_sbClearContentsArgBuf, 0,0,0,0,0,0,0);
+    }
+    g_sbSetContentsInv = 0;
+    g_sbSetContentsArgBuf = 0;
+    g_sbClearContentsInv = 0;
+    g_sbClearContentsArgBuf = 0;
+    g_iosReady = NO;
+    g_iosSbSurf = 0;
+    g_iosSbBase = 0;
+    g_iosPrevMinOff = 0;
+    g_iosPrevMaxOff = 0;
+    g_iosWasEmpty = 1;
+#endif
     g_sbPathHash = 0;
     g_sbLastPathBytes = 0;
     g_sbLastSubpaths = 0;
@@ -1117,8 +1177,10 @@ static void sb_disable_layer_actions(uint64_t layer) {
     uint64_t dict = r_msg2_main(NSMutableDictionary, "dictionary", 0,0,0,0);
     uint64_t nullObj = r_msg2_main(NSNullCls, "null", 0,0,0,0);
     uint64_t keyPath = r_nsstr_retained("path");
-    if (r_is_objc_ptr(dict) && r_is_objc_ptr(nullObj) && r_is_objc_ptr(keyPath)) {
-        r_msg2_main(dict, "setObject:forKey:", nullObj, keyPath, 0, 0);
+    uint64_t keyContents = r_nsstr_retained("contents");
+    if (r_is_objc_ptr(dict) && r_is_objc_ptr(nullObj)) {
+        if (r_is_objc_ptr(keyPath)) r_msg2_main(dict, "setObject:forKey:", nullObj, keyPath, 0, 0);
+        if (r_is_objc_ptr(keyContents)) r_msg2_main(dict, "setObject:forKey:", nullObj, keyContents, 0, 0);
         r_msg2_main(layer, "setActions:", dict, 0,0,0);
     }
 }
@@ -1399,6 +1461,270 @@ static BOOL sb_invoke_name_cached(int slot, uint64_t target, uint64_t path) {
     return YES;
 }
 
+#if SB_IOSURFACE_RENDER
+static BOOL sb_ensure_setcontents_invocation(void) {
+    if (r_is_objc_ptr(g_sbSetContentsInv) && g_sbSetContentsArgBuf &&
+        r_is_objc_ptr(g_sbClearContentsInv) && g_sbClearContentsArgBuf) {
+        return YES;
+    }
+    if (!r_is_objc_ptr(g_sbShape) || !r_is_objc_ptr(g_iosSbSurf)) return NO;
+
+    uint64_t setContentsSel = r_sel("setContents:");
+    if (!setContentsSel) return NO;
+
+    uint64_t sigSel = r_sel("methodSignatureForSelector:");
+    uint64_t sig = r_msg(g_sbShape, sigSel, setContentsSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+
+    if (!r_is_objc_ptr(g_sbClearContentsInv) || !g_sbClearContentsArgBuf) {
+        uint64_t cInv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+        if (!r_is_objc_ptr(cInv)) return NO;
+        r_msg2(cInv, "retain", 0, 0, 0, 0);
+        r_msg2(cInv, "setTarget:", g_sbShape, 0, 0, 0);
+        r_msg2(cInv, "setSelector:", setContentsSel, 0, 0, 0);
+        uint64_t cBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (!cBuf) {
+            r_msg2(cInv, "release", 0, 0, 0, 0);
+            return NO;
+        }
+        remote_write64(cBuf, 0);
+        r_msg2(cInv, "setArgument:atIndex:", cBuf, 2, 0, 0);
+        r_msg2(cInv, "retainArguments", 0, 0, 0, 0);
+        g_sbClearContentsInv = cInv;
+        g_sbClearContentsArgBuf = cBuf;
+    }
+
+    if (!r_is_objc_ptr(g_sbSetContentsInv) || !g_sbSetContentsArgBuf) {
+        uint64_t sInv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+        if (!r_is_objc_ptr(sInv)) return NO;
+        r_msg2(sInv, "retain", 0, 0, 0, 0);
+        r_msg2(sInv, "setTarget:", g_sbShape, 0, 0, 0);
+        r_msg2(sInv, "setSelector:", setContentsSel, 0, 0, 0);
+        uint64_t sBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (!sBuf) {
+            r_msg2(sInv, "release", 0, 0, 0, 0);
+            return NO;
+        }
+        remote_write64(sBuf, g_iosSbSurf);
+        r_msg2(sInv, "setArgument:atIndex:", sBuf, 2, 0, 0);
+        r_msg2(sInv, "retainArguments", 0, 0, 0, 0);
+        g_sbSetContentsInv = sInv;
+        g_sbSetContentsArgBuf = sBuf;
+    }
+
+    if (!g_sbPerformMainSel) {
+        g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    }
+    if (!g_sbInvokeSel) {
+        g_sbInvokeSel = r_sel("invoke");
+    }
+    NSLog(@"[SB-IOS] ContentsInvocations ready clear=0x%llx set=0x%llx surf=0x%llx",
+          (unsigned long long)g_sbClearContentsInv,
+          (unsigned long long)g_sbSetContentsInv,
+          (unsigned long long)g_iosSbSurf);
+    return YES;
+}
+
+static void sb_invoke_ios_present_cached(void) {
+    if (!r_is_objc_ptr(g_iosSbSurf) || !r_is_objc_ptr(g_sbShape)) return;
+    // Increment the IOSurface kernel modification seed so WindowServer / RenderServer
+    // sees a new seed and re-composites the updated surface pixels.
+    dlsym_remote_void("IOSurfaceLock", g_iosSbSurf, 0, 0, 0,0,0,0,0);
+    dlsym_remote_void("IOSurfaceUnlock", g_iosSbSurf, 0, 0, 0,0,0,0,0);
+    if (!sb_ensure_setcontents_invocation()) {
+        r_msg2_main_async(g_sbShape, "setContents:", 0, 0,0,0);
+        r_msg2_main_async(g_sbShape, "setContents:", g_iosSbSurf, 0,0,0);
+        return;
+    }
+    if (g_sbPerformMainSel && g_sbInvokeSel) {
+        r_msg(g_sbClearContentsInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        r_msg(g_sbSetContentsInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
+}
+
+static BOOL sb_ios_render_frame(UIView *espView,
+                                size_t *outMinOff,
+                                size_t *outMaxOff,
+                                uint32_t *outSubCount) {
+    if (!g_iosReady || !g_iosLocalBuf || !g_iosCtx || !g_iosSbBase || g_iosLocalSize == 0) {
+        return NO;
+    }
+
+    const CGRect vb = espView.bounds;
+    const CGFloat landW = (vb.size.width  > vb.size.height) ? vb.size.width  : vb.size.height;
+    const CGFloat landH = (vb.size.width  > vb.size.height) ? vb.size.height : vb.size.width;
+    if (landW <= 0 || landH <= 0) return NO;
+
+    // 1. Clear only the dirty byte range from the previous frame.
+    const size_t prevMin = g_iosPrevMinOff;
+    const size_t prevMax = (g_iosPrevMaxOff <= g_iosLocalSize) ? g_iosPrevMaxOff : g_iosLocalSize;
+    if (prevMax > prevMin) {
+        memset((uint8_t *)g_iosLocalBuf + prevMin, 0, prevMax - prevMin);
+    }
+
+    // 2. Collect non-empty paths from espView on the caller (main) thread and
+    //    compute their union bounding box in landscape coordinates.
+    CGPathRef geomPaths[16];
+    int geomCount = 0;
+    CGPathRef nameBgPath = NULL;
+    CGPathRef nameTextPath = NULL;
+    CGPathRef counterPath = sb_text_glyph_path_for_frame(espView);
+
+    CGRect unionBB = CGRectNull;
+    int haveBB = 0;
+    int curHasContent = 0;
+    uint32_t subCount = 0;
+
+    for (int i = 0; i < SB_SHAPE_KEY_COUNT; i++) {
+        if (!kShapeKeys[i]) continue;
+#if !SB_DRAW_BONES
+        if (i >= 3 && i <= 5) continue;
+#endif
+        NSString *key = [NSString stringWithUTF8String:kShapeKeys[i]];
+        if (![espView respondsToSelector:NSSelectorFromString(key)]) continue;
+        id val = [espView valueForKey:key];
+        if (![val isKindOfClass:[CAShapeLayer class]]) continue;
+        CGPathRef p = ((CAShapeLayer *)val).path;
+        if (!p || CGPathIsEmpty(p)) continue;
+
+        CGRect bb = CGPathGetBoundingBox(p);
+        if (!CGRectIsNull(bb) && !CGRectIsEmpty(bb) &&
+            isfinite(bb.origin.x) && isfinite(bb.origin.y) &&
+            isfinite(bb.size.width) && isfinite(bb.size.height)) {
+            unionBB = haveBB ? CGRectUnion(unionBB, bb) : bb;
+            haveBB = 1;
+            curHasContent = 1;
+            subCount++;
+            if (i == SB_NAME_BG_INDEX) {
+                nameBgPath = p;
+            } else if (i == SB_NAME_TEXT_INDEX) {
+                nameTextPath = p;
+            } else if (i < 16 && geomCount < 16) {
+                geomPaths[geomCount++] = p;
+            }
+        }
+    }
+
+    if (counterPath && !CGPathIsEmpty(counterPath)) {
+        CGRect bb = CGPathGetBoundingBox(counterPath);
+        if (!CGRectIsNull(bb) && !CGRectIsEmpty(bb) &&
+            isfinite(bb.origin.x) && isfinite(bb.origin.y) &&
+            isfinite(bb.size.width) && isfinite(bb.size.height)) {
+            unionBB = haveBB ? CGRectUnion(unionBB, bb) : bb;
+            haveBB = 1;
+            curHasContent = 1;
+            subCount++;
+        } else {
+            counterPath = NULL;
+        }
+    } else {
+        counterPath = NULL;
+    }
+
+    // 3. Render paths into the persistent CGBitmapContext matching 52f25c938 visuals:
+    //    - Geometry (boxes, snaplines, 0.75pt HP bars, FOV): stroked white at 0.75pt
+    //    - Name plate (alertNumBGLayer): filled dark grey (0.16, 0.16, 0.16, 0.82)
+    //    - Name & distance glyphs (nameTextLayer): filled white (1.0, 1.0, 1.0, 1.0)
+    //    - Enemy counter digits (statusLayer): filled red (1.0, 0.0, 0.0, 1.0)
+    if (curHasContent) {
+        CGContextSaveGState(g_iosCtx);
+        const CGFloat s = (CGFloat)g_iosScale;
+        // sbEmit maps landscape (sx, sy) to portrait (px = landH - sy, py = sx).
+        // CGBitmapContext has user-space y=0 at the bottom row (row = g_iosH - ctx_y),
+        // while CALayer.contents places row 0 at the top of the screen (py = 0).
+        // Thus ctx_x = (landH - sy) * s and ctx_y = (landW - sx) * s.
+        CGAffineTransform ctm = CGAffineTransformMake(0.0, -s, -s, 0.0, landH * s, landW * s);
+        CGContextConcatCTM(g_iosCtx, ctm);
+
+        CGContextSetShouldAntialias(g_iosCtx, true);
+        CGContextSetAllowsAntialiasing(g_iosCtx, true);
+        CGContextSetLineJoin(g_iosCtx, kCGLineJoinRound);
+        CGContextSetLineCap(g_iosCtx, kCGLineCapRound);
+        CGContextSetLineWidth(g_iosCtx, 0.75);
+
+        if (geomCount > 0) {
+            CGContextSetRGBStrokeColor(g_iosCtx, 1.0, 1.0, 1.0, 1.0);
+            CGContextBeginPath(g_iosCtx);
+            for (int k = 0; k < geomCount; k++) {
+                CGContextAddPath(g_iosCtx, geomPaths[k]);
+            }
+            CGContextStrokePath(g_iosCtx);
+        }
+
+        if (nameBgPath) {
+            CGContextSetRGBFillColor(g_iosCtx, 0.16, 0.16, 0.16, 0.82);
+            CGContextBeginPath(g_iosCtx);
+            CGContextAddPath(g_iosCtx, nameBgPath);
+            CGContextFillPath(g_iosCtx);
+        }
+
+        if (nameTextPath) {
+            CGContextSetRGBFillColor(g_iosCtx, 1.0, 1.0, 1.0, 1.0);
+            CGContextBeginPath(g_iosCtx);
+            CGContextAddPath(g_iosCtx, nameTextPath);
+            CGContextFillPath(g_iosCtx);
+        }
+
+        if (counterPath) {
+            CGContextSetRGBFillColor(g_iosCtx, 1.0, 0.0, 0.0, 1.0);
+            CGContextBeginPath(g_iosCtx);
+            CGContextAddPath(g_iosCtx, counterPath);
+            CGContextFillPath(g_iosCtx);
+        }
+
+        CGContextRestoreGState(g_iosCtx);
+    }
+
+    // 4. Compute dirty memory row range in portrait bitmap space (row = sx * scale).
+    size_t curMinOff = 0;
+    size_t curMaxOff = 0;
+    if (curHasContent && haveBB) {
+        const double pad = 4.0;
+        double minPy = (double)unionBB.origin.x - pad;
+        double maxPy = (double)(unionBB.origin.x + unionBB.size.width) + pad;
+        int minRow = (int)floor(minPy * g_iosScale);
+        int maxRow = (int)ceil(maxPy * g_iosScale);
+        if (minRow < 0) minRow = 0;
+        if (maxRow > g_iosH) maxRow = g_iosH;
+        if (maxRow < minRow) maxRow = minRow;
+        curMinOff = (size_t)minRow * g_iosBpr;
+        curMaxOff = (size_t)maxRow * g_iosBpr;
+        if (curMaxOff > g_iosLocalSize) curMaxOff = g_iosLocalSize;
+    }
+
+    size_t dirtyMin = 0;
+    size_t dirtyMax = 0;
+    if (curMaxOff > curMinOff && prevMax > prevMin) {
+        dirtyMin = (curMinOff < prevMin) ? curMinOff : prevMin;
+        dirtyMax = (curMaxOff > prevMax) ? curMaxOff : prevMax;
+    } else if (curMaxOff > curMinOff) {
+        dirtyMin = curMinOff;
+        dirtyMax = curMaxOff;
+    } else if (prevMax > prevMin) {
+        dirtyMin = prevMin;
+        dirtyMax = prevMax;
+    }
+    g_iosPrevMinOff = curMinOff;
+    g_iosPrevMaxOff = curMaxOff;
+
+    if (!curHasContent && g_iosWasEmpty) {
+        return NO;
+    }
+    g_iosWasEmpty = curHasContent ? 0 : 1;
+    if (dirtyMax <= dirtyMin) {
+        return NO;
+    }
+
+    *outMinOff = dirtyMin;
+    *outMaxOff = dirtyMax;
+    *outSubCount = subCount;
+    return YES;
+}
+#endif
+
 static int sb_open_session(void) {
     if (!g_kexploit_ready) return -1;
     if (remote_call_has_local_state()) {
@@ -1644,6 +1970,13 @@ int SBoardStartOverlay(void) {
     double winLevel = SB_OVERLAY_WIN_LEVEL;
     r_msg2_main_raw(win, "setWindowLevel:", &winLevel, 8, NULL,0,NULL,0,NULL,0);
     r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0);
+    if (r_responds_main(win, "_setIgnoresHitTest:")) {
+        r_msg2_main(win, "_setIgnoresHitTest:", 1, 0,0,0);
+    }
+    uint64_t winLayer = r_msg2_main(win, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(winLayer) && r_responds_main(winLayer, "setAllowsHitTesting:")) {
+        r_msg2_main(winLayer, "setAllowsHitTesting:", 0, 0,0,0);
+    }
     if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
 
     uint64_t container = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
@@ -2046,7 +2379,112 @@ int SBoardStartOverlay(void) {
         NSLog(@"[SB-NAME] bg=0x%llx text=0x%llx",
               (unsigned long long)g_sbNameBgShape,
               (unsigned long long)g_sbNameTextShape);
+        if (r_responds_main(cLayer2, "setAllowsHitTesting:")) {
+            r_msg2_main(cLayer2, "setAllowsHitTesting:", 0, 0,0,0);
+        }
     }
+    if (r_responds_main(shape, "setAllowsHitTesting:")) {
+        r_msg2_main(shape, "setAllowsHitTesting:", 0, 0,0,0);
+    }
+
+#if SB_IOSURFACE_RENDER
+    {
+        g_iosReady = NO;
+        double scale = 1.5;
+        int iosW = (int)lround(bounds[2] * scale);
+        int iosH = (int)lround(bounds[3] * scale);
+        // RemoteCall.m caches SHMEM_CACHE_SIZE = 256 pages (4 MB). Keep the full
+        // surface under 192 pages (~3.14 MB) so every page stays permanently in
+        // g_RC_shmemCache with zero LRU evictions on all iPhone sizes.
+        if ((size_t)iosW * (size_t)iosH * 4ULL > 192ULL * 16384ULL) {
+            scale = 1.25;
+            iosW = (int)lround(bounds[2] * scale);
+            iosH = (int)lround(bounds[3] * scale);
+        }
+        g_iosScale = scale;
+
+        uint64_t clsIOS = r_class("IOSurface");
+        uint64_t clsDict = r_class("NSMutableDictionary");
+        uint64_t clsNum = r_class("NSNumber");
+        if (r_is_objc_ptr(clsIOS) && r_is_objc_ptr(clsDict) && r_is_objc_ptr(clsNum) &&
+            iosW > 0 && iosH > 0) {
+            uint64_t props = r_msg2_main(clsDict, "dictionary", 0,0,0,0);
+            uint64_t nW = r_msg2_main(clsNum, "numberWithInt:", (uint64_t)iosW, 0,0,0);
+            uint64_t nH = r_msg2_main(clsNum, "numberWithInt:", (uint64_t)iosH, 0,0,0);
+            uint64_t nBpe = r_msg2_main(clsNum, "numberWithInt:", 4, 0,0,0);
+            uint64_t nFmt = r_msg2_main(clsNum, "numberWithUnsignedInt:", 0x42475241U, 0,0,0); // 'BGRA'
+            uint64_t kW = r_nsstr_retained("IOSurfaceWidth");
+            uint64_t kH = r_nsstr_retained("IOSurfaceHeight");
+            uint64_t kBpe = r_nsstr_retained("IOSurfaceBytesPerElement");
+            uint64_t kFmt = r_nsstr_retained("IOSurfacePixelFormat");
+            if (r_is_objc_ptr(props) && r_is_objc_ptr(nW) && r_is_objc_ptr(nH) &&
+                r_is_objc_ptr(nBpe) && r_is_objc_ptr(nFmt) &&
+                r_is_objc_ptr(kW) && r_is_objc_ptr(kH) &&
+                r_is_objc_ptr(kBpe) && r_is_objc_ptr(kFmt)) {
+                r_msg2_main(props, "setObject:forKey:", nW, kW, 0,0);
+                r_msg2_main(props, "setObject:forKey:", nH, kH, 0,0);
+                r_msg2_main(props, "setObject:forKey:", nBpe, kBpe, 0,0);
+                r_msg2_main(props, "setObject:forKey:", nFmt, kFmt, 0,0);
+
+                uint64_t surfAlloc = r_msg2_main(clsIOS, "alloc", 0,0,0,0);
+                uint64_t sbSurf = r_is_objc_ptr(surfAlloc)
+                                ? r_msg2_main(surfAlloc, "initWithProperties:", props, 0,0,0)
+                                : 0;
+                if (r_is_objc_ptr(sbSurf)) {
+                    dlsym_remote("IOSurfaceLock", sbSurf, 0, 0, 0,0,0,0,0);
+                    uint64_t sbBase = dlsym_remote("IOSurfaceGetBaseAddress", sbSurf, 0,0,0,0,0,0,0);
+                    uint64_t sbBpr  = dlsym_remote("IOSurfaceGetBytesPerRow", sbSurf, 0,0,0,0,0,0,0);
+                    if (sbBase > 0x100000000ULL && sbBpr >= (uint64_t)(iosW * 4) && sbBpr < 32768ULL) {
+                        size_t bufSize = (size_t)sbBpr * (size_t)iosH;
+                        dlsym_remote("memset", sbBase, 0, (uint64_t)bufSize, 0,0,0,0,0);
+                        dlsym_remote("IOSurfaceUnlock", sbSurf, 0, 0, 0,0,0,0,0);
+
+                        r_msg2_main(shape, "setContents:", sbSurf, 0,0,0);
+                        r_msg2_main_raw(shape, "setContentsScale:", &g_iosScale, 8, NULL,0,NULL,0,NULL,0);
+
+                        if (g_iosCtx) { CGContextRelease(g_iosCtx); g_iosCtx = NULL; }
+                        if (g_iosLocalBuf) { free(g_iosLocalBuf); g_iosLocalBuf = NULL; }
+                        g_iosLocalBuf = calloc(1, bufSize);
+                        if (g_iosLocalBuf) {
+                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                            g_iosCtx = CGBitmapContextCreate(
+                                g_iosLocalBuf, (size_t)iosW, (size_t)iosH, 8, (size_t)sbBpr, cs,
+                                (CGBitmapInfo)kCGImageAlphaPremultipliedFirst |
+                                (CGBitmapInfo)kCGBitmapByteOrder32Little);
+                            CGColorSpaceRelease(cs);
+                        }
+                        if (g_iosLocalBuf && g_iosCtx) {
+                            g_iosSbSurf = sbSurf;
+                            g_iosSbBase = sbBase;
+                            g_iosBpr = (size_t)sbBpr;
+                            g_iosW = iosW;
+                            g_iosH = iosH;
+                            g_iosLandW = (bounds[3] > bounds[2]) ? bounds[3] : bounds[2];
+                            g_iosLandH = (bounds[3] > bounds[2]) ? bounds[2] : bounds[3];
+                            g_iosLocalSize = bufSize;
+                            g_iosPrevMinOff = 0;
+                            g_iosPrevMaxOff = 0;
+                            g_iosWasEmpty = 1;
+                            g_iosReady = YES;
+                            (void)sb_ensure_setcontents_invocation();
+                            NSLog(@"[SB-IOS] READY surf=0x%llx base=0x%llx %dx%d bpr=%zu scale=%.2f pages=%zu",
+                                  (unsigned long long)sbSurf, (unsigned long long)sbBase,
+                                  iosW, iosH, (size_t)sbBpr, g_iosScale, (bufSize + 16383) / 16384);
+                        } else {
+                            NSLog(@"[SB-IOS] local CGBitmapContext alloc failed — falling back to CGPath");
+                        }
+                    } else {
+                        dlsym_remote("IOSurfaceUnlock", sbSurf, 0, 0, 0,0,0,0,0);
+                        NSLog(@"[SB-IOS] invalid base=0x%llx bpr=%llu — falling back to CGPath",
+                              (unsigned long long)sbBase, (unsigned long long)sbBpr);
+                    }
+                } else {
+                    NSLog(@"[SB-IOS] initWithProperties failed — falling back to CGPath");
+                }
+            }
+        }
+    }
+#endif
     // Publishes only start now, at the end, once the name layers exist. This flag
     // used to be set about a hundred lines earlier, immediately after
     // sb_text_forget, which is what left the boxes on screen for a second before
@@ -2387,6 +2825,115 @@ void SBRemotePushESPFrame(UIView *espView) {
         return;
     }
 
+    static int s_remoteBusy = 0;
+#if SB_IOSURFACE_RENDER
+    if (g_iosReady) {
+        g_sbLastPublishUS = tGate;
+        if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+            g_sbBusyDrops++;
+            g_sbSummarySkips++;
+            return;
+        }
+        const uint64_t tAcquire = now_us();
+        const uint64_t tRender0 = now_us();
+        size_t dirtyMinOff = 0;
+        size_t dirtyMaxOff = 0;
+        uint32_t subCount = 0;
+        const BOOL shouldPush = sb_ios_render_frame(espView, &dirtyMinOff, &dirtyMaxOff, &subCount);
+        const uint64_t renderUS = now_us() - tRender0;
+        if (!shouldPush || dirtyMaxOff <= dirtyMinOff) {
+            __sync_lock_release(&s_remoteBusy);
+            g_sbSummarySkips++;
+            return;
+        }
+        g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            const uint64_t tPubStart = now_us();
+            const uint64_t dispUS = tPubStart - tAcquire;
+            pthread_mutex_lock(&g_sbIoLock);
+            const uint64_t lockUS = now_us() - tPubStart;
+            @try {
+                if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+                if (!g_iosReady || !g_iosSbBase || !g_iosLocalBuf) return;
+
+                const size_t writeLen = dirtyMaxOff - dirtyMinOff;
+                const uint64_t tWrite0 = now_us();
+                const bool wOk = remote_write(g_iosSbBase + dirtyMinOff,
+                                              (const uint8_t *)g_iosLocalBuf + dirtyMinOff,
+                                              writeLen);
+                const uint64_t writeUS = now_us() - tWrite0;
+                if (!wOk || !remote_call_current_success()) {
+                    if (++g_sbConsecFail >= 3) {
+                        NSLog(@"[PUSH-DEAD] IOSurface remote_write failed %d times — rebuilding",
+                              g_sbConsecFail);
+                        abandon_remote_call();
+                        pthread_mutex_lock(&g_sbLock);
+                        g_sbOverlayOn = NO;
+                        pthread_mutex_unlock(&g_sbLock);
+                        g_sbRearmAfterUS = now_us() + 2000000ULL;
+                    }
+                    return;
+                }
+                g_sbConsecFail = 0;
+
+                const uint64_t tPres0 = now_us();
+                sb_invoke_ios_present_cached();
+                const uint64_t presentUS = now_us() - tPres0;
+                const uint64_t pubUS = now_us() - tPubStart;
+
+                g_sbSummaryUpdates++;
+                g_sbLastPublishUS = now_us();
+                g_sbRearmBackoffUS = 5000000ULL;
+                g_sbLastSubpaths = subCount;
+                g_sbLastCalls = 4;
+                g_sbWinMergeUS += renderUS;
+                g_sbWinDispUS += dispUS;
+                g_sbWinLockUS += lockUS;
+                g_sbWinDecodeUS += writeUS;
+                g_sbWinPresentUS += presentUS;
+                g_sbWinPubUS += pubUS;
+                if (pubUS > g_sbWinPubMaxUS) g_sbWinPubMaxUS = pubUS;
+
+                static uint64_t s_iosWinStartUS = 0;
+                static uint64_t s_iosWinUpd = 0, s_iosWinDrops = 0;
+                static uint64_t s_iosWinRender = 0, s_iosWinWrite = 0, s_iosWinPres = 0, s_iosWinPub = 0;
+                const uint64_t nowS = now_us();
+                if (nowS - s_iosWinStartUS >= 1000000ULL) {
+                    const uint64_t winUS = nowS - s_iosWinStartUS;
+                    const uint64_t updWin = g_sbSummaryUpdates - s_iosWinUpd;
+                    const double hz = (double)updWin * 1e6 / (double)winUS;
+                    const double bdropHz = (double)(g_sbBusyDrops - s_iosWinDrops) * 1e6 / (double)winUS;
+                    const double n = updWin ? (double)updWin : 1.0;
+                    const double avgRenderMS = (double)(g_sbWinMergeUS - s_iosWinRender) / n / 1000.0;
+                    const double avgWriteMS  = (double)(g_sbWinDecodeUS - s_iosWinWrite) / n / 1000.0;
+                    const double avgPresMS   = (double)(g_sbWinPresentUS - s_iosWinPres) / n / 1000.0;
+                    const double avgPubMS    = (double)(g_sbWinPubUS - s_iosWinPub) / n / 1000.0;
+                    s_iosWinStartUS = nowS;
+                    s_iosWinUpd = g_sbSummaryUpdates;
+                    s_iosWinDrops = g_sbBusyDrops;
+                    s_iosWinRender = g_sbWinMergeUS;
+                    s_iosWinWrite = g_sbWinDecodeUS;
+                    s_iosWinPres = g_sbWinPresentUS;
+                    s_iosWinPub = g_sbWinPubUS;
+                    NSLog(@"[SB-PUSH] IOSURFACE hz=%.1f bdropsHz=%.1f ups=%llu "
+                          @"render=%.2fms write=%.2fms present=%.2fms pubavg=%.2fms "
+                          @"dirtyKB=%zu layers=%u",
+                          hz, bdropHz, (unsigned long long)updWin,
+                          avgRenderMS, avgWriteMS, avgPresMS, avgPubMS,
+                          writeLen / 1024, subCount);
+                    g_sbWinPubMaxUS = 0;
+                }
+            } @finally {
+                pthread_mutex_unlock(&g_sbIoLock);
+                g_sbHoldUS += now_us() - tAcquire;
+                __sync_lock_release(&s_remoteBusy);
+            }
+        });
+        return;
+    }
+#endif
+
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
@@ -2426,7 +2973,6 @@ void SBRemotePushESPFrame(UIView *espView) {
         return;
     }
 
-    static int s_remoteBusy = 0;
     if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
         // How long one publish holds the flag, and how often a frame arrives
         // while it is still held. The interval gate lets frames through
@@ -3543,6 +4089,21 @@ void SBClearESPNameLayers(void) {
     pthread_mutex_lock(&g_sbIoLock);
     // Same nil hand-over as the publish's off edges, one crossing per layer.
     @try {
+#if SB_IOSURFACE_RENDER
+        if (g_iosReady && g_iosSbBase && g_iosLocalBuf && g_iosLocalSize > 0) {
+            const size_t cMin = g_iosPrevMinOff;
+            const size_t cMax = (g_iosPrevMaxOff <= g_iosLocalSize) ? g_iosPrevMaxOff : g_iosLocalSize;
+            if (cMax > cMin) {
+                memset((uint8_t *)g_iosLocalBuf + cMin, 0, cMax - cMin);
+                remote_write(g_iosSbBase + cMin, (const uint8_t *)g_iosLocalBuf + cMin, cMax - cMin);
+                sb_invoke_ios_present_cached();
+            }
+            g_iosPrevMinOff = 0;
+            g_iosPrevMaxOff = 0;
+            g_iosWasEmpty = 1;
+            return;
+        }
+#endif
         if (s_sbNameTextLive && r_is_objc_ptr(g_sbNameTextShape)) {
             if (!sb_invoke_name_cached(1, g_sbNameTextShape, 0)) {
                 r_msg2_main(g_sbNameTextShape, "setPath:", 0, 0,0,0);
