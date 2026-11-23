@@ -14,6 +14,7 @@ extern "C" {
 // Call AFTER kexploit_opa334(). Returns 0 on success.
 int SBoardStartOverlay(void);
 void SBoardStopOverlay(void);
+void SBoardOverlaySetHidden(BOOL hidden);
 
 // Read-only view of whether the SpringBoard-hosted DrawView is currently up.
 // The app UI needs a real answer for its status card: IsHUDEnabled() only
