@@ -15,6 +15,7 @@
 #import "DirectOverlay.h"
 #import "SpringBoardOverlay.h"
 #import "../esp/menu.h"
+#import "../../esp/DSMemory.h"
 
 extern "C" char **environ;
 
@@ -102,6 +103,7 @@ void StopESPSession(void)
     // was mirroring it, then the -hud process. Skipping the first two is what
     // left the overlay on screen after the user pressed Stop.
     StopESPHost();
+    ds_detach();
     SBoardStopOverlay();
     SetHUDEnabled(NO);
     // The optimistic flag, cleared with the real session. Left set, it made the

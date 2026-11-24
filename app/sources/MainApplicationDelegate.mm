@@ -201,6 +201,7 @@ static void MDResetAccentPrefs(void) {
     // then hide the SB overlay and cleanly pthread_exit the synthetic call
     // thread in SpringBoard before the kernel tears down our IPC space.
     StopESPSession();
+    SBoardTeardownOverlayForExit();
 }
 
 @end

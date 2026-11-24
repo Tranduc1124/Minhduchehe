@@ -107,6 +107,9 @@ static void kernelBootStartEx(BOOL kernelOnly) {
             L(@"OK Kernel already ready — nothing else to do.");
             return;
         }
+        // Detach any stale game task/base from a previous session so ESP_View
+        // re-attaches cleanly to the currently running Free Fire PID.
+        ds_detach();
         boot_start_sb_overlay();
         boot_start_esp_host();
         return;

@@ -1944,6 +1944,29 @@ int SBoardStartOverlay(void) {
     if (!g_kexploit_ready) return sb_fail_start_overlay(false);
 
     NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (extra thread, 15fps)...");
+    if (remote_call_has_local_state() && remote_call_current_success() &&
+        r_is_objc_ptr(g_sbWin) && r_is_objc_ptr(g_sbShape)) {
+        uint64_t livePid = do_remote_call_stable(3000, "getpid", 0,0,0,0,0,0,0,0);
+        if (livePid != 0 && remote_call_current_success()) {
+            r_msg2_main(g_sbWin, "setHidden:", 0, 0,0,0);
+            pthread_mutex_lock(&g_sbLock);
+            g_sbConsecFail = 0;
+            g_sbLastPublishUS = now_us();
+            g_sbRearmAfterUS = 0;
+            g_sbOverlayOn = YES;
+            g_sbBuilding = 0;
+            pthread_mutex_unlock(&g_sbLock);
+            pthread_mutex_unlock(&g_sbIoLock);
+            NSLog(@"[SBOverlay] Reused existing SpringBoard overlay win=0x%llx shape=0x%llx",
+                  (unsigned long long)g_sbWin, (unsigned long long)g_sbShape);
+            return 0;
+        }
+        g_sbWin = 0;
+        g_sbShape = 0;
+        g_sbCanvas = 0;
+        sb_forget_local_paint_state();
+        abandon_remote_call();
+    }
     if (sb_open_session() != 0) {
         NSLog(@"[SBOverlay] session open failed");
         return sb_fail_start_overlay(false);
@@ -4213,13 +4236,64 @@ void SBoardStopOverlay(void) {
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }
     uint64_t win = g_sbWin;
     g_sbOverlayOn = NO;
+    pthread_mutex_unlock(&g_sbLock);
+
+    // Pause the overlay while MINHDUC stays running: hide g_sbWin and clear
+    // the local/remote IOSurface dirty ranges, but keep the healthy RemoteCall
+    // session, UIWindow, and IOSurface double-buffers alive so Start ESP
+    // resumes in ~2ms without re-hijacking SpringBoard or leaking windows.
+    pthread_mutex_lock(&g_sbIoLock);
+    @try {
+        if (remote_call_has_local_state()) {
+            if (remote_call_current_success()) {
+#if SB_IOSURFACE_RENDER
+                if (g_iosReady && g_iosLocalBuf && g_iosLocalSize > 0) {
+                    memset(g_iosLocalBuf, 0, g_iosLocalSize);
+                    for (int b = 0; b < 2; b++) {
+                        const size_t rMin = g_iosPrevRemoteMinOff[b];
+                        const size_t rMax = (g_iosPrevRemoteMaxOff[b] <= g_iosLocalSize)
+                                          ? g_iosPrevRemoteMaxOff[b] : g_iosLocalSize;
+                        if (g_iosSbBase[b] && rMax > rMin) {
+                            remote_write(g_iosSbBase[b] + rMin,
+                                         (const uint8_t *)g_iosLocalBuf + rMin,
+                                         rMax - rMin);
+                        }
+                        g_iosPrevRemoteMinOff[b] = 0;
+                        g_iosPrevRemoteMaxOff[b] = 0;
+                    }
+                    g_iosPrevLocalMinOff = 0;
+                    g_iosPrevLocalMaxOff = 0;
+                    g_iosWasEmpty = 1;
+                }
+#endif
+                if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
+            } else {
+                pthread_mutex_lock(&g_sbLock);
+                g_sbWin = 0;
+                g_sbShape = 0;
+                g_sbCanvas = 0;
+                pthread_mutex_unlock(&g_sbLock);
+                for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
+                g_sbPathRingAt = 0;
+                sb_forget_local_paint_state();
+                abandon_remote_call();
+            }
+        }
+    } @finally {
+        pthread_mutex_unlock(&g_sbIoLock);
+    }
+}
+
+void SBoardTeardownOverlayForExit(void) {
+    SBoardStopOverlay();
+    pthread_mutex_lock(&g_sbLock);
+    uint64_t win = g_sbWin;
+    g_sbOverlayOn = NO;
     g_sbWin = 0;
     g_sbShape = 0;
     g_sbCanvas = 0;
     pthread_mutex_unlock(&g_sbLock);
 
-    // Serialise against any in-flight SBRemotePushESPFrame publish so we never
-    // tear down exception ports while Thread 10 in SpringBoard is mid-call.
     pthread_mutex_lock(&g_sbIoLock);
     @try {
         if (remote_call_has_local_state()) {

@@ -415,11 +415,12 @@ uint64_t ds_translate_page(uint64_t page_va) {
         object = g_cached_object; obj_offset = g_cached_obj_offset;
     } else {
         uint64_t map = kread_ptr(g_ff_task + off_task_map);
+        if (!K(map) || !is_kaddr_valid(map + off_vm_map_hdr)) return 0;
         uint64_t hdr = map + off_vm_map_hdr;
         uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
         uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
 
-        for (uint32_t i = 0; i < nentries && K(e); i++) {
+        for (uint32_t i = 0; i < nentries && K(e) && is_kaddr_valid(e + E_START); i++) {
             uint64_t s = kread64(e + E_START);
             uint64_t t = kread64(e + E_END);
             if (page_va >= s && page_va < t) {
@@ -941,7 +942,16 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
     // completed pass clears it and lets the next tick begin another: the walk is
     // continuous by construction rather than by a timer that can be starved.
     if (g_vmoCursor == 0) {
-        const uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
+        const uint64_t map = kread_ptr(g_ff_task + off_task_map);
+        if (!K(map) || !is_kaddr_valid(map + off_vm_map_hdr)) {
+            g_ff_task = 0;
+            g_ff_base = 0;
+            g_ff_pid  = 0;
+            g_ff_proc = 0;
+            g_ff_map  = 0;
+            return false;
+        }
+        const uint64_t hdr = map + off_vm_map_hdr;
         const uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
         if (nentries == 0) {
             // A vm_map with 0 entries means the target game process has exited and
@@ -950,6 +960,9 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
             // cleanly re-attaches when the game is reopened.
             g_ff_task = 0;
             g_ff_base = 0;
+            g_ff_pid  = 0;
+            g_ff_proc = 0;
+            g_ff_map  = 0;
             return false;
         }
         if (nentries > DS_VMO_SNAP_MAX) {
@@ -975,7 +988,7 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
     DSVmoRange *a = g_vmoSnap[build];
     for (uint32_t n = 0; n < DS_VMO_SWEEP_PER_TICK; n++) {
         if (g_vmoFill >= g_vmoTotal) break;
-        if (!K(g_vmoCursor)) break;
+        if (!K(g_vmoCursor) || !is_kaddr_valid(g_vmoCursor + E_START)) break;
         a[g_vmoFill].start  = kread64(g_vmoCursor + E_START);
         a[g_vmoFill].end    = kread64(g_vmoCursor + E_END);
         a[g_vmoFill].object = kread_ptr(g_vmoCursor + E_OBJECT);
@@ -1126,33 +1139,42 @@ void ds_page_cache_stats(DSPageCacheStats *out) {
     out->deadAddrMiss = g_dsDeadAddrMissCount;
 }
 
+static bool ds_verify_target_alive_in_kernel(void) {
+    if (!K(g_ff_task) || !K(g_ff_proc) || g_ff_pid <= 0) return false;
+    if (!is_kaddr_valid(g_ff_proc + off_proc_p_pid)) return false;
+    pid_t curPid = (pid_t)kread32(g_ff_proc + off_proc_p_pid);
+    if (curPid != g_ff_pid) return false;
+    uint64_t proc_ro = kread64(g_ff_proc + off_proc_p_proc_ro);
+    if (!K(proc_ro) || !is_kaddr_valid(proc_ro + off_proc_ro_pr_task)) return false;
+    uint64_t task = kread64(proc_ro + off_proc_ro_pr_task);
+    if (task != g_ff_task || !is_kaddr_valid(task + off_task_map)) return false;
+    uint64_t map = kread_ptr(task + off_task_map);
+    if (!K(map) || !is_kaddr_valid(map + off_vm_map_hdr)) return false;
+    uint32_t nentries = kread32(map + off_vm_map_hdr + off_vm_map_header_nentries);
+    if (nentries == 0 || nentries > 100000) return false;
+    return true;
+}
+
 void ds_begin_read_transaction(void) {
     ds_lock();
     // Before the depth bump, so a frame that opens during a cooldown is already
     // un-latched by the time its first read lands.
     ds_expire_degrade_locked();
     g_readTxnDepth++;
-    // The frame stamp was declared and read and written, but never advanced. It sat
-    // at 1 for the life of the process, so every slot that had ever been used
-    // carried touchedFrame == 1 and the victim picker -- which skips any slot whose
-    // touchedFrame matches the current stamp, to avoid evicting a page this frame
-    // has already read -- skipped all 256 of them unconditionally.
-    //
-    // The consequence is not a slow cache, it is a frozen one. The table fills, the
-    // empty-slot loop finds nothing, the LRU loop finds no candidate, and the
-    // function returns 0. Every read of a page outside the resident 256 then fails
-    // isVaildPtr forever: those pawns do not draw and do not resolve, which is the
-    // "nothing happens for a while" half. The only remaining way a slot comes back
-    // is the TTL evictor, capped at DS_MAX_EVICT_PER_TXN per transaction, and it
-    // cannot touch the hot slots at all because their lastUseMs is always fresh. So
-    // recovery is a slow drip of four slots per frame against a set that needs to
-    // rotate around fifty to a hundred players -- and each of those four costs a
-    // vm_map_remote_page under g_pageCacheLock. That is the "then it lurches" half.
-    //
-    // Bumped only on the outermost open, so it means "the frame running right now".
-    // ds_begin_read_transaction has exactly one call site and it is unconditional
-    // once per frame, which is what makes this the frame boundary.
-    if (g_readTxnDepth == 1) g_txnFrameStamp++;
+    if (g_readTxnDepth == 1) {
+        g_txnFrameStamp++;
+        static uint64_t s_lastLivenessCheckMs = 0;
+        uint64_t nowMs = ds_now_ms();
+        if (K(g_ff_task) && (nowMs - s_lastLivenessCheckMs >= 500ULL)) {
+            s_lastLivenessCheckMs = nowMs;
+            if (!ds_verify_target_alive_in_kernel()) {
+                NSLog(@"[DS] target pid=%d exited or vm_map torn down — detaching for clean re-attach", g_ff_pid);
+                ds_unlock();
+                ds_detach();
+                return;
+            }
+        }
+    }
     ds_unlock();
 }
 
