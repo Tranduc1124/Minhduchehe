@@ -215,21 +215,12 @@ BOOL MDLicenseGuardPerformProtected(const char *siteTag,
     if (!MDLicenseGuardVerifyLive(siteTag)) {
         return NO;
     }
-
-    dispatch_block_t copiedWork = [workBlock copy];
-    BOOL ok = APIClientPerformAuthorized(@"paid", ^{
-        if (!APIClientValidConfirmed()) return;
-        if (g_mdLeaseTicket.load(std::memory_order_acquire) == 0) return;
-        copiedWork();
-    }, ^{
-        g_mdLeaseTicket.store(0, std::memory_order_release);
-        MDTriggerRevocationTeardown(@"perform_protected_denied");
-    });
-
-    if (!ok) {
+    if (!APIClientValidConfirmed() ||
+        g_mdLeaseTicket.load(std::memory_order_acquire) == 0) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         return NO;
     }
+    workBlock();
     return YES;
 }
 
