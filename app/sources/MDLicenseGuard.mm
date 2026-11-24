@@ -7,8 +7,8 @@
 #import "MainApplicationDelegate.h"
 #import "GameViewController.h"
 #import "../KernelBoot.h"
-#import "../esp/hud/DirectOverlay.h"
-#import "../../remote/SpringBoardOverlay.h"
+#import "DirectOverlay.h"
+#import "SpringBoardOverlay.h"
 #import "../../kexploit/kexploit_opa334.h"
 
 #import <QuartzCore/QuartzCore.h>
@@ -99,7 +99,7 @@ static BOOL MDVerifyBinaryIntegrity(void) {
     if (!MDFunctionIntegrityOK((const void *)&APIClientValidConfirmed, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&APIClientPerformAuthorized, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&APIClientStartAuthorization, mainHdr)) return NO;
-    if (!MDFunctionIntegrityOK((const void *)&APIClientRemainingSeconds, mainHdr)) return NO;
+    if (!MDFunctionIntegrityOK((const void *)&APIClientRenderTemplate, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&kernelBootStart, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&StartESPHost, mainHdr)) return NO;
     return YES;
@@ -127,7 +127,7 @@ static void MDConfigureSDKOnce(void) {
         return;
     }
 
-    APIClientSetFridaGuardEnabled(YES);
+    setENC(1);
 
     // Decrypt package token on stack at runtime via compile-time XOR obfuscation,
     // verify prefix/length integrity, configure SDK, then scrub stack bytes.
@@ -173,7 +173,6 @@ static void MDConfigureSDKOnce(void) {
 
 BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
     const char *tag = siteTag ? siteTag : "unspecified";
-    APIClientSetFridaGuardEnabled(YES);
 
     if (!MDVerifyBinaryIntegrity()) {
         NSLog(@"[LICENSE-GATE] REJECT site=%s reason=integrity_tamper", tag);
@@ -188,27 +187,29 @@ BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
     }
 
     __block BOOL innerExecuted = NO;
+    __block BOOL wasDenied = NO;
     __block uint64_t computedTicket = 0;
 
     BOOL gateOK = APIClientPerformAuthorized(@"paid", ^{
         if (!APIClientValidConfirmed()) return;
-        NSString *keyId = APIClientKeyId();
-        NSInteger remSec = APIClientRemainingSeconds();
-        if (keyId.length == 0 || remSec <= 0) return;
+        NSString *keyStr = APIClientRenderTemplate(@"%tserver_key%");
+        if (keyStr.length == 0) return;
 
-        computedTicket = ((uint64_t)remSec ^ kMDTicketMagic) | 1ULL;
+        computedTicket = ((uint64_t)[keyStr hash] ^ kMDTicketMagic) | 1ULL;
         innerExecuted = YES;
+    }, ^{
+        wasDenied = YES;
     });
 
-    if (!gateOK || !innerExecuted || computedTicket == 0) {
+    if (!gateOK || wasDenied || !innerExecuted || computedTicket == 0) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         NSLog(@"[LICENSE-GATE] REJECT site=%s reason=perform_authorized_denied", tag);
         return NO;
     }
 
     g_mdLeaseTicket.store(computedTicket, std::memory_order_release);
-    NSLog(@"[LICENSE-GATE] OK site=%s key=%@ rem=%lds",
-          tag, APIClientKeyId() ?: @"?", (long)APIClientRemainingSeconds());
+    NSLog(@"[LICENSE-GATE] OK site=%s summary=%@",
+          tag, APIClientRenderTemplate(@"key=%tserver_key% rem=%tserver_timekeyt%"));
     return YES;
 }
 
@@ -220,14 +221,17 @@ BOOL MDLicenseGuardPerformProtected(const char *siteTag,
     }
 
     __block BOOL didRun = NO;
+    __block BOOL deniedCalled = NO;
     BOOL ok = APIClientPerformAuthorized(@"paid", ^{
         if (!APIClientValidConfirmed()) return;
         if (g_mdLeaseTicket.load(std::memory_order_acquire) == 0) return;
         didRun = YES;
         workBlock();
+    }, ^{
+        deniedCalled = YES;
     });
 
-    if (!ok || !didRun) {
+    if (!ok || deniedCalled || !didRun) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         return NO;
     }
@@ -255,10 +259,6 @@ void MDLicenseGuardBootstrap(void (^onAuthorized)(void),
     g_onRevokedHandler = [onRevoked copy];
     MDConfigureSDKOnce();
 
-    APIClientOnRevoked(^(NSString *reason) {
-        MDTriggerRevocationTeardown(reason ?: @"server_revoked");
-    });
-
     APIClientStartAuthorization(^{
         // Only unlock if live multi-layer verification and signed lease execution succeed
         BOOL verified = MDLicenseGuardPerformProtected("launch_gate", ^{
@@ -269,8 +269,8 @@ void MDLicenseGuardBootstrap(void (^onAuthorized)(void),
         if (!verified) {
             MDTriggerRevocationTeardown(@"launch_gate_failed");
         }
-    }, ^(NSString *reason) {
-        MDTriggerRevocationTeardown(reason ?: @"auth_revoked");
+    }, ^{
+        MDTriggerRevocationTeardown(@"auth_revoked");
     });
 }
 
@@ -287,7 +287,5 @@ NSString *MDLicenseGuardStatusSummary(void) {
     if (rendered.length > 0) {
         return rendered;
     }
-    return [NSString stringWithFormat:@"Key: %@ · Hạn: %@",
-            APIClientKeyId() ?: @"Active",
-            APIClientTimeRemainingText() ?: @"—"];
+    return @"License: Active";
 }
