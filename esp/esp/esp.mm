@@ -5320,11 +5320,22 @@ static void EspEmitStatusLine(void) {
 
         if (isEspCheckVisible && (cacheMiss || (g_cacheFrameCounter & 1) == 0)) {
             const uint32_t vflags = get_VisibleFlags(PawnObject);
-            c.isCamVis = (vflags & kISVisibleCamera) != 0;
-            c.isPvsVis = (vflags & kISVisibleDynamicPVS) != 0;
-            c.isFPP = (vflags & kISVisibleFPPMask) == kISVisibleFPPMask;
-            c.isTrueVis = c.isFPP;
-            c.visGoodFrames = c.isTrueVis ? 1 : 0;
+            if (vflags == 0) {
+                // In FF 1.134.1, kVisibleObj (0xAD0 from 1.132.1) may be 0/unmapped;
+                // fail-open when the bitmask reads 0 so standing enemies (!isKnocked)
+                // are not hidden while only isKnocked enemies pass espVisible.
+                c.isCamVis = true;
+                c.isPvsVis = true;
+                c.isFPP = true;
+                c.isTrueVis = true;
+                c.visGoodFrames = 1;
+            } else {
+                c.isCamVis = (vflags & kISVisibleCamera) != 0;
+                c.isPvsVis = (vflags & kISVisibleDynamicPVS) != 0;
+                c.isFPP = (vflags & kISVisibleFPPMask) == kISVisibleFPPMask;
+                c.isTrueVis = c.isFPP;
+                c.visGoodFrames = c.isTrueVis ? 1 : 0;
+            }
         }
 
         bool isBot     = c.isBot;
@@ -5471,6 +5482,13 @@ static void EspEmitStatusLine(void) {
 
         // MINDOKERNEL parity: never invent CurHP=200 when CurHP<=0 (that revived
         // dead/pool dummy shells in playerDict and caused the +1 enemy count).
+        // Distinguish a failed DataPool read (!hpReadOk) from a real 0-HP reading:
+        // do not tombstone a live player for 120 frames on a transient read miss.
+        if (!hpReadOk) {
+            esp_count_drop(PawnObject);
+            rej.hpUnread++;
+            continue;
+        }
         if (CurHP <= 0) {
             markGhostDead(120);
             rej.dead++;
@@ -5538,24 +5556,16 @@ static void EspEmitStatusLine(void) {
         const bool bodyCollapsed = haveLiveBody && liveBodyLen < 0.35f;
         // CRITICAL: bodyCollapsed alone is NOT vehicle — dead shells often collapse.
         const bool treatAsVehicle = enemyMounted || haveMountPos;
+        (void)bodyCollapsed;
 
-        // MINDOKERNEL AvatarVisibility check (UmaAvatarSimple +0x101 == 1):
-        // Filters out hidden pool dummies, despawned corpses, and spectator clones in playerDict.
-        {
-            const uint64_t avatarMgrOff = GameTargetIsMax() ? 0x778ULL : 0x770ULL;
-            const bool avatarVis = AvatarVisibility::IsVisible(
-                PawnObject,
-                [](uint64_t address, void *value, size_t size) {
-                    return _read((long)address, value, (int)size);
-                },
-                [](uint64_t address) { return isVaildPtr(address); },
-                avatarMgrOff);
-            if (!avatarVis && !isKnocked && !treatAsVehicle) {
-                esp_count_drop(PawnObject);
-                rej.noAnchor++;
-                continue;
-            }
-        }
+        // NOTE: Do NOT filter by AvatarVisibility::IsVisible (Player+0x770 -> +0x138 ->
+        // Il2CppClass->name == "UmaAvatarSimple" -> +0x101 == 1).
+        // In external DSMemory mode on FF 1.134.1, Player+0x770 (1.132.1 offset) and the
+        // read-only global-metadata.dat class-name pages cause avatarVis to return false
+        // for every player, and `if (!avatarVis && !isKnocked && !treatAsVehicle) continue;`
+        // dropped 100% of standing enemies while only allowing knocked-down enemies
+        // (`isKnocked == true`) through! Dead corpses and pool dummies are already
+        // filtered by `hpReadOk && CurHP > 0` above and `anyLiveAnchor` + non-origin below.
 
         // No live skeleton AND no mount → despawned ghost (dict still holds pointer).
         const bool anyLiveAnchor =
@@ -5568,23 +5578,6 @@ static void EspEmitStatusLine(void) {
             markGhostDead(60);
             rej.noAnchor++;
             continue;
-        }
-        // Standing ghost: collapsed body without vehicle → skip (was ESP/aim on empty).
-        // Be robust to isKnocked lag: only treat as ghost when we have clear evidence they
-        // should be standing tall (root-to-head height looks upright) and bones are collapsed.
-        if (!treatAsVehicle && bodyCollapsed) {
-            bool expectStanding = !isKnocked;
-            bool rootSaysUpright = false;
-            if (looksLikeWorldPos(liveRoot) && looksLikeWorldPos(liveHead)) {
-                float dy = liveHead.y - liveRoot.y;
-                if (dy >= 1.15f) rootSaysUpright = true;
-            }
-            if (expectStanding && (rootSaysUpright || !looksLikeWorldPos(liveRoot))) {
-                markGhostDead(45);
-                rej.collapsed++;
-                continue;
-            }
-            // If root indicates low profile (knocked/prone) or isKnocked true, allow collapsed.
         }
         // Bones both missing while not mounted → shell / spectator leftover.
         if (!treatAsVehicle && !looksLikeWorldPos(liveHead) && !looksLikeWorldPos(liveHip) &&
