@@ -330,14 +330,14 @@ static bool ReadDataPoolVarOk(uint64_t player, int varID, int *outValue) {
     for (int pi = 0; pi < 3; pi++) {
         uint64_t pool = pools[pi];
         if (!isVaildPtr(pool)) continue;
-        const uint64_t innerOffs[] = { innerOff, 0x10, 0x18, 0x08, 0x00 };
+        const uint64_t innerOffs[] = { innerOff, 0x18, 0x08, 0x00 };
         for (size_t i = 0; i < sizeof(innerOffs) / sizeof(innerOffs[0]); i++) {
             uint64_t inner = (innerOffs[i] == 0) ? pool : ReadAddr<uint64_t>(pool + innerOffs[i]);
             if (!isVaildPtr(inner)) continue;
             uint64_t entry = ReadAddr<uint64_t>(inner + entriesBase + stride * (uint64_t)varID);
             if (!isVaildPtr(entry)) continue;
             // Value may be int32 or uint16 at +0x18 (and rarely +0x10/+0x14).
-            const uint64_t valOffs[] = { valueOff, 0x18, 0x14, 0x10 };
+            const uint64_t valOffs[] = { valueOff, 0x14, 0x10 };
             for (size_t v = 0; v < sizeof(valOffs) / sizeof(valOffs[0]); v++) {
                 int32_t i32 = 0;
                 if (!_read((long)(entry + valOffs[v]), &i32, (int)sizeof(i32))) {

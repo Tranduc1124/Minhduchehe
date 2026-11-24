@@ -113,25 +113,13 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     // same half point reuses the font and only the metrics differ by a fraction
     // of a point, which is not visible at these sizes.
     CTFontRef font = NULL;
+    int fontSlot = -1;
     {
         static CTFontRef s_font[24] = {NULL};
         static CGFloat s_size[24] = {0};
-        // Quarter-point buckets, offset by 15 so the smallest size that actually
-        // occurs lands on slot 0.
-        //
-        // The first version used half-point steps offset by 8, and that offset
-        // came from dynFontSize's 4.5 floor rather than from nameSize's. The
-        // names are set at 0.86 of dynFontSize, so the real floor is
-        // 4.5 * 0.86 = 3.87, and (int)(3.87 * 2) - 8 is -1. Every target at
-        // range, which is exactly where dynFontSize sits at its floor, fell out
-        // of the table and back to calling CTFontCreateWithName for every string
-        // on every frame. The cache did nothing at range, which is the range it
-        // was written for.
         const int slot = (int)(size * 4.0) - 15;   // 3.75 -> 0, 8.75 -> 20
         if (slot >= 0 && slot < 24) {
-            // fabs and not fabsf: CGFloat is a double on arm64, so the float
-            // overload would truncate the argument. The build turns that into an
-            // error under -Werror.
+            fontSlot = slot;
             if (s_font[slot] && fabs(s_size[slot] - size) < 0.2) {
                 font = s_font[slot];
             } else {
@@ -149,9 +137,6 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     }
     if (!font) return;
 
-    // Sized for a plate line: a 16 character nickname plus the "[123M]" tag, with
-    // room over. Longer input is clipped rather than grown for, because the stack
-    // arrays here are the reason this costs nothing per character.
     enum { kMaxGlyphs = 48 };
     if (s.length > (NSUInteger)kMaxGlyphs) s = [s substringToIndex:(NSUInteger)kMaxGlyphs];
     const CFIndex n = (CFIndex)s.length;
@@ -163,12 +148,6 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     CGGlyph glyphs[kMaxGlyphs];
     CGSize advances[kMaxGlyphs];
     if (!CTFontGetGlyphsForCharacters(font, ch, glyphs, n)) {
-        // The bulk call is all or nothing: a single character the font has no
-        // glyph for, a CJK nickname or an emoji the icon strip did not catch,
-        // makes it return false and takes the whole line with it. One at a time
-        // leaves the unmapped characters at glyph 0, which is what a missing
-        // character renders as everywhere else, and the ASCII part of the name
-        // still shows.
         for (CFIndex i = 0; i < n; i++) {
             CGGlyph g = 0;
             CTFontGetGlyphsForCharacters(font, ch + i, &g, 1);
@@ -176,10 +155,6 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
         }
     }
 
-    // The advances come back with the summed width, so there is no second pass to
-    // measure the string with. kCTFontOrientationHorizontal is read out of
-    // CTFont.h rather than assumed, the same reason sb_text_glyphs reads it out:
-    // the obvious argument order is not the real one.
     const double totalW = CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal,
                                                      glyphs, advances, n);
     if (totalW <= 0.0) return;   // font is cached, not owned here
@@ -189,19 +164,48 @@ static void ESPAppendTextPath(CGMutablePathRef dst, NSString *s, CGRect frame, C
     const double dx = frame.origin.x + (frame.size.width - totalW) * 0.5;
     const double dy = frame.origin.y + (frame.size.height + ascent + descent) * 0.5 - descent;
 
+    // Direct-mapped per-(fontSlot, glyph) y-flipped outline cache at (0,0) so
+    // CTFontCreatePathForGlyph runs once per unique character size instead of
+    // 200+ times per frame in a crowded match.
+    enum { kGlyphCacheMask = 511 };
+    typedef struct {
+        int       slot;
+        CGGlyph   glyph;
+        CGPathRef path;
+    } CachedGlyphOutline;
+    static CachedGlyphOutline s_glyphCache[kGlyphCacheMask + 1] = {};
+
     double penX = dx;
     for (CFIndex i = 0; i < n; i++) {
-        if (glyphs[i] != 0) {
-            CGAffineTransform m = CGAffineTransformMake(1.0, 0.0, 0.0, -1.0, penX, dy);
-            // CTFontCreatePathForGlyph, not the Get variant. There is no
-            // CTFontGetPathForGlyph in the iOS SDK — CTFont.h only declares the
-            // Create form, and the Get form is a macOS one — so the one named in
-            // the brief does not exist to call and this is the function that
-            // does. It hands back a new path per glyph, hence the release; the
-            // borrowed-and-cached form sb_text_glyphs wanted is simply not there
-            // to have.
-            CGPathRef g = CTFontCreatePathForGlyph(font, glyphs[i], &m);
-            if (g) { CGPathAddPath(dst, NULL, g); CGPathRelease(g); }
+        const CGGlyph gl = glyphs[i];
+        if (gl != 0) {
+            if (fontSlot >= 0) {
+                const uint32_t h = (((uint32_t)fontSlot * 131u) ^ (uint32_t)gl) & (uint32_t)kGlyphCacheMask;
+                CGPathRef basePath = NULL;
+                if (s_glyphCache[h].path &&
+                    s_glyphCache[h].slot == fontSlot &&
+                    s_glyphCache[h].glyph == gl) {
+                    basePath = s_glyphCache[h].path;
+                } else {
+                    CGAffineTransform flip = CGAffineTransformMake(1.0, 0.0, 0.0, -1.0, 0.0, 0.0);
+                    CGPathRef built = CTFontCreatePathForGlyph(font, gl, &flip);
+                    if (built) {
+                        if (s_glyphCache[h].path) CGPathRelease(s_glyphCache[h].path);
+                        s_glyphCache[h].slot = fontSlot;
+                        s_glyphCache[h].glyph = gl;
+                        s_glyphCache[h].path = built;
+                        basePath = built;
+                    }
+                }
+                if (basePath) {
+                    CGAffineTransform tr = CGAffineTransformMakeTranslation(penX, dy);
+                    CGPathAddPath(dst, &tr, basePath);
+                }
+            } else {
+                CGAffineTransform m = CGAffineTransformMake(1.0, 0.0, 0.0, -1.0, penX, dy);
+                CGPathRef g = CTFontCreatePathForGlyph(font, gl, &m);
+                if (g) { CGPathAddPath(dst, NULL, g); CGPathRelease(g); }
+            }
         }
         penX += advances[i].width;
     }

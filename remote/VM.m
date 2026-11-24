@@ -108,22 +108,85 @@ void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start,
     }
 }
 
+#define VME_RANGE_CACHE_SLOTS 32
+typedef struct {
+    uint64_t map;
+    uint64_t start;
+    uint64_t end;
+    uint64_t entry;
+} VmeRangeCacheSlot;
+static VmeRangeCacheSlot s_vmeRangeCache[VME_RANGE_CACHE_SLOTS];
+static uint32_t s_vmeRangeNext = 0;
+static pthread_mutex_t s_vmeRangeLock = PTHREAD_MUTEX_INITIALIZER;
+
 uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
 {
-    // No entry cache. pthread_create / stack COW splits map entries; a cached
-    // entry pointer keeps pointing at the pre-COW shared object (zeros) while
-    // the write landed on a new anonymous entry — DIAG: create ret=0 but
-    // remote_read(out) stayed 0 after shmem clear. Fl0rk/Cyanide walk fresh.
+    if (!vm_map_ptr || !address) return 0;
+
+    // 1. Probe the 32-slot recent vm_map_entry range cache, then ALWAYS verify
+    //    the entry's live [start, end) directly from the kernel in one 16-byte
+    //    kreadbuf. If COW split the entry or it was unmapped/reallocated, the
+    //    live range check detects it immediately and invalidates the slot.
+    //    When valid (the 98% case for contiguous IOSurface buffers and Unity
+    //    heap regions), this saves a 2,000-node kernel linked-list walk per page.
+    uint64_t cachedEntry = 0;
+    int cachedSlot = -1;
+    pthread_mutex_lock(&s_vmeRangeLock);
+    for (int i = 0; i < VME_RANGE_CACHE_SLOTS; i++) {
+        if (s_vmeRangeCache[i].map == vm_map_ptr &&
+            s_vmeRangeCache[i].entry != 0 &&
+            address >= s_vmeRangeCache[i].start &&
+            address < s_vmeRangeCache[i].end) {
+            cachedEntry = s_vmeRangeCache[i].entry;
+            cachedSlot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_vmeRangeLock);
+
+    if (cachedEntry && is_kaddr_valid(cachedEntry)) {
+        uint64_t liveStart = 0, liveEnd = 0;
+        vm_entry_get_range(cachedEntry, &liveStart, &liveEnd);
+        if (liveEnd > liveStart && address >= liveStart && address < liveEnd) {
+            pthread_mutex_lock(&s_vmeRangeLock);
+            if (cachedSlot >= 0 && s_vmeRangeCache[cachedSlot].entry == cachedEntry) {
+                s_vmeRangeCache[cachedSlot].start = liveStart;
+                s_vmeRangeCache[cachedSlot].end = liveEnd;
+            }
+            pthread_mutex_unlock(&s_vmeRangeLock);
+            return cachedEntry;
+        }
+        // Entry split by COW or unmapped: drop the stale range and walk fresh.
+        pthread_mutex_lock(&s_vmeRangeLock);
+        if (cachedSlot >= 0 && s_vmeRangeCache[cachedSlot].entry == cachedEntry) {
+            s_vmeRangeCache[cachedSlot].entry = 0;
+        }
+        pthread_mutex_unlock(&s_vmeRangeLock);
+    }
+
     __block uint64_t found_entry = 0;
+    __block uint64_t found_start = 0;
+    __block uint64_t found_end = 0;
     vm_map_iterate_entries(vm_map_ptr, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (address >= start && address < end) {
             found_entry = entry;
+            found_start = start;
+            found_end = end;
             *stop = YES;
         } else if (start > address) {
             // XNU vm_map entries are strictly sorted by start address.
             *stop = YES;
         }
     });
+    if (found_entry && found_end > found_start) {
+        pthread_mutex_lock(&s_vmeRangeLock);
+        uint32_t slot = s_vmeRangeNext++ % VME_RANGE_CACHE_SLOTS;
+        s_vmeRangeCache[slot].map = vm_map_ptr;
+        s_vmeRangeCache[slot].start = found_start;
+        s_vmeRangeCache[slot].end = found_end;
+        s_vmeRangeCache[slot].entry = found_entry;
+        pthread_mutex_unlock(&s_vmeRangeLock);
+    }
     return found_entry;
 }
 

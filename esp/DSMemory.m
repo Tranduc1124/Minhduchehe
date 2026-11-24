@@ -486,12 +486,12 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // Fl0rk DarkSwordMemoryProvider cache shape:
 //   _pageSlots[256] {VMShmem + lastUse}, _recentPageSlots[8], soft-age on txn end,
 //   NSRecursiveLock across map+insert, degraded after 3 consecutive map failures.
-#define DS_PAGE_CACHE_SLOTS 256
-#define DS_FAIL_DEGRADE_THRESHOLD 3
+#define DS_PAGE_CACHE_SLOTS 2048
+#define DS_FAIL_DEGRADE_THRESHOLD 12
 // How long a degrade pauses remapping before it is retried. Long enough not to
 // hammer a kernel that is refusing, short enough that a burst of failures costs
-// a quarter of a second of reads instead of the rest of the session.
-#define DS_DEGRADE_COOLDOWN_MS 250
+// a fraction of a second of reads instead of stalling a crowded 50-player match.
+#define DS_DEGRADE_COOLDOWN_MS 80
 
 // Hard lifetime for a mapping, counted from the moment it was taken.
 //
@@ -592,7 +592,7 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // finishes, which turns the interval between noticing a dead mapping from six seconds
 // into one cycle -- a couple of hundred milliseconds -- at a cost that is a few
 // hundred kernel reads per frame against the ~17,000 the render loop already makes.
-#define DS_VMO_SWEEP_PER_TICK 256
+#define DS_VMO_SWEEP_PER_TICK 64
 #define DS_VMO_SNAP_MAX       16384
 // Backoff before restarting after the map could not be read at all, so a torn or
 // absent map does not become a kread per frame.
@@ -1442,9 +1442,21 @@ static uint64_t ds_page_local(uint64_t pageVA) {
         // bounds misses by (working set - table) instead, and the resident window
         // rotates around the working set rather than thrashing inside it.
         if (victim < 0) {
-            g_dsNoVictimCount++;
-            ds_unlock();
-            return 0;
+            // Fallback to globally coldest slot if all 2048 slots were touched in
+            // the same frame, so end-of-frame reads (GetViewMatrixInto, Aim) are
+            // never starved or refused.
+            uint64_t oldestAny = UINT64_MAX;
+            for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+                if (g_pageCache[i].lastUse < oldestAny) {
+                    oldestAny = g_pageCache[i].lastUse;
+                    victim = i;
+                }
+            }
+            if (victim < 0) {
+                g_dsNoVictimCount++;
+                ds_unlock();
+                return 0;
+            }
         }
     }
 

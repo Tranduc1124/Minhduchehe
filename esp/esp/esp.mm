@@ -5276,8 +5276,9 @@ static void EspEmitStatusLine(void) {
         // HP first lets the hint carry the same number instead of re-reading it.
         bool hpReadOk = get_CurHPOk(PawnObject, &c.curHP);
         const bool maxReadOk = get_MaxHPOk(PawnObject, &c.maxHP);
-        if (!hpReadOk) c.curHP = get_CurHP(PawnObject);
-        if (!maxReadOk) c.maxHP = get_MaxHP(PawnObject);
+        if (!maxReadOk && hpReadOk && c.curHP > 0 && c.curHP <= 2000) {
+            c.maxHP = c.curHP;
+        }
         c.isKnocked = get_IsKnockedDown(PawnObject, hpReadOk ? c.curHP : -1);
         c.frame     = g_cacheFrameCounter;
 
