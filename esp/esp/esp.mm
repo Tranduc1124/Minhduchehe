@@ -1756,6 +1756,10 @@ bool isAimIgnoreBot = NO; bool isAimIgnoreKnock = NO;
 bool isAimRage = NO; bool isFastReload = NO;
 bool isAimLegit = NO;
 float fastReloadSpeed = 1.0f;
+bool isNoRecoilGun = NO;
+bool isFastMedkit = NO;
+bool isDualWeapon = NO;
+bool isFastSwitch = NO;
 
 bool isAimbot = NO; bool isAimAssist = NO;
 // The game's own chest magnet. This is the only thing that decides whether it
@@ -3162,6 +3166,10 @@ void ESPSyncFromPrefs(void) {
     isStreamerMode = ESPPrefsBool(@"StreamerMode", NO);
 
     Norecoil   = ESPPrefsBool(@"Norecoil", NO);
+    isNoRecoilGun = ESPPrefsBool(@"NoRecoilGun", NO) || Norecoil;
+    isFastMedkit  = ESPPrefsBool(@"FastMedkit", NO);
+    isDualWeapon  = ESPPrefsBool(@"DualWeapon", NO);
+    isFastSwitch  = ESPPrefsBool(@"FastSwitch", NO);
     // Brutal run scale (slider). Default 0.16 = old crawl; adjustable Lite+Pro.
     {
         float bs = ESPPrefsFloat(@"BrutalSpeed", 0.16f);
@@ -4004,9 +4012,12 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // Keep frame alive when Brutal needs work (ON, still patched, or has saved addrs to restore).
         // Critical: user turns Brutal OFF after leave → must NOT early-return before restore.
         const bool brutalNeedsFrame = Norecoil || g_brutalPatched.load() || g_brutalHasAddrs.load();
-        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !brutalNeedsFrame) {
+        const bool otherNeedsFrame = isNoRecoilGun || isFastMedkit || isDualWeapon || isFastSwitch;
+        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !brutalNeedsFrame && !otherNeedsFrame) {
             [self clearAllContent];
             if (!self.hidden) self.hidden = YES;
+            extern void SBRemotePushESPFrame(UIView *espView);
+            SBRemotePushESPFrame(self);
             return;
         } else {
             if (self.hidden) self.hidden = NO;
@@ -4820,6 +4831,62 @@ static void EspEmitStatusLine(void) {
     }
     
     if (iAmAlive) {
+        if (isVaildPtr(myPawnObject)) {
+            if (isNoRecoilGun) {
+                ZeroWeaponScatterForAim(myPawnObject);
+            }
+            if (isFastSwitch || isDualWeapon || isFastMedkit) {
+                uint64_t weapon = SilentAimWeapon::OnHand(
+                    myPawnObject,
+                    [](uint64_t a, auto &v) { return SilentReadAny(a, v); },
+                    [](uint64_t a) { return isVaildPtr(a); });
+                if (!isVaildPtr(weapon)) {
+                    weapon = ReadAddr<uint64_t>(myPawnObject + kActiveWeapon);
+                }
+                if (isDualWeapon && kWeaponHolder) {
+                    uint64_t mgr = ReadAddr<uint64_t>(myPawnObject + kWeaponHolder);
+                    if (isVaildPtr(mgr) && ReadAddr<uint64_t>(mgr + 0x30) == myPawnObject) {
+                        uint8_t comb = ReadAddr<uint8_t>(mgr + 0x148);
+                        if (comb == 0) WriteAddr<uint8_t>(mgr + 0x148, 1);
+                    }
+                }
+                if (isFastSwitch && isVaildPtr(weapon) && kWeaponRepItem) {
+                    uint64_t rep = ReadAddr<uint64_t>(weapon + kWeaponRepItem);
+                    if (isVaildPtr(rep)) {
+                        if (kSwitchWeaponTime) WriteAddr<float>(rep + kSwitchWeaponTime, 0.0f);
+                        if (kPreSwitchWeaponTime) WriteAddr<float>(rep + kPreSwitchWeaponTime, 0.0f);
+                        if (kPostSwitchWeaponTime) WriteAddr<float>(rep + kPostSwitchWeaponTime, 0.0f);
+                    }
+                }
+                if (isFastMedkit) {
+                    const bool curing =
+                        (kPlayerIsCuring && ReadAddr<uint8_t>(myPawnObject + kPlayerIsCuring) != 0) ||
+                        (kPlayerIsPreparing && ReadAddr<uint8_t>(myPawnObject + kPlayerIsPreparing) != 0) ||
+                        (kPlayerIsRepairing && ReadAddr<uint8_t>(myPawnObject + kPlayerIsRepairing) != 0);
+                    if (curing && kPlayerNetPrepDuration) {
+                        float dur = ReadAddr<float>(myPawnObject + kPlayerNetPrepDuration);
+                        if (dur > 0.05f && dur < 30.0f) {
+                            WriteAddr<float>(myPawnObject + kPlayerNetPrepDuration, 0.02f);
+                        }
+                    }
+                    if (isVaildPtr(weapon)) {
+                        if (kWeaponFirstAidRepItem) {
+                            uint64_t aid = ReadAddr<uint64_t>(weapon + kWeaponFirstAidRepItem);
+                            if (isVaildPtr(aid)) {
+                                if (kUGCFirstAidDuration) WriteAddr<int>(aid + kUGCFirstAidDuration, 0);
+                                if (kUGCFirstAidPretime) WriteAddr<int>(aid + kUGCFirstAidPretime, 0);
+                            }
+                        }
+                        if (kWeaponRepairRepItem) {
+                            uint64_t repKit = ReadAddr<uint64_t>(weapon + kWeaponRepairRepItem);
+                            if (isVaildPtr(repKit) && kUGCRepairPreTime) {
+                                WriteAddr<float>(repKit + kUGCRepairPreTime, 0.0f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         static uint64_t rainbowPtrs[7] = {0};
         static NSString *cachedCustomName = nil;
 

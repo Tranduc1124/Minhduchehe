@@ -1082,6 +1082,8 @@ static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
     return YES;
 }
 
+static void sb_menu_forget(void);
+
 static void sb_forget_local_paint_state(void) {
     // Fl0rk: release_all_cached_main_invocations / forget_remote_state (local side)
     if (r_is_objc_ptr(g_sbSetPathInv) && remote_call_has_local_state()) {
@@ -1161,6 +1163,7 @@ static void sb_forget_local_paint_state(void) {
     g_sbLastCalls = 0;
     g_sbNextPublishUS = 0;
     sb_text_forget();
+    sb_menu_forget();
     // The hold ring outlives the session pointer, so it is emptied here rather
     // than left for the next SBoardStartOverlay to overwrite.
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
@@ -1530,6 +1533,660 @@ static void sb_invoke_ios_present_cached(int bufIdx) {
     }
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbSetContentsInv[bufIdx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
+}
+
+// =============================================================================
+//  SpringBoard UIKit Floating Menu (g_sbMenuWin)
+//  - Renders a native UIKit white rounded card with 3 tabs (Esp | Aimbot | Other),
+//    green UISwitch toggles, UISegmentedControl selectors, close button (✕),
+//    footer ("FFVN: External" / "Free Fire Vn"), and a 44x44 floating icon when
+//    minimized.
+//  - Window frame shrinks to the 44x44 icon when closed and to the 348x320 card
+//    when open, so all touches outside the card pass 100% through to Free Fire.
+//  - Runtime polling uses ONLY r_msg() and pre-built NSInvocations, so it NEVER
+//    calls remote_clear_shmem_cache() or r_settle().
+// =============================================================================
+extern void ESPSyncFromPrefs(void);
+
+static uint64_t g_sbMenuWin = 0;
+static uint64_t g_sbMenuCard = 0;
+static uint64_t g_sbFloatBtn = 0;
+static uint64_t g_sbFloatSeg = 0;
+static uint64_t g_sbCloseSeg = 0;
+static uint64_t g_sbTabSeg = 0;
+static uint64_t g_sbTabView[3] = {0, 0, 0};
+
+// Tab 0 (Esp): 6 switches
+static uint64_t g_sbEspSw[6] = {0, 0, 0, 0, 0, 0};
+static int      g_sbEspVal[6] = {1, 1, 1, 1, 1, 1};
+
+// Tab 1 (Aimbot): 3 switches + 3 segmented controls
+static uint64_t g_sbAimSw[3] = {0, 0, 0};
+static int      g_sbAimSwVal[3] = {0, 0, 1};
+static uint64_t g_sbAimBoneSeg = 0;
+static int      g_sbAimBoneVal = 0;
+static uint64_t g_sbAimFovSeg = 0;
+static int      g_sbAimFovVal = 2;
+static uint64_t g_sbAimHsSeg = 0;
+static int      g_sbAimHsVal = 4;
+
+// Tab 2 (Other): 6 switches (No Recoil, Aim Assist, Aim Lock, Fast Medkit, Dual Weapon, Fast Weapon Switch)
+static uint64_t g_sbOtherSw[6] = {0, 0, 0, 0, 0, 0};
+static int      g_sbOtherVal[6] = {0, 0, 0, 0, 0, 0};
+
+static int      g_sbMenuIsOpen = 1;
+static int      g_sbCurTab = 0;
+static uint64_t g_sbNextMenuPollUS = 0;
+
+// Cached selectors and invocations for zero-flush polling
+static uint64_t g_selIsOn = 0;
+static uint64_t g_selSelectedSeg = 0;
+static uint64_t g_selSetTarget = 0;
+static uint64_t g_selSetArg = 0;
+
+static uint64_t g_sbMenuWinOpenInv = 0;
+static uint64_t g_sbMenuWinOpenBuf = 0;
+static uint64_t g_sbMenuWinCloseInv = 0;
+static uint64_t g_sbMenuWinCloseBuf = 0;
+static uint64_t g_sbMenuBoolInv = 0;
+static uint64_t g_sbMenuBoolBuf = 0;
+static uint64_t g_sbMenuIntInv = 0;
+static uint64_t g_sbMenuIntBuf = 0;
+static uint64_t g_sbMenuSwOnInv = 0;
+static uint64_t g_sbMenuSwOnBuf0 = 0;
+static uint64_t g_sbMenuSwOnBuf1 = 0;
+
+static void sb_menu_release_inv(uint64_t *inv, uint64_t *buf) {
+    if (inv && r_is_objc_ptr(*inv) && remote_call_has_local_state()) {
+        r_msg2(*inv, "release", 0,0,0,0);
+    }
+    if (buf && *buf && remote_call_has_local_state()) {
+        dlsym_remote("free", *buf, 0,0,0,0,0,0,0);
+    }
+    if (inv) *inv = 0;
+    if (buf) *buf = 0;
+}
+
+static void sb_menu_forget(void) {
+    sb_menu_release_inv(&g_sbMenuWinOpenInv, &g_sbMenuWinOpenBuf);
+    sb_menu_release_inv(&g_sbMenuWinCloseInv, &g_sbMenuWinCloseBuf);
+    sb_menu_release_inv(&g_sbMenuBoolInv, &g_sbMenuBoolBuf);
+    sb_menu_release_inv(&g_sbMenuIntInv, &g_sbMenuIntBuf);
+    sb_menu_release_inv(&g_sbMenuSwOnInv, &g_sbMenuSwOnBuf0);
+    if (g_sbMenuSwOnBuf1 && remote_call_has_local_state()) {
+        dlsym_remote("free", g_sbMenuSwOnBuf1, 0,0,0,0,0,0,0);
+    }
+    g_sbMenuSwOnBuf1 = 0;
+    g_sbMenuWin = 0;
+    g_sbMenuCard = 0;
+    g_sbFloatBtn = 0;
+    g_sbFloatSeg = 0;
+    g_sbCloseSeg = 0;
+    g_sbTabSeg = 0;
+    for (int i = 0; i < 3; i++) g_sbTabView[i] = 0;
+    for (int i = 0; i < 6; i++) { g_sbEspSw[i] = 0; g_sbOtherSw[i] = 0; }
+    for (int i = 0; i < 3; i++) g_sbAimSw[i] = 0;
+    g_sbAimBoneSeg = 0;
+    g_sbAimFovSeg = 0;
+    g_sbAimHsSeg = 0;
+}
+
+static void sb_menu_set_hidden_fast(uint64_t view, uint64_t hiddenVal) {
+    if (!r_is_objc_ptr(view) || !r_is_objc_ptr(g_sbMenuBoolInv) || !g_sbMenuBoolBuf) return;
+    if (!g_selSetTarget || !g_selSetArg || !g_sbPerformMainSel || !g_sbInvokeSel) return;
+    remote_write64(g_sbMenuBoolBuf, hiddenVal ? 1ULL : 0ULL);
+    r_msg(g_sbMenuBoolInv, g_selSetTarget, view, 0, 0, 0);
+    r_msg(g_sbMenuBoolInv, g_selSetArg, g_sbMenuBoolBuf, 2, 0, 0);
+    r_msg(g_sbMenuBoolInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+}
+
+static void sb_menu_set_seg_fast(uint64_t seg, int64_t idxVal) {
+    if (!r_is_objc_ptr(seg) || !r_is_objc_ptr(g_sbMenuIntInv) || !g_sbMenuIntBuf) return;
+    if (!g_selSetTarget || !g_selSetArg || !g_sbPerformMainSel || !g_sbInvokeSel) return;
+    remote_write64(g_sbMenuIntBuf, (uint64_t)idxVal);
+    r_msg(g_sbMenuIntInv, g_selSetTarget, seg, 0, 0, 0);
+    r_msg(g_sbMenuIntInv, g_selSetArg, g_sbMenuIntBuf, 2, 0, 0);
+    r_msg(g_sbMenuIntInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+}
+
+static void sb_menu_set_switch_fast(uint64_t sw, int onVal) {
+    if (!r_is_objc_ptr(sw) || !r_is_objc_ptr(g_sbMenuSwOnInv) || !g_sbMenuSwOnBuf0 || !g_sbMenuSwOnBuf1) return;
+    if (!g_selSetTarget || !g_selSetArg || !g_sbPerformMainSel || !g_sbInvokeSel) return;
+    remote_write64(g_sbMenuSwOnBuf0, onVal ? 1ULL : 0ULL);
+    remote_write64(g_sbMenuSwOnBuf1, 0ULL);
+    r_msg(g_sbMenuSwOnInv, g_selSetTarget, sw, 0, 0, 0);
+    r_msg(g_sbMenuSwOnInv, g_selSetArg, g_sbMenuSwOnBuf0, 2, 0, 0);
+    r_msg(g_sbMenuSwOnInv, g_selSetArg, g_sbMenuSwOnBuf1, 3, 0, 0);
+    r_msg(g_sbMenuSwOnInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+}
+
+static uint64_t sb_menu_make_color(double r, double g, double b, double a) {
+    uint64_t cls = r_class("UIColor");
+    if (!r_is_objc_ptr(cls)) return 0;
+    return r_msg2_main_raw(cls, "colorWithRed:green:blue:alpha:", &r, 8, &g, 8, &b, 8, &a, 8);
+}
+
+static uint64_t sb_menu_make_view(double x, double y, double w, double h, uint64_t bgCol) {
+    uint64_t cls = r_class("UIView");
+    if (!r_is_objc_ptr(cls)) return 0;
+    double r[4] = { x, y, w, h };
+    uint64_t v = r_msg2_main_raw(r_msg2_main(cls, "alloc", 0,0,0,0), "initWithFrame:", r, 32, NULL,0,NULL,0,NULL,0);
+    if (r_is_objc_ptr(v) && r_is_objc_ptr(bgCol)) {
+        r_msg2_main(v, "setBackgroundColor:", bgCol, 0,0,0);
+    }
+    return v;
+}
+
+static uint64_t sb_menu_make_label(double x, double y, double w, double h,
+                                   const char *text, uint64_t font, uint64_t textCol, uint64_t align) {
+    uint64_t cls = r_class("UILabel");
+    if (!r_is_objc_ptr(cls)) return 0;
+    double r[4] = { x, y, w, h };
+    uint64_t lbl = r_msg2_main_raw(r_msg2_main(cls, "alloc", 0,0,0,0), "initWithFrame:", r, 32, NULL,0,NULL,0,NULL,0);
+    if (!r_is_objc_ptr(lbl)) return 0;
+    uint64_t ns = sb_text_make_nsstring(text);
+    if (r_is_objc_ptr(ns)) r_msg2_main(lbl, "setText:", ns, 0,0,0);
+    if (r_is_objc_ptr(font)) r_msg2_main(lbl, "setFont:", font, 0,0,0);
+    if (r_is_objc_ptr(textCol)) r_msg2_main(lbl, "setTextColor:", textCol, 0,0,0);
+    r_msg2_main(lbl, "setTextAlignment:", align, 0,0,0);
+    return lbl;
+}
+
+static uint64_t sb_menu_make_switch_row(uint64_t parent, int rowIdx, const char *title,
+                                        int initialOn, uint64_t font, uint64_t textCol,
+                                        uint64_t greenCol, uint64_t divCol) {
+    const double y = (double)rowIdx * 40.0;
+    uint64_t lbl = sb_menu_make_label(18.0, y, 210.0, 40.0, title, font, textCol, 0);
+    if (r_is_objc_ptr(lbl)) r_msg2_main(parent, "addSubview:", lbl, 0,0,0);
+
+    uint64_t clsSw = r_class("UISwitch");
+    double swRect[4] = { 320.0 - 66.0, y + 4.5, 51.0, 31.0 };
+    uint64_t sw = r_is_objc_ptr(clsSw)
+                ? r_msg2_main_raw(r_msg2_main(clsSw, "alloc", 0,0,0,0), "initWithFrame:", swRect, 32, NULL,0,NULL,0,NULL,0)
+                : 0;
+    if (r_is_objc_ptr(sw)) {
+        if (r_is_objc_ptr(greenCol)) r_msg2_main(sw, "setOnTintColor:", greenCol, 0,0,0);
+        r_msg2_main(sw, "setOn:animated:", initialOn ? 1 : 0, 0, 0, 0);
+        r_msg2_main(parent, "addSubview:", sw, 0,0,0);
+    }
+    if (rowIdx < 5) {
+        uint64_t div = sb_menu_make_view(14.0, y + 39.0, 292.0, 1.0, divCol);
+        if (r_is_objc_ptr(div)) r_msg2_main(parent, "addSubview:", div, 0,0,0);
+    }
+    return sw;
+}
+
+static uint64_t sb_menu_make_seg(double x, double y, double w, double h,
+                                 const char **items, int count, int64_t selectedIdx,
+                                 uint64_t bgCol, uint64_t tintCol) {
+    uint64_t clsSeg = r_class("UISegmentedControl");
+    if (!r_is_objc_ptr(clsSeg)) return 0;
+    double r[4] = { x, y, w, h };
+    uint64_t seg = r_msg2_main_raw(r_msg2_main(clsSeg, "alloc", 0,0,0,0), "initWithFrame:", r, 32, NULL,0,NULL,0,NULL,0);
+    if (!r_is_objc_ptr(seg)) return 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t s = sb_text_make_nsstring(items[i]);
+        if (r_is_objc_ptr(s)) {
+            r_msg2_main(seg, "insertSegmentWithTitle:atIndex:animated:", s, (uint64_t)i, 0, 0);
+        }
+    }
+    if (r_is_objc_ptr(bgCol)) r_msg2_main(seg, "setBackgroundColor:", bgCol, 0,0,0);
+    if (r_is_objc_ptr(tintCol) && r_responds_main(seg, "setSelectedSegmentTintColor:")) {
+        r_msg2_main(seg, "setSelectedSegmentTintColor:", tintCol, 0,0,0);
+    }
+    r_msg2_main(seg, "setSelectedSegmentIndex:", (uint64_t)selectedIdx, 0,0,0);
+    return seg;
+}
+
+static void sb_menu_build(uint64_t app, uint64_t scene, const double bounds[4]) {
+    sb_menu_forget();
+    uint32_t savedSettle = r_settle_us(400);
+
+    // Hide any leftover menu window from an earlier session
+    uint64_t assocKey = r_sel("fl0rkffESPUIKitMenuWin");
+    if (r_is_objc_ptr(app) && r_is_objc_ptr(assocKey)) {
+        uint64_t oldWin = dlsym_remote("objc_getAssociatedObject", app, assocKey, 0,0,0,0,0,0);
+        if (r_is_objc_ptr(oldWin)) {
+            r_msg2_main(oldWin, "setHidden:", 1, 0,0,0);
+        }
+    }
+
+    const double portW = (bounds[2] < bounds[3]) ? bounds[2] : bounds[3];
+    const double portH = (bounds[2] < bounds[3]) ? bounds[3] : bounds[2];
+    const double cardW = 320.0;
+    const double cardH = 348.0;
+
+    // Portrait frame of g_sbMenuWin when menu card is open (rotated 90deg CW)
+    double openRect[4] = { (portW - cardH) * 0.5, (portH - cardW) * 0.5, cardH, cardW };
+    // Portrait frame of g_sbMenuWin when collapsed to 44x44 floating button
+    double closeRect[4] = { portW - 52.0 - 44.0, 88.0, 44.0, 44.0 };
+
+    uint64_t clsWin = r_class("UIWindow");
+    uint64_t mWin = r_is_objc_ptr(clsWin)
+                  ? r_msg2_main(r_msg2_main(clsWin, "alloc", 0,0,0,0), "initWithWindowScene:", scene, 0,0,0)
+                  : 0;
+    if (!r_is_objc_ptr(mWin)) {
+        r_settle_us(savedSettle);
+        return;
+    }
+
+    uint64_t clearCol  = sb_menu_make_color(0.0, 0.0, 0.0, 0.0);
+    uint64_t whiteCol  = sb_menu_make_color(1.0, 1.0, 1.0, 1.0);
+    uint64_t blackCol  = sb_menu_make_color(0.08, 0.08, 0.10, 1.0);
+    uint64_t grayCol   = sb_menu_make_color(0.50, 0.50, 0.53, 1.0);
+    uint64_t tabBgCol  = sb_menu_make_color(0.91, 0.91, 0.92, 1.0);
+    uint64_t divCol    = sb_menu_make_color(0.92, 0.92, 0.94, 1.0);
+    uint64_t borderCol = sb_menu_make_color(0.84, 0.84, 0.86, 1.0);
+    uint64_t greenCol  = sb_menu_make_color(0.20, 0.78, 0.35, 1.0);
+    uint64_t floatBg   = sb_menu_make_color(0.10, 0.12, 0.15, 0.92);
+
+    uint64_t clsFont = r_class("UIFont");
+    double sz16 = 16.0, sz14 = 14.5, sz12 = 12.0;
+    uint64_t fontTitle = r_is_objc_ptr(clsFont) ? r_msg2_main_raw(clsFont, "boldSystemFontOfSize:", &sz16, 8, NULL,0,NULL,0,NULL,0) : 0;
+    uint64_t fontRow   = r_is_objc_ptr(clsFont) ? r_msg2_main_raw(clsFont, "systemFontOfSize:", &sz14, 8, NULL,0,NULL,0,NULL,0) : 0;
+    uint64_t fontFoot  = r_is_objc_ptr(clsFont) ? r_msg2_main_raw(clsFont, "systemFontOfSize:", &sz12, 8, NULL,0,NULL,0,NULL,0) : 0;
+
+    r_msg2_main_raw(mWin, "setFrame:", openRect, 32, NULL,0,NULL,0,NULL,0);
+    double mLevel = SB_OVERLAY_WIN_LEVEL + 2.0;
+    r_msg2_main_raw(mWin, "setWindowLevel:", &mLevel, 8, NULL,0,NULL,0,NULL,0);
+    if (r_is_objc_ptr(clearCol)) r_msg2_main(mWin, "setBackgroundColor:", clearCol, 0,0,0);
+    r_msg2_main(mWin, "setOpaque:", 0, 0,0,0);
+    r_msg2_main(mWin, "setClipsToBounds:", 0, 0,0,0);
+    r_msg2_main(mWin, "setUserInteractionEnabled:", 1, 0,0,0);
+    if (r_responds_main(mWin, "_setIgnoresHitTest:")) {
+        r_msg2_main(mWin, "_setIgnoresHitTest:", 0, 0,0,0);
+    }
+    uint64_t mWinLayer = r_msg2_main(mWin, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(mWinLayer) && r_responds_main(mWinLayer, "setAllowsHitTesting:")) {
+        r_msg2_main(mWinLayer, "setAllowsHitTesting:", 1, 0,0,0);
+    }
+
+    // 90-degree clockwise rotation so the menu faces the player in Landscape Right
+    double rotM[6] = { 0.0, 1.0, -1.0, 0.0, 0.0, 0.0 };
+
+    // 1. Main white rounded card (320 x 348 in landscape)
+    uint64_t card = sb_menu_make_view(0, 0, cardW, cardH, whiteCol);
+    if (r_is_objc_ptr(card)) {
+        double cBounds[4] = { 0.0, 0.0, cardW, cardH };
+        double cCenter[2] = { cardH * 0.5, cardW * 0.5 };
+        r_msg2_main_raw(card, "setBounds:", cBounds, 32, NULL,0,NULL,0,NULL,0);
+        r_msg2_main_raw(card, "setCenter:", cCenter, 16, NULL,0,NULL,0,NULL,0);
+        r_msg2_main_raw(card, "setTransform:", rotM, 48, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(card, "setClipsToBounds:", 1, 0,0,0);
+        r_msg2_main(card, "setUserInteractionEnabled:", 1, 0,0,0);
+        uint64_t cLayer = r_msg2_main(card, "layer", 0,0,0,0);
+        if (r_is_objc_ptr(cLayer)) {
+            double rad = 18.0, bw = 1.0;
+            r_msg2_main_raw(cLayer, "setCornerRadius:", &rad, 8, NULL,0,NULL,0,NULL,0);
+            r_msg2_main_raw(cLayer, "setBorderWidth:", &bw, 8, NULL,0,NULL,0,NULL,0);
+            uint64_t bCG = r_is_objc_ptr(borderCol) ? r_msg2_main(borderCol, "CGColor", 0,0,0,0) : 0;
+            if (r_is_objc_ptr(bCG)) r_msg2_main(cLayer, "setBorderColor:", bCG, 0,0,0);
+        }
+        r_msg2_main(mWin, "addSubview:", card, 0,0,0);
+    }
+
+    // Header: centered title + top-right ✕ close button
+    uint64_t titleLbl = sb_menu_make_label(44.0, 0.0, cardW - 88.0, 42.0, "MINHDUC.COM", fontTitle, blackCol, 1);
+    if (r_is_objc_ptr(titleLbl)) r_msg2_main(card, "addSubview:", titleLbl, 0,0,0);
+
+    const char *closeItems[1] = { "✕" };
+    g_sbCloseSeg = sb_menu_make_seg(cardW - 44.0, 6.0, 34.0, 30.0, closeItems, 1, -1, tabBgCol, whiteCol);
+    if (r_is_objc_ptr(g_sbCloseSeg)) r_msg2_main(card, "addSubview:", g_sbCloseSeg, 0,0,0);
+
+    // 3-Tab bar: Esp | Aimbot | Other
+    const char *tabItems[3] = { "Esp", "Aimbot", "Other" };
+    g_sbTabSeg = sb_menu_make_seg(0.0, 42.0, cardW, 36.0, tabItems, 3, 0, tabBgCol, whiteCol);
+    if (r_is_objc_ptr(g_sbTabSeg)) r_msg2_main(card, "addSubview:", g_sbTabSeg, 0,0,0);
+
+    // Tab 0: Esp (6 rows)
+    g_sbTabView[0] = sb_menu_make_view(0.0, 80.0, cardW, 240.0, whiteCol);
+    if (r_is_objc_ptr(g_sbTabView[0])) {
+        g_sbEspVal[0] = ESPPrefsBool(@"Box", YES) ? 1 : 0;
+        g_sbEspVal[1] = ESPPrefsBool(@"Line", YES) ? 1 : 0;
+        g_sbEspVal[2] = ESPPrefsBool(@"Bone", YES) ? 1 : 0;
+        g_sbEspVal[3] = ESPPrefsBool(@"Health", YES) ? 1 : 0;
+        g_sbEspVal[4] = ESPPrefsBool(@"Name", YES) ? 1 : 0;
+        g_sbEspVal[5] = ESPPrefsBool(@"Count", YES) ? 1 : 0;
+        const char *espTitles[6] = { "ESP Box", "ESP Line", "ESP Bone", "ESP Health", "ESP Name", "Enemy Count" };
+        for (int r = 0; r < 6; r++) {
+            g_sbEspSw[r] = sb_menu_make_switch_row(g_sbTabView[0], r, espTitles[r], g_sbEspVal[r],
+                                                   fontRow, blackCol, greenCol, divCol);
+        }
+        r_msg2_main(card, "addSubview:", g_sbTabView[0], 0,0,0);
+    }
+
+    // Tab 1: Aimbot (3 switches + 3 segment selectors)
+    g_sbTabView[1] = sb_menu_make_view(0.0, 80.0, cardW, 240.0, whiteCol);
+    if (r_is_objc_ptr(g_sbTabView[1])) {
+        g_sbAimSwVal[0] = ESPPrefsBool(@"AimSilent", NO) ? 1 : 0;
+        g_sbAimSwVal[1] = ESPPrefsBool(@"Aimbot", NO) ? 1 : 0;
+        g_sbAimSwVal[2] = ESPPrefsBool(@"ShowFovCircle", YES) ? 1 : 0;
+        const char *aimSwTitles[3] = { "Aim Silent", "Aim Lock", "Show FOV" };
+        for (int r = 0; r < 3; r++) {
+            g_sbAimSw[r] = sb_menu_make_switch_row(g_sbTabView[1], r, aimSwTitles[r], g_sbAimSwVal[r],
+                                                   fontRow, blackCol, greenCol, divCol);
+        }
+        // Row 3: Aim Bone (Head | Neck | Body)
+        g_sbAimBoneVal = (int)ESPPrefsFloat(@"AimPos", 0.0f);
+        if (g_sbAimBoneVal < 0 || g_sbAimBoneVal > 2) g_sbAimBoneVal = 0;
+        uint64_t lblBone = sb_menu_make_label(18.0, 120.0, 95.0, 40.0, "Aim Bone", fontRow, blackCol, 0);
+        if (r_is_objc_ptr(lblBone)) r_msg2_main(g_sbTabView[1], "addSubview:", lblBone, 0,0,0);
+        const char *boneItems[3] = { "Head", "Neck", "Body" };
+        g_sbAimBoneSeg = sb_menu_make_seg(118.0, 125.0, 188.0, 30.0, boneItems, 3, g_sbAimBoneVal, tabBgCol, whiteCol);
+        if (r_is_objc_ptr(g_sbAimBoneSeg)) r_msg2_main(g_sbTabView[1], "addSubview:", g_sbAimBoneSeg, 0,0,0);
+        uint64_t div3 = sb_menu_make_view(14.0, 159.0, 292.0, 1.0, divCol);
+        if (r_is_objc_ptr(div3)) r_msg2_main(g_sbTabView[1], "addSubview:", div3, 0,0,0);
+
+        // Row 4: FOV Size (60 | 100 | 140 | 170 | 190)
+        float curFov = ESPPrefsFloat(@"FovSize", 120.0f);
+        g_sbAimFovVal = (curFov <= 75.f) ? 0 : (curFov <= 115.f) ? 1 : (curFov <= 155.f) ? 2 : (curFov <= 180.f) ? 3 : 4;
+        uint64_t lblFov = sb_menu_make_label(18.0, 160.0, 82.0, 40.0, "FOV Size", fontRow, blackCol, 0);
+        if (r_is_objc_ptr(lblFov)) r_msg2_main(g_sbTabView[1], "addSubview:", lblFov, 0,0,0);
+        const char *fovItems[5] = { "60", "100", "140", "170", "190" };
+        g_sbAimFovSeg = sb_menu_make_seg(102.0, 165.0, 204.0, 30.0, fovItems, 5, g_sbAimFovVal, tabBgCol, whiteCol);
+        if (r_is_objc_ptr(g_sbAimFovSeg)) r_msg2_main(g_sbTabView[1], "addSubview:", g_sbAimFovSeg, 0,0,0);
+        uint64_t div4 = sb_menu_make_view(14.0, 199.0, 292.0, 1.0, divCol);
+        if (r_is_objc_ptr(div4)) r_msg2_main(g_sbTabView[1], "addSubview:", div4, 0,0,0);
+
+        // Row 5: Headshot % (25% | 50% | 75% | 90% | 100%)
+        float curHs = ESPPrefsFloat(@"HeadshotRate", 100.0f);
+        g_sbAimHsVal = (curHs <= 35.f) ? 0 : (curHs <= 60.f) ? 1 : (curHs <= 82.f) ? 2 : (curHs <= 95.f) ? 3 : 4;
+        uint64_t lblHs = sb_menu_make_label(18.0, 200.0, 82.0, 40.0, "Headshot", fontRow, blackCol, 0);
+        if (r_is_objc_ptr(lblHs)) r_msg2_main(g_sbTabView[1], "addSubview:", lblHs, 0,0,0);
+        const char *hsItems[5] = { "25%", "50%", "75%", "90%", "100%" };
+        g_sbAimHsSeg = sb_menu_make_seg(102.0, 205.0, 204.0, 30.0, hsItems, 5, g_sbAimHsVal, tabBgCol, whiteCol);
+        if (r_is_objc_ptr(g_sbAimHsSeg)) r_msg2_main(g_sbTabView[1], "addSubview:", g_sbAimHsSeg, 0,0,0);
+
+        r_msg2_main(g_sbTabView[1], "setHidden:", 1, 0,0,0);
+        r_msg2_main(card, "addSubview:", g_sbTabView[1], 0,0,0);
+    }
+
+    // Tab 2: Other (6 rows matching user screenshot: No Recoil, Aim Assist, Aim Lock, Fast Medkit, Dual Weapon, Fast Weapon Switch)
+    g_sbTabView[2] = sb_menu_make_view(0.0, 80.0, cardW, 240.0, whiteCol);
+    if (r_is_objc_ptr(g_sbTabView[2])) {
+        g_sbOtherVal[0] = ESPPrefsBool(@"NoRecoilGun", NO) ? 1 : 0;
+        g_sbOtherVal[1] = ESPPrefsBool(@"AimAssist", NO) ? 1 : 0;
+        g_sbOtherVal[2] = ESPPrefsBool(@"Aimbot", NO) ? 1 : 0;
+        g_sbOtherVal[3] = ESPPrefsBool(@"FastMedkit", NO) ? 1 : 0;
+        g_sbOtherVal[4] = ESPPrefsBool(@"DualWeapon", NO) ? 1 : 0;
+        g_sbOtherVal[5] = ESPPrefsBool(@"FastSwitch", NO) ? 1 : 0;
+        const char *otherTitles[6] = {
+            "No Recoil", "Aim Assist", "Aim Lock",
+            "Fast Medkit", "Dual Weapon", "Fast Weapon Switch"
+        };
+        for (int r = 0; r < 6; r++) {
+            g_sbOtherSw[r] = sb_menu_make_switch_row(g_sbTabView[2], r, otherTitles[r], g_sbOtherVal[r],
+                                                     fontRow, blackCol, greenCol, divCol);
+        }
+        r_msg2_main(g_sbTabView[2], "setHidden:", 1, 0,0,0);
+        r_msg2_main(card, "addSubview:", g_sbTabView[2], 0,0,0);
+    }
+
+    // Footer bar (y = 320, h = 28): "FFVN: External" | "Free Fire Vn"
+    uint64_t footSep = sb_menu_make_view(0.0, 320.0, cardW, 1.0, divCol);
+    if (r_is_objc_ptr(footSep)) r_msg2_main(card, "addSubview:", footSep, 0,0,0);
+    uint64_t footL = sb_menu_make_label(16.0, 320.0, 144.0, 28.0, "FFVN: External", fontFoot, grayCol, 0);
+    if (r_is_objc_ptr(footL)) r_msg2_main(card, "addSubview:", footL, 0,0,0);
+    uint64_t footR = sb_menu_make_label(160.0, 320.0, 144.0, 28.0, "Free Fire Vn", fontFoot, grayCol, 2);
+    if (r_is_objc_ptr(footR)) r_msg2_main(card, "addSubview:", footR, 0,0,0);
+
+    // 2. Floating 44x44 toggle button when menu is minimized (hidden initially)
+    uint64_t fBtn = sb_menu_make_view(0.0, 0.0, 44.0, 44.0, floatBg);
+    if (r_is_objc_ptr(fBtn)) {
+        double fBounds[4] = { 0.0, 0.0, 44.0, 44.0 };
+        double fCenter[2] = { 22.0, 22.0 };
+        r_msg2_main_raw(fBtn, "setBounds:", fBounds, 32, NULL,0,NULL,0,NULL,0);
+        r_msg2_main_raw(fBtn, "setCenter:", fCenter, 16, NULL,0,NULL,0,NULL,0);
+        r_msg2_main_raw(fBtn, "setTransform:", rotM, 48, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(fBtn, "setClipsToBounds:", 1, 0,0,0);
+        uint64_t fLayer = r_msg2_main(fBtn, "layer", 0,0,0,0);
+        if (r_is_objc_ptr(fLayer)) {
+            double frad = 22.0, fbw = 1.5;
+            r_msg2_main_raw(fLayer, "setCornerRadius:", &frad, 8, NULL,0,NULL,0,NULL,0);
+            r_msg2_main_raw(fLayer, "setBorderWidth:", &fbw, 8, NULL,0,NULL,0,NULL,0);
+            uint64_t gCG = r_is_objc_ptr(greenCol) ? r_msg2_main(greenCol, "CGColor", 0,0,0,0) : 0;
+            if (r_is_objc_ptr(gCG)) r_msg2_main(fLayer, "setBorderColor:", gCG, 0,0,0);
+        }
+        const char *openItems[1] = { "MD" };
+        g_sbFloatSeg = sb_menu_make_seg(-4.0, -4.0, 52.0, 52.0, openItems, 1, -1, clearCol, greenCol);
+        if (r_is_objc_ptr(g_sbFloatSeg)) r_msg2_main(fBtn, "addSubview:", g_sbFloatSeg, 0,0,0);
+        r_msg2_main(fBtn, "setHidden:", 1, 0,0,0);
+        r_msg2_main(mWin, "addSubview:", fBtn, 0,0,0);
+    }
+
+    // 3. Build cached NSInvocations for runtime polling (zero cache flush during gameplay)
+    g_selIsOn = r_sel("isOn");
+    g_selSelectedSeg = r_sel("selectedSegmentIndex");
+    g_selSetTarget = r_sel("setTarget:");
+    g_selSetArg = r_sel("setArgument:atIndex:");
+    if (!g_sbPerformMainSel) g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    if (!g_sbInvokeSel) g_sbInvokeSel = r_sel("invoke");
+
+    uint64_t NSInv = r_class("NSInvocation");
+    uint64_t sigSel = r_sel("methodSignatureForSelector:");
+
+    // Open & Close window frame invocations
+    uint64_t setFrameSel = r_sel("setFrame:");
+    uint64_t sigFrame = (r_is_objc_ptr(mWin) && setFrameSel) ? r_msg(mWin, sigSel, setFrameSel, 0,0,0) : 0;
+    if (r_is_objc_ptr(NSInv) && r_is_objc_ptr(sigFrame)) {
+        for (int k = 0; k < 2; k++) {
+            uint64_t inv = r_msg(NSInv, r_sel("invocationWithMethodSignature:"), sigFrame, 0,0,0);
+            uint64_t buf = dlsym_remote("malloc", 32, 0,0,0,0,0,0,0);
+            if (r_is_objc_ptr(inv) && buf) {
+                r_msg2(inv, "retain", 0,0,0,0);
+                r_msg2(inv, "setTarget:", mWin, 0,0,0);
+                r_msg2(inv, "setSelector:", setFrameSel, 0,0,0);
+                remote_write(buf, (k == 0) ? openRect : closeRect, 32);
+                r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+                r_msg2(inv, "retainArguments", 0,0,0,0);
+                if (k == 0) { g_sbMenuWinOpenInv = inv; g_sbMenuWinOpenBuf = buf; }
+                else        { g_sbMenuWinCloseInv = inv; g_sbMenuWinCloseBuf = buf; }
+            }
+        }
+    }
+
+    // setHidden: invocation
+    uint64_t setHidSel = r_sel("setHidden:");
+    uint64_t sigHid = (r_is_objc_ptr(card) && setHidSel) ? r_msg(card, sigSel, setHidSel, 0,0,0) : 0;
+    if (r_is_objc_ptr(NSInv) && r_is_objc_ptr(sigHid)) {
+        uint64_t inv = r_msg(NSInv, r_sel("invocationWithMethodSignature:"), sigHid, 0,0,0);
+        uint64_t buf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (r_is_objc_ptr(inv) && buf) {
+            r_msg2(inv, "retain", 0,0,0,0);
+            r_msg2(inv, "setTarget:", card, 0,0,0);
+            r_msg2(inv, "setSelector:", setHidSel, 0,0,0);
+            remote_write64(buf, 0);
+            r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+            g_sbMenuBoolInv = inv;
+            g_sbMenuBoolBuf = buf;
+        }
+    }
+
+    // setSelectedSegmentIndex: invocation
+    uint64_t setSegSel = r_sel("setSelectedSegmentIndex:");
+    uint64_t sigSeg = (r_is_objc_ptr(g_sbTabSeg) && setSegSel) ? r_msg(g_sbTabSeg, sigSel, setSegSel, 0,0,0) : 0;
+    if (r_is_objc_ptr(NSInv) && r_is_objc_ptr(sigSeg)) {
+        uint64_t inv = r_msg(NSInv, r_sel("invocationWithMethodSignature:"), sigSeg, 0,0,0);
+        uint64_t buf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (r_is_objc_ptr(inv) && buf) {
+            r_msg2(inv, "retain", 0,0,0,0);
+            r_msg2(inv, "setTarget:", g_sbTabSeg, 0,0,0);
+            r_msg2(inv, "setSelector:", setSegSel, 0,0,0);
+            remote_write64(buf, (uint64_t)(-1LL));
+            r_msg2(inv, "setArgument:atIndex:", buf, 2, 0, 0);
+            g_sbMenuIntInv = inv;
+            g_sbMenuIntBuf = buf;
+        }
+    }
+
+    // setOn:animated: invocation for syncing shared switches across tabs
+    uint64_t setOnSel = r_sel("setOn:animated:");
+    uint64_t sigOn = (r_is_objc_ptr(g_sbEspSw[0]) && setOnSel) ? r_msg(g_sbEspSw[0], sigSel, setOnSel, 0,0,0) : 0;
+    if (r_is_objc_ptr(NSInv) && r_is_objc_ptr(sigOn)) {
+        uint64_t inv = r_msg(NSInv, r_sel("invocationWithMethodSignature:"), sigOn, 0,0,0);
+        uint64_t b0 = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        uint64_t b1 = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+        if (r_is_objc_ptr(inv) && b0 && b1) {
+            r_msg2(inv, "retain", 0,0,0,0);
+            r_msg2(inv, "setTarget:", g_sbEspSw[0], 0,0,0);
+            r_msg2(inv, "setSelector:", setOnSel, 0,0,0);
+            remote_write64(b0, 0);
+            remote_write64(b1, 0);
+            r_msg2(inv, "setArgument:atIndex:", b0, 2, 0, 0);
+            r_msg2(inv, "setArgument:atIndex:", b1, 3, 0, 0);
+            g_sbMenuSwOnInv = inv;
+            g_sbMenuSwOnBuf0 = b0;
+            g_sbMenuSwOnBuf1 = b1;
+        }
+    }
+
+    r_msg2_main(mWin, "setHidden:", 0, 0,0,0);
+    if (r_is_objc_ptr(app) && r_is_objc_ptr(assocKey)) {
+        dlsym_remote("objc_setAssociatedObject", app, assocKey, mWin, 1, 0,0,0,0);
+    }
+
+    g_sbMenuWin = mWin;
+    g_sbMenuCard = card;
+    g_sbFloatBtn = fBtn;
+    g_sbMenuIsOpen = 1;
+    g_sbCurTab = 0;
+    g_sbNextMenuPollUS = now_us() + 200000ULL;
+
+    r_settle_us(savedSettle);
+    NSLog(@"[SB-MENU] UIKit floating menu LIVE win=0x%llx card=0x%llx float=0x%llx",
+          (unsigned long long)mWin, (unsigned long long)card, (unsigned long long)fBtn);
+}
+
+static void sb_menu_poll_locked(void) {
+    if (!r_is_objc_ptr(g_sbMenuWin) || !g_selIsOn || !g_selSelectedSeg) return;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+
+    if (!g_sbMenuIsOpen) {
+        if (!r_is_objc_ptr(g_sbFloatSeg)) return;
+        int64_t tap = (int64_t)r_msg(g_sbFloatSeg, g_selSelectedSeg, 0,0,0,0);
+        if (tap == 0) {
+            sb_menu_set_seg_fast(g_sbFloatSeg, -1);
+            sb_menu_set_hidden_fast(g_sbFloatBtn, 1);
+            sb_menu_set_hidden_fast(g_sbMenuCard, 0);
+            if (r_is_objc_ptr(g_sbMenuWinOpenInv) && g_sbPerformMainSel && g_sbInvokeSel) {
+                r_msg(g_sbMenuWinOpenInv, g_sbPerformMainSel, g_sbInvokeSel, 0,0,0);
+            }
+            g_sbMenuIsOpen = 1;
+        }
+        return;
+    }
+
+    // 1. Check Close button (✕)
+    if (r_is_objc_ptr(g_sbCloseSeg)) {
+        int64_t cTap = (int64_t)r_msg(g_sbCloseSeg, g_selSelectedSeg, 0,0,0,0);
+        if (cTap == 0) {
+            sb_menu_set_seg_fast(g_sbCloseSeg, -1);
+            sb_menu_set_hidden_fast(g_sbMenuCard, 1);
+            sb_menu_set_hidden_fast(g_sbFloatBtn, 0);
+            if (r_is_objc_ptr(g_sbMenuWinCloseInv) && g_sbPerformMainSel && g_sbInvokeSel) {
+                r_msg(g_sbMenuWinCloseInv, g_sbPerformMainSel, g_sbInvokeSel, 0,0,0);
+            }
+            g_sbMenuIsOpen = 0;
+            return;
+        }
+    }
+
+    // 2. Check 3-Tab bar (Esp | Aimbot | Other)
+    if (r_is_objc_ptr(g_sbTabSeg)) {
+        int64_t tIdx = (int64_t)r_msg(g_sbTabSeg, g_selSelectedSeg, 0,0,0,0);
+        if (tIdx >= 0 && tIdx <= 2 && (int)tIdx != g_sbCurTab) {
+            g_sbCurTab = (int)tIdx;
+            for (int t = 0; t < 3; t++) {
+                sb_menu_set_hidden_fast(g_sbTabView[t], (t == g_sbCurTab) ? 0 : 1);
+            }
+        }
+    }
+
+    // 3. Poll only the active tab's controls
+    BOOL changed = NO;
+    if (g_sbCurTab == 0) {
+        NSString * const espKeys[6] = { @"Box", @"Line", @"Bone", @"Health", @"Name", @"Count" };
+        for (int r = 0; r < 6; r++) {
+            if (!r_is_objc_ptr(g_sbEspSw[r])) continue;
+            int v = (int)(r_msg(g_sbEspSw[r], g_selIsOn, 0,0,0,0) & 1ULL);
+            if (v != g_sbEspVal[r]) {
+                g_sbEspVal[r] = v;
+                ESPPrefsSetBool(espKeys[r], v ? YES : NO);
+                if (r == 4) ESPPrefsSetBool(@"Distance", v ? YES : NO);
+                if (v) ESPPrefsSetBool(@"EnableESP", YES);
+                changed = YES;
+            }
+        }
+    } else if (g_sbCurTab == 1) {
+        NSString * const aimKeys[3] = { @"AimSilent", @"Aimbot", @"ShowFovCircle" };
+        for (int r = 0; r < 3; r++) {
+            if (!r_is_objc_ptr(g_sbAimSw[r])) continue;
+            int v = (int)(r_msg(g_sbAimSw[r], g_selIsOn, 0,0,0,0) & 1ULL);
+            if (v != g_sbAimSwVal[r]) {
+                g_sbAimSwVal[r] = v;
+                ESPPrefsSetBool(aimKeys[r], v ? YES : NO);
+                if (r == 1) {
+                    if (v) ESPPrefsSetBool(@"AimMaster", YES);
+                    g_sbOtherVal[2] = v;
+                    sb_menu_set_switch_fast(g_sbOtherSw[2], v);
+                }
+                changed = YES;
+            }
+        }
+        if (r_is_objc_ptr(g_sbAimBoneSeg)) {
+            int64_t bIdx = (int64_t)r_msg(g_sbAimBoneSeg, g_selSelectedSeg, 0,0,0,0);
+            if (bIdx >= 0 && bIdx <= 2 && (int)bIdx != g_sbAimBoneVal) {
+                g_sbAimBoneVal = (int)bIdx;
+                ESPPrefsSetFloat(@"AimPos", (float)g_sbAimBoneVal);
+                changed = YES;
+            }
+        }
+        if (r_is_objc_ptr(g_sbAimFovSeg)) {
+            static const float kFovPresets[5] = { 60.f, 100.f, 140.f, 170.f, 190.f };
+            int64_t fIdx = (int64_t)r_msg(g_sbAimFovSeg, g_selSelectedSeg, 0,0,0,0);
+            if (fIdx >= 0 && fIdx <= 4 && (int)fIdx != g_sbAimFovVal) {
+                g_sbAimFovVal = (int)fIdx;
+                ESPPrefsSetFloat(@"FovSize", kFovPresets[g_sbAimFovVal]);
+                ESPPrefsSetFloat(@"Fov", kFovPresets[g_sbAimFovVal]);
+                changed = YES;
+            }
+        }
+        if (r_is_objc_ptr(g_sbAimHsSeg)) {
+            static const float kHsPresets[5] = { 25.f, 50.f, 75.f, 90.f, 100.f };
+            int64_t hIdx = (int64_t)r_msg(g_sbAimHsSeg, g_selSelectedSeg, 0,0,0,0);
+            if (hIdx >= 0 && hIdx <= 4 && (int)hIdx != g_sbAimHsVal) {
+                g_sbAimHsVal = (int)hIdx;
+                ESPPrefsSetFloat(@"HeadshotRate", kHsPresets[g_sbAimHsVal]);
+                changed = YES;
+            }
+        }
+    } else if (g_sbCurTab == 2) {
+        NSString * const otherKeys[6] = {
+            @"NoRecoilGun", @"AimAssist", @"Aimbot",
+            @"FastMedkit", @"DualWeapon", @"FastSwitch"
+        };
+        for (int r = 0; r < 6; r++) {
+            if (!r_is_objc_ptr(g_sbOtherSw[r])) continue;
+            int v = (int)(r_msg(g_sbOtherSw[r], g_selIsOn, 0,0,0,0) & 1ULL);
+            if (v != g_sbOtherVal[r]) {
+                g_sbOtherVal[r] = v;
+                ESPPrefsSetBool(otherKeys[r], v ? YES : NO);
+                if ((r == 1 || r == 2) && v) {
+                    ESPPrefsSetBool(@"AimMaster", YES);
+                }
+                if (r == 2) {
+                    g_sbAimSwVal[1] = v;
+                    sb_menu_set_switch_fast(g_sbAimSw[1], v);
+                }
+                changed = YES;
+            }
+        }
+    }
+
+    if (changed) {
+        ESPPrefsSync();
+        ESPSyncFromPrefs();
     }
 }
 
@@ -2399,6 +3056,11 @@ int SBoardStartOverlay(void) {
         r_msg2_main(shape, "setAllowsHitTesting:", 0, 0,0,0);
     }
 
+    // Build the SpringBoard UIKit Floating Menu (g_sbMenuWin) BEFORE mapping
+    // the IOSurface buffers so r_msg2_main_raw / r_alloc_str never flushes the
+    // IOSurface page cache once g_iosReady goes live.
+    sb_menu_build(app, scene, bounds);
+
 #if SB_IOSURFACE_RENDER
     {
         g_iosReady = NO;
@@ -2861,12 +3523,19 @@ void SBRemotePushESPFrame(UIView *espView) {
         uint32_t subCount = 0;
         const BOOL shouldPush = sb_ios_render_frame(espView, &bufIdx, &dirtyMinOff, &dirtyMaxOff, &subCount);
         const uint64_t renderUS = now_us() - tRender0;
-        if (!shouldPush || dirtyMaxOff <= dirtyMinOff) {
+        const BOOL hasDirtyFrame = (shouldPush && dirtyMaxOff > dirtyMinOff);
+        const BOOL needMenuPoll = (r_is_objc_ptr(g_sbMenuWin) && t >= g_sbNextMenuPollUS);
+        if (!hasDirtyFrame && !needMenuPoll) {
             __sync_lock_release(&s_remoteBusy);
             g_sbSummarySkips++;
             return;
         }
-        g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+        if (hasDirtyFrame) {
+            g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+        }
+        if (needMenuPoll) {
+            g_sbNextMenuPollUS = t + 180000ULL;
+        }
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
@@ -2877,6 +3546,11 @@ void SBRemotePushESPFrame(UIView *espView) {
             @try {
                 if (!remote_call_has_local_state() || !remote_call_current_success()) return;
                 if (!g_iosReady || !g_iosSbBase[bufIdx] || !g_iosLocalBuf) return;
+
+                if (needMenuPoll) {
+                    sb_menu_poll_locked();
+                    if (!hasDirtyFrame) return;
+                }
 
                 const size_t writeLen = dirtyMaxOff - dirtyMinOff;
                 const uint64_t tWrite0 = now_us();
@@ -4161,8 +4835,10 @@ void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }
     uint64_t win = g_sbWin;
+    uint64_t menuWin = g_sbMenuWin;
     g_sbOverlayOn = NO;
     g_sbWin = 0;
+    g_sbMenuWin = 0;
     g_sbShape = 0;
     g_sbCanvas = 0;
     pthread_mutex_unlock(&g_sbLock);
@@ -4170,6 +4846,7 @@ void SBoardStopOverlay(void) {
     // Fl0rk stop_in_session
     if (remote_call_has_local_state()) {
         if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
+        if (r_is_objc_ptr(menuWin)) r_msg2_main(menuWin, "setHidden:", 1, 0,0,0);
         if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
         // The hold ring still holds paths handed to a queued setPath: that the
         // main thread has not run yet, so they are freed with the session rather
