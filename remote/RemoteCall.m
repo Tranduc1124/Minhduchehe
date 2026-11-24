@@ -1819,19 +1819,33 @@ int destroy_remote_call_internal(void) {
         g_RC_trojanMem = 0;
     }
     if (g_RC_creatingExtraThread) {
-        // Never call pthread_exit or destroy g_RC_secondExceptionPort on a synthetic
-        // thread parked at creation-time PC=0x301/0x401 inside SpringBoard:
-        // pthread_create_suspended_np bypassed _pthread_start so TSD/self is not
-        // initialized for pthread_exit, and destroying g_RC_secondExceptionPort while
-        // the synthetic thread is still parked on 0x401 immediately delivers
-        // MACH_RCV_PORT_DIED in XNU exception_deliver and kills SpringBoard with
-        // EXC_BAD_ACCESS (SIGBUS) at PC=0x401. Keeping the two exception ports
-        // armed in our IPC space costs 2 port names and guarantees SpringBoard never
-        // takes an uncaught 0x401 fault.
+        // Tell the synthetic call thread in SpringBoard to terminate itself via
+        // pthread_exit(0) and wait until it leaves SpringBoard's task->threads
+        // list. Without this, when MINHDUC is swiped away in the App Switcher
+        // (applicationWillTerminate: -> SBoardStopOverlay -> destroy_remote_call),
+        // the kernel destroys MINHDUC's IPC space (including g_RC_secondExceptionPort)
+        // on process exit while the synthetic thread in SpringBoard is still parked
+        // at PC=0x401 after munmap (x0=0), causing XNU to kill SpringBoard with
+        // EXC_BAD_ACCESS (SIGBUS) at PC=0x401.
+        bool wasPoisoned = g_RC_crossingPoisoned;
+        g_RC_crossingPoisoned = false;
+        do_remote_call_stable(RC_TIMEOUT_CLEANUP, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        g_RC_crossingPoisoned = wasPoisoned;
+
+        if (g_RC_callThreadAddr && g_RC_taskAddr) {
+            bool stillInTarget = rc_synthetic_thread_still_in_target(g_RC_taskAddr, g_RC_callThreadAddr);
+            if (stillInTarget) {
+                NSLog(@"[PUSH-KEEP] destroy: synthetic thread 0x%llx still inside target after pthread_exit wait",
+                      (unsigned long long)g_RC_callThreadAddr);
+            } else {
+                NSLog(@"[PUSH-KEEP] destroy: synthetic thread 0x%llx cleanly exited target via pthread_exit",
+                      (unsigned long long)g_RC_callThreadAddr);
+            }
+        }
+        // Still keep local exception port receive rights armed until process exit
+        // rather than calling destroy_exception_port manually.
         if (g_RC_callThreadAddr || g_RC_trojanThreadAddr || g_RC_taskAddr) {
             g_RC_wedgeKeepPorts = true;
-            NSLog(@"[PUSH-KEEP] destroy: keeping both exception ports armed for synthetic call thread 0x%llx",
-                  (unsigned long long)g_RC_callThreadAddr);
         }
     }
     else {

@@ -197,8 +197,10 @@ static void MDResetAccentPrefs(void) {
     // (hacking usecount back) triggers sodealloc on the corrupted
     // socket → kernel panic → device respring. The leak IS the fix.
     //
-    // Hide SB overlay so a killed app does not leave a ghost DrawView.
-    SBoardStopOverlay();
+    // Stop the local ESP host timer first so no new frame publish is queued,
+    // then hide the SB overlay and cleanly pthread_exit the synthetic call
+    // thread in SpringBoard before the kernel tears down our IPC space.
+    StopESPSession();
 }
 
 @end
