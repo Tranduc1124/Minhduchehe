@@ -1909,12 +1909,15 @@ static void sb_cost_probe(void) {
 
 static int sb_fail_start_overlay(bool destroySession) {
     if (destroySession) {
-        if (remote_call_current_success()) {
-            destroy_remote_call();
-        } else {
+        // Keep the RemoteCall session open if it is still healthy (e.g. SpringBoard
+        // had no active keyWindow/UIWindowScene yet); tearing down a healthy
+        // session and destroying exception ports right after r_msg2(inv, "release")
+        // risks SIGBUS 0x401 and forces a full re-injection 2s later.
+        if (!remote_call_current_success()) {
             abandon_remote_call();
         }
     }
+    pthread_mutex_unlock(&g_sbIoLock);
     pthread_mutex_lock(&g_sbLock);
     g_sbBuilding = 0;
     pthread_mutex_unlock(&g_sbLock);
@@ -1937,6 +1940,7 @@ int SBoardStartOverlay(void) {
     g_sbBuilding = 1;
     pthread_mutex_unlock(&g_sbLock);
 
+    pthread_mutex_lock(&g_sbIoLock);
     if (!g_kexploit_ready) return sb_fail_start_overlay(false);
 
     NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (extra thread, 15fps)...");
@@ -2552,6 +2556,7 @@ int SBoardStartOverlay(void) {
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    pthread_mutex_unlock(&g_sbIoLock);
     pthread_mutex_lock(&g_sbLock);
     g_sbOverlayOn = YES;
     g_sbBuilding = 0;
@@ -2875,7 +2880,6 @@ void SBRemotePushESPFrame(UIView *espView) {
         // ESP_View.frameTimer already owns 60Hz pacing and s_remoteBusy drops
         // overlapping publishes; a second independent timer gate (g_sbNextPublishUS)
         // skipped 16-22 valid ticks/s due to timer phase beat and caused frame-drop stutter.
-        g_sbLastPublishUS = tGate;
         if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
             g_sbBusyDrops++;
             g_sbSummarySkips++;
@@ -2890,6 +2894,9 @@ void SBRemotePushESPFrame(UIView *espView) {
         const BOOL shouldPush = sb_ios_render_frame(espView, &bufIdx, &dirtyMinOff, &dirtyMaxOff, &subCount);
         const uint64_t renderUS = now_us() - tRender0;
         if (!shouldPush || dirtyMaxOff <= dirtyMinOff) {
+            if (remote_call_has_local_state() && remote_call_current_success()) {
+                g_sbLastPublishUS = tGate;
+            }
             __sync_lock_release(&s_remoteBusy);
             g_sbSummarySkips++;
             return;
@@ -4114,7 +4121,9 @@ void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 // and read here once a second from the app's status card; a torn read of one
 // byte is not possible on arm64, and taking the lock from the UI thread would
 // put the status poll behind a build that can take milliseconds.
-int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
+int SBoardOverlayIsOn(void) {
+    return (g_sbOverlayOn && remote_call_current_success()) ? 1 : 0;
+}
 
 // Has a frame actually been drawn, as opposed to a window existing.
 //
@@ -4129,7 +4138,7 @@ int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
 // so g_sbOverlayOn is what makes the answer mean "right now" rather than
 // "once".
 int SBoardOverlayHasPublishedFrame(void) {
-    return (g_sbOverlayOn && g_sbLastPublishUS != 0) ? 1 : 0;
+    return (g_sbOverlayOn && g_sbLastPublishUS != 0 && remote_call_current_success()) ? 1 : 0;
 }
 
 // Clear the two filled name layers, once, from outside a publish.

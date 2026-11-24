@@ -14,3 +14,5 @@ uint64_t ptrauth_blend_discriminator_wrapper(uint64_t diver, uint64_t discrimina
 uint64_t ptrauth_string_discriminator_special(const char *name);
 uint64_t find_pacia_gadget(void);
 void pac_cleanup(mach_port_t pacThread, mach_port_t exceptionPort, void *stack);
+void remote_pac_pin_keys_for_thread(uint64_t remoteThreadAddr);
+void remote_pac_reset_pinned_keys(void);

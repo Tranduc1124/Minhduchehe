@@ -31,6 +31,8 @@
 #import <mach/mach_time.h>
 #import <sys/sysctl.h>
 #import <pthread.h>
+#import <signal.h>
+#import <errno.h>
 
 // Same declares as remote/VM.m — mach/mach_vm.h is not always public in the SDK.
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mach_vm_size_t size);
@@ -1720,7 +1722,13 @@ DSPageCacheDiag ds_page_cache_diag(void) {
     return d;
 }
 
-bool ds_attached(void) { return K(g_ff_task); }
+bool ds_attached(void) {
+    if (!K(g_ff_task) || g_ff_pid <= 0) return false;
+    if (kill(g_ff_pid, 0) != 0 && errno == ESRCH) {
+        return false;
+    }
+    return true;
+}
 uint64_t ds_base(void) { return g_ff_base; }
 pid_t    ds_pid(void)  { return g_ff_pid; }
 mach_port_t ds_task_port(void) { return MACH_PORT_NULL; } // unused in DS mode

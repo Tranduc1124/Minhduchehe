@@ -12,6 +12,7 @@
 #import <dlfcn.h>
 #import <pthread.h>
 #import <errno.h>
+#import <signal.h>
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <unistd.h>
@@ -1075,8 +1076,35 @@ void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint
     }
 }
 
+static bool rc_signed_state_is_valid(const arm_thread_state64_internal *state,
+                                     uint64_t expectPC,
+                                     uint64_t expectLR)
+{
+    if (!state) return false;
+    if (expectPC) {
+        uint64_t pc = state->__pc;
+        if (pc == 0 || pc == (uint64_t)-1) return false;
+        if (native_strip(pc) != native_strip(expectPC)) return false;
+        if (gIsPACSupported && (pc >> 39) == 0) return false;
+    }
+    if (expectLR) {
+        uint64_t lr = state->__lr;
+        if (lr == 0 || lr == (uint64_t)-1) return false;
+        if (native_strip(lr) != native_strip(expectLR)) return false;
+        if (gIsPACSupported && (lr >> 39) == 0) return false;
+    }
+    return true;
+}
+
 bool remote_call_current_success(void)
 {
+    if (!g_RC_success) return false;
+    if (!g_RC_vphoneBridge && g_RC_pid > 0) {
+        if (kill((pid_t)g_RC_pid, 0) != 0 && errno == ESRCH) {
+            g_RC_success = false;
+            return false;
+        }
+    }
     return g_RC_success;
 }
 
@@ -1209,6 +1237,16 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
+    if (!rc_signed_state_is_valid(&exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR)) {
+        RC_DIAG("temp/%s PAC sign failed (pc=0x%llx lr=0x%llx) — refusing reply_with_state",
+                name ?: "?",
+                (unsigned long long)exc.threadState.__pc,
+                (unsigned long long)exc.threadState.__lr);
+        g_RC_crossingPoisoned = true;
+        g_RC_wedgeKeepPorts = true;
+        g_RC_success = false;
+        return 0;
+    }
     reply_with_state(&exc, &exc.threadState);
 
     // Only the cleanup spelling skips the wait here. The temp path runs on the
@@ -1352,6 +1390,10 @@ static bool rc_resync_trojan_after_wait2_timeout(const char *name)
     park.__fp    = g_RC_originalState.__fp;
     park.__flags = late.threadState.__flags;
     sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+    if (!rc_signed_state_is_valid(&park, FAKE_PC_TROJAN, FAKE_LR_TROJAN)) {
+        RC_DIAG("resync/%s PAC sign failed — leaving thread blocked on port", name ?: "?");
+        return false;
+    }
     reply_with_state(&late, &park);
     RC_DIAG("resync/%s reparked at 0x301 after wait2 timeout", name ?: "?");
     return true;
@@ -1474,6 +1516,20 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     const uint64_t tW1Done = rc_now_us();
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
     const uint64_t tSignDone = rc_now_us();
+    if (!rc_signed_state_is_valid(&exc.threadState, pcAddr, FAKE_LR_TROJAN)) {
+        RC_DIAG("stable/%s PAC sign failed (pc=0x%llx lr=0x%llx) — refusing reply_with_state to prevent SIGBUS 0x401",
+                name ?: "(addr-call)",
+                (unsigned long long)exc.threadState.__pc,
+                (unsigned long long)exc.threadState.__lr);
+        NSLog(@"[PUSH-PAC-FAIL] stable/%s PAC sign failed (pc=0x%llx lr=0x%llx) — poisoning crossing and keeping ports armed",
+              name ?: "(addr-call)",
+              (unsigned long long)exc.threadState.__pc,
+              (unsigned long long)exc.threadState.__lr);
+        g_RC_crossingPoisoned = true;
+        g_RC_wedgeKeepPorts = true;
+        g_RC_success = false;
+        return 0;
+    }
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -1649,15 +1705,18 @@ void abandon_remote_call_internal(void) {
     // instead. The cost is two mach ports and one blocked thread per abandoned
     // session, which is nothing next to SpringBoard being dead and needing a
     // respawn.
-    if (g_RC_callThreadAddr && g_RC_taskAddr) {
+    if ((g_RC_callThreadAddr || g_RC_trojanThreadAddr || g_RC_creatingExtraThread) && g_RC_taskAddr) {
         g_RC_wedgeKeepPorts = true;
-        NSLog(@"[PUSH-KEEP] abandon: synthetic call thread 0x%llx may still be inside the target — keeping both exception ports armed",
-              (unsigned long long)g_RC_callThreadAddr);
+        NSLog(@"[PUSH-KEEP] abandon: call/trojan thread (call=0x%llx trojan=0x%llx) may still be inside target — keeping both exception ports armed",
+              (unsigned long long)g_RC_callThreadAddr,
+              (unsigned long long)g_RC_trojanThreadAddr);
     }
     if (g_RC_wedgeKeepPorts) {
         printf("[%s:%d] wedged trojan — keeping both exception ports alive and armed\n",
                __FUNCTION__, __LINE__);
         NSLog(@"[PUSH-KEEP] abandon: keeping both exception ports alive and armed (wedged trojan)");
+        g_RC_firstExceptionPort = MACH_PORT_NULL;
+        g_RC_secondExceptionPort = MACH_PORT_NULL;
     } else {
         destroy_exception_port(g_RC_firstExceptionPort);
         destroy_exception_port(g_RC_secondExceptionPort);
@@ -1714,7 +1773,7 @@ int destroy_remote_call(void) {
 // An empty list means the target is gone -- the thread died with it -- or that
 // the read missed. The second case is the dangerous one, so an empty list is
 // only believed after a second, independent scan agrees.
-static bool rc_synthetic_thread_still_in_target(uint64_t taskAddr, uint64_t threadAddr)
+static __attribute__((unused)) bool rc_synthetic_thread_still_in_target(uint64_t taskAddr, uint64_t threadAddr)
 {
     if (!taskAddr || !threadAddr) return false;
 
@@ -1760,35 +1819,18 @@ int destroy_remote_call_internal(void) {
         g_RC_trojanMem = 0;
     }
     if (g_RC_creatingExtraThread) {
-        // This is the call that kills the wedged thread, and it was being REFUSED:
-        // crossingPoisoned short-circuits do_remote_call_stable, which is the only
-        // way to make this call. So destroy removed the catcher and then, by the
-        // same latch, declined to remove the thread it belonged to.
-        //
-        // The refusal is right for ordinary callers and wrong here, so the escape is
-        // explicit: clear the latch, kill the thread, then put it back. Nothing runs
-        // between those two points, since destroy holds the IPC mutex.
-        if (g_RC_crossingPoisoned) {
-            g_RC_crossingPoisoned = false;
-            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
-            g_RC_crossingPoisoned = true;
-        } else {
-            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
-        }
-        // pthread_exit never returns, so a thread that really took it cannot
-        // fault at 0x401 again and the ports are free to go. But "really took
-        // it" is not something the call above reports: the cleanup form returns
-        // 0 whether the crossing landed or wait1 timed out, and in the timeout
-        // case the thread is still parked on 0x301 with the second exception
-        // port as its only way back out.
-        //
-        // So ask the target instead of trusting the call. Its thread list is
-        // the ground truth, and a thread that is still linked into the task is
-        // still inside SpringBoard.
-        if (g_RC_callThreadAddr && g_RC_taskAddr &&
-            rc_synthetic_thread_still_in_target(g_RC_taskAddr, g_RC_callThreadAddr)) {
+        // Never call pthread_exit or destroy g_RC_secondExceptionPort on a synthetic
+        // thread parked at creation-time PC=0x301/0x401 inside SpringBoard:
+        // pthread_create_suspended_np bypassed _pthread_start so TSD/self is not
+        // initialized for pthread_exit, and destroying g_RC_secondExceptionPort while
+        // the synthetic thread is still parked on 0x401 immediately delivers
+        // MACH_RCV_PORT_DIED in XNU exception_deliver and kills SpringBoard with
+        // EXC_BAD_ACCESS (SIGBUS) at PC=0x401. Keeping the two exception ports
+        // armed in our IPC space costs 2 port names and guarantees SpringBoard never
+        // takes an uncaught 0x401 fault.
+        if (g_RC_callThreadAddr || g_RC_trojanThreadAddr || g_RC_taskAddr) {
             g_RC_wedgeKeepPorts = true;
-            NSLog(@"[PUSH-KEEP] destroy: synthetic thread 0x%llx is still inside the target after pthread_exit — keeping both exception ports armed",
+            NSLog(@"[PUSH-KEEP] destroy: keeping both exception ports armed for synthetic call thread 0x%llx",
                   (unsigned long long)g_RC_callThreadAddr);
         }
     }
@@ -2482,6 +2524,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     if (!g_RC_trojanThreadAddr)
         g_RC_trojanThreadAddr = firstThread;
+    remote_pac_reset_pinned_keys();
+    remote_pac_pin_keys_for_thread(g_RC_trojanThreadAddr);
 
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
@@ -2691,6 +2735,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     if(useMigFilterBypass)
         mig_bypass_resume();
+
+    if (g_RC_callThreadAddr) {
+        remote_pac_pin_keys_for_thread(g_RC_callThreadAddr);
+    }
 
     if (!set_exception_port_on_thread(secondExceptionPort, g_RC_callThreadAddr, useMigFilterBypass)) {
         printf("[%s:%d] Failed set exc port on new thread, retrying...\n", __FUNCTION__, __LINE__);
