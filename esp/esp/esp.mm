@@ -4159,9 +4159,13 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
 
 
-        if (showVisuals && stats.aimAssistPath) {
-            MenuViewApplyPath(self.aimAssistLayer, stats.aimAssistPath, YES);
+        if (stats.aimAssistPath) {
+            const bool hasAimLine = !CGPathIsEmpty(stats.aimAssistPath);
+            MenuViewApplyPath(self.aimAssistLayer,
+                              ((showVisuals || isShowFovCircle) && hasAimLine) ? stats.aimAssistPath : nil,
+                              hasAimLine);
             CGPathRelease(stats.aimAssistPath);
+            stats.aimAssistPath = NULL;
         } else {
             self.aimAssistLayer.path = nil;
         }
@@ -7159,6 +7163,21 @@ static void EspEmitStatusLine(void) {
                 Vector3 fromNow = AimCameraOrigin(myPawnObject, myLocation);
                 if (!looksLikeWorldPos(fromNow)) fromNow = myLocation;
                 AimSyncFireHit(myPawnObject, fromNow, liveBone);
+            }
+
+            // Vẽ Line to Target từ tâm màn hình vào đúng bone đang ngắm/bắn của Silent Aim khi bật FOV
+            if (isShowFovCircle && stats.aimAssistPath) {
+                Vector3 w2sTargetBone = WorldToScreenLayer(
+                    liveBone, matrixData,
+                    (float)matrixVpWidth, (float)matrixVpHeight,
+                    (float)viewWidth, (float)viewHeight);
+                if (std::isfinite(w2sTargetBone.x) && std::isfinite(w2sTargetBone.y) &&
+                    w2sTargetBone.z > 0.001f &&
+                    w2sTargetBone.x >= 0.0f && w2sTargetBone.x <= viewWidth &&
+                    w2sTargetBone.y >= 0.0f && w2sTargetBone.y <= viewHeight) {
+                    CGPathMoveToPoint(stats.aimAssistPath, NULL, screenCenter.x, screenCenter.y);
+                    CGPathAddLineToPoint(stats.aimAssistPath, NULL, w2sTargetBone.x, w2sTargetBone.y);
+                }
             }
         } else {
             SilentAimClearTarget();

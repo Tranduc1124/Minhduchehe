@@ -3600,7 +3600,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                         // too, so allowing the whole bucket brought the diamonds
                         // back alongside the snapline. It also cost two remote
                         // calls each and took the frame from 15 calls to 115.
-                        if (curLayer >= 6 && curLayer <= 8) {
+                        if ((curLayer >= 6 && curLayer <= 8) || curLayer == 15) {
                             uint64_t segDst = sb_pts_reserve((size_t)rn * 8);
                             if (segDst) {
                                 remote_write(segDst, run, (size_t)rn * 8);
