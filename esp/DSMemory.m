@@ -943,7 +943,16 @@ static bool ds_vmo_walk_tick(uint64_t nowMs) {
     if (g_vmoCursor == 0) {
         const uint64_t hdr = kread_ptr(g_ff_task + off_task_map) + off_vm_map_hdr;
         const uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
-        if (nentries == 0 || nentries > DS_VMO_SNAP_MAX) {
+        if (nentries == 0) {
+            // A vm_map with 0 entries means the target game process has exited and
+            // XNU tore down its address space. Clear g_ff_task/g_ff_base via kernel
+            // state so ds_attached() returns false on the next frame and ds_attach()
+            // cleanly re-attaches when the game is reopened.
+            g_ff_task = 0;
+            g_ff_base = 0;
+            return false;
+        }
+        if (nentries > DS_VMO_SNAP_MAX) {
             // Cannot hold it. Say so rather than truncating: a partial map reports "not
             // mapped" for everything past the cut and drops live mappings wholesale.
             static uint32_t s_oversizeLogged = 0;
@@ -1722,13 +1731,7 @@ DSPageCacheDiag ds_page_cache_diag(void) {
     return d;
 }
 
-bool ds_attached(void) {
-    if (!K(g_ff_task) || g_ff_pid <= 0) return false;
-    if (kill(g_ff_pid, 0) != 0 && errno == ESRCH) {
-        return false;
-    }
-    return true;
-}
+bool ds_attached(void) { return K(g_ff_task); }
 uint64_t ds_base(void) { return g_ff_base; }
 pid_t    ds_pid(void)  { return g_ff_pid; }
 mach_port_t ds_task_port(void) { return MACH_PORT_NULL; } // unused in DS mode

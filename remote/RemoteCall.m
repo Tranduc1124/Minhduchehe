@@ -1098,13 +1098,6 @@ static bool rc_signed_state_is_valid(const arm_thread_state64_internal *state,
 
 bool remote_call_current_success(void)
 {
-    if (!g_RC_success) return false;
-    if (!g_RC_vphoneBridge && g_RC_pid > 0) {
-        if (kill((pid_t)g_RC_pid, 0) != 0 && errno == ESRCH) {
-            g_RC_success = false;
-            return false;
-        }
-    }
     return g_RC_success;
 }
 

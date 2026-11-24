@@ -4121,9 +4121,7 @@ void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 // and read here once a second from the app's status card; a torn read of one
 // byte is not possible on arm64, and taking the lock from the UI thread would
 // put the status poll behind a build that can take milliseconds.
-int SBoardOverlayIsOn(void) {
-    return (g_sbOverlayOn && remote_call_current_success()) ? 1 : 0;
-}
+int SBoardOverlayIsOn(void) { return g_sbOverlayOn ? 1 : 0; }
 
 // Has a frame actually been drawn, as opposed to a window existing.
 //
@@ -4138,7 +4136,7 @@ int SBoardOverlayIsOn(void) {
 // so g_sbOverlayOn is what makes the answer mean "right now" rather than
 // "once".
 int SBoardOverlayHasPublishedFrame(void) {
-    return (g_sbOverlayOn && g_sbLastPublishUS != 0 && remote_call_current_success()) ? 1 : 0;
+    return (g_sbOverlayOn && g_sbLastPublishUS != 0) ? 1 : 0;
 }
 
 // Clear the two filled name layers, once, from outside a publish.
