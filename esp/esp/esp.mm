@@ -1764,6 +1764,7 @@ bool isAimbot = NO; bool isAimAssist = NO;
 // custom aim is firing. Every call site passes this and nothing else.
 bool isKillGameAA = YES;
 bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing)
+bool isAimTargetLine = YES; // draw center-to-bone line when FOV & Silent Aim lock a target
 // Aim sphere mode (requires Aimbot): 0=FOV circle, 1=180 front, 2=360 full.
 int aimSphereMode = 0;
 int triggerMode = 0; int aimPosition = 0;
@@ -3271,6 +3272,7 @@ void ESPSyncFromPrefs(void) {
     // Approach from AimSilent.h: high-freq thread rewrites AimingInfo direction.
     bool wasSilent = isAimSilent;
     isAimSilent = ESPPrefsBool(@"AimSilent", NO);
+    isAimTargetLine = ESPPrefsBool(@"AimTargetLine", YES);
     if (wasSilent && !isAimSilent) {
         SilentAimStop();
     }
@@ -4160,7 +4162,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
 
         if (stats.aimAssistPath) {
-            const bool hasAimLine = !CGPathIsEmpty(stats.aimAssistPath);
+            const bool hasAimLine = isAimTargetLine && !CGPathIsEmpty(stats.aimAssistPath);
             MenuViewApplyPath(self.aimAssistLayer,
                               ((showVisuals || isShowFovCircle) && hasAimLine) ? stats.aimAssistPath : nil,
                               hasAimLine);
@@ -7165,8 +7167,8 @@ static void EspEmitStatusLine(void) {
                 AimSyncFireHit(myPawnObject, fromNow, liveBone);
             }
 
-            // Vẽ Line to Target từ tâm màn hình vào đúng bone đang ngắm/bắn của Silent Aim khi bật FOV
-            if (isShowFovCircle && stats.aimAssistPath) {
+            // Vẽ Line to Target từ tâm màn hình vào đúng bone đang ngắm/bắn của Silent Aim khi bật FOV & Line to Target
+            if (isAimTargetLine && isShowFovCircle && stats.aimAssistPath) {
                 Vector3 w2sTargetBone = WorldToScreenLayer(
                     liveBone, matrixData,
                     (float)matrixVpWidth, (float)matrixVpHeight,

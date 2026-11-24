@@ -423,6 +423,7 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"g", @"Aim Type",          @"AimTypeMode",   @(0.0f),
                    @[ @"Aimbot", @"Aim Assist" ] ],
                 @[ @"s", @"Aim Silent",        @"AimSilent",     @NO ],
+                @[ @"s", @"Line to Target",    @"AimTargetLine", @YES ],
                 @[ @"g", @"Aim Position",      @"AimPos",        @(0.0f),
                    @[ @"Head", @"Neck", @"Chest" ] ],
                 @[ @"l", @"Tỉ lệ Headshot",    @"HeadshotRate",  @(0.0f),  @(100.0f), @(100.0f) ],
@@ -744,6 +745,8 @@ static float ESPRowClamp(float v, float lo, float hi) {
         [self applyFovRequiresAimbot:YES];
     }
 
+    ESPPrefsSetBool(key, isOn);
+    ESPPrefsSync();
     ESPSyncFromPrefs();
 }
 
