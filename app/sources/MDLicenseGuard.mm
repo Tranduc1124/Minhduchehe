@@ -28,11 +28,7 @@ static void (^g_onRevokedHandler)(NSString *reason) = nil;
 
 static inline const void *MDStripCodePtr(const void *ptr) {
     if (!ptr) return nullptr;
-#if __has_feature(ptrauth_calls)
-    return ptrauth_strip(ptr, ptrauth_key_function_pointer);
-#else
     return (const void *)((uintptr_t)ptr & 0x0000007FFFFFFFFFULL);
-#endif
 }
 
 /// Checks if a critical function was patched with an immediate `MOV W0/X0, #1; RET`
@@ -67,11 +63,6 @@ static BOOL MDFunctionIntegrityOK(const void *rawFn, const void *mainHeader) {
         (i0 == 0x58000051u && i1 == 0xD61F0220u)) {
         return NO;
     }
-    // Reject direct `BR X16` or `BR X17` at instruction 0 or 1
-    if (i0 == 0xD61F0200u || i0 == 0xD61F0220u ||
-        i1 == 0xD61F0200u || i1 == 0xD61F0220u) {
-        return NO;
-    }
     return YES;
 }
 
@@ -95,7 +86,13 @@ static BOOL MDVerifyBinaryIntegrity(void) {
     if (!MDDyldEnvironmentClean()) {
         return NO;
     }
-    const void *mainHdr = (const void *)_dyld_get_image_header(0);
+    // Resolve our own executable's Mach-O header directly via dladdr rather than
+    // _dyld_get_image_header(0), because on iOS 17+ image index 0 can be
+    // libobjc-trampolines.dylib instead of the main app binary.
+    Dl_info selfInfo{};
+    const void *selfFn = MDStripCodePtr((const void *)&MDVerifyBinaryIntegrity);
+    const void *mainHdr = (dladdr(selfFn, &selfInfo) != 0) ? selfInfo.dli_fbase : nullptr;
+
     if (!MDFunctionIntegrityOK((const void *)&APIClientValidConfirmed, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&APIClientPerformAuthorized, mainHdr)) return NO;
     if (!MDFunctionIntegrityOK((const void *)&APIClientStartAuthorization, mainHdr)) return NO;
@@ -186,27 +183,26 @@ BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
         return NO;
     }
 
-    __block BOOL innerExecuted = NO;
-    __block BOOL wasDenied = NO;
-    __block uint64_t computedTicket = 0;
-
+    // Note: APIClientPerformAuthorized verifies the ES256 signed lease and
+    // capability synchronously (returning YES/NO immediately) and dispatches the
+    // work/denied callback asynchronously onto dispatch_get_main_queue().
     BOOL gateOK = APIClientPerformAuthorized(@"paid", ^{
-        if (!APIClientValidConfirmed()) return;
-        NSString *keyStr = APIClientRenderTemplate(@"%tserver_key%");
-        if (keyStr.length == 0) return;
-
-        computedTicket = ((uint64_t)[keyStr hash] ^ kMDTicketMagic) | 1ULL;
-        innerExecuted = YES;
+        if (!APIClientValidConfirmed()) {
+            g_mdLeaseTicket.store(0, std::memory_order_release);
+        }
     }, ^{
-        wasDenied = YES;
+        g_mdLeaseTicket.store(0, std::memory_order_release);
+        MDTriggerRevocationTeardown(@"perform_authorized_denied_async");
     });
 
-    if (!gateOK || wasDenied || !innerExecuted || computedTicket == 0) {
+    if (!gateOK) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         NSLog(@"[LICENSE-GATE] REJECT site=%s reason=perform_authorized_denied", tag);
         return NO;
     }
 
+    NSString *keyStr = APIClientRenderTemplate(@"%tserver_key%");
+    uint64_t computedTicket = (((uint64_t)[keyStr hash]) ^ kMDTicketMagic) | 1ULL;
     g_mdLeaseTicket.store(computedTicket, std::memory_order_release);
     NSLog(@"[LICENSE-GATE] OK site=%s summary=%@",
           tag, APIClientRenderTemplate(@"key=%tserver_key% rem=%tserver_timekeyt%"));
@@ -220,18 +216,17 @@ BOOL MDLicenseGuardPerformProtected(const char *siteTag,
         return NO;
     }
 
-    __block BOOL didRun = NO;
-    __block BOOL deniedCalled = NO;
+    dispatch_block_t copiedWork = [workBlock copy];
     BOOL ok = APIClientPerformAuthorized(@"paid", ^{
         if (!APIClientValidConfirmed()) return;
         if (g_mdLeaseTicket.load(std::memory_order_acquire) == 0) return;
-        didRun = YES;
-        workBlock();
+        copiedWork();
     }, ^{
-        deniedCalled = YES;
+        g_mdLeaseTicket.store(0, std::memory_order_release);
+        MDTriggerRevocationTeardown(@"perform_protected_denied");
     });
 
-    if (!ok || deniedCalled || !didRun) {
+    if (!ok) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         return NO;
     }
