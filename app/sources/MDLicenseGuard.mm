@@ -177,9 +177,9 @@ BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
         return NO;
     }
 
-    if (!APIClientValidConfirmed() || !APIClientIsValid()) {
+    if (!APIClientValidConfirmed()) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
-        NSLog(@"[LICENSE-GATE] REJECT site=%s reason=unconfirmed_or_invalid", tag);
+        NSLog(@"[LICENSE-GATE] REJECT site=%s reason=unconfirmed", tag);
         return NO;
     }
 
@@ -235,7 +235,7 @@ BOOL MDLicenseGuardVerifyRenderTick(void) {
     CFTimeInterval now = CACurrentMediaTime();
     if (now - s_lastVerifyTime >= 15.0) {
         s_lastVerifyTime = now;
-        if (!MDVerifyBinaryIntegrity() || !APIClientIsValid()) {
+        if (!MDVerifyBinaryIntegrity() || !APIClientPerformAuthorized(@"paid", nil, nil)) {
             MDTriggerRevocationTeardown(@"render_tick_expired");
             return NO;
         }
