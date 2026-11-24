@@ -7,6 +7,13 @@
 #import "../../remote/SpringBoardOverlay.h" // SBRemotePushESPFrame (extern "C")
 
 #import "GameLogic.h" 
+#include "SilentAimDirection.h"
+#include "SilentAimPolicy.h"
+#include "SilentAimNativePolicy.h"
+#include "SilentAimWeapon.h"
+#include "SilentAimSelection.h"
+#include "AimPoint.h"
+#include "GamePRI.h"
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach_time.h>
 #import <UIKit/UIKit.h>
@@ -902,31 +909,80 @@ static inline Vector3 ResolveSilentHeadWorldPos(uint64_t pawn) {
     return Vector3{0, 0, 0};
 }
 
+static inline bool SilentReadMem(uint64_t address, uint64_t &value) {
+    if (!isVaildPtr(address)) return false;
+    return _read((long)address, &value, sizeof(value));
+}
+
+static inline bool SilentReadMemU8(uint64_t address, uint8_t &value) {
+    if (!isVaildPtr(address)) return false;
+    return _read((long)address, &value, sizeof(value));
+}
+
+static inline bool SilentTextEquals(uint64_t ptrAddress, const char *expected) {
+    if (!isVaildPtr(ptrAddress) || !expected) return false;
+    uint64_t textPtr = 0;
+    if (!_read((long)ptrAddress, &textPtr, sizeof(textPtr)) || !isVaildPtr(textPtr)) return false;
+    char buffer[64]{};
+    const size_t length = std::strlen(expected) + 1;
+    if (length > sizeof(buffer)) return false;
+    return _read((long)textPtr, buffer, (int)length) && std::memcmp(buffer, expected, length) == 0;
+}
+
+template <typename T>
+static inline bool SilentReadAny(uint64_t address, T &value) {
+    if (!isVaildPtr(address)) return false;
+    return _read((long)address, &value, sizeof(value));
+}
+
+static inline bool SilentIsCGKJLKPMGDJ(uint64_t obj) {
+    if (!isVaildPtr(obj)) return false;
+    uint64_t klass = 0;
+    if (!SilentReadAny(obj, klass) || !isVaildPtr(klass)) return false;
+    return SilentTextEquals(klass + 0x10, "CGKJLKPMGDJ");
+}
+
 static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
     if (posMode < 0) posMode = 0;
     if (posMode > 2) posMode = 2;
+
+    Vector3 head = ResolveSilentHeadWorldPos(pawn);
     if (posMode == 0) {
-        return ResolveSilentHeadWorldPos(pawn);
+        return head;
+    }
+    Vector3 hip = getPositionExt(getHip(pawn));
+    if (looksLikeWorldPos(head) && !IsZeroVec(head) &&
+        looksLikeWorldPos(hip) && !IsZeroVec(hip)) {
+        if (posMode == 1) {
+            // MINDOKERNEL AimPoint::Neck: exact upper-body clamp (max 10cm below head)
+            Vector3 neck = AimPoint::Neck(head, hip);
+            if (AimPoint::Valid(neck) && looksLikeWorldPos(neck)) return neck;
+        } else {
+            // MINDOKERNEL SilentAimPolicy::Chest: hip + (head - hip) * 0.4f
+            SilentAimDirection::Point chest = SilentAimPolicy::Chest(
+                {head.x, head.y, head.z}, {hip.x, hip.y, hip.z});
+            Vector3 bodyPos(chest.x, chest.y, chest.z);
+            if (SilentAimDirection::Finite(chest) && looksLikeWorldPos(bodyPos)) return bodyPos;
+        }
     }
     Vector3 bone = GetAimTargetPosMode(pawn, posMode, 0.0f);
     if (!IsZeroVec(bone) && looksLikeWorldPos(bone)) return bone;
-    Vector3 head = ResolveSilentHeadWorldPos(pawn);
     if (IsZeroVec(head) || !looksLikeWorldPos(head)) return Vector3{0, 0, 0};
-    Vector3 hip = getPositionExt(getHip(pawn));
-    if (looksLikeWorldPos(hip) && !IsZeroVec(hip)) {
-        const float t = (posMode == 1) ? 0.22f : 0.52f;
-        return Vector3(head.x + (hip.x - head.x) * t,
-                       head.y + (hip.y - head.y) * t,
-                       head.z + (hip.z - head.z) * t);
-    }
-    head.y -= (posMode == 1) ? 0.12f : 0.32f;
+    head.y -= (posMode == 1) ? 0.10f : 0.32f;
     return head;
 }
 
 static inline void ZeroWeaponScatterForAim(uint64_t localPawn) {
     if (!isVaildPtr(localPawn)) return;
-    uint64_t weapon = ReadAddr<uint64_t>(localPawn + kActiveWeapon);
+    // Prefer MINDOKERNEL SilentAimWeapon::OnHand (handles single 0xA0 & dual 0xA8 weapons)
+    uint64_t weapon = SilentAimWeapon::OnHand(
+        localPawn,
+        [](uint64_t a, auto &v) { return SilentReadAny(a, v); },
+        [](uint64_t a) { return isVaildPtr(a); });
+    if (!isVaildPtr(weapon)) {
+        weapon = ReadAddr<uint64_t>(localPawn + kActiveWeapon);
+    }
     if (!isVaildPtr(weapon)) {
         uint64_t inv = ReadAddr<uint64_t>(localPawn + kWeaponHolder);
         if (isVaildPtr(inv)) weapon = ReadAddr<uint64_t>(inv + kHolderActiveWeapon);
@@ -947,52 +1003,46 @@ static inline void ZeroWeaponScatterForAim(uint64_t localPawn) {
 static Vector3 g_silentLastLiveOrigin{0, 0, 0};
 
 // ============================================================
-//  SilentWriteAimingDir — FIX VIÊN TRÚNG VIÊN KHÔNG
-//  Origin: live muzzle → last → camera fallback.
-//  Re-read origin after write: nếu game cập nhật → ghi lại dir.
+//  SilentWriteAimingDir — Ported MINDOKERNEL SilentAimDirection::Toward
+//  (double-precision direction normalization + CGKJLKPMGDJ origin/dir/hitPoint)
 // ============================================================
 static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
                                         const Vector3 &targetPos,
                                         const Vector3 &fromFallback) {
     if (!isVaildPtr(aimingInfo) || IsZeroVec(targetPos)) return false;
+    const SilentAimDirection::Point targetPt{targetPos.x, targetPos.y, targetPos.z};
+    if (!SilentAimDirection::Finite(targetPt)) return false;
 
-    Vector3 startPos = ReadAddr<Vector3>(aimingInfo + kSilentOriginOff);
-    if (IsZeroVec(startPos)) startPos = g_silentLastLiveOrigin;
-    if (IsZeroVec(startPos)) startPos = fromFallback;
+    Vector3 startPos = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
+        startPos = g_silentLastLiveOrigin;
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
+        startPos = fromFallback;
     if (IsZeroVec(startPos) || !looksLikeWorldPos(startPos)) return false;
+
+    SilentAimDirection::Point originPt{startPos.x, startPos.y, startPos.z};
+    SilentAimDirection::Point desired{};
+    if (!SilentAimDirection::Toward(originPt, targetPt, desired)) return false;
     g_silentLastLiveOrigin = startPos;
 
-    Vector3 dir;
-    dir.x = targetPos.x - startPos.x;
-    dir.y = targetPos.y - startPos.y;
-    dir.z = targetPos.z - startPos.z;
-    float mag = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-    if (mag <= 0.0001f) return false;
-    dir.x /= mag; dir.y /= mag; dir.z /= mag;
-
-    // The game's bullet collision uses the hit point at +0x28, not only the
-    // direction. When the crosshair was on the ground, the stale hit point kept
-    // the shot on the ground and Silent appeared to do nothing. Move the hit
-    // point with the direction so a downward/ground target is actually hit.
+    Vector3 dir(desired.x, desired.y, desired.z);
     WriteAddr<Vector3>(aimingInfo + kGmpHitPointOff, targetPos);
-    WriteAddr<Vector3>(aimingInfo + kSilentDirOff, dir);
+    WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
 
-    Vector3 start2 = ReadAddr<Vector3>(aimingInfo + kSilentOriginOff);
-    if (!IsZeroVec(start2)) {
+    Vector3 start2 = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
+    if (!IsZeroVec(start2) && SilentAimDirection::Finite({start2.x, start2.y, start2.z})) {
         g_silentLastLiveOrigin = start2;
         if (fabsf(start2.x - startPos.x) > 0.0005f ||
             fabsf(start2.y - startPos.y) > 0.0005f ||
             fabsf(start2.z - startPos.z) > 0.0005f) {
-            dir.x = targetPos.x - start2.x;
-            dir.y = targetPos.y - start2.y;
-            dir.z = targetPos.z - start2.z;
-            mag = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-            if (mag > 0.0001f) {
-                dir.x /= mag; dir.y /= mag; dir.z /= mag;
+            SilentAimDirection::Point origin2Pt{start2.x, start2.y, start2.z};
+            SilentAimDirection::Point desired2{};
+            if (SilentAimDirection::Toward(origin2Pt, targetPt, desired2)) {
+                dir = Vector3(desired2.x, desired2.y, desired2.z);
+                WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
             }
         }
     }
-    WriteAddr<Vector3>(aimingInfo + kSilentDirOff, dir);
     return true;
 }
 
@@ -1000,16 +1050,31 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (!isVaildPtr(localPawn) || IsZeroVec(targetPos)) return 0;
     int wrote = 0;
 
-    // Resolve the AimingInfo fresh every write. The old cached fast path kept
-    // a pointer that could be recycled by the game; writing a direction into a
-    // recycled object is the kind of corruption that shows up as random speed
-    // or movement glitches.
+    // 1. MINDOKERNEL primary path: resolve active weapon -> WeaponHandler (+0x80, MDPBNKPCGNG)
+    //    -> HandlerInfo (+0x28, CGKJLKPMGDJ). This is the exact CGKJLKPMGDJ object
+    //    MDPBNKPCGNG::CommonFire (virtual slot 17) reads +0x4C (Origin) and +0x40 (Direction) from.
+    uint64_t weapon = 0, handler = 0;
+    uint64_t handlerInfo = SilentAimWeapon::ResolveHandlerInfo(
+        localPawn,
+        [](uint64_t a, auto &v) { return SilentReadAny(a, v); },
+        SilentTextEquals,
+        [](uint64_t a) { return isVaildPtr(a); },
+        &weapon, &handler);
+    if (isVaildPtr(handlerInfo)) {
+        if (SilentWriteAimingDir(handlerInfo, targetPos, fromLoc)) {
+            g_lastAimingInfo = handlerInfo;
+            wrote++;
+        }
+    }
+
+    // 2. Also update Player's cached HitObjectInfo slots (0xE50 / 0xE58) when present
+    //    and distinct from handlerInfo.
     uint64_t offs[2];
     int n = 0;
     SilentFillPrimaryOnly(offs, &n);
     for (int i = 0; i < n; i++) {
         uint64_t aimingInfo = ReadAddr<uint64_t>(localPawn + offs[i]);
-        if (!isVaildPtr(aimingInfo)) continue;
+        if (!isVaildPtr(aimingInfo) || aimingInfo == handlerInfo) continue;
         if (SilentWriteAimingDir(aimingInfo, targetPos, fromLoc)) {
             g_lastAimingInfo = aimingInfo;
             wrote++;
@@ -6575,12 +6640,21 @@ static void EspEmitStatusLine(void) {
                     } else {
                         score = rangeNorm * 0.45f + distanceNorm * 0.55f;
                     }
+                } else if (useSilent && !isAimbot && !useAssist) {
+                    // MINDOKERNEL SilentAimSelection::Selection formula:
+                    // direction (0.75) + distance (0.25) - previous target hysteresis (0.025)
+                    const float radius = fmaxf(sqrtf(fovSq), 1.0f);
+                    const float direction = sqrtf(distSq) / radius;
+                    const float distance = fminf(1.0f, dis / fmaxf(aimDistance, 1.0f));
+                    score = 0.75f * direction + 0.25f * distance - (PawnObject == gAimLockTarget ? 0.025f : 0.0f);
                 } else {
                     score = rangeNorm;
                 }
             }
-            if (PawnObject == gAimLockTarget) score *= 0.18f;
-            if (isBot && !isAimIgnoreBot) score *= 0.92f;
+            if (!(useSilent && !isAimbot && !useAssist)) {
+                if (PawnObject == gAimLockTarget) score *= 0.18f;
+                if (isBot && !isAimIgnoreBot) score *= 0.92f;
+            }
 
             // Always pick with AimPos bone (aimPos already mode-aware for silent/aimbot/assist).
             Vector3 pickHead = aimPos;
@@ -7195,16 +7269,19 @@ static void EspEmitStatusLine(void) {
     // ============================================================
     if (silentActive && bestTarget != 0 && AimTargetStillValid(bestTarget) &&
         (allowThroughWall || AimTargetVisibleStrictForSilent(myPawnObject, bestTarget))) {
+        // MINDOKERNEL SilentAimPolicy::Head deterministic phase accumulator:
+        // - headPhase initialized to 50 and preserved across target clears.
+        // - Only advances phase on actual eligible shot events (never on idle render ticks).
+        static uint32_t s_silentHeadPhase = 50;
         static int s_silentRolledPos = 0;
         static bool s_silentWasFiring = false;
         static int s_silentHoldFrames = 0;
-        static int s_silentHsAcc = 50;
         int silentPosMode = aimPosition;
         if (aimPosition == 0) {
-            const int rate = (int)lroundf(headshotRate);
-            if (rate >= 100) {
+            const uint32_t headPct = SilentAimPolicy::HeadPercent(headshotRate);
+            if (headPct >= 100u) {
                 silentPosMode = 0;
-            } else if (rate <= 0) {
+            } else if (headPct == 0u) {
                 silentPosMode = 2;
             } else {
                 const bool newShotEdge = (isFiring && !s_silentWasFiring) || bulletJustFired;
@@ -7212,17 +7289,10 @@ static void EspEmitStatusLine(void) {
                 else s_silentHoldFrames = 0;
                 if (newShotEdge || s_silentHoldFrames >= 5) {
                     s_silentHoldFrames = 0;
-                    // Combine error-diffusion accumulator with random jitter so
-                    // short bursts match the exact percentage while staying organic.
-                    s_silentHsAcc += rate;
-                    const int jitter = (int)arc4random_uniform(25) - 12;
-                    if (s_silentHsAcc + jitter >= 100) {
-                        s_silentHsAcc -= 100;
-                        if (s_silentHsAcc < 0) s_silentHsAcc = 0;
-                        s_silentRolledPos = 0; // Head
-                    } else {
-                        s_silentRolledPos = 2; // Chest / Body (non-head bone)
-                    }
+                    uint32_t nextPhase = s_silentHeadPhase;
+                    const bool isHead = SilentAimPolicy::Head(headPct, s_silentHeadPhase, nextPhase);
+                    s_silentHeadPhase = nextPhase;
+                    s_silentRolledPos = isHead ? 0 : 2;
                 }
                 silentPosMode = s_silentRolledPos;
             }
@@ -7528,8 +7598,14 @@ bool get_IsFiring(uint64_t player) {
         src |= kFireSrcAltB;
     }
 
-    // 3) PRI fire status (var 21).
-    if (GetDataUInt16(player, kPriVarFire) != 0) {
+    // 3) PRI fire status (var 21 — MINDOKERNEL GamePRI::TryUInt16 + GetDataUInt16).
+    uint16_t priFireVal = 0;
+    const bool priOk = GamePRI::TryUInt16(
+        player, GamePRI::FiringIndex,
+        [](uint64_t a, void *buf, size_t sz) { return isVaildPtr(a) && _read((long)a, buf, (int)sz); },
+        [](uint64_t a) { return isVaildPtr(a); },
+        priFireVal);
+    if ((priOk && GamePRI::Firing(priFireVal)) || GetDataUInt16(player, kPriVarFire) != 0) {
         src |= kFireSrcPri;
     }
 
