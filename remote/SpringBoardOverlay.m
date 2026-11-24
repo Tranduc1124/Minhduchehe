@@ -1084,20 +1084,23 @@ static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
 
 static void sb_forget_local_paint_state(void) {
     // Fl0rk: release_all_cached_main_invocations / forget_remote_state (local side)
-    if (r_is_objc_ptr(g_sbSetPathInv) && remote_call_has_local_state()) {
+    // Only issue remote release/free IPC when the remote session is actually healthy;
+    // otherwise each call blocks for 10s waiting on a dead SpringBoard exception port.
+    const bool sessionLive = remote_call_has_local_state() && remote_call_current_success();
+    if (r_is_objc_ptr(g_sbSetPathInv) && sessionLive) {
         r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
     }
-    if (g_sbSetPathArgBuf && remote_call_has_local_state()) {
+    if (g_sbSetPathArgBuf && sessionLive) {
         dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
     }
     g_sbSetPathInv = 0;
     g_sbSetPathArgBuf = 0;
     g_sbPerformMainSel = 0;
     g_sbInvokeSel = 0;
-    if (r_is_objc_ptr(g_sbTextInv) && remote_call_has_local_state()) {
+    if (r_is_objc_ptr(g_sbTextInv) && sessionLive) {
         r_msg2(g_sbTextInv, "release", 0,0,0,0);
     }
-    if (g_sbTextArgBuf && remote_call_has_local_state()) {
+    if (g_sbTextArgBuf && sessionLive) {
         dlsym_remote("free", g_sbTextArgBuf, 0,0,0,0,0,0,0);
     }
     g_sbTextInv = 0;
@@ -1125,10 +1128,10 @@ static void sb_forget_local_paint_state(void) {
     s_sbNameBgLive = 0;
     s_sbNameTextLive = 0;
     for (int i = 0; i < 2; i++) {
-        if (r_is_objc_ptr(g_sbNameInv[i]) && remote_call_has_local_state()) {
+        if (r_is_objc_ptr(g_sbNameInv[i]) && sessionLive) {
             r_msg2(g_sbNameInv[i], "release", 0,0,0,0);
         }
-        if (g_sbNameArgBuf[i] && remote_call_has_local_state()) {
+        if (g_sbNameArgBuf[i] && sessionLive) {
             dlsym_remote("free", g_sbNameArgBuf[i], 0,0,0,0,0,0,0);
         }
         g_sbNameInv[i] = 0;
@@ -1136,10 +1139,10 @@ static void sb_forget_local_paint_state(void) {
     }
 #if SB_IOSURFACE_RENDER
     for (int i = 0; i < 2; i++) {
-        if (r_is_objc_ptr(g_sbSetContentsInv[i]) && remote_call_has_local_state()) {
+        if (r_is_objc_ptr(g_sbSetContentsInv[i]) && sessionLive) {
             r_msg2(g_sbSetContentsInv[i], "release", 0,0,0,0);
         }
-        if (g_sbSetContentsArgBuf[i] && remote_call_has_local_state()) {
+        if (g_sbSetContentsArgBuf[i] && sessionLive) {
             dlsym_remote("free", g_sbSetContentsArgBuf[i], 0,0,0,0,0,0,0);
         }
         g_sbSetContentsInv[i] = 0;
@@ -1904,24 +1907,46 @@ static void sb_cost_probe(void) {
     }
 }
 
+static int sb_fail_start_overlay(bool destroySession) {
+    if (destroySession) {
+        if (remote_call_current_success()) {
+            destroy_remote_call();
+        } else {
+            abandon_remote_call();
+        }
+    }
+    pthread_mutex_lock(&g_sbLock);
+    g_sbBuilding = 0;
+    pthread_mutex_unlock(&g_sbLock);
+    return -1;
+}
+
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
-    if (g_sbOverlayOn || g_sbBuilding) { pthread_mutex_unlock(&g_sbLock); return 0; }
+    if (g_sbBuilding) { pthread_mutex_unlock(&g_sbLock); return 0; }
+    if (g_sbOverlayOn) {
+        if (remote_call_has_local_state() && remote_call_current_success()) {
+            pthread_mutex_unlock(&g_sbLock);
+            return 0;
+        }
+        // Remote session died (e.g. SpringBoard resprung); drop stale flag and rebuild.
+        g_sbOverlayOn = NO;
+    }
     // Claimed before the lock is dropped, and cleared at the very end below, so
     // a rearm arriving mid-build sees it and leaves the frame alone.
     g_sbBuilding = 1;
     pthread_mutex_unlock(&g_sbLock);
 
-    if (!g_kexploit_ready) return -1;
+    if (!g_kexploit_ready) return sb_fail_start_overlay(false);
 
     NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (extra thread, 15fps)...");
     if (sb_open_session() != 0) {
         NSLog(@"[SBOverlay] session open failed");
-        return -1;
+        return sb_fail_start_overlay(false);
     }
 
     uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0,0,0,0);
-    if (!r_is_objc_ptr(app)) { destroy_remote_call(); return -1; }
+    if (!r_is_objc_ptr(app)) return sb_fail_start_overlay(true);
 
     uint64_t keyWin = r_msg2_main(app, "keyWindow", 0,0,0,0);
     if (!r_is_objc_ptr(keyWin)) {
@@ -1931,15 +1956,13 @@ int SBoardStartOverlay(void) {
     }
     if (!r_is_objc_ptr(keyWin)) {
         NSLog(@"[SBOverlay] no SB window");
-        destroy_remote_call();
-        return -1;
+        return sb_fail_start_overlay(true);
     }
 
     uint64_t scene = r_msg2_main(keyWin, "windowScene", 0,0,0,0);
     if (!r_is_objc_ptr(scene)) {
         NSLog(@"[SBOverlay] no UIWindowScene");
-        destroy_remote_call();
-        return -1;
+        return sb_fail_start_overlay(true);
     }
 
     double bounds[4] = {0, 0, 390, 844};
@@ -1969,13 +1992,12 @@ int SBoardStartOverlay(void) {
     // double r_msg2_main_raw and a nine settle r_msg2_main were paid on every
     // build for a value nothing read. About sixty six milliseconds, gone.
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
-    if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
+    if (!r_is_objc_ptr(winAlloc)) return sb_fail_start_overlay(true);
 
     uint64_t win = r_msg2_main(winAlloc, "initWithWindowScene:", scene, 0,0,0);
     if (!r_is_objc_ptr(win)) {
         NSLog(@"[SBOverlay] initWithWindowScene failed");
-        destroy_remote_call();
-        return -1;
+        return sb_fail_start_overlay(true);
     }
 
     r_msg2_main_raw(win, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
@@ -1993,7 +2015,7 @@ int SBoardStartOverlay(void) {
 
     uint64_t container = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
                                          "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (!r_is_objc_ptr(container)) { destroy_remote_call(); return -1; }
+    if (!r_is_objc_ptr(container)) return sb_fail_start_overlay(true);
     if (r_is_objc_ptr(clear)) r_msg2_main(container, "setBackgroundColor:", clear, 0,0,0);
     r_msg2_main(container, "setUserInteractionEnabled:", 0, 0,0,0);
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
@@ -2159,7 +2181,7 @@ int SBoardStartOverlay(void) {
 #endif
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-    if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
+    if (!r_is_objc_ptr(shape)) return sb_fail_start_overlay(true);
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
     // White. It was green, and that was deliberate: commit 69cab125 set the
     // stroke to green as a one-round proof that four CGFloat arguments survive
@@ -2525,17 +2547,15 @@ int SBoardStartOverlay(void) {
     // passes this function's own guard, and the loser of that race is never
     // hidden. Cleared immediately after, so the rearm can fire again on a later
     // frame but not during this one.
-    g_sbOverlayOn = YES;
-    g_sbBuilding = 0;
-    // Warm-up, deliberately after the overlay goes live. None of these three are
-    // needed to paint a frame: persistentPath and ptsBuffer are both cached and
-    // would be built by the first publish that needed them, and the geometry
-    // invocation is only reached by sb_invoke_cached_main_raw. Leaving them in
-    // front put about a quarter of a second of settles ahead of the first
-    // painted frame for no gain, since the first publish builds them anyway.
+    // Warm-up BEFORE setting g_sbOverlayOn = YES so SBRemotePushESPFrame on the
+    // publish queue cannot interleave RC_TIMEOUT_NORET calls with these setup calls.
     (void)persistentPath();
     (void)ptsBuffer();
     (void)sb_ensure_setpath_invocation();
+    pthread_mutex_lock(&g_sbLock);
+    g_sbOverlayOn = YES;
+    g_sbBuilding = 0;
+    pthread_mutex_unlock(&g_sbLock);
     // The cost probe, the colour probe and the lineWidth read-back are all behind
     // SB_STARTUP_DIAGNOSTICS. They used to run here, before the first frame, and
     // between them they were about a hundred and fifteen remote calls of
@@ -2734,8 +2754,18 @@ void SBRemotePushESPFrame(UIView *espView) {
         }
     }
     if (!remote_call_has_local_state() || !remote_call_current_success()) {
-        // Session died (SB respawn?). Drop until restart.
+        // Session died (SB respawn?). Tear down stale local state after 3 consecutive
+        // unhealthy frames so the rearm path can rebuild against the new SpringBoard PID.
         g_sbSummarySkips++;
+        if (++g_sbSessionDead >= 3) {
+            g_sbSessionDead = 0;
+            NSLog(@"[PUSH-DEAD] session unhealthy for 3 frames — abandoning and scheduling rearm");
+            abandon_remote_call();
+            pthread_mutex_lock(&g_sbLock);
+            g_sbOverlayOn = NO;
+            pthread_mutex_unlock(&g_sbLock);
+            g_sbRearmAfterUS = now_us() + 1500000ULL;
+        }
         return;
     }
     g_sbSessionDead = 0;
@@ -2899,6 +2929,18 @@ void SBRemotePushESPFrame(UIView *espView) {
                 const uint64_t tPres0 = now_us();
                 sb_invoke_ios_present_cached(bufIdx);
                 const uint64_t presentUS = now_us() - tPres0;
+                if (!remote_call_current_success()) {
+                    if (++g_sbConsecFail >= 3) {
+                        NSLog(@"[PUSH-DEAD] IOSurface present failed %d times — rebuilding",
+                              g_sbConsecFail);
+                        abandon_remote_call();
+                        pthread_mutex_lock(&g_sbLock);
+                        g_sbOverlayOn = NO;
+                        pthread_mutex_unlock(&g_sbLock);
+                        g_sbRearmAfterUS = now_us() + 1500000ULL;
+                    }
+                    return;
+                }
                 const uint64_t pubUS = now_us() - tPubStart;
 
                 g_sbSummaryUpdates++;
@@ -4169,23 +4211,33 @@ void SBoardStopOverlay(void) {
     g_sbCanvas = 0;
     pthread_mutex_unlock(&g_sbLock);
 
-    // Fl0rk stop_in_session
-    if (remote_call_has_local_state()) {
-        if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
-        if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
-        // The hold ring still holds paths handed to a queued setPath: that the
-        // main thread has not run yet, so they are freed with the session rather
-        // than left for the next one to overwrite the slots of.
-        for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
-            if (g_sbPathRing[k] && g_sbPathRing[k] != g_sbPersistentPath) {
-                dlsym_remote("CGPathRelease", g_sbPathRing[k], 0,0,0,0,0,0,0);
+    // Serialise against any in-flight SBRemotePushESPFrame publish so we never
+    // tear down exception ports while Thread 10 in SpringBoard is mid-call.
+    pthread_mutex_lock(&g_sbIoLock);
+    @try {
+        if (remote_call_has_local_state()) {
+            if (remote_call_current_success()) {
+                if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
+                if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
+                for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
+                    if (g_sbPathRing[k] && g_sbPathRing[k] != g_sbPersistentPath) {
+                        dlsym_remote("CGPathRelease", g_sbPathRing[k], 0,0,0,0,0,0,0);
+                    }
+                    g_sbPathRing[k] = 0;
+                }
+                g_sbPathRingAt = 0;
+                sb_forget_local_paint_state();
+                destroy_remote_call();
+            } else {
+                for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
+                g_sbPathRingAt = 0;
+                sb_forget_local_paint_state();
+                abandon_remote_call();
             }
-            g_sbPathRing[k] = 0;
+        } else {
+            sb_forget_local_paint_state();
         }
-        g_sbPathRingAt = 0;
-        sb_forget_local_paint_state();
-        destroy_remote_call();
-    } else {
-        sb_forget_local_paint_state();
+    } @finally {
+        pthread_mutex_unlock(&g_sbIoLock);
     }
 }

@@ -3905,7 +3905,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
     @autoreleasepool {
         if (!MDLicenseGuardVerifyRenderTick()) {
             [self clearAllContent];
-            SBoardStopOverlay();
             return;
         }
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame

@@ -177,35 +177,29 @@ BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
         return NO;
     }
 
-    if (!APIClientValidConfirmed()) {
+    if (!APIClientValidConfirmed() || !APIClientIsValid()) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
-        NSLog(@"[LICENSE-GATE] REJECT site=%s reason=unconfirmed", tag);
+        NSLog(@"[LICENSE-GATE] REJECT site=%s reason=unconfirmed_or_invalid", tag);
         return NO;
     }
 
-    // Note: APIClientPerformAuthorized verifies the ES256 signed lease and
-    // capability synchronously (returning YES/NO immediately) and dispatches the
-    // work/denied callback asynchronously onto dispatch_get_main_queue().
-    BOOL gateOK = APIClientPerformAuthorized(@"paid", ^{
-        if (!APIClientValidConfirmed()) {
-            g_mdLeaseTicket.store(0, std::memory_order_release);
-        }
-    }, ^{
-        g_mdLeaseTicket.store(0, std::memory_order_release);
-        MDTriggerRevocationTeardown(@"perform_authorized_denied_async");
-    });
-
+    // Synchronously verify the ES256 signed lease and "paid" capability.
+    // Do NOT attach a destructive teardown to the async `denied` block here,
+    // because TserverAuthorizationLeasePerformCapability's async main-queue
+    // callback enforces `gLeaseGeneration == generation` and fires `denied`
+    // benignly whenever the 25s background heartbeat rotates to a fresh lease
+    // generation. True revocations are delivered via APIClientStartAuthorization's
+    // revocation handler.
+    BOOL gateOK = APIClientPerformAuthorized(@"paid", nil, nil);
     if (!gateOK) {
         g_mdLeaseTicket.store(0, std::memory_order_release);
         NSLog(@"[LICENSE-GATE] REJECT site=%s reason=perform_authorized_denied", tag);
         return NO;
     }
 
-    NSString *keyStr = APIClientRenderTemplate(@"%tserver_key%");
-    uint64_t computedTicket = (((uint64_t)[keyStr hash]) ^ kMDTicketMagic) | 1ULL;
+    uint64_t computedTicket = (((uint64_t)tag[0] << 32) ^ kMDTicketMagic) | 1ULL;
     g_mdLeaseTicket.store(computedTicket, std::memory_order_release);
-    NSLog(@"[LICENSE-GATE] OK site=%s summary=%@",
-          tag, APIClientRenderTemplate(@"key=%tserver_key% rem=%tserver_timekeyt%"));
+    NSLog(@"[LICENSE-GATE] OK site=%s", tag);
     return YES;
 }
 
@@ -225,19 +219,28 @@ BOOL MDLicenseGuardPerformProtected(const char *siteTag,
 }
 
 BOOL MDLicenseGuardVerifyRenderTick(void) {
+    // If called inside the child `-hud` helper process (spawned with argv[1] == "-hud"),
+    // MDLicenseGuardBootstrap is not run in that helper process; allow render tick
+    // while the main app process enforces the lease and tears down `-hud` on revocation.
+    if (!g_mdConfigured.load(std::memory_order_acquire)) {
+        return YES;
+    }
     if (g_mdLeaseTicket.load(std::memory_order_acquire) == 0) {
+        return NO;
+    }
+    if (!APIClientValidConfirmed()) {
         return NO;
     }
     static CFTimeInterval s_lastVerifyTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
-    if (now - s_lastVerifyTime >= 2.0) {
+    if (now - s_lastVerifyTime >= 15.0) {
         s_lastVerifyTime = now;
-        if (!MDLicenseGuardVerifyLive("esp_render_tick")) {
+        if (!MDVerifyBinaryIntegrity() || !APIClientIsValid()) {
             MDTriggerRevocationTeardown(@"render_tick_expired");
             return NO;
         }
     }
-    return APIClientValidConfirmed();
+    return YES;
 }
 
 void MDLicenseGuardBootstrap(void (^onAuthorized)(void),
