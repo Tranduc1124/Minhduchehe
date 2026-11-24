@@ -123,12 +123,6 @@ uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
 {
     if (!vm_map_ptr || !address) return 0;
 
-    // 1. Probe the 32-slot recent vm_map_entry range cache, then ALWAYS verify
-    //    the entry's live [start, end) directly from the kernel in one 16-byte
-    //    kreadbuf. If COW split the entry or it was unmapped/reallocated, the
-    //    live range check detects it immediately and invalidates the slot.
-    //    When valid (the 98% case for contiguous IOSurface buffers and Unity
-    //    heap regions), this saves a 2,000-node kernel linked-list walk per page.
     uint64_t cachedEntry = 0;
     int cachedSlot = -1;
     pthread_mutex_lock(&s_vmeRangeLock);
@@ -156,7 +150,6 @@ uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
             pthread_mutex_unlock(&s_vmeRangeLock);
             return cachedEntry;
         }
-        // Entry split by COW or unmapped: drop the stale range and walk fresh.
         pthread_mutex_lock(&s_vmeRangeLock);
         if (cachedSlot >= 0 && s_vmeRangeCache[cachedSlot].entry == cachedEntry) {
             s_vmeRangeCache[cachedSlot].entry = 0;
@@ -172,9 +165,6 @@ uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
             found_entry = entry;
             found_start = start;
             found_end = end;
-            *stop = YES;
-        } else if (start > address) {
-            // XNU vm_map entries are strictly sorted by start address.
             *stop = YES;
         }
     });

@@ -4615,8 +4615,7 @@ static void EspEmitStatusLine(void) {
         // that: a changed matchGame is one flush, and the keys move immediately.
         const bool firstMatch    = (s_lastMatchDiag == 0);
         const bool newMatchGame  = (s_lastMatchGame != 0 && matchGame != s_lastMatchGame);
-        const bool newMatch      = (s_lastMatchDiag != 0 && match != s_lastMatchDiag);
-        if (firstMatch || newMatchGame || newMatch) {
+        if (firstMatch || newMatchGame) {
             DSPageCacheDiag before = ds_page_cache_diag();
             ds_flush_page_cache();
             DSPageCacheDiag after = ds_page_cache_diag();
@@ -4841,19 +4840,15 @@ static void EspEmitStatusLine(void) {
     // When iAmAlive=false (HP pool read 0), distance was hard-forced to 10m → ghosts.
     Vector3 myLocation = {0, 0, 0};
     Vector3 myBodyHead = {0, 0, 0};
-    Vector3 myBodyRoot = {0, 0, 0};
-    uint64_t myMainCamTf = 0;
     const uint64_t localRefPawn = isVaildPtr(myPawnObject) ? myPawnObject : s_locPawn;
     if (isVaildPtr(localRefPawn)) {
         myBodyHead = getHeadWorld(localRefPawn);
-        myBodyRoot = ReadPlayerRootTransform(localRefPawn);
         uint64_t mainCameraTransform = ReadAddr<uint64_t>(localRefPawn + kMainCameraTransform);
         if (isVaildPtr(mainCameraTransform)) {
-            myMainCamTf = mainCameraTransform;
             myLocation = getPositionExt(mainCameraTransform);
         }
         if (!looksLikeWorldPos(myLocation)) {
-            myLocation = myBodyRoot;
+            myLocation = ReadPlayerRootTransform(localRefPawn);
         }
         if (!looksLikeWorldPos(myLocation)) {
             if (looksLikeWorldPos(myBodyHead)) myLocation = myBodyHead;
@@ -5121,11 +5116,20 @@ static void EspEmitStatusLine(void) {
         dictWalkSlots++;
 
         uint64_t PawnObject = ReadAddr<uint64_t>(ent + entryValueOff);
-        // Never probe 0x10 or 0x18 when entryValueOff (0x20) is null: in
-        // Dictionary<BHGGAEEHJCO, Player>, 0x10 and 0x18 sit inside the 24-byte
-        // key struct, so probing them when value==0 turns key bytes into a
-        // phantom PawnObject that inflates the enemy counter by +1.
+        // Set when the documented value offset did not answer and a pointer came
+        // from the layout-probe list instead.
         bool pawnFromProbe = false;
+        if (!isVaildPtr(PawnObject)) {
+            const uint64_t vOffs[] = { 0x10, 0x18, 0x20, 0x28 };
+            for (size_t vo = 0; vo < 4; vo++) {
+                uint64_t cand = ReadAddr<uint64_t>(ent + vOffs[vo]);
+                if (isVaildPtr(cand)) {
+                    PawnObject = cand;
+                    pawnFromProbe = true;
+                    break;
+                }
+            }
+        }
         if (!isVaildPtr(PawnObject)) continue;
 
         // isVaildPtr is a range test and nothing else -- not below 0x100000, not
@@ -5199,14 +5203,11 @@ static void EspEmitStatusLine(void) {
                 if (liveId.m_TeamID) s_locTeam = liveId.m_TeamID;
             }
 
-            // Self: pointer first (live or cached), then camera transform, then stable identities.
+            // Self: pointer first (live or cached), then the two stable identities.
             // Any one matching is enough, and esp_count_drop immediately purges any
             // 3-frame hold slot if the local pawn slipped through on an earlier frame.
             bool isSelf = false;
             if (PawnObject == myPawnObject || (s_locPawn && PawnObject == s_locPawn)) {
-                isSelf = true;
-            } else if (isVaildPtr(myMainCamTf) &&
-                       ReadAddr<uint64_t>(PawnObject + kMainCameraTransform) == myMainCamTf) {
                 isSelf = true;
             } else if (s_locUid) {
                 isSelf = (ReadAddr<uint64_t>(PawnObject + kUserID) == s_locUid);
@@ -5485,61 +5486,36 @@ static void EspEmitStatusLine(void) {
             }
         }
 
-        // Fallback HP if DataPool reads fail/delay (!hpReadOk) but 3D bones exist.
-        // CRITICAL: Never overwrite CurHP with 200 when hpReadOk is true and CurHP <= 0!
-        // When DataPool genuinely read CurHP == 0 (a dead corpse whose bones are still
-        // in the world), inventing 200 HP resurrected the corpse and kept the counter
-        // +1 above the live enemies.
-        if (!hpReadOk && hasLiveBone && !isKnocked) {
-            if (MaxHP <= 0 || MaxHP > 2000) MaxHP = 200;
-            CurHP = MaxHP;
-        } else if (hpReadOk && CurHP > 0 && MaxHP <= 0) {
-            MaxHP = (CurHP <= 2000) ? CurHP : 200;
+        // Fallback HP if DataPool reads fail/delay but 3D bones exist. Only for a pawn
+        // that is knocked or otherwise still in the round.
+        if (hasLiveBone && !isKnocked) {
+            if (CurHP <= 0 && MaxHP <= 0) {
+                CurHP = 200;
+                MaxHP = 200;
+            } else if (MaxHP <= 0) {
+                MaxHP = 200;
+                if (CurHP <= 0) CurHP = 200;
+            }
         }
 
         // Alive/knocked always have MaxHP > 0.
-        const bool hpUnreadable = (!hpReadOk && CurHP == 0 && MaxHP == 0);
+        const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
 
         // HP did not land AND the bones did not land either: this pawn is UNKNOWN,
         // not dead. Tombstoning here is what produced the reported symptom.
-        //
-        // The death filter writes a 120-frame hold, which is about two seconds at
-        // 60Hz. In a crowded match the reads fail often enough that a live player
-        // whose HP page and whose bones both failed to map in the same frame landed
-        // in that branch, and stayed suppressed for the full hold: no box, not
-        // aimable, looking exactly like an ESP that had not loaded yet. It lifted
-        // only once a later frame's reads succeeded, which is why it looked
-        // intermittent rather than constant.
-        //
-        // Both halves of the condition are needed. When the bones DO read, the
-        // fallback above has already turned the unreadable HP into 200 and the pawn
-        // draws, which is the right answer -- a body left in the world keeps
-        // readable bones, so bones alone cannot decide death, but they are enough to
-        // decide the pawn is not being misread as a corpse. And when HP DID read and
-        // said 0, that is a real death and fullyDead below still handles it.
-        //
-        // Skipping the pawn for this frame is the honest response either way: the
-        // next frame retries.
         if (!hpReadOk && !hasLiveBone && !pawnRemembered) {
             rej.hpUnread++;
             continue;
         }
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
                                 (MaxHP > 0 && CurHP > MaxHP + 50));
-        // A dead body keeps readable bones for as long as it lies in the world, so
-        // hasLiveBone cannot decide this. It is HP that decides, and only after the
-        // knocked test: a knocked player is alive on HP 0 and must survive, a body
-        // on HP 0 must not. Checking knocked first is the whole point, the other way
-        // round the knocked players disappear instead of the dead ones.
-        const bool fullyDead = (!isKnocked && CurHP <= 0 && (hpReadOk || !hpUnreadable));
+        const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
         if (fullyDead) {
-            esp_count_drop(PawnObject);
             markGhostDead(120); // longer hold for death
             rej.dead++;
             continue;
         }
         if (!hasLiveBone && (hpGarbage || hpUnreadable || MaxHP <= 0)) {
-            esp_count_drop(PawnObject);
             markGhostDead((hpUnreadable || MaxHP <= 0) ? 120 : 45);
             rej.hpBad++;
             continue;
@@ -5549,7 +5525,6 @@ static void EspEmitStatusLine(void) {
             uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
             COW_GamePlay_PlayerID_o pid = ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID);
             if (uid == 0 && pid.m_Value == 0 && pid.m_ID == 0 && !isBot && !hasLiveBone) {
-                esp_count_drop(PawnObject);
                 markGhostDead(90);
                 rej.noUid++;
                 continue;
@@ -5563,14 +5538,12 @@ static void EspEmitStatusLine(void) {
         // ---------------------------------------------------------------------
         Vector3 liveRoot = ReadPlayerRootTransform(PawnObject);
 
-        // Local player 3D body position match: in TPP, myLocation is the camera (~2.5m
-        // behind the body), whereas myBodyHead / myBodyRoot are the local character's
-        // actual head and root bones. If a dict entry's head or root sits on top of
-        // the local character's own head or root (< 0.45m), it is the local player.
-        if ((looksLikeWorldPos(myBodyHead) && looksLikeWorldPos(liveHead) &&
-             Vector3::Distance(myBodyHead, liveHead) < 0.45f) ||
-            (looksLikeWorldPos(myBodyRoot) && looksLikeWorldPos(liveRoot) &&
-             Vector3::Distance(myBodyRoot, liveRoot) < 0.45f)) {
+        // Local player 3D head match: in TPP, myLocation is the camera (~2.5m behind
+        // the body), whereas myBodyHead is the local character's actual head bone.
+        // If a dict entry's head sits on top of the local character's own head (< 0.25m),
+        // it is the local player.
+        if (looksLikeWorldPos(myBodyHead) && looksLikeWorldPos(liveHead) &&
+            Vector3::Distance(myBodyHead, liveHead) < 0.25f) {
             esp_count_drop(PawnObject);
             selfSkipped++;
             rej.self++;
