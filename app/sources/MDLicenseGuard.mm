@@ -162,13 +162,13 @@ static void MDConfigureSDKOnce(void) {
     APIClientProtectHostMethod([GameViewController class], @selector(presentBootLogAndStart));
     APIClientProtectHostMethod([GameViewController class], @selector(startHUDForRequest:));
 
-    APIClientProtectHostFunction((const void *)&kernelBootStart);
-    APIClientProtectHostFunction((const void *)&kernelBootStartKernelOnly);
-    APIClientProtectHostFunction((const void *)&StartESPHost);
-    APIClientProtectHostFunction((const void *)&SBoardStartOverlay);
-    APIClientProtectHostFunction((const void *)&kexploit_opa334);
-    APIClientProtectHostFunction((const void *)&MDLicenseGuardVerifyLive);
-    APIClientProtectHostFunction((const void *)&MDLicenseGuardPerformProtected);
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&kernelBootStart));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&kernelBootStartKernelOnly));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&StartESPHost));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&SBoardStartOverlay));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&kexploit_opa334));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&MDLicenseGuardVerifyLive));
+    APIClientProtectHostFunction(MDStripCodePtr((const void *)&MDLicenseGuardPerformProtected));
 }
 
 BOOL MDLicenseGuardVerifyLive(const char *siteTag) {
