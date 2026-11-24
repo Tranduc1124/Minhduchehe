@@ -32,6 +32,7 @@ struct COW_GamePlay_PlayerID_o {
 Vector3 WorldToScreen(Vector3 obj, float *matrix, float screenX, float screenY);
 
 Vector3 WorldToScreenLayer(Vector3 obj, float *matrix, float vpW, float vpH, float layerW, float layerH);
+void BeginTransformFrame(void);
 Vector3 getPositionExt(uint64_t transObj2);
 NSString *GetNickName(uint64_t PawnObject);
 

@@ -14,6 +14,7 @@
 #include "SilentAimSelection.h"
 #include "AimPoint.h"
 #include "GamePRI.h"
+#include "AvatarVisibility.h"
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach_time.h>
 #import <UIKit/UIKit.h>
@@ -122,7 +123,7 @@ static void ESPSyncTickRate(void) {
     dispatch_source_set_timer(timer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNS),
                               intervalNS,
-                              2 * NSEC_PER_MSEC);
+                              0);
 }
 
 // Forward decls used by aim helpers (defined later in this file).
@@ -3702,7 +3703,7 @@ static void ESPDiagHeartbeat(void) {
             dispatch_source_set_timer(self.frameTimer,
                                       dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNS),
                                       intervalNS,
-                                      2 * NSEC_PER_MSEC);
+                                      0);
             __weak ESP_View *wself = self;
             dispatch_source_set_event_handler(self.frameTimer, ^{
                 [wself updateFrame];
@@ -4108,6 +4109,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
 
         ESPGeometryBuffers buffers = ESPGeometryBuffersCreate();
         g_PlayerDrawIndex = 1;
+        BeginTransformFrame();
         // Fl0rk DarkSwordMemoryProvider beginReadTransaction / endReadTransaction:
         // keep remapped pages hot across the whole frame (bones/HP/dict).
         ds_begin_read_transaction();
@@ -4326,7 +4328,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
 // can name the same pawn twice and two entries for one player is a number that
 // disagrees with the boxes beside it. Entries are never removed; they age out,
 // and a match restart ages everything out within the hold window on its own.
-#define ESP_COUNT_HOLD_FRAMES 3
+#define ESP_COUNT_HOLD_FRAMES 0
 static uint64_t s_espCountKey[192]  = {0};
 static int64_t  s_espCountFrame[192] = {0};
 static uint8_t  s_espCountBot[192]   = {0};
@@ -4944,30 +4946,29 @@ static void EspEmitStatusLine(void) {
     // (spectator / HP-pool glitch still gets correct culls instead of fake 10m).
     const bool useLocalDistance = haveLocalPos;
 
-    // Simple dump-backed player dict walk (no multi-layout probe every frame).
-    // Dictionary<BHGGAEEHJCO,Player> @ match+kMatchPlayerDict
-    // Entry: hash+next+key(0x18)+value* => stride 0x28, value @ 0x20
-    // Only the main dict @ kMatchPlayerDict (0x128). No probing of 0x130/0x138/0x140/
-    // 0x150 as a fallback: those are the lobby and social dictionaries, and picking
-    // one of them while the match dict is momentarily unreadable puts a non-match
-    // pawn into the player loop, which then draws it and counts it. The symptom is a
-    // count one higher than the enemies on screen that does not move when enemies
-    // die, because that pawn is not an enemy and never disappears.
-    uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
-    if (!isVaildPtr(playerDict)) {
-        return stats;
-    }
-
-    int dictCount = ReadAddr<int>(playerDict + kDictCount);
-    uint64_t entriesArr = ReadAddr<uint64_t>(playerDict + kDictEntries);
-    if (!isVaildPtr(entriesArr)) {
-        const uint64_t eOffs[] = { 0x10, 0x20 };
-        for (size_t ei = 0; ei < 2 && !isVaildPtr(entriesArr); ei++) {
-            entriesArr = ReadAddr<uint64_t>(playerDict + eOffs[ei]);
+    // Simple dump-backed player dict walk (MINDOKERNEL parity):
+    // Prefer Match+0x148 (Dictionary<byte,Player>, stride 24, value @ 16) first,
+    // with fallback to Match+kMatchPlayerDict (0x128, stride 0x28, value @ 0x20).
+    uint64_t usedEntryStride = kDictEntryStrideBytePlayer ? kDictEntryStrideBytePlayer : 0x28;
+    uint64_t usedEntryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
+    uint64_t playerDict = ReadAddr<uint64_t>(match + 0x148);
+    int dictCount = isVaildPtr(playerDict) ? ReadAddr<int>(playerDict + kDictCount) : 0;
+    uint64_t entriesArr = isVaildPtr(playerDict) ? ReadAddr<uint64_t>(playerDict + kDictEntries) : 0;
+    int byteDictCap = isVaildPtr(entriesArr) ? ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength) : 0;
+    if (isVaildPtr(playerDict) && isVaildPtr(entriesArr) &&
+        dictCount > 0 && byteDictCap >= dictCount && byteDictCap <= 256) {
+        usedEntryStride = 24;
+        usedEntryValueOff = 16;
+    } else {
+        playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
+        if (!isVaildPtr(playerDict)) {
+            return stats;
         }
-    }
-    if (!isVaildPtr(entriesArr)) {
-        return stats;
+        dictCount = ReadAddr<int>(playerDict + kDictCount);
+        entriesArr = ReadAddr<uint64_t>(playerDict + kDictEntries);
+        if (!isVaildPtr(entriesArr)) {
+            return stats;
+        }
     }
 
     // ---- Bad read, or a big match? Today they are one integer, and only one of
@@ -5125,51 +5126,22 @@ static void EspEmitStatusLine(void) {
     const float maxPossibleDistance = fmaxf(espDistanceLimit, aimDistance) + 5.0f;
 
     const uint64_t entriesBase = entriesArr + kIl2CppArrayItems;
-    const uint64_t entryStride = kDictEntryStrideBytePlayer ? kDictEntryStrideBytePlayer : 0x28;
-    const uint64_t entryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
-    // The clamp: the second of the two places this capacity is handled, and the one
-    // that degrades instead of deleting the frame.
-    //
-    // 512 is what this was before it was lowered to 128, and it clears every mode
-    // that exists here -- the capacity only passes 512 in a match with more players
-    // than that. Walking 512 is affordable now for the reason the limit was invented
-    // for, because that case can no longer reach this line: a corrupt capacity is
-    // rejected above, and the walk ends on the dictionary's own live count.
-    //
-    // 128 was not a player-count decision either. Walking 128 slots of a 163-slot
-    // capacity finds about 50*128/163 = 39 of 50 players, because the entries are
-    // hash-placed across the whole capacity and not packed at the front -- so the
-    // players that go missing are a spread-out 22%, not a tail.
+    const uint64_t entryStride = usedEntryStride;
+    const uint64_t entryValueOff = usedEntryValueOff;
+    // In C# Dictionary<TKey,TValue>, dictCount (dict+0x20) is the high-water count
+    // of initialized slots in entries[0..dictCount-1]. Walking past dictCount up to
+    // slotCap reads uninitialized tail slots, which is why MINDOKERNEL loops
+    // strictly for (int i = 0; i < count; ++i).
     const int kMaxWalkSlots = 512;
-    int loopCount = slotCap;
+    int loopCount = (usedEntryStride == 24) ? dictCount : slotCap;
+    if (loopCount > slotCap) loopCount = slotCap;
     if (loopCount > kMaxWalkSlots) loopCount = kMaxWalkSlots;
-    // How many dict entries were dropped as "that is me". Printed with the count
-    // below because it is the whole question behind "the counter counts me": the
-    // self filter needs the local pawn, and getLocalPlayer(match) returns 0 when
-    // kMatchLocalPlayer does not resolve, in which case isSamePlayerAsLocal
-    // answers false for everything and the local player is counted as an enemy.
-    // self=0 with local=0 is that case, and self=0 with a valid local is a
-    // different bug entirely. One log line separates them.
     int selfSkipped = 0;
 
-    // Zeroed here rather than at the top of the method, because this is where the walk
-    // begins and a frame that returns before it must not publish last frame's
-    // arithmetic.
     PawnRejects rej{};
 
-    // ---- What the walk found, and the one bound that is not a constant -------
-    //
-    // Exactly dictCount slots of this array can hold a live entry, so the first
-    // dictCount resolvable pawns are the players and anything past that did not come
-    // from this dictionary. That is the phantom budget, and it is the dictionary's
-    // own number rather than a constant that has to be chosen small enough to also
-    // fit a real match: a corrupt array is cut off here instead of after a thousand
-    // iterations of full pawn pipeline, and a real match cannot reach it, because
-    // exactly dictCount live entries exist. A slot whose pawn pointer fails to read
-    // is skipped without consuming budget, so a late read costs a slot and not a
-    // player.
     const int liveBudget = dictCount;
-    int dictClamped   = (loopCount < slotCap) ? 1 : 0;
+    int dictClamped   = (loopCount < dictCount) ? 1 : 0;
     int dictIters     = 0;  // loop iterations actually performed
     int dictWalkSlots = 0;  // slots whose hash code was not a free marker
     int dictLive      = 0;  // slots that yielded a pawn not already seen
@@ -5178,40 +5150,20 @@ static void EspEmitStatusLine(void) {
     int dictStopLive  = 0;  // 1 = the walk ended on the live count
     int snapDrop      = 0;  // pawns refused by the 128-snapshot draw buffer
 
-    // One pawn, one slot. This dictionary can name the same Player under two keys --
-    // the count table's own comment above s_espCountKey says so -- and the tally
-    // already dedupes by pawn pointer, so a duplicate never inflated the number, but
-    // it did cost a second full read pipeline and a second box. Depth matches the
-    // count table, which a 100+ player match also fits inside.
     uint64_t seenPawn[192];
     int seenPawnN = 0;
 
     for (int i = 0; i < loopCount; i++) {
-        // The live count is the bound, checked at the top of the iteration so the
-        // walk stops without reading one more slot than there are players.
         if (dictLive >= liveBudget) { dictStopLive = 1; break; }
         dictIters++;
         uint64_t ent = entriesBase + entryStride * (uint64_t)i;
         int hc = ReadAddr<int>(ent);
-        // Free slots typically 0 or -1.
-        if (hc == 0 || hc == -1) continue;
+        // Removed free-list slots in C# Dictionary have hashCode < 0 (-1).
+        if (hc < 0 || (usedEntryStride != 24 && hc == 0)) continue;
         dictWalkSlots++;
 
         uint64_t PawnObject = ReadAddr<uint64_t>(ent + entryValueOff);
-        // Set when the documented value offset did not answer and a pointer came
-        // from the layout-probe list instead.
         bool pawnFromProbe = false;
-        if (!isVaildPtr(PawnObject)) {
-            const uint64_t vOffs[] = { 0x10, 0x18, 0x20, 0x28 };
-            for (size_t vo = 0; vo < 4; vo++) {
-                uint64_t cand = ReadAddr<uint64_t>(ent + vOffs[vo]);
-                if (isVaildPtr(cand)) {
-                    PawnObject = cand;
-                    pawnFromProbe = true;
-                    break;
-                }
-            }
-        }
         if (!isVaildPtr(PawnObject)) continue;
 
         // isVaildPtr is a range test and nothing else -- not below 0x100000, not
@@ -5523,82 +5475,20 @@ static void EspEmitStatusLine(void) {
         Vector3 liveHead = getHeadWorld(PawnObject);
         Vector3 liveHip  = getHipWorld(PawnObject);
         bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
-
-        // ---- A read that did not land is not a pawn that went away.
-        //
-        // This is the "some players yes, some players no, and some appear then
-        // disappear entirely" report. Its shape here is specific: when none of the
-        // four anchors read, the pawn was tombstoned for 60 frames -- a whole second
-        // with no box and no aim -- and markGhostDead also wipes headSmoothed and
-        // hipSmoothed, so there was nothing left to fall back on afterwards.
-        //
-        // But the reason the reads failed is that this pawn's transform pages were
-        // not resident, which in a crowded match is routine rather than meaningful.
-        // The per-pawn working set is far larger than the page cache, so a pawn's
-        // pages come and go as the resident window rotates across the roster. A pawn
-        // that reads for two seconds, misses for one, then reads again, is not a
-        // despawned ghost: it is a cache that cannot hold everyone at once, and the
-        // old behaviour turned that shortfall into a visible disappearance every
-        // couple of seconds.
-        //
-        // The pawn's own PosTrack still holds the last position that DID read, so use
-        // it. Bounded on purpose, because this must never keep a genuine ghost alive:
-        // thirty frames, after which the pawn is tombstoned exactly as before. A
-        // remembered position is also never used across a tombstone, since
-        // markGhostDead has already cleared it by then -- the two guards below are
-        // belt and braces, not redundant.
-        const int kRememberedFrames = 30;
         bool pawnRemembered = false;
-        if (!hasLiveBone) {
-            std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
-            PosTrack &trMem = g_posTrack[PosTrackSlot(PawnObject)];
-            const bool memOwned  = (trMem.pawn == PawnObject);
-            const bool memTombed = (trMem.deadUntilFrame > 0 &&
-                                    g_cacheFrameCounter < trMem.deadUntilFrame);
-            const bool memFresh  = (g_cacheFrameCounter - trMem.frame) < kRememberedFrames;
-            if (memOwned && !memTombed && memFresh) {
-                if (looksLikeWorldPos(trMem.headSmoothed)) {
-                    liveHead = trMem.headSmoothed;
-                    pawnRemembered = true;
-                } else if (looksLikeWorldPos(trMem.hipSmoothed)) {
-                    liveHip = trMem.hipSmoothed;
-                    pawnRemembered = true;
-                }
-                if (pawnRemembered) hasLiveBone = true;
-            }
-        }
 
-        // Fallback HP if DataPool reads fail/delay but 3D bones exist. Only for a pawn
-        // that is knocked or otherwise still in the round.
-        if (hasLiveBone && !isKnocked) {
-            if (CurHP <= 0 && MaxHP <= 0) {
-                CurHP = 200;
-                MaxHP = 200;
-            } else if (MaxHP <= 0) {
-                MaxHP = 200;
-                if (CurHP <= 0) CurHP = 200;
-            }
-        }
-
-        // Alive/knocked always have MaxHP > 0.
-        const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
-
-        // HP did not land AND the bones did not land either: this pawn is UNKNOWN,
-        // not dead. Tombstoning here is what produced the reported symptom.
-        if (!hpReadOk && !hasLiveBone && !pawnRemembered) {
-            rej.hpUnread++;
-            continue;
-        }
-        const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
-                                (MaxHP > 0 && CurHP > MaxHP + 50));
-        const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
-        if (fullyDead) {
-            markGhostDead(120); // longer hold for death
+        // MINDOKERNEL parity: never invent CurHP=200 when CurHP<=0 (that revived
+        // dead/pool dummy shells in playerDict and caused the +1 enemy count).
+        if (CurHP <= 0) {
+            markGhostDead(120);
             rej.dead++;
             continue;
         }
-        if (!hasLiveBone && (hpGarbage || hpUnreadable || MaxHP <= 0)) {
-            markGhostDead((hpUnreadable || MaxHP <= 0) ? 120 : 45);
+        if (MaxHP <= 0 || MaxHP > 2000) {
+            MaxHP = (CurHP > 200 && CurHP <= 2000) ? CurHP : 200;
+        }
+        if (CurHP > 2000 || CurHP > MaxHP + 50) {
+            markGhostDead(45);
             rej.hpBad++;
             continue;
         }
@@ -5656,6 +5546,24 @@ static void EspEmitStatusLine(void) {
         const bool bodyCollapsed = haveLiveBody && liveBodyLen < 0.35f;
         // CRITICAL: bodyCollapsed alone is NOT vehicle — dead shells often collapse.
         const bool treatAsVehicle = enemyMounted || haveMountPos;
+
+        // MINDOKERNEL AvatarVisibility check (UmaAvatarSimple +0x101 == 1):
+        // Filters out hidden pool dummies, despawned corpses, and spectator clones in playerDict.
+        {
+            const uint64_t avatarMgrOff = GameTargetIsMax() ? 0x778ULL : 0x770ULL;
+            const bool avatarVis = AvatarVisibility::IsVisible(
+                PawnObject,
+                [](uint64_t address, void *value, size_t size) {
+                    return _read((long)address, value, (int)size);
+                },
+                [](uint64_t address) { return isVaildPtr(address); },
+                avatarMgrOff);
+            if (!avatarVis && !isKnocked && !treatAsVehicle) {
+                esp_count_drop(PawnObject);
+                rej.noAnchor++;
+                continue;
+            }
+        }
 
         // No live skeleton AND no mount → despawned ghost (dict still holds pointer).
         const bool anyLiveAnchor =
@@ -5778,93 +5686,17 @@ static void EspEmitStatusLine(void) {
             else headSrcNow = 4;
         }
 
-        // World-space EMA on validated live positions only — kills bone micro-jitter
-        // without inventing ghosts (markGhostDead already filtered dead shells).
-        // If source flipped this frame, bypass smoothing to stop a stretch that box smoother can't hide.
-        std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
-        PosTrack &trDisp = g_posTrack[PosTrackSlot(PawnObject)];
-        const bool headSrcFlip = (trDisp.lastHeadSrcDisp != 0 && headSrcNow != 0 && trDisp.lastHeadSrcDisp != headSrcNow);
-        const bool hipSrcFlip  = (trDisp.lastHipSrcDisp  != 0 && hipSrcNow  != 0 && trDisp.lastHipSrcDisp  != hipSrcNow);
-        Vector3 preSmoothHead = headBonePos;
-        Vector3 preSmoothHip  = espHipPos;
-        headBonePos = EspSmoothDisplayPos(PawnObject, headBonePos, /*isHead=*/true);
-        espHipPos   = EspSmoothDisplayPos(PawnObject, espHipPos,   /*isHead=*/false);
-        // EspSmoothDisplayPos returns {0,0,0} as its DROP signal -- its own comment
-        // says "if dead hold is active for THIS pawn, do not smooth or emit". Nothing
-        // between here and the snapshot tested for it, so the drop signal was consumed
-        // as a coordinate and every later check read it as this pawn's position:
-        //
-        //   tempDisForAim = Distance(myLocation, {0,0,0})   distance to the WORLD
-        //                                                    ORIGIN, not to the pawn
-        //   dis            = that same wrong distance, so dis > espDrawLimit
-        //                                                    -> wantDraw = false
-        //   bone = headBonePos = {0,0,0}, so IsZeroVec(bone)  -> canAim stays false
-        //
-        // and the entry was published anyway, taking a snaps[] slot and putting
-        // |myLocation| into dmin/dmax -- the field that exists to reveal a collapsed
-        // world position.
-        //
-        // There is already a zero-head guard, but it is in the draw pass, hundreds of
-        // lines too late: dis, wantDraw and canAim are all decided by then.
-        //
-        // Falling back to preSmooth is safe because those are the pre-smoothing values,
-        // which already passed the headFromLive, IsZeroVec and world-origin gates, so
-        // this cannot manufacture a ghost. It is the same "prefer preSmooth" the
-        // source-flip branch below already uses.
-        if (!looksLikeWorldPos(headBonePos)) headBonePos = preSmoothHead;
-        if (!looksLikeWorldPos(espHipPos))   espHipPos   = preSmoothHip;
-        if (headSrcFlip || hipSrcFlip) {
-            if (looksLikeWorldPos(preSmoothHead)) headBonePos = preSmoothHead;
-            if (looksLikeWorldPos(preSmoothHip))  espHipPos   = preSmoothHip;
-        }
-        trDisp.lastHeadSrcDisp = headSrcNow ? headSrcNow : trDisp.lastHeadSrcDisp;
-        trDisp.lastHipSrcDisp  = hipSrcNow  ? hipSrcNow  : trDisp.lastHipSrcDisp;
+        // MINDOKERNEL parity: use direct live 3D bone positions (zero world-space EMA lag,
+        // zero velocity-extrapolation lead jumps, zero learned-bodyLen height snapping)
+        // so Head, Hip, Ankles, and the ViewMatrix are 100% in phase on every frame.
+        (void)headSrcNow;
+        (void)hipSrcNow;
 
-        // Keep hip under smoothed head as a sane body column (no inverted boxes).
-        // Use learned stable body length when available to stop size oscillation on stationary pose.
-        {
-            float bodyLen = Vector3::Distance(headBonePos, espHipPos);
-            float dy = headBonePos.y - espHipPos.y;
-
-            // Learn/refresh canonical body length from good live pairs.
-            if (looksLikeWorldPos(liveHead) && looksLikeWorldPos(liveHip)) {
-                float liveBL = Vector3::Distance(liveHead, liveHip);
-                if (liveBL >= 0.45f && liveBL <= 1.25f) {
-                    if (trDisp.bodyLenHold <= 0 || trDisp.bodyLen <= 0.f) {
-                        trDisp.bodyLen = liveBL;
-                        trDisp.bodyLenHold = 45;
-                    } else {
-                        float rel = fabsf(liveBL - trDisp.bodyLen) / fmaxf(trDisp.bodyLen, 0.1f);
-                        if (rel < 0.18f) {
-                            trDisp.bodyLen = trDisp.bodyLen * 0.85f + liveBL * 0.15f;
-                            trDisp.bodyLenHold = 45;
-                        } else if (rel > 0.35f) {
-                            trDisp.bodyLen = liveBL;
-                            trDisp.bodyLenHold = 30;
-                        }
-                    }
-                }
-            }
-            if (trDisp.bodyLenHold > 0) trDisp.bodyLenHold--;
-
-            const bool haveStableBL = (trDisp.bodyLen >= 0.45f && trDisp.bodyLen <= 1.25f);
-            if (bodyLen < 0.28f || bodyLen > 2.6f || dy < 0.15f || dy > 1.35f) {
-                if (haveStableBL) {
-                    espHipPos = headBonePos;
-                    espHipPos.y -= trDisp.bodyLen;
-                } else {
-                    espHipPos = headBonePos;
-                    espHipPos.y -= treatAsVehicle ? 1.05f : 0.85f;
-                }
-            } else if (haveStableBL) {
-                float want = trDisp.bodyLen;
-                float cur  = bodyLen;
-                if (fabsf(cur - want) > 0.22f) {
-                    espHipPos = headBonePos;
-                    espHipPos.y -= want;
-                }
-            }
-        }
+        // Pre-warm left & right ankle transforms into BeginTransformFrame()'s per-frame
+        // positionCache now (during Phase-1 before GetViewMatrixInto), so ESPRenderPawnCore
+        // in Phase-2 hits positionCache in 0 syscalls with zero temporal skew.
+        (void)getPositionExt(getLeftAnkle(PawnObject));
+        (void)getPositionExt(getRightAnkle(PawnObject));
 
         // Always use real local↔enemy distance when we have a local world anchor.
         float tempDisForAim = useLocalDistance

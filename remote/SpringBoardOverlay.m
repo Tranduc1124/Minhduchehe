@@ -108,7 +108,7 @@ static int      g_iosBackIdx           = 0;      // Which buffer (0 or 1) is the
 static size_t   g_iosBpr               = 0;      // bytes per row
 static int      g_iosW                 = 0;      // surface pixel width (portrait)
 static int      g_iosH                 = 0;      // surface pixel height (portrait)
-static double   g_iosScale             = 1.5;    // pixel scale factor (1.5x -> ~183 pages/buffer)
+static double   g_iosScale             = 2.0;    // pixel scale factor (2.0x Retina -> ~323 pages/buffer, 646 total < 1024 shmem cache)
 static CGFloat  g_iosLandW             = 0;      // landscape width in points (= portrait H)
 static CGFloat  g_iosLandH             = 0;      // landscape height in points (= portrait W)
 static void    *g_iosLocalBuf          = NULL;   // malloc'd local draw buffer (app process)
@@ -2839,14 +2839,12 @@ void SBRemotePushESPFrame(UIView *espView) {
     g_sbSummaryAttempts++;
 
     uint64_t t = now_us();
-    if (t < g_sbNextPublishUS) {
-        g_sbSummarySkips++;
-        return;
-    }
-
     static int s_remoteBusy = 0;
 #if SB_IOSURFACE_RENDER
     if (g_iosReady) {
+        // ESP_View.frameTimer already owns 60Hz pacing and s_remoteBusy drops
+        // overlapping publishes; a second independent timer gate (g_sbNextPublishUS)
+        // skipped 16-22 valid ticks/s due to timer phase beat and caused frame-drop stutter.
         g_sbLastPublishUS = tGate;
         if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
             g_sbBusyDrops++;
@@ -2866,7 +2864,7 @@ void SBRemotePushESPFrame(UIView *espView) {
             g_sbSummarySkips++;
             return;
         }
-        g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
+        g_sbNextPublishUS = t;
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
@@ -2956,6 +2954,10 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
 #endif
 
+    if (t < g_sbNextPublishUS) {
+        g_sbSummarySkips++;
+        return;
+    }
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 

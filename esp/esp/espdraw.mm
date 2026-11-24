@@ -352,71 +352,62 @@ static void ESPRenderPawnCore(
 
     Vector3 HeadPos; HeadPos.x = headX; HeadPos.y = headY; HeadPos.z = headZ;
     Vector3 HipPos;  HipPos.x = hipX;  HipPos.y = hipY;  HipPos.z = hipZ;
-    Vector3 RightToePos = getPositionExt(getRightToeNode(PawnObject));
-    Vector3 LeftToePos  = getPositionExt(getLeftAnkle(PawnObject));
 
-    if (fabsf(RightToePos.x) < 0.1f && fabsf(RightToePos.y) < 0.1f && fabsf(RightToePos.z) < 0.1f) {
-        RightToePos = HeadPos;
-        RightToePos.y -= 1.65f;
+    auto validBonePos = [&](const Vector3 &v) -> bool {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+               (fabsf(v.x) > 0.1f || fabsf(v.y) > 0.1f || fabsf(v.z) > 0.1f) &&
+               Vector3::Distance(v, HipPos) <= 3.0f;
+    };
+
+    const Vector3 leftAnkle  = getPositionExt(getLeftAnkle(PawnObject));
+    const Vector3 rightAnkle = getPositionExt(getRightAnkle(PawnObject));
+    Vector3 feet = HipPos;
+    feet.y -= 0.85f;
+    const bool leftOk  = validBonePos(leftAnkle);
+    const bool rightOk = validBonePos(rightAnkle);
+    if (leftOk && rightOk) {
+        feet = (leftAnkle + rightAnkle) * 0.5f;
+    } else if (leftOk) {
+        feet = leftAnkle;
+    } else if (rightOk) {
+        feet = rightAnkle;
     }
-    if (fabsf(LeftToePos.x) < 0.1f && fabsf(LeftToePos.y) < 0.1f && fabsf(LeftToePos.z) < 0.1f) {
-        LeftToePos = RightToePos;
-    }
+    feet.y -= 0.08f;
 
-    float worldHeight = fabsf(HeadPos.y - RightToePos.y);
+    Vector3 HeadTop = HeadPos;
+    HeadTop.y += 0.14f;
+    Vector3 w2sHead = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+    Vector3 w2sFeet = WorldToScreenLayer(feet,    matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
 
-    Vector3 HeadTop = HeadPos; HeadTop.y += 0.2f;
-    Vector3 w2sHead    = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-    Vector3 w2sToe     = WorldToScreenLayer(RightToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-    Vector3 w2sLeftToe = WorldToScreenLayer(LeftToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-    Vector3 w2sHip     = WorldToScreenLayer(HipPos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-
-    if (w2sHead.z < 0.001f) return;
+    if (w2sHead.z <= 0.001f || w2sFeet.z <= 0.001f ||
+        !std::isfinite(w2sHead.x) || !std::isfinite(w2sHead.y) ||
+        !std::isfinite(w2sFeet.x) || !std::isfinite(w2sFeet.y)) return;
     const float margin = layerWidth * 0.6f;
-    if (w2sHead.x < -margin || w2sHead.x > layerWidth + margin || w2sHead.y < -margin || w2sHead.y > layerHeight + margin) return;
+    if (w2sHead.x < -margin || w2sHead.x > layerWidth + margin ||
+        w2sHead.y < -margin || w2sHead.y > layerHeight + margin) return;
 
     // ==========================================
-    // THUẬT TOÁN BOX CHUẨN XÁC
+    // THUẬT TOÁN BOX SMOOTH (MINDOKERNEL _0xEDR2862_.mm)
+    // - Đáy box lấy trung điểm 2 cổ chân (leftAnkle + rightAnkle)*0.5f:
+    //   khi chạy 2 chân vung ngược pha nên trung điểm đứng yên tuyệt đối,
+    //   triệt tiêu hoàn toàn hiện tượng box phập phồng theo từng bước chân.
+    // - Tâm ngang box lấy trung điểm (w2sHead.x + w2sFeet.x)*0.5f:
+    //   triệt tiêu dao động lắc đầu khi chạy/bắn.
+    // - Công thức liên tục duy nhất, không nhảy ngưỡng ở 1.35m / 0.70m.
     // ==========================================
-    float top = w2sHead.y;
-    // Chân nào chạm đất sâu nhất thì lấy chân đó làm đáy Box
-    float bottom = fmaxf(w2sToe.y, w2sLeftToe.y);
-    if (top > bottom) { float temp = top; top = bottom; bottom = temp; }
-
-    float screenRealHeight = bottom - top;
-
-    Vector3 fakeBasePos = HeadPos;
-    fakeBasePos.y -= 1.65f;
-    Vector3 w2sFakeBase = WorldToScreenLayer(fakeBasePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-    float stdHeight = fabsf(w2sHead.y - w2sFakeBase.y);
-
-    float boxHeight, boxWidth, x, y;
-
-    if (isKnocked || CurHP <= 0 || worldHeight < 0.7f) {
-        // GỤC / CHẾT / NẰM MÓC
-        boxHeight = stdHeight * 0.35f;
-        boxWidth  = stdHeight * 0.45f;
-        x = w2sHip.x - boxWidth * 0.5f;
-        y = w2sHip.y - boxHeight * 0.5f;
-    } else if (worldHeight < 1.35f) {
-        // NGỒI: Box lùn theo thực tế nhưng giữ nguyên bề ngang của Đứng
-        boxHeight = screenRealHeight;
-        boxWidth  = stdHeight * 0.45f;
-        x = w2sHead.x - boxWidth * 0.5f;
-        y = top;
-    } else {
-        // ĐỨNG / CHẠY / NHẢY: Box bao trọn 100%
-        boxHeight = screenRealHeight;
-        boxWidth  = boxHeight * 0.45f;
-        x = w2sHead.x - boxWidth * 0.5f;
-        y = top;
-    }
-
-    if (boxHeight < 6.0f) boxHeight = 6.0f;
-    if (boxWidth < 4.0f) boxWidth = 4.0f;
+    const float minY = fminf(w2sHead.y, w2sFeet.y);
+    const float maxY = fmaxf(w2sHead.y, w2sFeet.y);
+    float boxHeight = maxY - minY;
+    if (!std::isfinite(boxHeight) || boxHeight < 2.0f || boxHeight > layerHeight * 3.0f) return;
+    const float halfW = boxHeight * (isKnocked ? 0.40f : 0.23f);
+    float boxWidth = halfW * 2.0f;
+    if (!std::isfinite(boxWidth) || boxWidth < 1.0f || boxWidth > layerWidth * 3.0f) return;
+    const float centerX = (w2sHead.x + w2sFeet.x) * 0.5f;
+    float x = centerX - halfW;
+    float y = minY;
+    if (x + boxWidth < 0.0f || x > layerWidth || y + boxHeight < 0.0f || y > layerHeight) return;
 
     CGFloat dynFontSize = fmaxf(4.5f, fminf(10.0f, 350.0f / fmaxf(dis, 1.0f)));
-    float centerX = x + boxWidth * 0.5f;
 
     // The health bar's height and its gap off the top of the box, defined here
     // rather than inside the health bar block because two things have to agree on
