@@ -680,6 +680,11 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         // pointer reaches vm_map_enter and comes back as
         // "attempt to map illegal VA" on the panic of 2026-10-03 10:11.
         if (check != newOD) {
+            if (bumpedRef) {
+                uint32_t rc = kread32(object->address + off_vm_object_ref_count);
+                if (rc > 0) kwrite32(object->address + off_vm_object_ref_count, rc - 1);
+                bumpedRef = NO;
+            }
             mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
             if (MACH_PORT_VALID(memoryObject)) {
                 mach_port_deallocate(mach_task_self_, memoryObject);

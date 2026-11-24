@@ -115,7 +115,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
             [cell applyIconNamed:@"gamecontroller.fill" color:MDThemeAccent()];
             [cell applyTitle:@"Select Game"
                      subtitle:@"Which game ESP attaches to"
-                        value:GameTargetIsMax() ? @"Free Fire MAX" : @"Free Fire THG"
+                        value:@"Free Fire Vn"
                  showsChevron:YES
                      tappable:YES];
             break;

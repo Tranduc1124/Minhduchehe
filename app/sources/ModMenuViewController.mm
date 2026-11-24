@@ -1278,6 +1278,25 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                                                        y:y width:contentWidth key:@(oxorany("AimPos"))];
         [_contentContainer addSubview:posRow];
         y += posRow.frame.size.height;
+        {
+            CGFloat hsRate = ESPPrefsFloat(@(oxorany("HeadshotRate")), 100.0f);
+            if (hsRate < 0.0f) hsRate = 0.0f;
+            if (hsRate > 100.0f) hsRate = 100.0f;
+            UILabel *hsLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y+5, contentWidth - 32, 20)];
+            hsLbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Headshot Rate: %.0f%%")) viText:@(oxorany("Tỉ lệ Headshot: %.0f%%"))], hsRate];
+            hsLbl.font = MDFont(14, UIFontWeightMedium);
+            hsLbl.textColor = textColor;
+            [_contentContainer addSubview:hsLbl];
+            y += 25;
+            UISlider *hsSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, y, contentWidth - 32, 30)];
+            hsSlider.minimumValue = 0.0f; hsSlider.maximumValue = 100.0f; hsSlider.value = hsRate;
+            hsSlider.minimumTrackTintColor = MDAccent();
+            objc_setAssociatedObject(hsSlider, kKeyKey, @(oxorany("HeadshotRate")), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(hsSlider, kLabelKey, hsLbl, OBJC_ASSOCIATION_ASSIGN);
+            [hsSlider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+            [_contentContainer addSubview:hsSlider];
+            y += 40;
+        }
         if (menuStyle == 0) {
             addSwitchRow([self localized:@(oxorany("Show Aim Mode Quick Button")) viText:@(oxorany("Hiện nút chế độ Aim nhanh"))], @(oxorany("FloatAimPosBtn")), YES);
         }
@@ -2373,6 +2392,8 @@ typedef NS_ENUM(NSInteger, MenuTab) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Distance: %.0fm")) viText:@(oxorany("Cự ly Aim: %.0fm"))], v];
     } else if ([key isEqualToString:@(oxorany("AimSpeed"))]) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Aim Speed: %.0f%%")) viText:@(oxorany("Tốc độ kéo: %.0f%%"))], v];
+    } else if ([key isEqualToString:@(oxorany("HeadshotRate"))]) {
+        lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Headshot Rate: %.0f%%")) viText:@(oxorany("Tỉ lệ Headshot: %.0f%%"))], v];
     } else if ([key isEqualToString:@(oxorany("SpeedValue"))]) {
         lbl.text = [NSString stringWithFormat:[self localized:@(oxorany("Run Speed: %.2fx (online ≤1.28)")) viText:@(oxorany("Tốc độ chạy: %.2fx (online ≤1.28)"))], v];
     } else if ([key isEqualToString:@(oxorany("BrutalSpeed"))]) {

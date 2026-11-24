@@ -1568,13 +1568,26 @@ static BOOL sb_ios_render_frame(UIView *espView,
     int curHasContent = 0;
     uint32_t subCount = 0;
 
+    static NSString *s_shapeKeyStrs[SB_SHAPE_KEY_COUNT];
+    static SEL s_shapeKeySels[SB_SHAPE_KEY_COUNT];
+    static dispatch_once_t s_shapeKeysOnce;
+    dispatch_once(&s_shapeKeysOnce, ^{
+        for (int k = 0; k < SB_SHAPE_KEY_COUNT; k++) {
+            if (kShapeKeys[k]) {
+                s_shapeKeyStrs[k] = [NSString stringWithUTF8String:kShapeKeys[k]];
+                s_shapeKeySels[k] = NSSelectorFromString(s_shapeKeyStrs[k]);
+            }
+        }
+    });
+
     for (int i = 0; i < SB_SHAPE_KEY_COUNT; i++) {
-        if (!kShapeKeys[i]) continue;
+        NSString *key = s_shapeKeyStrs[i];
+        SEL sel = s_shapeKeySels[i];
+        if (!key || !sel) continue;
 #if !SB_DRAW_BONES
         if (i >= 3 && i <= 5) continue;
 #endif
-        NSString *key = [NSString stringWithUTF8String:kShapeKeys[i]];
-        if (![espView respondsToSelector:NSSelectorFromString(key)]) continue;
+        if (![espView respondsToSelector:sel]) continue;
         id val = [espView valueForKey:key];
         if (![val isKindOfClass:[CAShapeLayer class]]) continue;
         CGPathRef p = ((CAShapeLayer *)val).path;
@@ -2762,12 +2775,12 @@ void SBRemotePushESPFrame(UIView *espView) {
     // lookup and a string compare, both local. The floor on how often the text
     // thread is woken lives on the signal, not here, because a signal that waits
     // on a timer is a delay rather than a ceiling.
-    static int s_textPrev = -1;
-    const int textOn = ESPPrefsBool(@"Count", YES) ? 1 : 0;
-    const int textChanged = (s_textPrev != textOn);
-    s_textPrev = textOn;
-    g_sbTextStageBounds = espView.bounds;
-    {
+    if (!SB_IOSURFACE_RENDER || !g_iosReady) {
+        static int s_textPrev = -1;
+        const int textOn = ESPPrefsBool(@"Count", YES) ? 1 : 0;
+        const int textChanged = (s_textPrev != textOn);
+        s_textPrev = textOn;
+        g_sbTextStageBounds = espView.bounds;
         {
             SbTextReq r;
             // Field by field, not memset. The struct holds an NSString, so it is
@@ -2807,14 +2820,6 @@ void SBRemotePushESPFrame(UIView *espView) {
             g_sbTextSeq++;
             pthread_mutex_unlock(&g_sbTextHandoff);
 
-            // Wake the text thread only when the value it would send is actually
-            // different from the last one staged. Posting on every frame would
-            // turn a 4Hz poll into a 60Hz wakeup, and posting only on a toggle
-            // would miss a count that changed on its own.
-            //
-            // isEqualToString: rather than pointer equality, because the app
-            // builds a fresh NSString for the number whenever the count moves
-            // and two equal strings are still one thing to send.
             NSString *prev = g_sbTextStaged;
             BOOL differs = (r.text == nil || prev == nil)
                          ? (r.text != prev)
@@ -2864,6 +2869,7 @@ void SBRemotePushESPFrame(UIView *espView) {
         g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            @autoreleasepool {
             const uint64_t tPubStart = now_us();
             const uint64_t dispUS = tPubStart - tAcquire;
             pthread_mutex_lock(&g_sbIoLock);
@@ -2944,6 +2950,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 g_sbHoldUS += now_us() - tAcquire;
                 __sync_lock_release(&s_remoteBusy);
             }
+            } // @autoreleasepool
         });
         return;
     }

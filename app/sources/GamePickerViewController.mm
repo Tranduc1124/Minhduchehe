@@ -23,10 +23,10 @@
         // string comparison: `id == @"ffmax"` compares pointers, which is
         // undefined behaviour and can pick the wrong branch, and a literal is
         // not required to be identical across two occurrences.
-        _ids = @[ @"ffmax", @"ff" ];
-        _titles = @[ @"Free Fire MAX", @"Free Fire THG" ];
-        _subtitles = @[ @"com.dts.freefiremax", @"vn.vng.freefireth" ];
-        _icons = @[ @"crown.fill", @"flame.fill" ];
+        _ids = @[ @"ff" ];
+        _titles = @[ @"Free Fire Vn" ];
+        _subtitles = @[ @"vn.vng.freefireth" ];
+        _icons = @[ @"flame.fill" ];
     }
     return self;
 }

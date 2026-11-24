@@ -1701,6 +1701,7 @@ bool isAimSilent = NO; // independent magic bullet (HitObject spoof while firing
 // Aim sphere mode (requires Aimbot): 0=FOV circle, 1=180 front, 2=360 full.
 int aimSphereMode = 0;
 int triggerMode = 0; int aimPosition = 0;
+float headshotRate = 100.0f; // 0..100% headshot probability when AimSilent + Head (aimPosition==0)
 
 // Which probe inside get_IsFiring said "the fire button is held". Declared up
 // here because [AIM-DIAG] prints the mask and that log runs long before the
@@ -3049,7 +3050,7 @@ static inline ESPGeometryBuffers ESPGeometryBuffersCreate(void) {
 // Counts path elements and curve elements for the [APP-LAYER] diagnostic.
 // CGPathApply takes a plain C function, not a block.
 typedef struct { uint32_t n; uint32_t curves; } ESPPathCountCtx;
-static void espCountPathElements(void *info, const CGPathElement *e) {
+static __attribute__((unused)) void espCountPathElements(void *info, const CGPathElement *e) {
     ESPPathCountCtx *c = (ESPPathCountCtx *)info;
     if (!c) return;
     c->n++;
@@ -3230,6 +3231,9 @@ void ESPSyncFromPrefs(void) {
     aimPosition = (int)ESPPrefsFloat(@"AimPos", 0.0f);
     if (aimPosition < 0) aimPosition = 0;
     if (aimPosition > 2) aimPosition = 2;
+    headshotRate = ESPPrefsFloat(@"HeadshotRate", 100.0f);
+    if (headshotRate < 0.0f) headshotRate = 0.0f;
+    if (headshotRate > 100.0f) headshotRate = 100.0f;
     aimTargetMode = (int)ESPPrefsFloat(@"AimTargetMode", 0.0f);
 
     // The aim radius and the ring radius are one setting, read from one pref.
@@ -3879,36 +3883,58 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 s_liveFovB = ESPPrefsFloat(@"FovColorB", fovB);
             }
 
-            if (isESP2) {
-                self.boxLayer.lineWidth = 1.0f;
-                self.boxLayer.strokeColor = [UIColor whiteColor].CGColor;
-                self.snaplineLayer.lineWidth = 1.0f;
-                self.snaplineLayer.strokeColor = [UIColor whiteColor].CGColor;
-                self.fovLayer.lineWidth = 0.6f;
-                self.fovLayer.strokeColor = [UIColor greenColor].CGColor;
-            } else {
-                float drawBoxR = s_liveBoxR, drawBoxG = s_liveBoxG, drawBoxB = s_liveBoxB;
-                float drawLineR = s_liveLineR, drawLineG = s_liveLineG, drawLineB = s_liveLineB;
-                float drawBoneR = s_liveBoneR, drawBoneG = s_liveBoneG, drawBoneB = s_liveBoneB;
-                float drawFovR = s_liveFovR, drawFovG = s_liveFovG, drawFovB = s_liveFovB;
-                ESPResolveDrawColor(s_liveBoxMode, s_liveBoxR, s_liveBoxG, s_liveBoxB, 0.00f, &drawBoxR, &drawBoxG, &drawBoxB);
-                ESPResolveDrawColor(s_liveLineMode, s_liveLineR, s_liveLineG, s_liveLineB, 0.25f, &drawLineR, &drawLineG, &drawLineB);
-                ESPResolveDrawColor(s_liveBoneMode, s_liveBoneR, s_liveBoneG, s_liveBoneB, 0.50f, &drawBoneR, &drawBoneG, &drawBoneB);
-                ESPResolveDrawColor(s_liveFovMode, s_liveFovR, s_liveFovG, s_liveFovB, 0.75f, &drawFovR, &drawFovG, &drawFovB);
+            float wantBoxR = 1.0f, wantBoxG = 1.0f, wantBoxB = 1.0f, wantBoxW = 1.0f;
+            float wantBoneR = s_liveBoneR, wantBoneG = s_liveBoneG, wantBoneB = s_liveBoneB, wantBoneW = boneThick;
+            float wantLineR = 1.0f, wantLineG = 1.0f, wantLineB = 1.0f, wantLineW = 1.0f;
+            float wantFovR = 0.0f, wantFovG = 1.0f, wantFovB = 0.0f, wantFovW = 0.6f;
 
-                self.boxLayer.lineWidth = boxThick;
-                self.boxLayer.strokeColor = [UIColor colorWithRed:drawBoxR green:drawBoxG blue:drawBoxB alpha:1.0f].CGColor;
-                self.boneLayer.lineWidth = boneThick;
-                self.boneLayer.strokeColor = [UIColor colorWithRed:drawBoneR green:drawBoneG blue:drawBoneB alpha:1.0f].CGColor;
-                self.snaplineLayer.lineWidth = lineThick;
-                self.snaplineLayer.strokeColor = [UIColor colorWithRed:drawLineR green:drawLineG blue:drawLineB alpha:1.0f].CGColor;
-                self.fovLayer.lineWidth = fovThick;
-                self.fovLayer.strokeColor = [UIColor colorWithRed:drawFovR green:drawFovG blue:drawFovB alpha:1.0f].CGColor;
+            if (!isESP2) {
+                wantBoxR = s_liveBoxR; wantBoxG = s_liveBoxG; wantBoxB = s_liveBoxB; wantBoxW = boxThick;
+                wantLineR = s_liveLineR; wantLineG = s_liveLineG; wantLineB = s_liveLineB; wantLineW = lineThick;
+                wantBoneR = s_liveBoneR; wantBoneG = s_liveBoneG; wantBoneB = s_liveBoneB; wantBoneW = boneThick;
+                wantFovR = s_liveFovR; wantFovG = s_liveFovG; wantFovB = s_liveFovB; wantFovW = fovThick;
+                ESPResolveDrawColor(s_liveBoxMode, s_liveBoxR, s_liveBoxG, s_liveBoxB, 0.00f, &wantBoxR, &wantBoxG, &wantBoxB);
+                ESPResolveDrawColor(s_liveLineMode, s_liveLineR, s_liveLineG, s_liveLineB, 0.25f, &wantLineR, &wantLineG, &wantLineB);
+                ESPResolveDrawColor(s_liveBoneMode, s_liveBoneR, s_liveBoneG, s_liveBoneB, 0.50f, &wantBoneR, &wantBoneG, &wantBoneB);
+                ESPResolveDrawColor(s_liveFovMode, s_liveFovR, s_liveFovG, s_liveFovB, 0.75f, &wantFovR, &wantFovG, &wantFovB);
+            }
+
+            static float s_appBoxR = -1.f, s_appBoxG = -1.f, s_appBoxB = -1.f, s_appBoxW = -1.f;
+            static float s_appBoneR = -1.f, s_appBoneG = -1.f, s_appBoneB = -1.f, s_appBoneW = -1.f;
+            static float s_appLineR = -1.f, s_appLineG = -1.f, s_appLineB = -1.f, s_appLineW = -1.f;
+            static float s_appFovR = -1.f, s_appFovG = -1.f, s_appFovB = -1.f, s_appFovW = -1.f;
+
+            if (s_appBoxW != wantBoxW) { self.boxLayer.lineWidth = wantBoxW; s_appBoxW = wantBoxW; }
+            if (s_appBoxR != wantBoxR || s_appBoxG != wantBoxG || s_appBoxB != wantBoxB) {
+                self.boxLayer.strokeColor = [UIColor colorWithRed:wantBoxR green:wantBoxG blue:wantBoxB alpha:1.0f].CGColor;
+                s_appBoxR = wantBoxR; s_appBoxG = wantBoxG; s_appBoxB = wantBoxB;
+            }
+            if (s_appBoneW != wantBoneW) { self.boneLayer.lineWidth = wantBoneW; s_appBoneW = wantBoneW; }
+            if (s_appBoneR != wantBoneR || s_appBoneG != wantBoneG || s_appBoneB != wantBoneB) {
+                self.boneLayer.strokeColor = [UIColor colorWithRed:wantBoneR green:wantBoneG blue:wantBoneB alpha:1.0f].CGColor;
+                s_appBoneR = wantBoneR; s_appBoneG = wantBoneG; s_appBoneB = wantBoneB;
+            }
+            if (s_appLineW != wantLineW) { self.snaplineLayer.lineWidth = wantLineW; s_appLineW = wantLineW; }
+            if (s_appLineR != wantLineR || s_appLineG != wantLineG || s_appLineB != wantLineB) {
+                self.snaplineLayer.strokeColor = [UIColor colorWithRed:wantLineR green:wantLineG blue:wantLineB alpha:1.0f].CGColor;
+                s_appLineR = wantLineR; s_appLineG = wantLineG; s_appLineB = wantLineB;
+            }
+            if (s_appFovW != wantFovW) { self.fovLayer.lineWidth = wantFovW; s_appFovW = wantFovW; }
+            if (s_appFovR != wantFovR || s_appFovG != wantFovG || s_appFovB != wantFovB) {
+                self.fovLayer.strokeColor = [UIColor colorWithRed:wantFovR green:wantFovG blue:wantFovB alpha:1.0f].CGColor;
+                s_appFovR = wantFovR; s_appFovG = wantFovG; s_appFovB = wantFovB;
             }
         }
 
-        self.aimAssistLayer.lineWidth = aimAssistThick;
-        self.aimAssistLayer.strokeColor = [UIColor colorWithRed:aimAssistR green:aimAssistG blue:aimAssistB alpha:1.0f].CGColor;
+        static float s_appAimR = -1.f, s_appAimG = -1.f, s_appAimB = -1.f, s_appAimW = -1.f;
+        if (s_appAimW != aimAssistThick) {
+            self.aimAssistLayer.lineWidth = aimAssistThick;
+            s_appAimW = aimAssistThick;
+        }
+        if (s_appAimR != aimAssistR || s_appAimG != aimAssistG || s_appAimB != aimAssistB) {
+            self.aimAssistLayer.strokeColor = [UIColor colorWithRed:aimAssistR green:aimAssistG blue:aimAssistB alpha:1.0f].CGColor;
+            s_appAimR = aimAssistR; s_appAimG = aimAssistG; s_appAimB = aimAssistB;
+        }
 
         // Keep frame alive when Brutal needs work (ON, still patched, or has saved addrs to restore).
         // Critical: user turns Brutal OFF after leave → must NOT early-return before restore.
@@ -4104,20 +4130,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
         // the frame on screen rather than the one before it.
         {
             static uint32_t s_layerLogTick = 0;
-            if ((++s_layerLogTick % 60u) == 1u) {
-                ESPPathCountCtx bx = {0,0}, bn = {0,0}, sn = {0,0}, fv = {0,0}, am = {0,0};
-                CGPathApply(self.boxLayer.path, &bx, espCountPathElements);
-                CGPathApply(self.boneLayer.path, &bn, espCountPathElements);
-                CGPathApply(self.snaplineLayer.path, &sn, espCountPathElements);
-                CGPathApply(self.fovLayer.path, &fv, espCountPathElements);
-                CGPathApply(self.aimAssistLayer.path, &am, espCountPathElements);
+            if ((++s_layerLogTick % 300u) == 1u) {
                 NSLog(@"[APP-LAYER] esp=%d esp2=%d box=%d line=%d bone=%d hp=%d show=%d | "
-                      @"box=%u/%u bone=%u/%u snap=%u/%u fov=%u/%u aim=%u/%u | "
                       @"dirty box=%d bone=%d snap=%d hpG=%d fovNil=%d aimNil=%d",
                       (int)isESP, (int)isESP2, (int)isBox, (int)isLine, (int)isBone, (int)isHealth,
                       (int)showVisuals,
-                      bx.n, bx.curves, bn.n, bn.curves, sn.n, sn.curves,
-                      fv.n, fv.curves, am.n, am.curves,
                       (int)s_dirtyBox, (int)s_dirtyBone,
                       (int)s_dirtySnap, (int)s_dirtyHpG,
                       (int)(self.fovLayer.path == nil), (int)(self.aimAssistLayer.path == nil));
@@ -6066,78 +6083,12 @@ static void EspEmitStatusLine(void) {
         // Compare [PUSH] scr against [SB-PUSH] p0 to see if the push survived.
         if (si == 0) {
             static int s_pushLog = 0;
-            if (++s_pushLog % 60 == 1) {
-                uint64_t hn = ReadAddr<uint64_t>(s.pawn + kHeadNode);
-                uint64_t hp = ReadAddr<uint64_t>(s.pawn + kHipNode);
-                uint64_t h628 = ReadAddr<uint64_t>(s.pawn + 0x628);
-
-                // Cache versus no-cache, same frame, same address. Walks the
-                // same chain getPositionExt walks and lands on the same
-                // Vector3, then reads those 12 bytes twice: once through the
-                // page cache, once through ds_read_uncached, which maps the page
-                // from scratch and cannot be the reason a value looks frozen.
-                //
-                // This settles a question the TTL could not. The device log has
-                // world constant for 19 seconds while evicts and remaps run at
-                // 25/s, so the page really is being replaced and the number
-                // still does not move. Either the cache is handing back bytes
-                // the game has already changed, or the game genuinely has that
-                // value and the fault is in the offset rather than the cache.
-                // agree  -> cache innocent, the constant is the game's data
-                // differ -> cache lying, and the TTL is not reaching the page
-                uint64_t posVA = 0;
-                Vector3 fresh{};
-                Vector3 rawCached{};
-                bool haveFresh = false;
-                bool haveRaw = false;
-                {
-                    // Start from exactly the object getPositionExt was handed.
-                    // Reading pawn + kHeadNode directly and then adding
-                    // kTransformInner guesses the branch, and getBoneTrans has
-                    // three: it returns the node, node+0x10, or one level
-                    // deeper. Guessing left posVA=0 on every line, so ok=0 and
-                    // differs=0 said nothing at all.
-                    uint64_t node = getHead(s.pawn);
-                    uint64_t tObj = isVaildPtr((uintptr_t)node)
-                                  ? ReadAddr<uint64_t>(node + kTransformInner) : 0;
-                    uint64_t mtx = (isVaildPtr((uintptr_t)tObj))
-                                 ? ReadAddr<uint64_t>(tObj + kTransformMatrix) : 0;
-                    uint64_t idxU = (isVaildPtr((uintptr_t)tObj))
-                                  ? ReadAddr<uint64_t>(tObj + kTransformIndex) : 0;
-                    uint64_t mlist = (isVaildPtr((uintptr_t)mtx))
-                                   ? ReadAddr<uint64_t>(mtx + kMatrixList) : 0;
-                    if (isVaildPtr((uintptr_t)mlist) && idxU <= 8192) {
-                        posVA = mlist + sizeof(TMatrix) * (size_t)idxU;
-                        // Same twelve bytes, two paths. raw goes through the page
-                        // cache, fresh maps the page from scratch. Comparing
-                        // these two isolates the cache and nothing else.
-                        //
-                        // Note it must NOT be compared against s.head: that is
-                        // the position after the whole parent transform chain has
-                        // been folded in, while this is the raw matrix entry. They
-                        // are different quantities and are not expected to match.
-                        rawCached = ReadAddr<Vector3>(posVA);
-                        haveRaw = true;
-                        haveFresh = ds_read_uncached(posVA, &fresh, sizeof(Vector3));
-                    }
-                }
-                const int cacheDiffers = (haveFresh && haveRaw &&
-                    (memcmp(&rawCached, &fresh, sizeof(Vector3)) != 0)) ? 1 : 0;
-
-                NSLog(@"[PUSH] pawn=0x%llx headN=0x%llx hipN=0x%llx n628=0x%llx "
-                      @"world=(%.2f,%.2f,%.2f) scr=(%.1f,%.1f,%.3f) on=%d frame=%d "
-                      @"posVA=0x%llx raw=(%.2f,%.2f,%.2f) fresh=(%.2f,%.2f,%.2f) "
-                      @"ok=%d differs=%d",
+            if (++s_pushLog % 300 == 1) {
+                NSLog(@"[PUSH] pawn=0x%llx world=(%.2f,%.2f,%.2f) scr=(%.1f,%.1f,%.3f) on=%d frame=%d",
                       (unsigned long long)s.pawn,
-                      (unsigned long long)hn, (unsigned long long)hp,
-                      (unsigned long long)h628,
                       s.head.x, s.head.y, s.head.z,
                       w2sAimCheck.x, w2sAimCheck.y, w2sAimCheck.z,
-                      (int)isOnScreen, g_cacheFrameCounter,
-                      (unsigned long long)posVA,
-                      rawCached.x, rawCached.y, rawCached.z,
-                      fresh.x, fresh.y, fresh.z,
-                      (int)haveFresh, cacheDiffers);
+                      (int)isOnScreen, g_cacheFrameCounter);
             }
         }
 
@@ -7239,16 +7190,52 @@ static void EspEmitStatusLine(void) {
     // ============================================================
     // [SILENT-BURST-FIX] Silent target apply — tăng burst khi firing,
     // refresh bone + origin mỗi 4 burst để viên trúng viên.
+    // Khi chọn Đầu (aimPosition == 0), áp dụng Tỉ lệ Headshot (headshotRate%):
+    // ví dụ 50% thì mỗi phát bắn có 50% ghim Đầu (0) và 50% ghim Xương thân/ngực (2).
     // ============================================================
     if (silentActive && bestTarget != 0 && AimTargetStillValid(bestTarget) &&
         (allowThroughWall || AimTargetVisibleStrictForSilent(myPawnObject, bestTarget))) {
-        Vector3 silentBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+        static int s_silentRolledPos = 0;
+        static bool s_silentWasFiring = false;
+        static int s_silentHoldFrames = 0;
+        static int s_silentHsAcc = 50;
+        int silentPosMode = aimPosition;
+        if (aimPosition == 0) {
+            const int rate = (int)lroundf(headshotRate);
+            if (rate >= 100) {
+                silentPosMode = 0;
+            } else if (rate <= 0) {
+                silentPosMode = 2;
+            } else {
+                const bool newShotEdge = (isFiring && !s_silentWasFiring) || bulletJustFired;
+                if (isFiring) s_silentHoldFrames++;
+                else s_silentHoldFrames = 0;
+                if (newShotEdge || s_silentHoldFrames >= 5) {
+                    s_silentHoldFrames = 0;
+                    // Combine error-diffusion accumulator with random jitter so
+                    // short bursts match the exact percentage while staying organic.
+                    s_silentHsAcc += rate;
+                    const int jitter = (int)arc4random_uniform(25) - 12;
+                    if (s_silentHsAcc + jitter >= 100) {
+                        s_silentHsAcc -= 100;
+                        if (s_silentHsAcc < 0) s_silentHsAcc = 0;
+                        s_silentRolledPos = 0; // Head
+                    } else {
+                        s_silentRolledPos = 2; // Chest / Body (non-head bone)
+                    }
+                }
+                silentPosMode = s_silentRolledPos;
+            }
+        }
+        s_silentWasFiring = isFiring;
+
+        Vector3 silentBone = ResolveSilentAimWorldPos(bestTarget, silentPosMode);
         if (!IsZeroVec(silentBone) && bestDistance >= 0.15f) {
-            SilentAimSetTarget(myPawnObject, bestTarget, silentBone, myLocation, aimPosition);
+            SilentAimSetTarget(myPawnObject, bestTarget, silentBone, myLocation, silentPosMode);
             s_lastAimPawn = bestTarget;
             bestHeadPos = silentBone;
 
-            Vector3 liveBone = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+            Vector3 liveBone = ResolveSilentAimWorldPos(bestTarget, silentPosMode);
             if (IsZeroVec(liveBone)) liveBone = silentBone;
             {
                 std::lock_guard<std::mutex> lk(g_silentMtx);
@@ -7259,7 +7246,7 @@ static void EspEmitStatusLine(void) {
             const int bursts = silentFireWindow ? 160 : 6;
             for (int burst = 0; burst < bursts; burst++) {
                 if ((burst & 3) == 0) {
-                    Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
+                    Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, silentPosMode);
                     if (!IsZeroVec(h2) && looksLikeWorldPos(h2)) {
                         liveBone = h2;
                         std::lock_guard<std::mutex> lk(g_silentMtx);

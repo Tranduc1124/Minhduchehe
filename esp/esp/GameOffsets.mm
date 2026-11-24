@@ -403,11 +403,8 @@ static const GameOffsets *gActiveOffsets = &kOffsetsFF;
 static bool gIsMax = false;
 
 static bool GameIdIsMax(NSString *gameId) {
-    if (![gameId isKindOfClass:[NSString class]]) return false;
-    NSString *normalized = gameId.lowercaseString;
-    return [normalized isEqualToString:kGameIdFFMax] ||
-           [normalized isEqualToString:@"max"] ||
-           [normalized isEqualToString:@"freefiremax"];
+    (void)gameId;
+    return false;
 }
 
 NSString *GameTargetSelectedId(void) {

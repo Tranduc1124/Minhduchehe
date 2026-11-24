@@ -425,6 +425,7 @@ typedef NS_ENUM(NSInteger, ESPSection) {
                 @[ @"s", @"Aim Silent",        @"AimSilent",     @NO ],
                 @[ @"g", @"Aim Position",      @"AimPos",        @(0.0f),
                    @[ @"Head", @"Neck", @"Chest" ] ],
+                @[ @"l", @"Tỉ lệ Headshot",    @"HeadshotRate",  @(0.0f),  @(100.0f), @(100.0f) ],
                 @[ @"g", @"Target",            @"AimTargetMode", @(0.0f),
                    @[ @"Crosshair", @"Low HP", @"Closest" ] ],
                 @[ @"g", @"Trigger",           @"TriggerMode",   @(0.0f),
@@ -616,8 +617,9 @@ static float ESPRowClamp(float v, float lo, float hi) {
         cell.nameLabel.text = title;
         cell.slider.minimumValue = min;
         cell.slider.maximumValue = max;
+        BOOL isPct = [key isEqualToString:@"HeadshotRate"] || [key isEqualToString:@"AimSpeed"];
         cell.slider.value = ESPPrefsFloat(key, [row[5] floatValue]);
-        cell.valueLabel.text = [NSString stringWithFormat:@"%.0f", cell.slider.value];
+        cell.valueLabel.text = [NSString stringWithFormat:(isPct ? @"%.0f%%" : @"%.0f"), cell.slider.value];
 
         __weak MDSliderCell *weakCell = cell;
         cell.onLive = ^(UISlider *s) {
@@ -625,7 +627,7 @@ static float ESPRowClamp(float v, float lo, float hi) {
             // re-reads the pref every frame, so disk is irrelevant here and
             // writing it on every move is what made the old menu stutter.
             ESPPrefsSetFloatLive(key, (float)s.value);
-            weakCell.valueLabel.text = [NSString stringWithFormat:@"%.0f", s.value];
+            weakCell.valueLabel.text = [NSString stringWithFormat:(isPct ? @"%.0f%%" : @"%.0f"), s.value];
         };
         cell.onCommit = ^(UISlider *s) {
             ESPPrefsSetFloat(key, (float)s.value);

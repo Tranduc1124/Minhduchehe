@@ -507,7 +507,7 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // tracking accuracy against remap cost, so both rates are logged every second
 // (see ds_end_read_transaction) and the value is meant to be tuned from the
 // device log, not defended.
-#define DS_PAGE_TTL_MS 2000ULL
+#define DS_PAGE_TTL_MS 30000ULL
 
 // Upper bound on mappings torn down in one transaction. Releasing all 256 at
 // once is what produced "Taking non-sleepable RW lock with preemption enabled"
