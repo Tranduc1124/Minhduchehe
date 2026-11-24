@@ -11,6 +11,7 @@
 #import "../esp/GameOffsets.h"
 #import "../esp/menu.h"
 #import "../../app/KeepAlive.h"
+#import "../../app/sources/MDLicenseGuard.h"
 #import <objc/runtime.h>
 
 static UIWindow *g_espHostWindow = nil;
@@ -43,8 +44,12 @@ static UIWindow *g_espHostWindow = nil;
 @end
 
 int StartESPHost(void) {
+    if (!MDLicenseGuardVerifyLive("start_esp_host")) {
+        return -1;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_espHostWindow) return;
+        if (!MDLicenseGuardVerifyLive("start_esp_host_main")) return;
 
         [[KeepAlive shared] start];
         ESPPrefsSync();

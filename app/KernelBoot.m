@@ -17,6 +17,7 @@
 #import "../remote/SpringBoardOverlay.h"
 #import "../remote/RemoteCall.h"
 #import "KeepAlive.h"
+#import "sources/MDLicenseGuard.h"
 #import "../esp/esp/ESPPrefs.h"
 
 // From app/sources/HUDHelper.mm. Declared here rather than included so the boot
@@ -77,6 +78,11 @@ static void boot_start_sb_overlay(void) {
 }
 
 static void kernelBootStartEx(BOOL kernelOnly) {
+    if (!MDLicenseGuardVerifyLive(kernelOnly ? "kernel_boot_only_entry" : "kernel_boot_full_entry")) {
+        L(@"ERR License verification failed — refusing kernel boot.");
+        StopESPSession();
+        return;
+    }
     if (g_booting) {
         // The launch-time boot is already on the queue. Returning here used to
         // drop the tap on the floor, and the caller had already recorded the
@@ -113,7 +119,18 @@ static void kernelBootStartEx(BOOL kernelOnly) {
 
     dispatch_async(g_bootQueue, ^{
         L(@"RUN 1/6 Authorizing protected ESP access");
-        L(@"OK Device authorized — no key required.");
+        __block BOOL stage1Authorized = NO;
+        BOOL gateOK = MDLicenseGuardPerformProtected("kernel_stage1_auth", ^{
+            stage1Authorized = YES;
+        });
+        if (!gateOK || !stage1Authorized) {
+            L(@"ERR 1/6 License verification failed — aborting boot.");
+            g_startESPAfterBoot = NO;
+            g_booting = NO;
+            StopESPSession();
+            return;
+        }
+        L(@"OK Device authorized — %@", MDLicenseGuardStatusSummary());
 
         L(@"RUN 2/6 Cleaning previous runtime state");
         ds_detach();

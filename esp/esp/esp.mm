@@ -4,6 +4,7 @@
 #import "GameOffsets.h"
 #import "../DSMemory.h"
 #import "../../app/KernelBoot.h" // kernelBootLog (diag output to Home log card)
+#import "../../app/sources/MDLicenseGuard.h"
 #import "../../remote/SpringBoardOverlay.h" // SBRemotePushESPFrame (extern "C")
 
 #import "GameLogic.h" 
@@ -3902,6 +3903,11 @@ static inline uint64_t ESPPhaseNowUS(void) {
     // would freeze the SB overlay. The timer itself is the lifecycle.
 
     @autoreleasepool {
+        if (!MDLicenseGuardVerifyRenderTick()) {
+            [self clearAllContent];
+            SBoardStopOverlay();
+            return;
+        }
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame
         static CFTimeInterval lastPrefSync = 0;
         CFTimeInterval now = CACurrentMediaTime();
