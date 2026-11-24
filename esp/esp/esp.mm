@@ -4262,6 +4262,7 @@ static int      s_espCountN = 0;
 // last good value instead of erasing it. Cleared at the match -> lobby edge,
 // which is the only place the identity legitimately belongs to a different
 // player. See the block in the collect loop.
+static uint64_t s_locPawn = 0;
 static uint64_t s_locUid  = 0;
 static int64_t  s_locPid  = 0;
 static int      s_locTeam = 0;
@@ -4526,6 +4527,7 @@ static void EspEmitStatusLine(void) {
             // Same for the cached local identity: it described a player in the
             // match that just ended, and carrying it into the lobby would filter
             // the lobby's first pawns against a stranger's uid and team.
+            s_locPawn = 0;
             s_locUid = 0;
             s_locPid = 0;
             s_locTeam = 0;
@@ -4613,7 +4615,8 @@ static void EspEmitStatusLine(void) {
         // that: a changed matchGame is one flush, and the keys move immediately.
         const bool firstMatch    = (s_lastMatchDiag == 0);
         const bool newMatchGame  = (s_lastMatchGame != 0 && matchGame != s_lastMatchGame);
-        if (firstMatch || newMatchGame) {
+        const bool newMatch      = (s_lastMatchDiag != 0 && match != s_lastMatchDiag);
+        if (firstMatch || newMatchGame || newMatch) {
             DSPageCacheDiag before = ds_page_cache_diag();
             ds_flush_page_cache();
             DSPageCacheDiag after = ds_page_cache_diag();
@@ -4625,6 +4628,13 @@ static void EspEmitStatusLine(void) {
                   (unsigned long long)matchGame,
                   before.liveSlots, before.staleGen, after.liveSlots);
             ds_cache_bump_generation();
+            s_espCountN = 0;
+            s_locPawn = 0;
+            s_locUid = 0;
+            s_locPid = 0;
+            s_locTeam = 0;
+            memset(s_espCountFrame, 0, sizeof(s_espCountFrame));
+            memset(s_espCountBot, 0, sizeof(s_espCountBot));
         }
         s_lastMatchDiag = match;
         s_lastMatchGame = matchGame;
@@ -4639,6 +4649,9 @@ static void EspEmitStatusLine(void) {
     }
 
     uint64_t myPawnObject = getLocalPlayer(match);
+    if (isVaildPtr(myPawnObject)) {
+        s_locPawn = myPawnObject;
+    }
 
     int curHp = isVaildPtr(myPawnObject) ? get_CurHP(myPawnObject) : 0;
     bool iAmAlive = isVaildPtr(myPawnObject) && (curHp >= 0);
@@ -4827,20 +4840,26 @@ static void EspEmitStatusLine(void) {
     // iAmAlive=true → Distance(origin, enemy) ~thousands → all real enemies culled.
     // When iAmAlive=false (HP pool read 0), distance was hard-forced to 10m → ghosts.
     Vector3 myLocation = {0, 0, 0};
-    if (isVaildPtr(myPawnObject)) {
-        uint64_t mainCameraTransform = ReadAddr<uint64_t>(myPawnObject + kMainCameraTransform);
+    Vector3 myBodyHead = {0, 0, 0};
+    Vector3 myBodyRoot = {0, 0, 0};
+    uint64_t myMainCamTf = 0;
+    const uint64_t localRefPawn = isVaildPtr(myPawnObject) ? myPawnObject : s_locPawn;
+    if (isVaildPtr(localRefPawn)) {
+        myBodyHead = getHeadWorld(localRefPawn);
+        myBodyRoot = ReadPlayerRootTransform(localRefPawn);
+        uint64_t mainCameraTransform = ReadAddr<uint64_t>(localRefPawn + kMainCameraTransform);
         if (isVaildPtr(mainCameraTransform)) {
+            myMainCamTf = mainCameraTransform;
             myLocation = getPositionExt(mainCameraTransform);
         }
         if (!looksLikeWorldPos(myLocation)) {
-            myLocation = ReadPlayerRootTransform(myPawnObject);
+            myLocation = myBodyRoot;
         }
         if (!looksLikeWorldPos(myLocation)) {
-            Vector3 lh = tryTransformPos(getHead(myPawnObject));
-            if (looksLikeWorldPos(lh)) myLocation = lh;
+            if (looksLikeWorldPos(myBodyHead)) myLocation = myBodyHead;
         }
         if (!looksLikeWorldPos(myLocation)) {
-            myLocation = ResolvePawnWorldPosAny(myPawnObject);
+            myLocation = ResolvePawnWorldPosAny(localRefPawn);
         }
     }
     const bool haveLocalPos = looksLikeWorldPos(myLocation);
@@ -5102,23 +5121,11 @@ static void EspEmitStatusLine(void) {
         dictWalkSlots++;
 
         uint64_t PawnObject = ReadAddr<uint64_t>(ent + entryValueOff);
-        // Set when the documented value offset did not answer and a pointer came
-        // from the layout-probe list instead. 0x10 and 0x18 sit inside the 0x18-byte
-        // key, so this probe can pick up something that was never a Player. Counted
-        // rather than removed, because it is also the layout tolerance that
-        // kDictEntryValueOffByte exists for, and a count is what tells the two apart.
+        // Never probe 0x10 or 0x18 when entryValueOff (0x20) is null: in
+        // Dictionary<BHGGAEEHJCO, Player>, 0x10 and 0x18 sit inside the 24-byte
+        // key struct, so probing them when value==0 turns key bytes into a
+        // phantom PawnObject that inflates the enemy counter by +1.
         bool pawnFromProbe = false;
-        if (!isVaildPtr(PawnObject)) {
-            const uint64_t vOffs[] = { 0x10, 0x18, 0x20, 0x28 };
-            for (size_t vo = 0; vo < 4; vo++) {
-                uint64_t cand = ReadAddr<uint64_t>(ent + vOffs[vo]);
-                if (isVaildPtr(cand)) {
-                    PawnObject = cand;
-                    pawnFromProbe = true;
-                    break;
-                }
-            }
-        }
         if (!isVaildPtr(PawnObject)) continue;
 
         // isVaildPtr is a range test and nothing else -- not below 0x100000, not
@@ -5183,21 +5190,23 @@ static void EspEmitStatusLine(void) {
         // stop depending on whether the local player happens to be alive.
         // ---------------------------------------------------------------------
         {
-            if (isVaildPtr(myPawnObject)) {
-                const uint64_t liveUid = ReadAddr<uint64_t>(myPawnObject + kUserID);
+            if (isVaildPtr(localRefPawn)) {
+                const uint64_t liveUid = ReadAddr<uint64_t>(localRefPawn + kUserID);
                 if (liveUid) s_locUid = liveUid;
                 const COW_GamePlay_PlayerID_o liveId =
-                    ReadAddr<COW_GamePlay_PlayerID_o>(myPawnObject + kPlayerID);
+                    ReadAddr<COW_GamePlay_PlayerID_o>(localRefPawn + kPlayerID);
                 if (liveId.m_Value) s_locPid = liveId.m_Value;
                 if (liveId.m_TeamID) s_locTeam = liveId.m_TeamID;
             }
 
-            // Self: pointer first, then the two stable identities. Any one of the
-            // three matching is enough -- that is the same rule as
-            // isSamePlayerAsLocal, only fed from values that survive the local
-            // pawn becoming unreadable.
+            // Self: pointer first (live or cached), then camera transform, then stable identities.
+            // Any one matching is enough, and esp_count_drop immediately purges any
+            // 3-frame hold slot if the local pawn slipped through on an earlier frame.
             bool isSelf = false;
-            if (PawnObject == myPawnObject) {
+            if (PawnObject == myPawnObject || (s_locPawn && PawnObject == s_locPawn)) {
+                isSelf = true;
+            } else if (isVaildPtr(myMainCamTf) &&
+                       ReadAddr<uint64_t>(PawnObject + kMainCameraTransform) == myMainCamTf) {
                 isSelf = true;
             } else if (s_locUid) {
                 isSelf = (ReadAddr<uint64_t>(PawnObject + kUserID) == s_locUid);
@@ -5206,7 +5215,7 @@ static void EspEmitStatusLine(void) {
                 isSelf = (ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID).m_Value
                           == s_locPid);
             }
-            if (isSelf) { selfSkipped++; rej.self++; continue; }
+            if (isSelf) { esp_count_drop(PawnObject); selfSkipped++; rej.self++; continue; }
 
             // Teammate. The bot early-out is gone, because it used to
             // answer "enemy" before the team was ever read: a teammate whose
@@ -5246,8 +5255,8 @@ static void EspEmitStatusLine(void) {
             // Unknown team: not counted. The self case, which is the one the
             // original report was about, is decided above from cached identity and
             // does not depend on the team read at all.
-            if (c.team == 0) { s_countTeamUnknown++; rej.team++; continue; }
-            if (s_locTeam && c.team == s_locTeam) continue;
+            if (c.team == 0) { esp_count_drop(PawnObject); s_countTeamUnknown++; rej.team++; continue; }
+            if (s_locTeam && c.team == s_locTeam) { esp_count_drop(PawnObject); continue; }
         }
 
         // HP/knocked EVERY frame (stale cache was the floating "ghost ESP" after kills).
@@ -5391,11 +5400,13 @@ static void EspEmitStatusLine(void) {
                 PosTrack &trLift = g_posTrack[PosTrackSlot(PawnObject)];
                 if (trLift.pawn == PawnObject) trLift.deadUntilFrame = 0;
             } else if (g_cacheFrameCounter < s_deadUntilFrame[deadSlot]) {
+                esp_count_drop(PawnObject);
                 rej.banned++;
                 continue;
             }
         }
         auto markGhostDead = [&](int holdFrames) {
+            esp_count_drop(PawnObject);
             std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
             // Tombstone inside PosTrack by exact pawn (not just the
             // kPawnSlotCount bucket). This prevents the same pawn (or a colliding
@@ -5474,23 +5485,20 @@ static void EspEmitStatusLine(void) {
             }
         }
 
-        // Fallback HP if DataPool reads fail/delay but 3D bones exist. Only for a pawn
-        // that is knocked or otherwise still in the round. A body left in the world
-        // after death keeps readable bones, so inventing 200 HP here is what turned
-        // every kill into a permanent extra box and a permanently higher counter.
-        // A real dead body has HP 0 and must stay 0; the tests below drop it.
-        if (hasLiveBone && !isKnocked) {
-            if (CurHP <= 0 && MaxHP <= 0) {
-                CurHP = 200;
-                MaxHP = 200;
-            } else if (MaxHP <= 0) {
-                MaxHP = 200;
-                if (CurHP <= 0) CurHP = 200;
-            }
+        // Fallback HP if DataPool reads fail/delay (!hpReadOk) but 3D bones exist.
+        // CRITICAL: Never overwrite CurHP with 200 when hpReadOk is true and CurHP <= 0!
+        // When DataPool genuinely read CurHP == 0 (a dead corpse whose bones are still
+        // in the world), inventing 200 HP resurrected the corpse and kept the counter
+        // +1 above the live enemies.
+        if (!hpReadOk && hasLiveBone && !isKnocked) {
+            if (MaxHP <= 0 || MaxHP > 2000) MaxHP = 200;
+            CurHP = MaxHP;
+        } else if (hpReadOk && CurHP > 0 && MaxHP <= 0) {
+            MaxHP = (CurHP <= 2000) ? CurHP : 200;
         }
 
         // Alive/knocked always have MaxHP > 0.
-        const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
+        const bool hpUnreadable = (!hpReadOk && CurHP == 0 && MaxHP == 0);
 
         // HP did not land AND the bones did not land either: this pawn is UNKNOWN,
         // not dead. Tombstoning here is what produced the reported symptom.
@@ -5523,13 +5531,15 @@ static void EspEmitStatusLine(void) {
         // knocked test: a knocked player is alive on HP 0 and must survive, a body
         // on HP 0 must not. Checking knocked first is the whole point, the other way
         // round the knocked players disappear instead of the dead ones.
-        const bool fullyDead = (!isKnocked && CurHP <= 0 && !hpUnreadable);
+        const bool fullyDead = (!isKnocked && CurHP <= 0 && (hpReadOk || !hpUnreadable));
         if (fullyDead) {
+            esp_count_drop(PawnObject);
             markGhostDead(120); // longer hold for death
             rej.dead++;
             continue;
         }
         if (!hasLiveBone && (hpGarbage || hpUnreadable || MaxHP <= 0)) {
+            esp_count_drop(PawnObject);
             markGhostDead((hpUnreadable || MaxHP <= 0) ? 120 : 45);
             rej.hpBad++;
             continue;
@@ -5539,6 +5549,7 @@ static void EspEmitStatusLine(void) {
             uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
             COW_GamePlay_PlayerID_o pid = ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID);
             if (uid == 0 && pid.m_Value == 0 && pid.m_ID == 0 && !isBot && !hasLiveBone) {
+                esp_count_drop(PawnObject);
                 markGhostDead(90);
                 rej.noUid++;
                 continue;
@@ -5551,6 +5562,20 @@ static void EspEmitStatusLine(void) {
         // ESP MUST use the SAME head aim uses when possible.
         // ---------------------------------------------------------------------
         Vector3 liveRoot = ReadPlayerRootTransform(PawnObject);
+
+        // Local player 3D body position match: in TPP, myLocation is the camera (~2.5m
+        // behind the body), whereas myBodyHead / myBodyRoot are the local character's
+        // actual head and root bones. If a dict entry's head or root sits on top of
+        // the local character's own head or root (< 0.45m), it is the local player.
+        if ((looksLikeWorldPos(myBodyHead) && looksLikeWorldPos(liveHead) &&
+             Vector3::Distance(myBodyHead, liveHead) < 0.45f) ||
+            (looksLikeWorldPos(myBodyRoot) && looksLikeWorldPos(liveRoot) &&
+             Vector3::Distance(myBodyRoot, liveRoot) < 0.45f)) {
+            esp_count_drop(PawnObject);
+            selfSkipped++;
+            rej.self++;
+            continue;
+        }
 
         Vector3 mountPos{};
         const bool enemyMounted = IsActivelyMounted(PawnObject, &mountPos);
@@ -5791,9 +5816,11 @@ static void EspEmitStatusLine(void) {
             ? Vector3::Distance(myLocation, headBonePos)
             : 0.0f;
         // On vehicle distance can be noisy; only skip clearly insane ranges.
-        // Min-distance cull skipped for vehicle/collapsed (passenger next to you).
-        if (useLocalDistance && tempDisForAim > maxPossibleDistance) { rej.far++; continue; }
-        if (useLocalDistance && !treatAsVehicle && tempDisForAim < 0.35f) { rej.near++; continue; }
+        // Min-distance cull unified to 1.0f to match ESPRenderPawnCore's dis < 1.0f
+        // rejection in espdraw.mm:321 so a pawn at 0.35m..0.99m is never counted
+        // without a box being drawn.
+        if (useLocalDistance && tempDisForAim > maxPossibleDistance) { esp_count_drop(PawnObject); rej.far++; continue; }
+        if (useLocalDistance && !treatAsVehicle && tempDisForAim < 1.0f) { esp_count_drop(PawnObject); rej.near++; continue; }
 
         // Aimbot + Aim Assist + Silent all honor AimPos (Head/Neck/Chest-Body).
         // Prefer GetAimTargetPosMode / ResolveSilentAimWorldPos (live).
@@ -5842,7 +5869,7 @@ static void EspEmitStatusLine(void) {
         }
 
         // Belt-and-suspenders: never emit a dead shell into the snapshot (CurHP<=0 is terminal).
-        if (CurHP <= 0) { rej.hpZero++; continue; }
+        if (CurHP <= 0) { esp_count_drop(PawnObject); rej.hpZero++; continue; }
 
         // The tally used to be recorded here, on wantDraw alone. It cannot be:
         // this pass runs before the view matrix is sampled (it is sampled at
@@ -6372,7 +6399,10 @@ static void EspEmitStatusLine(void) {
             // the honest answer -- the information the check needs is not there. The
             // same zero also counted as off-screen (0 < espDistanceLimit) and
             // collapsed distanceNorm in the aim score.
-            if (!useLocalDistance) continue;
+            if (!useLocalDistance || s.dis < 1.0f || s.dis > 400.0f) {
+                esp_count_drop(s.pawn);
+                continue;
+            }
             // CurHP<=0 is terminal; ignore lagged isKnocked (corpse/transition ghost).
             if (s.curHP <= 0) {
                 // Unreachable in practice: the collect pass drops CurHP <= 0
