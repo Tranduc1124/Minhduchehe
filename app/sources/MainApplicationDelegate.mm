@@ -10,7 +10,6 @@
 #import "KeepAlive.h"
 #import "HUDHelper.h"
 #import "SpringBoardOverlay.h"
-#import "MDLicenseGuard.h"
 #import "../KernelBoot.h"
 
 // The custom accent picker is gone, but an install that used it has
@@ -45,18 +44,9 @@ static void MDResetAccentPrefs(void) {
     }
 }
 
-- (UIViewController *)buildLockedGateRootController {
-    UIViewController *gateRoot = [[UIViewController alloc] init];
-    gateRoot.view.backgroundColor = MDThemeBg();
-    return gateRoot;
-}
-
 /// Builds the tab bar UI. Only installed as the window root once the license
 /// gate authorizes, so an unlicensed run never reaches the product.
 - (UITabBarController *)buildMainTabController {
-    if (!MDLicenseGuardVerifyLive("build_main_tab")) {
-        return nil;
-    }
     GameViewController *gameVC = [[GameViewController alloc] init];
     LogViewController *logVC = [[LogViewController alloc] init];
     SettingsViewController *settingsVC = [[SettingsViewController alloc] init];
@@ -126,60 +116,29 @@ static void MDResetAccentPrefs(void) {
                                                  name:MDThemeDidChangeNotification
                                                object:nil];
 
-    // Install an empty locked placeholder root controller first. The main tab
-    // bar and AutoBootOnLaunch are never constructed or mounted until the
-    // Tserver ES256 signed lease is verified by MDLicenseGuardBootstrap.
-    self.window.rootViewController = [self buildLockedGateRootController];
+    _tabController = [self buildMainTabController];
+    MDThemeApplyToTabBar(_tabController.tabBar);
+    self.window.rootViewController = _tabController;
     [self.window makeKeyAndVisible];
 
-    __weak __typeof(self) weakSelf = self;
-    MDLicenseGuardBootstrap(^{
-        __strong __typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        if (!MDLicenseGuardVerifyLive("launch_authorized_cb")) return;
-
-        if (!strongSelf->_tabController) {
-            UITabBarController *tab = [strongSelf buildMainTabController];
-            if (!tab) return;
-            strongSelf->_tabController = tab;
-            MDThemeApplyToTabBar(strongSelf->_tabController.tabBar);
-            strongSelf.window.rootViewController = strongSelf->_tabController;
-        }
-
-        [MDLog appendLine:[NSString stringWithFormat:@"OK %@", MDLicenseGuardStatusSummary()]];
-        if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
-            [MDLog appendLine:@"RUN Preparing the exploit at launch."];
-            kernelBootStartKernelOnly();
-        }
-    }, ^(NSString *reason) {
-        __strong __typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        StopESPSession();
-        if (strongSelf->_tabController) {
-            strongSelf->_tabController = nil;
-            strongSelf.window.rootViewController = [strongSelf buildLockedGateRootController];
-        }
-    });
-
+    if (ESPPrefsBool(@"AutoBootOnLaunch", NO)) {
+        [MDLog appendLine:@"RUN Preparing the exploit at launch."];
+        kernelBootStartKernelOnly();
+    }
     return YES;
 }
 
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey,id> *)options {
     (void)app;
+    (void)url;
     (void)options;
-    return MDLicenseGuardHandleOpenURL(url);
+    return NO;
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     // KeepAlive must survive audio interruptions / media-server resets.
     [[KeepAlive shared] start];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->_tabController && !MDLicenseGuardVerifyLive("app_become_active")) {
-            StopESPSession();
-            self->_tabController = nil;
-            self.window.rootViewController = [self buildLockedGateRootController];
-            return;
-        }
         ESPPrefsSync();
         MDThemeLoadFromPrefs();
         if (self->_tabController) MDThemeApplyToTabBar(self->_tabController.tabBar);
@@ -197,11 +156,8 @@ static void MDResetAccentPrefs(void) {
     // (hacking usecount back) triggers sodealloc on the corrupted
     // socket → kernel panic → device respring. The leak IS the fix.
     //
-    // Stop the local ESP host timer first so no new frame publish is queued,
-    // then hide the SB overlay and cleanly pthread_exit the synthetic call
-    // thread in SpringBoard before the kernel tears down our IPC space.
-    StopESPSession();
-    SBoardTeardownOverlayForExit();
+    // Hide SB overlay so a killed app does not leave a ghost DrawView.
+    SBoardStopOverlay();
 }
 
 @end

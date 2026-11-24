@@ -412,27 +412,13 @@ int get_MaxHP(uint64_t Player) {
 }
 
 void EnableFastReload(uint64_t localPlayerPawn, bool isEnabled, float speedMult) {
-    static bool s_fastReloadWasEnabled = false;
-    static uint64_t s_fastReloadLastAttrs = 0;
-    if (!isEnabled && !s_fastReloadWasEnabled) return;
     if (!isVaildPtr(localPlayerPawn)) return;
     // PlayerAttributes: FF 0x700 / MAX 0x708 (kPlayerAttributes)
     uint64_t attrsOff = kPlayerAttributes ? kPlayerAttributes : 0x700;
     uint64_t attrs = ReadAddr<uint64_t>(localPlayerPawn + attrsOff);
     if (!isVaildPtr(attrs)) return;
-    if (!isEnabled) {
-        if (s_fastReloadWasEnabled && attrs == s_fastReloadLastAttrs) {
-            WriteAddr<bool>(attrs + 0xD8, false);
-            WriteAddr<bool>(attrs + 0xD9, false);
-        }
-        s_fastReloadWasEnabled = false;
-        s_fastReloadLastAttrs = 0;
-        return;
-    }
-    WriteAddr<bool>(attrs + 0xD8, true); // ReloadNoConsumeAmmoclip
-    WriteAddr<bool>(attrs + 0xD9, true); // ShootNoReload
-    s_fastReloadWasEnabled = true;
-    s_fastReloadLastAttrs = attrs;
+    WriteAddr<bool>(attrs + 0xD8, isEnabled); // ReloadNoConsumeAmmoclip
+    WriteAddr<bool>(attrs + 0xD9, isEnabled); // ShootNoReload
     (void)speedMult;
 }
 

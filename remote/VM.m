@@ -91,13 +91,11 @@ void vm_entry_get_range(uint64_t vm_entry_ptr, uint64_t *start_address_out, uint
 
 void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop))
 {
-    if (!vm_map_ptr || !is_kaddr_valid(vm_map_ptr + off_vm_map_hdr)) return;
     uint64_t header = vm_map_get_header(vm_map_ptr);
     uint64_t entry = vm_map_header_get_first_entry(header);
     uint64_t numEntries = vm_header_get_nentries(header);
-    if (numEntries > 100000) return;
 
-    while (entry != 0 && is_kaddr_valid(entry + 0x10) && numEntries > 0) {
+    while (entry != 0 && numEntries > 0) {
         uint64_t start = 0, end = 0;
         vm_entry_get_range(entry, &start, &end);
 
