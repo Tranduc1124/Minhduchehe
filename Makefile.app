@@ -41,7 +41,7 @@ $(APPLICATION_NAME)_FILES += XPF/external/ChOma/src/arm64.c XPF/external/ChOma/s
 
 # --- Flags ---
 $(APPLICATION_NAME)_CFLAGS += -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -Wno-unused-value -Wno-module-import-in-extern-c -Wno-unknown-warning-option -Wno-unguarded-availability-new -Wno-return-type -Wno-macro-redefined -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types -Wno-format -Wno-unused-but-set-variable -Wno-delete-incomplete
-$(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany -Ivendor
+$(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany -Ivendor -Ivendor/APIClient
 $(APPLICATION_NAME)_CFLAGS += -Iesp -Iesp/esp -Iesp/esp/espdraw
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD) -I$(PWD)/remote -I$(PWD)/XPF/src -I$(PWD)/XPF/external/ChOma/include
 UNAME_S := $(shell uname -s)
@@ -56,9 +56,10 @@ $(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/com.gare
 $(APPLICATION_NAME)_CCFLAGS += -std=c++17
 $(APPLICATION_NAME)_OBJCFLAGS += -fobjc-arc
 
-$(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIKit CoreText AVFoundation AVKit CoreMedia CFNetwork Security SystemConfiguration MobileCoreServices UniformTypeIdentifiers SafariServices
+$(APPLICATION_NAME)_FRAMEWORKS += Foundation CoreGraphics CoreServices QuartzCore IOKit UIKit CoreText AVFoundation AVKit CoreMedia CFNetwork Security SystemConfiguration MobileCoreServices UniformTypeIdentifiers SafariServices
 $(APPLICATION_NAME)_PRIVATE_FRAMEWORKS += BackBoardServices GraphicsServices SpringBoardServices IOSurface
 $(APPLICATION_NAME)_LIBRARIES += z compression
+$(APPLICATION_NAME)_LDFLAGS += -L$(PWD)/vendor/APIClient -lAPIClient -ObjC
 
 $(APPLICATION_NAME)_CODESIGN_FLAGS += -Sapp/layout/entitlements.plist
 $(APPLICATION_NAME)_RESOURCE_DIRS = ./app/layout/Resources ./app/Font

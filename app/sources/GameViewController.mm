@@ -5,6 +5,7 @@
 #import "MDUI.h"
 #import "MDTheme.h"
 #import "HUDHelper.h"
+#import "MDLicenseGuard.h"
 #import "ESPPrefs.h"
 #import "GameOffsets.h"
 #import "roothide/varCleanController.h"
@@ -128,7 +129,8 @@
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSString *text = nil;
     if (section == 0) {
-        text = @"Keeps the ESP session alive while you play.";
+        text = [NSString stringWithFormat:@"Keeps the ESP session alive while you play.\n%@",
+                MDLicenseGuardStatusSummary()];
     } else {
         text = @"Starts a new ESP session.";
     }
@@ -274,7 +276,13 @@
         [self stopSession];
         return;
     }
-    [self presentBootLogAndStart];
+    __weak __typeof(self) weakSelf = self;
+    BOOL allowed = MDLicenseGuardPerformProtected("game_action_tapped", ^{
+        [weakSelf presentBootLogAndStart];
+    });
+    if (!allowed) {
+        [self stopSession];
+    }
 }
 
 // Stopping is a kill, so there is nothing to confirm on this row: the Game
@@ -326,6 +334,12 @@ static NSString *const kMDGameSessionKey = @"App_LocalHUDState";
 }
 
 - (void)startHUDForRequest:(NSInteger)requestSerial {
+    if (!MDLicenseGuardVerifyLive("start_hud_request")) {
+        _pendingHUDEnableUntil = 0;
+        [MDLog appendLine:@"ERR License not authorized — session blocked."];
+        [self stopSession];
+        return;
+    }
     // How long the row stays on "Starting…". A full boot is the exploit, which
     // either works in a second or does not work at all. Starting from
     // kernel-ready is only the SpringBoard overlay, and boot_start_sb_overlay

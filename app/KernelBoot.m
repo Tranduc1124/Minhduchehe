@@ -17,6 +17,7 @@
 #import "../remote/SpringBoardOverlay.h"
 #import "../remote/RemoteCall.h"
 #import "KeepAlive.h"
+#import "sources/MDLicenseGuard.h"
 #import "../esp/esp/ESPPrefs.h"
 
 // From app/sources/HUDHelper.mm. Declared here rather than included so the boot
@@ -54,9 +55,9 @@ static void boot_start_esp_host(void) {
 
 static void boot_start_sb_overlay(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static const int delays[] = {0, 2, 3, 4};
+        static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s, 5s, 8s, 12s
         for (int attempt = 0; attempt < 4; attempt++) {
-            if (delays[attempt] > 0) sleep(delays[attempt]);
+            sleep(delays[attempt]);
             int sbret = SBoardStartOverlay();
             if (sbret == 0) {
                 NSLog(@"[BOOT] SpringBoard overlay OK attempt %d", attempt + 1);
@@ -77,7 +78,21 @@ static void boot_start_sb_overlay(void) {
 }
 
 static void kernelBootStartEx(BOOL kernelOnly) {
+    if (!MDLicenseGuardVerifyLive(kernelOnly ? "kernel_boot_only_entry" : "kernel_boot_full_entry")) {
+        L(@"ERR License verification failed — refusing kernel boot.");
+        StopESPSession();
+        return;
+    }
     if (g_booting) {
+        // The launch-time boot is already on the queue. Returning here used to
+        // drop the tap on the floor, and the caller had already recorded the
+        // session as running before it got here -- markSessionRunning:YES and
+        // SetHUDEnabled(YES) both run ahead of this call. So the Game tab went
+        // to "Active" with nothing drawing and nothing queued to draw it.
+        //
+        // Arm the request instead. Whoever owns the queue reads it at the
+        // kernel-only exit, and a plain boot needs no handling because it is
+        // already going to run stages 5 and 6.
         if (!kernelOnly) {
             g_startESPAfterBoot = YES;
             L(@"WAIT Boot already running — the overlay and ESP start when it finishes.");
@@ -87,11 +102,11 @@ static void kernelBootStartEx(BOOL kernelOnly) {
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
         [[KeepAlive shared] start];
+        // A kernel-only boot after the fact must not drag the overlay back up.
         if (kernelOnly) {
             L(@"OK Kernel already ready — nothing else to do.");
             return;
         }
-        ds_detach();
         boot_start_sb_overlay();
         boot_start_esp_host();
         return;
@@ -104,7 +119,18 @@ static void kernelBootStartEx(BOOL kernelOnly) {
 
     dispatch_async(g_bootQueue, ^{
         L(@"RUN 1/6 Authorizing protected ESP access");
-        L(@"OK Device authorized — no key required.");
+        __block BOOL stage1Authorized = NO;
+        BOOL gateOK = MDLicenseGuardPerformProtected("kernel_stage1_auth", ^{
+            stage1Authorized = YES;
+        });
+        if (!gateOK || !stage1Authorized) {
+            L(@"ERR 1/6 License verification failed — aborting boot.");
+            g_startESPAfterBoot = NO;
+            g_booting = NO;
+            StopESPSession();
+            return;
+        }
+        L(@"OK Device authorized — %@", MDLicenseGuardStatusSummary());
 
         L(@"RUN 2/6 Cleaning previous runtime state");
         ds_detach();

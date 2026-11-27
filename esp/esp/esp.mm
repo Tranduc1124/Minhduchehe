@@ -4,6 +4,7 @@
 #import "GameOffsets.h"
 #import "../DSMemory.h"
 #import "../../app/KernelBoot.h" // kernelBootLog (diag output to Home log card)
+#import "../../app/sources/MDLicenseGuard.h"
 #import "../../remote/SpringBoardOverlay.h" // SBRemotePushESPFrame (extern "C")
 
 #import "GameLogic.h" 
@@ -1008,12 +1009,35 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
     const SilentAimDirection::Point targetPt{targetPos.x, targetPos.y, targetPos.z};
     if (!SilentAimDirection::Finite(targetPt)) return false;
 
+    // CRITICAL (FreeFireVN-2026-11-27-213143.ips proof):
+    // In a genuine live CGKJLKPMGDJ object:
+    //  1) +0x4C (InfoOrigin) is populated by the game with the muzzle/camera 3D world
+    //     origin near the local player (within 25m of fromFallback). Never substitute
+    //     g_silentLastLiveOrigin or fromFallback when +0x4C is zero/invalid!
+    //  2) +0x40 (InfoDirection) is populated by the game with a normalized 3D unit
+    //     direction vector (|curDir|^2 in [0.85, 1.15]). If aimingInfo was freed/recycled
+    //     by Boehm GC into another managed object or points to a non-CGKJLKPMGDJ object
+    //     whose +0x40 is a 64-bit managed pointer (nullptr 0x0 or 0x00000001xxxxxxxx),
+    //     |curDir|^2 is 0.0f or ~1e14f and +0x4C is not near fromFallback. Refusing
+    //     those objects prevents writing dir.x|dir.y (e.g. 0x3c14e69d3f751eee) into a
+    //     GC-scanned pointer slot at +0x40.
     Vector3 startPos = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
-    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
-        startPos = g_silentLastLiveOrigin;
-    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
-        startPos = fromFallback;
-    if (IsZeroVec(startPos) || !looksLikeWorldPos(startPos)) return false;
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}) ||
+        !looksLikeWorldPos(startPos)) {
+        return false;
+    }
+    if (looksLikeWorldPos(fromFallback) && Vector3::Distance(startPos, fromFallback) > 25.0f) {
+        return false;
+    }
+
+    Vector3 curDir = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection);
+    if (!SilentAimDirection::Finite({curDir.x, curDir.y, curDir.z})) {
+        return false;
+    }
+    const float curDirLenSq = curDir.x * curDir.x + curDir.y * curDir.y + curDir.z * curDir.z;
+    if (!std::isfinite(curDirLenSq) || curDirLenSq < 0.85f || curDirLenSq > 1.15f) {
+        return false;
+    }
 
     SilentAimDirection::Point originPt{startPos.x, startPos.y, startPos.z};
     SilentAimDirection::Point desired{};
@@ -1021,25 +1045,22 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
     g_silentLastLiveOrigin = startPos;
 
     Vector3 dir(desired.x, desired.y, desired.z);
-    // CRITICAL (FF 1.134.1 crash log proof: FreeFireVN-2026-11-27-195108.ips & 195558.ips):
-    // NEVER write targetPos (12 bytes) to aimingInfo + 0x28 (kGmpHitPointOff)!
-    // Writing 12 bytes at +0x28..+0x33 writes targetPos.z (e.g. 0x43ced4be = 413.66f,
-    // 0xc378eb0f = -248.92f) into the lower 32 bits of the 64-bit managed pointer at
-    // CGKJLKPMGDJ + 0x30, causing Unity's AssetGarbageCollectorHelper thread to crash with
-    // SIGSEGV at 0x0000000043ced4be / 0x00000000c378eb0f during match-end GC!
-    // MINDOKERNEL ONLY writes InfoDirection (+0x40..+0x4B).
+    // Re-check class header before writing to close the GC recycling race window.
+    if (ReadAddr<uint64_t>(aimingInfo) != klass) return false;
     WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
 
     Vector3 start2 = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
     if (!IsZeroVec(start2) && SilentAimDirection::Finite({start2.x, start2.y, start2.z}) &&
-        looksLikeWorldPos(start2)) {
+        looksLikeWorldPos(start2) &&
+        (!looksLikeWorldPos(fromFallback) || Vector3::Distance(start2, fromFallback) <= 25.0f)) {
         g_silentLastLiveOrigin = start2;
         if (fabsf(start2.x - startPos.x) > 0.0005f ||
             fabsf(start2.y - startPos.y) > 0.0005f ||
             fabsf(start2.z - startPos.z) > 0.0005f) {
             SilentAimDirection::Point origin2Pt{start2.x, start2.y, start2.z};
             SilentAimDirection::Point desired2{};
-            if (SilentAimDirection::Toward(origin2Pt, targetPt, desired2)) {
+            if (SilentAimDirection::Toward(origin2Pt, targetPt, desired2) &&
+                ReadAddr<uint64_t>(aimingInfo) == klass) {
                 dir = Vector3(desired2.x, desired2.y, desired2.z);
                 WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
             }
@@ -3903,6 +3924,10 @@ static inline uint64_t ESPPhaseNowUS(void) {
     // would freeze the SB overlay. The timer itself is the lifecycle.
 
     @autoreleasepool {
+        if (!MDLicenseGuardVerifyRenderTick()) {
+            [self clearAllContent];
+            return;
+        }
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame
         static CFTimeInterval lastPrefSync = 0;
         CFTimeInterval now = CACurrentMediaTime();
