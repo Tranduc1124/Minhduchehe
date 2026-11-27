@@ -172,33 +172,11 @@ uint64_t getTransNode(uint64_t BodyPart) {
 static uint64_t getBoneTrans(uint64_t player, uintptr_t nodeOffset, Vector3 *outPos) {
     if (outPos) *outPos = Vector3{0, 0, 0};
     if (!isVaildPtr((uintptr_t)player)) return 0;
-    uint64_t node = ReadAddr<uint64_t>(player + nodeOffset);
+    uint64_t BodyPart = ReadAddr<uint64_t>(player + nodeOffset);
+    if (!isVaildPtr((uintptr_t)BodyPart)) return 0;
+    uint64_t node = getTransNode(BodyPart); // BodyPart + kBodyPartTransNode (+0x10)
     if (!isVaildPtr((uintptr_t)node)) return 0;
-
-    Vector3 direct = getPositionExt(node);
-    if (!(direct.x == 0.0f && direct.y == 0.0f && direct.z == 0.0f)) {
-        if (outPos) *outPos = direct;
-        return node;
-    }
-
-    uint64_t inner = getTransNode(node); // node + 0x10
-    if (isVaildPtr((uintptr_t)inner)) {
-        Vector3 via = getPositionExt(inner);
-        if (!(via.x == 0.0f && via.y == 0.0f && via.z == 0.0f)) {
-            if (outPos) *outPos = via;
-            return inner;
-        }
-        // Some wrappers nest one more level.
-        uint64_t inner2 = getTransNode(inner);
-        if (isVaildPtr((uintptr_t)inner2)) {
-            Vector3 via2 = getPositionExt(inner2);
-            if (!(via2.x == 0.0f && via2.y == 0.0f && via2.z == 0.0f)) {
-                if (outPos) *outPos = via2;
-                return inner2;
-            }
-        }
-        return inner;
-    }
+    if (outPos) *outPos = getPositionExt(node);
     return node;
 }
 
@@ -308,61 +286,19 @@ bool isSamePlayerAsLocal(uint64_t localPlayer, uint64_t player) {
 // So a pawn whose HP page could not be mapped looked dead rather than unread, and
 // the death filter wrote a two-second tombstone for it. Reads fail far more often
 // in a crowded match, which is why this showed up only in one mode.
+#include "GamePRI.h"
+
 static bool ReadDataPoolVarOk(uint64_t player, int varID, int *outValue) {
     if (outValue) *outValue = 0;
-    if (!isVaildPtr(player) || varID < 0 || varID > 64) return false;
-    const uint64_t poolOff = kDataPool ? kDataPool : 0x70;
-    const uint64_t innerOff = kDataPoolInner ? kDataPoolInner : 0x10;
-    const uint64_t entriesBase = kDataPoolEntriesBase ? kDataPoolEntriesBase : 0x20;
-    const uint64_t stride = kDataPoolEntryStride ? kDataPoolEntryStride : 0x8;
-    const uint64_t valueOff = kDataPoolValue ? kDataPoolValue : 0x18;
-
-    // Player.DataPool may be the pool object, or a one-hop wrapper.
-    uint64_t pools[3] = {
-        ReadAddr<uint64_t>(player + poolOff),
-        0, 0
+    uint16_t u16 = 0;
+    auto read = [](uint64_t addr, void *buf, size_t len) {
+        return _read((long)addr, buf, (int)len);
     };
-    if (isVaildPtr(pools[0])) {
-        pools[1] = ReadAddr<uint64_t>(pools[0] + 0x10);
-        pools[2] = ReadAddr<uint64_t>(pools[0] + 0x18);
-    }
-
-    for (int pi = 0; pi < 3; pi++) {
-        uint64_t pool = pools[pi];
-        if (!isVaildPtr(pool)) continue;
-        const uint64_t innerOffs[] = { innerOff, 0x18, 0x08, 0x00 };
-        for (size_t i = 0; i < sizeof(innerOffs) / sizeof(innerOffs[0]); i++) {
-            uint64_t inner = (innerOffs[i] == 0) ? pool : ReadAddr<uint64_t>(pool + innerOffs[i]);
-            if (!isVaildPtr(inner)) continue;
-            uint64_t entry = ReadAddr<uint64_t>(inner + entriesBase + stride * (uint64_t)varID);
-            if (!isVaildPtr(entry)) continue;
-            // Value may be int32 or uint16 at +0x18 (and rarely +0x10/+0x14).
-            const uint64_t valOffs[] = { valueOff, 0x14, 0x10 };
-            for (size_t v = 0; v < sizeof(valOffs) / sizeof(valOffs[0]); v++) {
-                int32_t i32 = 0;
-                if (!_read((long)(entry + valOffs[v]), &i32, (int)sizeof(i32))) {
-                    continue;   // this offset did not read; try the next candidate
-                }
-                if (varID <= 1) {
-                    // HP / MaxHP: accept uint16 range stored in low word too.
-                    if (i32 >= 0 && i32 <= 2000) {
-                        if (outValue) *outValue = i32;
-                        return true;
-                    }
-                    uint16_t u16 = 0;
-                    if (!_read((long)(entry + valOffs[v]), &u16, (int)sizeof(u16))) continue;
-                    if (u16 > 0 && u16 <= 2000) {
-                        if (outValue) *outValue = (int)u16;
-                        return true;
-                    }
-                } else {
-                    if (outValue) *outValue = i32;
-                    return true;
-                }
-            }
-        }
-    }
-    return false;   // nothing resolved, or nothing read
+    auto valid = [](uint64_t addr) { return isVaildPtr((uintptr_t)addr); };
+    if (!GamePRI::TryUInt16(player, varID, read, valid, u16)) return false;
+    if (varID <= 1 && u16 > 10000) return false;
+    if (outValue) *outValue = (int)u16;
+    return true;
 }
 
 static int ReadDataPoolVar(uint64_t player, int varID) {
@@ -374,11 +310,29 @@ static int ReadDataPoolVar(uint64_t player, int varID) {
 // True only when the HP was actually read. False means "could not tell", which is
 // NOT the same as 0 -- 0 is a legitimate reading for a dead player.
 bool get_CurHPOk(uint64_t player, int *outHp) {
+    int cur = 0, maxHp = 0;
+    auto read = [](uint64_t addr, void *buf, size_t len) {
+        return _read((long)addr, buf, (int)len);
+    };
+    auto valid = [](uint64_t addr) { return isVaildPtr((uintptr_t)addr); };
+    if (GamePRI::SnapshotHP(player, read, valid, cur, maxHp)) {
+        if (outHp) *outHp = cur;
+        return true;
+    }
     return ReadDataPoolVarOk(player, 0, outHp);
 }
 
 bool get_MaxHPOk(uint64_t player, int *outHp) {
-    return ReadDataPoolVarOk(player, 1, outHp);
+    int cur = 0, maxHp = 0;
+    auto read = [](uint64_t addr, void *buf, size_t len) {
+        return _read((long)addr, buf, (int)len);
+    };
+    auto valid = [](uint64_t addr) { return isVaildPtr((uintptr_t)addr); };
+    if (GamePRI::SnapshotHP(player, read, valid, cur, maxHp)) {
+        if (outHp) *outHp = maxHp;
+        return true;
+    }
+    return false;
 }
 
 int GetDataUInt16(uint64_t player, int varID) {
@@ -402,13 +356,8 @@ int get_CurHP(uint64_t Player) {
 }
 
 int get_MaxHP(uint64_t Player) {
-    int maxHp = ReadDataPoolVar(Player, 1);
-    // Some shells expose only CurHP; treat positive CurHP as alive shell.
-    if (maxHp <= 0) {
-        int cur = ReadDataPoolVar(Player, 0);
-        if (cur > 0 && cur <= 2000) return cur;
-    }
-    return maxHp;
+    int maxHp = 0;
+    return get_MaxHPOk(Player, &maxHp) ? maxHp : 0;
 }
 
 void EnableFastReload(uint64_t localPlayerPawn, bool isEnabled, float speedMult) {

@@ -321,16 +321,10 @@ static void ESPRenderPawnCore(
     if (dis > 400.0f || !buffers || !matrix || !PawnObject || dis < 1.0f) return;
     if (headX == 0.0f && headY == 0.0f && headZ == 0.0f) return;
 
-    // MaxHP arrives from the collect loop, which has already read it off the same
-    // DataPool. This used to be a fresh get_MaxHP walk here, so the draw pass paid a
-    // full pool traversal per drawn pawn for a value the caller was holding three
-    // arguments away -- and it is per drawn pawn, so it scaled with exactly the thing
-    // that gets heavier as more visuals are switched on. That is why the full set of
-    // options cost noticeably more than a subset did.
-    //
-    // The range check stays: it now validates a passed value rather than a fresh read,
-    // and a bad MaxHP gives a nonsense health bar either way.
-    if (MaxHP <= 0 || MaxHP > 2000) MaxHP = 200;
+    // MaxHP arrives from the collect loop, which has already validated it via
+    // GamePRI::SnapshotHP (OverlayHealth::Snapshot). If invalid, skip health bar
+    // rather than fabricating MaxHP = 200.
+    const bool validMaxHP = (MaxHP > 0 && MaxHP <= 10000 && CurHP > 0 && CurHP <= MaxHP);
 
     const bool isKnocked = (isKnockedFlag != 0);
     const bool isBot = (isBotFlag != 0);
@@ -379,12 +373,18 @@ static void ESPRenderPawnCore(
     Vector3 w2sHead = WorldToScreenLayer(HeadTop, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
     Vector3 w2sFeet = WorldToScreenLayer(feet,    matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
 
+    // Mizze _0xEDR2862_.mm parity: only draw box/snapline/name/health when head is
+    // actually inside the camera viewport (prevents offscreen snaplines lingering while turning).
+    const Vector3 headScreen = WorldToScreenLayer(HeadPos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
+    const bool headOnScreen = std::isfinite(headScreen.x) && std::isfinite(headScreen.y) &&
+                              headScreen.z > 0.001f &&
+                              headScreen.x >= 0.0f && headScreen.x <= layerWidth &&
+                              headScreen.y >= 0.0f && headScreen.y <= layerHeight;
+    if (!headOnScreen) return;
+
     if (w2sHead.z <= 0.001f || w2sFeet.z <= 0.001f ||
         !std::isfinite(w2sHead.x) || !std::isfinite(w2sHead.y) ||
         !std::isfinite(w2sFeet.x) || !std::isfinite(w2sFeet.y)) return;
-    const float margin = layerWidth * 0.6f;
-    if (w2sHead.x < -margin || w2sHead.x > layerWidth + margin ||
-        w2sHead.y < -margin || w2sHead.y > layerHeight + margin) return;
 
     // ==========================================
     // THUẬT TOÁN BOX SMOOTH (MINDOKERNEL _0xEDR2862_.mm)
@@ -621,17 +621,19 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // THANH MÁU — dọc bên trái khung địch, bản to rõ nét.
+    // THANH MÁU — dọc bên trái khung địch, bản to rõ nét (Mizze _0xEDR2862_.mm).
     // ---------------------------------------------------------
-    if (isHealth) {
-        float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
+    if (isHealth && validMaxHP) {
+        float healthRatio = Clamp01f((float)CurHP / (float)MaxHP);
         const CGFloat barFillH = boxHeight * healthRatio;
         const CGFloat barLeft = x - barGap - barW;
         const CGFloat barTop = y + (boxHeight - barFillH);
 
-        CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                      CGRectMake(barLeft, barTop, barW, barFillH));
-        buffers->hpFillGreenDirty = true;
+        if (barFillH >= 0.5f) {
+            CGPathAddRect(buffers->hpFillGreenPath, NULL,
+                          CGRectMake(barLeft, barTop, barW, barFillH));
+            buffers->hpFillGreenDirty = true;
+        }
     }
 }
 

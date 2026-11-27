@@ -5294,10 +5294,21 @@ static void EspEmitStatusLine(void) {
         // get_IsKnockedDown opens with its own get_CurHP walk, so it used to be a
         // second, discarded walk of the value read two lines below it. Ordering
         // HP first lets the hint carry the same number instead of re-reading it.
-        bool hpReadOk = get_CurHPOk(PawnObject, &c.curHP);
-        const bool maxReadOk = get_MaxHPOk(PawnObject, &c.maxHP);
-        if (!maxReadOk && hpReadOk && c.curHP > 0 && c.curHP <= 2000) {
-            c.maxHP = c.curHP;
+        int snapCurHP = 0, snapMaxHP = 0;
+        const bool hpSnapOk = GamePRI::SnapshotHP(
+            PawnObject,
+            [](uint64_t a, void *p, size_t n) { return _read((long)a, p, (int)n); },
+            [](uint64_t a) { return isVaildPtr(a); },
+            snapCurHP, snapMaxHP);
+        bool hpReadOk = hpSnapOk;
+        bool maxReadOk = hpSnapOk;
+        if (hpSnapOk) {
+            c.curHP = snapCurHP;
+            c.maxHP = snapMaxHP;
+        } else {
+            hpReadOk = get_CurHPOk(PawnObject, &c.curHP);
+            maxReadOk = false;
+            c.maxHP = 0;
         }
         c.isKnocked = get_IsKnockedDown(PawnObject, hpReadOk ? c.curHP : -1);
         c.frame     = g_cacheFrameCounter;
@@ -5461,9 +5472,10 @@ static void EspEmitStatusLine(void) {
         bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
         bool pawnRemembered = false;
 
-        // MINDOKERNEL parity: never invent CurHP=200 when CurHP<=0 (that revived
-        // dead/pool dummy shells in playerDict and caused the +1 enemy count).
-        if (!hpReadOk) {
+        // Mizze-Kernel-iOS-NoKey parity:
+        // 1) Require atomic PRI DataPool SnapshotHP (0 < CurHP <= MaxHP <= 10000);
+        //    never invent MaxHP=200 when MaxHP fails to read.
+        if (!hpReadOk || !maxReadOk || MaxHP <= 0 || MaxHP > 10000) {
             esp_count_drop(PawnObject);
             rej.hpUnread++;
             continue;
@@ -5473,10 +5485,7 @@ static void EspEmitStatusLine(void) {
             rej.dead++;
             continue;
         }
-        if (MaxHP <= 0 || MaxHP > 2000) {
-            MaxHP = (CurHP > 200 && CurHP <= 2000) ? CurHP : 200;
-        }
-        if (CurHP > 2000 || CurHP > MaxHP + 50) {
+        if (CurHP > 10000 || CurHP > MaxHP) {
             markGhostDead(45);
             rej.hpBad++;
             continue;
@@ -5537,18 +5546,26 @@ static void EspEmitStatusLine(void) {
         const bool treatAsVehicle = enemyMounted || haveMountPos;
         (void)bodyCollapsed;
 
-        // No live skeleton AND no mount → despawned ghost (dict still holds pointer).
-        const bool anyLiveAnchor =
-            looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip) ||
-            looksLikeWorldPos(liveRoot) || haveMountPos;
-        if (!anyLiveAnchor) {
-            markGhostDead(60);
+        // 2) Mizze AvatarVisibility::IsVisible (UmaAvatarSimple + 0x101 == 1):
+        //    Verifies the player's 3D character avatar actually exists and is active
+        //    in the scene (eliminating unspawned pool dummies, dead corpses, and
+        //    spectator clones). Knocked and vehicle-mounted players are also allowed.
+        const uint64_t avatarMgrOff = (uint64_t)(kPlayerAttributes ? kPlayerAttributes : 0x768) + 0x8ULL;
+        const bool avatarVis = AvatarVisibility::IsVisible(
+            PawnObject,
+            [](uint64_t a, void *p, size_t n) { return _read((long)a, p, (int)n); },
+            [](uint64_t a) { return isVaildPtr(a); },
+            avatarMgrOff);
+        if (!avatarVis && !isKnocked && !treatAsVehicle) {
+            esp_count_drop(PawnObject);
             rej.noAnchor++;
             continue;
         }
-        // Bones both missing while not mounted → shell / spectator leftover.
-        if (!treatAsVehicle && !looksLikeWorldPos(liveHead) && !looksLikeWorldPos(liveHip) &&
-            !looksLikeWorldPos(liveRoot)) {
+
+        // 3) Mizze _0xE298S9_.mm & _0xEDR2862_.mm parity:
+        //    Require BOTH liveHead AND liveHip to be valid 3D world positions for
+        //    non-mounted players (never synthesize fake head from root or hip).
+        if (!treatAsVehicle && (!looksLikeWorldPos(liveHead) || !looksLikeWorldPos(liveHip))) {
             markGhostDead(60);
             rej.noBone++;
             continue;
@@ -5556,20 +5573,11 @@ static void EspEmitStatusLine(void) {
 
         Vector3 headBonePos{};
         bool headFromLive = false;
-        // 1) Live head first — same as aim path.
         if (looksLikeWorldPos(liveHead)) {
             headBonePos = liveHead;
             headFromLive = true;
         } else if (haveMountPos) {
             headBonePos = mountPos;
-            headFromLive = true;
-        } else if (looksLikeWorldPos(liveRoot)) {
-            headBonePos = liveRoot;
-            headBonePos.y += treatAsVehicle ? 0.95f : 0.85f;
-            headFromLive = true;
-        } else if (looksLikeWorldPos(liveHip)) {
-            headBonePos = liveHip;
-            headBonePos.y += 0.55f;
             headFromLive = true;
         }
         // No ResolveHeadWorldPosTracked fallback here — sticky track invents ghosts.
