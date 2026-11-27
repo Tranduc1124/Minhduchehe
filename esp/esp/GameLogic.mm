@@ -510,28 +510,22 @@ static int32_t g_savedEAimAssistMode = kEAimAssistAllOn;
 static bool g_eAimAssistModeSaved = false;
 static bool g_defaultAADisabled = false;
 
+void ResetGameLogicProcessState(void) {
+    g_aaStaticsSaved = false;
+    g_aaStaticsZeroed = false;
+    g_eAimAssistModeSaved = false;
+    g_defaultAADisabled = false;
+}
+
 void DisableGameDefaultAimAssist(uint64_t localPlayerPawn, bool disable) {
     if (!isVaildPtr(localPlayerPawn)) return;
 
+    // CRITICAL (FF 1.134.1): Never write int32_t to localPlayerPawn + kEAimAssistMode (0x660).
+    // 0x660 was a 1.132.1 Player offset; in 1.134.1 Player fields shifted, so writing int32_t(2)
+    // to localPlayerPawn + 0x660 corrupts the low 32 bits of a Player field/pointer and crashes
+    // FreeFire during match teardown or match entry. Only soft-zero the AimAssist statics.
     if (disable) {
-        // Kill vanilla AA fully while custom aimbot/assist is on (wall ON or OFF):
-        // 1) zero magnet static scales
-        // 2) force EAimAssist AllOff so fire-stick / ADS chest magnet cannot re-pull
-        // Wall-OFF LOS is geometric (cover raycast), NOT AA-list dependent — safe to AllOff.
         SoftZeroAimAssistStrength();
-
-        int32_t cur = ReadAddr<int32_t>(localPlayerPawn + kEAimAssistMode);
-        if (!g_eAimAssistModeSaved) {
-            if (cur == kEAimAssistAllOn || cur == kEAimAssistOffOnSighting || cur == kEAimAssistAllOff) {
-                g_savedEAimAssistMode = cur;
-            } else {
-                g_savedEAimAssistMode = kEAimAssistAllOn;
-            }
-            g_eAimAssistModeSaved = true;
-        }
-        if (cur != kEAimAssistAllOff) {
-            WriteAddr<int32_t>(localPlayerPawn + kEAimAssistMode, kEAimAssistAllOff);
-        }
         g_defaultAADisabled = true;
         return;
     }
@@ -539,15 +533,6 @@ void DisableGameDefaultAimAssist(uint64_t localPlayerPawn, bool disable) {
     // Restore when custom aimbot/assist is fully off.
     if (g_defaultAADisabled || g_aaStaticsZeroed || g_aaStaticsSaved) {
         SoftRestoreAimAssistStrength();
-        if (g_eAimAssistModeSaved) {
-            int32_t restore = g_savedEAimAssistMode;
-            if (restore != kEAimAssistAllOn && restore != kEAimAssistOffOnSighting && restore != kEAimAssistAllOff) {
-                restore = kEAimAssistAllOn;
-            }
-            // Never restore AllOff as "original" when user turned custom aim off.
-            if (restore == kEAimAssistAllOff) restore = kEAimAssistAllOn;
-            WriteAddr<int32_t>(localPlayerPawn + kEAimAssistMode, restore);
-        }
     }
     g_defaultAADisabled = false;
     g_eAimAssistModeSaved = false;

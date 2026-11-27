@@ -1168,7 +1168,7 @@ void ds_begin_read_transaction(void) {
         g_txnFrameStamp++;
         static uint64_t s_lastLivenessCheckMs = 0;
         uint64_t nowMs = ds_now_ms();
-        if (K(g_ff_task) && (nowMs - s_lastLivenessCheckMs >= 500ULL)) {
+        if (K(g_ff_task) && (nowMs - s_lastLivenessCheckMs >= 200ULL)) {
             s_lastLivenessCheckMs = nowMs;
             if (!ds_verify_target_alive_in_kernel()) {
                 NSLog(@"[DS] Target PID %d exited or task/vm_map torn down in kernel — auto-detaching", g_ff_pid);
@@ -1678,6 +1678,7 @@ void ds_detach(void) {
     g_cached_end = 0;
     g_cached_object = 0;
     g_cached_obj_offset = 0;
+    vm_clear_range_cache();
 }
 
 
@@ -1750,6 +1751,7 @@ void ds_flush_page_cache(void) {
     g_cached_end = 0;
     g_cached_object = 0;
     g_cached_obj_offset = 0;
+    vm_clear_range_cache();
 }
 
 // Bumped by the ESP layer the moment the match pointer changes. A new match

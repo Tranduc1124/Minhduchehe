@@ -51,5 +51,6 @@ void EnableFastReload(uint64_t localPlayerPawn, bool isEnabled, float speedMult)
 
 // Kill vanilla game aim-assist (chest magnet) while custom aimbot/assist is active.
 void DisableGameDefaultAimAssist(uint64_t localPlayerPawn, bool disable);
+void ResetGameLogicProcessState(void);
 
 #endif

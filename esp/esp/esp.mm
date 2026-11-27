@@ -155,6 +155,14 @@ static uint64_t gAimLockTarget = 0;
 static int gAimLockLostFrames = 0;
 static int s_lockHoldFrames = 0;
 static uint64_t s_lastAimPawn = 0;
+static uint64_t s_lastLiveMatch = 0;
+static uint64_t s_lastMatchDiag = 0;
+static uint64_t s_lastMatchGame = 0;
+static uint64_t s_locPawn = 0;
+static uint64_t s_locUid  = 0;
+static int64_t  s_locPid  = 0;
+static int      s_locTeam = 0;
+static int      s_espCountN = 0;
 
 // Per-frame visibility health (reset in AimVisFrameBegin).
 static int g_aimVisSampled = 0;      // how many pawns we read flags for
@@ -975,30 +983,11 @@ static inline Vector3 ResolveSilentAimWorldPos(uint64_t pawn, int posMode) {
 }
 
 static inline void ZeroWeaponScatterForAim(uint64_t localPawn) {
-    if (!isVaildPtr(localPawn)) return;
-    // Prefer MINDOKERNEL SilentAimWeapon::OnHand (handles single 0xA0 & dual 0xA8 weapons)
-    uint64_t weapon = SilentAimWeapon::OnHand(
-        localPawn,
-        [](uint64_t a, auto &v) { return SilentReadAny(a, v); },
-        [](uint64_t a) { return isVaildPtr(a); });
-    if (!isVaildPtr(weapon)) {
-        weapon = ReadAddr<uint64_t>(localPawn + kActiveWeapon);
-    }
-    if (!isVaildPtr(weapon)) {
-        uint64_t inv = ReadAddr<uint64_t>(localPawn + kWeaponHolder);
-        if (isVaildPtr(inv)) weapon = ReadAddr<uint64_t>(inv + kHolderActiveWeapon);
-    }
-    if (!isVaildPtr(weapon)) return;
-    uint64_t rep = ReadAddr<uint64_t>(weapon + kWeaponRepItem);
-    if (!isVaildPtr(rep)) return;
-    WriteAddr<float>(rep + 0x194, 0.0f); // ScatterNum
-    WriteAddr<float>(rep + 0x198, 0.0f); // ScatterMax
-    WriteAddr<float>(rep + 0x1E0, 0.0f); // ScatterSpeed
-    WriteAddr<float>(rep + 0x1E4, 0.0f); // ScatterRecoverSpeed
-    WriteAddr<float>(rep + 0x1EC, 0.0f); // ScatterMove
-    WriteAddr<float>(rep + 0x190, 0.0f);
-    WriteAddr<float>(rep + 0x19C, 0.0f);
-    WriteAddr<float>(rep + 0x1E8, 0.0f);
+    // CRITICAL (FF 1.134.1): Never write 32 bytes of 0.0f into *(weapon + kWeaponRepItem)
+    // (0x768 is a stale 1.132.1 offset). Overwriting +0x190..+0x19C and +0x1E0..+0x1EC inside
+    // *(weapon + 0x768) corrupts weapon sub-object pointers and crashes FreeFire on match entry
+    // or match teardown. SilentAim direction rewrite (HandlerInfo +0x40/+0x28) does not use scatter.
+    (void)localPawn;
 }
 
 static Vector3 g_silentLastLiveOrigin{0, 0, 0};
@@ -1010,16 +999,19 @@ static Vector3 g_silentLastLiveOrigin{0, 0, 0};
 static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
                                         const Vector3 &targetPos,
                                         const Vector3 &fromFallback) {
+    (void)fromFallback;
     if (!isVaildPtr(aimingInfo) || IsZeroVec(targetPos)) return false;
     const SilentAimDirection::Point targetPt{targetPos.x, targetPos.y, targetPos.z};
     if (!SilentAimDirection::Finite(targetPt)) return false;
 
+    // MINDOKERNEL requirement: Only write when HandlerInfo + 0x4C (InfoOrigin) has already been
+    // populated by MDPBNKPCGNG with a valid world position. Never write when InfoOrigin is 0/invalid,
+    // which prevents corrupting uninitialized or tearing-down objects at match start/end.
     Vector3 startPos = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
-    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
-        startPos = g_silentLastLiveOrigin;
-    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
-        startPos = fromFallback;
-    if (IsZeroVec(startPos) || !looksLikeWorldPos(startPos)) return false;
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}) ||
+        !looksLikeWorldPos(startPos)) {
+        return false;
+    }
 
     SilentAimDirection::Point originPt{startPos.x, startPos.y, startPos.z};
     SilentAimDirection::Point desired{};
@@ -1031,7 +1023,8 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
     WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
 
     Vector3 start2 = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
-    if (!IsZeroVec(start2) && SilentAimDirection::Finite({start2.x, start2.y, start2.z})) {
+    if (!IsZeroVec(start2) && SilentAimDirection::Finite({start2.x, start2.y, start2.z}) &&
+        looksLikeWorldPos(start2)) {
         g_silentLastLiveOrigin = start2;
         if (fabsf(start2.x - startPos.x) > 0.0005f ||
             fabsf(start2.y - startPos.y) > 0.0005f ||
@@ -1051,9 +1044,11 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (!isVaildPtr(localPawn) || IsZeroVec(targetPos)) return 0;
     int wrote = 0;
 
-    // 1. MINDOKERNEL primary path: resolve active weapon -> WeaponHandler (+0x80, MDPBNKPCGNG)
-    //    -> HandlerInfo (+0x28, CGKJLKPMGDJ). This is the exact CGKJLKPMGDJ object
-    //    MDPBNKPCGNG::CommonFire (virtual slot 17) reads +0x4C (Origin) and +0x40 (Direction) from.
+    // MINDOKERNEL primary path ONLY: resolve active weapon (verified by Il2Cpp class name "Weapon")
+    // -> WeaponHandler (+0x80, MDPBNKPCGNG) -> HandlerInfo (+0x28, CGKJLKPMGDJ).
+    // CRITICAL (FF 1.134.1): Never write to stale 1.132.1 localPawn + 0xDC8 / 0xDD0 (kHitObjectInfo):
+    // in 1.134.1 those Player offsets hold unrelated C# sub-objects whose internal pointers at
+    // +0x28 / +0x40 were overwritten with floats, causing FreeFire to crash on match teardown!
     uint64_t weapon = 0, handler = 0;
     uint64_t handlerInfo = SilentAimWeapon::ResolveHandlerInfo(
         localPawn,
@@ -1064,20 +1059,6 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (isVaildPtr(handlerInfo)) {
         if (SilentWriteAimingDir(handlerInfo, targetPos, fromLoc)) {
             g_lastAimingInfo = handlerInfo;
-            wrote++;
-        }
-    }
-
-    // 2. Also update Player's cached HitObjectInfo slots (0xE50 / 0xE58) when present
-    //    and distinct from handlerInfo.
-    uint64_t offs[2];
-    int n = 0;
-    SilentFillPrimaryOnly(offs, &n);
-    for (int i = 0; i < n; i++) {
-        uint64_t aimingInfo = ReadAddr<uint64_t>(localPawn + offs[i]);
-        if (!isVaildPtr(aimingInfo) || aimingInfo == handlerInfo) continue;
-        if (SilentWriteAimingDir(aimingInfo, targetPos, fromLoc)) {
-            g_lastAimingInfo = aimingInfo;
             wrote++;
         }
     }
@@ -1113,7 +1094,7 @@ static void SilentAimThread(uint64_t localPlayer) {
             if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(lp, enemy)) {
                 SilentAimClearTarget();
                 g_lastAimingInfo = 0;
-                std::this_thread::yield();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
             if (isVaildPtr(enemy)) {
@@ -1128,10 +1109,9 @@ static void SilentAimThread(uint64_t localPlayer) {
             Vector3 fromNow = AimCameraOrigin(lp, fromLoc);
             if (!looksLikeWorldPos(fromNow)) fromNow = fromLoc;
             if (!IsZeroVec(targetPos)) {
-                for (int i = 0; i < 12; i++) {
-                    SilentForcePrimary(lp, fromNow, targetPos);
-                }
+                SilentForcePrimary(lp, fromNow, targetPos);
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
             g_lastAimingInfo = 0;
             // No target: do not spin a full core. The old yield-only loop kept
@@ -1140,7 +1120,6 @@ static void SilentAimThread(uint64_t localPlayer) {
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
             continue;
         }
-        std::this_thread::yield();
     }
 }
 
@@ -4056,6 +4035,7 @@ static inline uint64_t ESPPhaseNowUS(void) {
                     // or draw leftover state from the old game PID.
                     SilentAimStop();
                     AimLockClear();
+                    ResetGameLogicProcessState();
                     gAimLockTarget = 0;
                     gAimLockLostFrames = 0;
                     s_lockHoldFrames = 0;
@@ -4063,8 +4043,18 @@ static inline uint64_t ESPPhaseNowUS(void) {
                     g_target_task = 0;
                     g_rainbowInit = 0;
                     g_rainbowPawn = 0;
+                    g_rainbowOrigNick = 0;
+                    g_rainbowOrigNickDisp = 0;
                     g_gvdPatched = false;
                     g_aaLegitBoostActive = false;
+                    s_lastLiveMatch = 0;
+                    s_lastMatchDiag = 0;
+                    s_lastMatchGame = 0;
+                    s_locPawn = 0;
+                    s_locUid = 0;
+                    s_locPid = 0;
+                    s_locTeam = 0;
+                    s_espCountN = 0;
                     memset(g_playerCache, 0, sizeof(g_playerCache));
                     {
                         std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
@@ -4360,24 +4350,6 @@ static inline uint64_t ESPPhaseNowUS(void) {
 static uint64_t s_espCountKey[192]  = {0};
 static int64_t  s_espCountFrame[192] = {0};
 static uint8_t  s_espCountBot[192]   = {0};
-static int      s_espCountN = 0;
-
-// The local player's identity, cached.
-//
-// "Enemy" is decided by comparing a pawn against these, not against a read of
-// match->localPlayer taken this frame. The report that sent this in: team of 2,
-// both alive, the counter says 3; only I die, it says 4. A counter that moves
-// when the local player dies is counting the local player, because
-// match->localPlayer stops being usable at exactly that moment.
-//
-// A field is only ever written from a non-zero read, so a failed read keeps the
-// last good value instead of erasing it. Cleared at the match -> lobby edge,
-// which is the only place the identity legitimately belongs to a different
-// player. See the block in the collect loop.
-static uint64_t s_locPawn = 0;
-static uint64_t s_locUid  = 0;
-static int64_t  s_locPid  = 0;
-static int      s_locTeam = 0;
 
 // Age an entry out of the count on the spot.
 //
@@ -4595,6 +4567,8 @@ static void EspEmitStatusLine(void) {
     self.alertNumRedLayer.path = nil;
 
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
+        SilentAimClearTarget();
+        AimLockClear();
         DIAG_EARLY(@"no-base");
         return stats;
     }
@@ -4616,17 +4590,15 @@ static void EspEmitStatusLine(void) {
     //
     // Once per transition, never per frame — DSMemory.m records that a per-frame
     // flush caused "Taking non-sleepable RW lock" panics.
-    static uint64_t s_lastLiveMatch = 0;
-    // Declared here rather than inside the flush block below, which runs after
-    // this one and is reset by it when a match ends.
-    static uint64_t s_lastMatchDiag = 0;
-    // The MatchGame pointer, which is what the flush below keys on. `match` is a
-    // recycled address and cannot be; see the block that uses this.
-    static uint64_t s_lastMatchGame = 0;
     {
         const bool live = isVaildPtr(match);
         if (s_lastLiveMatch != 0 && !live) {
             const uint64_t left = s_lastLiveMatch;
+            // Stop SilentAimThread / AimLock FIRST before match teardown and cache flush
+            // so background threads never write into freed pawn/weapon objects at match end!
+            SilentAimClearTarget();
+            AimLockClear();
+            ResetGameLogicProcessState();
             // First, while the mappings are still good: give the game back the
             // string pointers we replaced, so its teardown does not free memory it
             // never allocated. See RainbowNameDetach.
@@ -4648,7 +4620,7 @@ static void EspEmitStatusLine(void) {
             gAimLockTarget = 0;
             gAimLockLostFrames = 0;
             s_lockHoldFrames = 0;
-            AimLockClear();
+            s_lastAimPawn = 0;
             // Reset so the flush on the way into the next match runs again.
             s_lastMatchDiag = 0;
             s_lastMatchGame = 0;
@@ -4667,6 +4639,8 @@ static void EspEmitStatusLine(void) {
     }
 
     if (!isVaildPtr(matchGame)) {
+        SilentAimClearTarget();
+        AimLockClear();
         static int s_lobbyLog = 0;
         if (++s_lobbyLog % 300 == 1) {
             NSLog(@"[ESP] Lobby mode: waiting for match...");
@@ -4676,6 +4650,8 @@ static void EspEmitStatusLine(void) {
     }
 
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
+        SilentAimClearTarget();
+        AimLockClear();
         DIAG_EARLY(@"loading-match");
         return stats;
     }
@@ -4693,41 +4669,12 @@ static void EspEmitStatusLine(void) {
     // pixels every frame because the data behind them is the same freed memory.
     // Report it rather than guess: staleGen > 0 means the cache crossed a match.
     {
-        // s_lastMatchDiag and s_lastMatchGame are declared above, at the match ->
-        // lobby transition, which resets them so this fires again for the next
-        // match.
-        //
-        // The trigger is matchGame, and `match` is the reason it was not before.
-        //
-        // `match` is a recycled address. When a match ends the game frees the
-        // Match object, and the next match's Match can land on the same VA, so
-        // `match` compares equal straight across the boundary and the whole block
-        // is skipped. That is measured, not guessed: the comment this replaces
-        // records that the previous attempt hung the flush off `match` changing
-        // and that "the 19:51 log proved it never fires" -- mt=0x13d66e800 was
-        // constant for the whole window with zero [PUSH-FLUSH] lines.
-        //
-        // A skipped flush is the whole bug. A page slot pins one shmem mapping
-        // made by the kernel remap, and ds_page_local re-serves that slot on a
-        // bare VA match with no re-validation and no age. So every mapping from
-        // the finished match keeps answering with the bytes it was taken with,
-        // the chain reads the lobby's values, getMatchGame returns 0, the lobby
-        // gate below trips, and both this block and the leave-edge detector above
-        // become unreachable. The ESP then never picks the next match up, for the
-        // rest of the session, and carries it into the match after that.
-        //
-        // matchGame is the head of that chain and is re-read every frame from the
-        // statics block, so it is what actually differs across a boundary.
-        //
-        // Once per match, never per frame: both keys are written below every frame
-        // this block is reached at all -- which is only past the lobby gate and the
-        // camera/match check above, so never in a lobby -- and firstMatch goes
-        // false the moment the keys are set. The DSMemory.m:410 note about per-frame
-        // flushes causing RW-lock panics still applies, and this does not become
-        // that: a changed matchGame is one flush, and the keys move immediately.
         const bool firstMatch    = (s_lastMatchDiag == 0);
         const bool newMatchGame  = (s_lastMatchGame != 0 && matchGame != s_lastMatchGame);
         if (firstMatch || newMatchGame) {
+            SilentAimClearTarget();
+            AimLockClear();
+            ResetGameLogicProcessState();
             DSPageCacheDiag before = ds_page_cache_diag();
             ds_flush_page_cache();
             DSPageCacheDiag after = ds_page_cache_diag();
@@ -4766,6 +4713,10 @@ static void EspEmitStatusLine(void) {
 
     int curHp = isVaildPtr(myPawnObject) ? get_CurHP(myPawnObject) : 0;
     bool iAmAlive = isVaildPtr(myPawnObject) && (curHp >= 0);
+    if (!iAmAlive) {
+        SilentAimClearTarget();
+        AimLockClear();
+    }
 
     // Speed — Brutal run scale (slider) + menu Speed.
     // Brutal ON: hold BrutalSpeed (default 0.16). Menu Speed only when Brutal OFF.
@@ -4864,7 +4815,7 @@ static void EspEmitStatusLine(void) {
 
         bool actualFastReload = isFastReload && (fastReloadSpeed > 1.0f);
         EnableFastReload(myPawnObject, actualFastReload, fastReloadSpeed);
-        const bool anyCustomAimOn = (isAimbot || isAimAssist || isAimSilent || isAimLegit);
+        const bool anyCustomAimOn = (isAimbot || isAimAssist || isAimLegit);
         DisableGameDefaultAimAssist(myPawnObject, isKillGameAA && anyCustomAimOn);
 
         // DIAG (once per 5s): confirm the cheat apply-path is actually running.
@@ -7123,8 +7074,7 @@ static void EspEmitStatusLine(void) {
                 g_silentTargetPos = liveBone;
                 g_silentFromLoc = myLocation;
             }
-            // Tăng 160 burst khi firing (trước 120) — viên trúng viên.
-            const int bursts = silentFireWindow ? 160 : 6;
+            const int bursts = silentFireWindow ? 4 : 1;
             for (int burst = 0; burst < bursts; burst++) {
                 if ((burst & 3) == 0) {
                     Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, silentPosMode);

@@ -121,6 +121,14 @@ static VmeRangeCacheSlot s_vmeRangeCache[VME_RANGE_CACHE_SLOTS];
 static uint32_t s_vmeRangeNext = 0;
 static pthread_mutex_t s_vmeRangeLock = PTHREAD_MUTEX_INITIALIZER;
 
+void vm_clear_range_cache(void)
+{
+    pthread_mutex_lock(&s_vmeRangeLock);
+    memset(s_vmeRangeCache, 0, sizeof(s_vmeRangeCache));
+    s_vmeRangeNext = 0;
+    pthread_mutex_unlock(&s_vmeRangeLock);
+}
+
 uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
 {
     if (!vm_map_ptr || !address) return 0;
