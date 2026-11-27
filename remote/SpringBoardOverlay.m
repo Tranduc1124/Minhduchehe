@@ -1651,7 +1651,7 @@ static BOOL sb_ios_render_frame(UIView *espView,
         CGContextSetLineWidth(g_iosCtx, 0.75);
 
         if (geomCount > 0) {
-            CGContextSetRGBStrokeColor(g_iosCtx, 1.0, 1.0, 1.0, 1.0);
+            CGContextSetRGBStrokeColor(g_iosCtx, 0.0, 1.0, 0.0, 1.0);
             CGContextBeginPath(g_iosCtx);
             for (int k = 0; k < geomCount; k++) {
                 CGContextAddPath(g_iosCtx, geomPaths[k]);
@@ -1991,8 +1991,8 @@ int SBoardStartOverlay(void) {
 
     uint64_t clsCol = r_class("UIColor");
     uint64_t clear = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "clearColor", 0,0,0,0) : 0;
-    uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
-    uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
+    uint64_t greenColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "greenColor", 0,0,0,0) : 0;
+    uint64_t greenCGColor = r_is_objc_ptr(greenColor) ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
 
     // Built with four separate CGFloats, which is the call the diagnostic proved
     // carries its arguments: numberWithDouble: on the same path came back
@@ -2206,9 +2206,9 @@ int SBoardStartOverlay(void) {
     // log line that had already been wrong four times. The proof was made and
     // the diagnostic was never taken back down, so the overlay has been drawing
     // green ever since. The requested ESP is monochrome white.
-    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
-    NSLog(@"[SB-COLOR] white=%d cg=%d", (int)r_is_objc_ptr(whiteColor),
-          (int)r_is_objc_ptr(whiteCGColor));
+    if (r_is_objc_ptr(greenCGColor)) r_msg2_main(shape, "setStrokeColor:", greenCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] green=%d cg=%d", (int)r_is_objc_ptr(greenColor),
+          (int)r_is_objc_ptr(greenCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     // 0.75, down from 1.5. At 1.5 the box reads as a thick slab on a phone
     // screen and the horizontal health bar 2.5pt tall disappears into its own
