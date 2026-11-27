@@ -1798,20 +1798,20 @@ bool isStreamerMode = NO;
 
 float espDistanceLimit = 150.0f;
 float boxThick = 1.0f;
-float boxR = 0.0f, boxG = 1.0f, boxB = 0.0f;
+float boxR = 0.0f, boxG = 0.898f, boxB = 1.0f;
 // 0 = Color Picker (custom RGB), 1 = Rainbow cycle
 int boxColorMode = 0;
 float boneThick = 1.2f;
-float boneR = 0.0f, boneG = 1.0f, boneB = 0.0f;
+float boneR = 1.0f, boneG = 1.0f, boneB = 1.0f;
 int boneColorMode = 0;
 float lineThick = 1.0f;
-float lineR = 0.0f, lineG = 1.0f, lineB = 0.0f;
+float lineR = 1.0f, lineG = 1.0f, lineB = 1.0f;
 int lineColorMode = 0;
 float fovThick = 0.6f;
-float fovR = 0.0f, fovG = 1.0f, fovB = 0.0f;
+float fovR = 1.0f, fovG = 1.0f, fovB = 1.0f;
 int fovColorMode = 0;
 float aimAssistThick = 1.5f;
-float aimAssistR = 0.0f, aimAssistG = 1.0f, aimAssistB = 0.0f;
+float aimAssistR = 1.0f, aimAssistG = 0.85f, aimAssistB = 0.0f;
 
 // Rainbow HSV → RGB. phaseOffset staggers Box/Line/FOV so they don't all match.
 static inline void ESPRainbowRGB(float phaseOffset, float *outR, float *outG, float *outB) {
@@ -3744,22 +3744,22 @@ static void ESPDiagHeartbeat(void) {
     
     self.bgFillBlackLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithWhite:0.0f alpha:0.65f] lineWidth:0 zPos:baseZ + 4];
     
-    self.snaplineLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
-    self.boxLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
-    self.boneLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
-    self.snaplineBotLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
-    self.boxBotLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
-    self.boneBotLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
+    self.snaplineLayer = [self buildShapeLayerWithStroke:[UIColor whiteColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
+    self.boxLayer = [self buildShapeLayerWithStroke:[UIColor colorWithRed:0.0f green:229.0f/255.0f blue:1.0f alpha:1.0f] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
+    self.boneLayer = [self buildShapeLayerWithStroke:[UIColor whiteColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
+    self.snaplineBotLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
+    self.boxBotLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
+    self.boneBotLayer = [self buildShapeLayerWithStroke:[UIColor orangeColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2];
     self.snaplineKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 1];
     self.boxKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ + 3];
     self.boneKnockedLayer = [self buildShapeLayerWithStroke:[UIColor redColor] fill:UIColor.clearColor lineWidth:0.7f zPos:baseZ + 2]; 
     
-    self.fovLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ];
-    self.aimAssistLayer = [self buildShapeLayerWithStroke:[UIColor greenColor] fill:UIColor.clearColor lineWidth:1.5f zPos:baseZ + 6];
+    self.fovLayer = [self buildShapeLayerWithStroke:[UIColor whiteColor] fill:UIColor.clearColor lineWidth:0.6f zPos:baseZ];
+    self.aimAssistLayer = [self buildShapeLayerWithStroke:[UIColor yellowColor] fill:UIColor.clearColor lineWidth:1.5f zPos:baseZ + 6];
     
     self.hpFillGreenLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:0.0f green:1.0f blue:0.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5]; 
-    self.hpFillOrangeLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor orangeColor] lineWidth:0 zPos:baseZ + 5];
-    self.hpFillRedLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor redColor] lineWidth:0 zPos:baseZ + 5];
+    self.hpFillOrangeLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:0.0f green:1.0f blue:0.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5];
+    self.hpFillRedLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:0.0f green:1.0f blue:0.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5];
     
     self.alertLayer = [self buildShapeLayerWithStroke:nil fill:[UIColor colorWithRed:103.0f/255.0f green:194.0f/255.0f blue:42.0f/255.0f alpha:1.0f] lineWidth:0 zPos:baseZ + 5]; 
 
@@ -3920,10 +3920,10 @@ static inline uint64_t ESPPhaseNowUS(void) {
         {
             static CFTimeInterval s_lastColorPref = 0;
             static int s_liveBoxMode = 0, s_liveLineMode = 0, s_liveBoneMode = 0, s_liveFovMode = 0;
-            static float s_liveBoxR = 0, s_liveBoxG = 1, s_liveBoxB = 0;
-            static float s_liveLineR = 0, s_liveLineG = 1, s_liveLineB = 0;
-            static float s_liveBoneR = 0, s_liveBoneG = 1, s_liveBoneB = 0;
-            static float s_liveFovR = 0, s_liveFovG = 1, s_liveFovB = 0;
+            static float s_liveBoxR = 0, s_liveBoxG = 0.898f, s_liveBoxB = 1;
+            static float s_liveLineR = 1, s_liveLineG = 1, s_liveLineB = 1;
+            static float s_liveBoneR = 1, s_liveBoneG = 1, s_liveBoneB = 1;
+            static float s_liveFovR = 1, s_liveFovG = 1, s_liveFovB = 1;
             const bool anyRainbow =
                 (boxColorMode == 1) || (lineColorMode == 1) ||
                 (boneColorMode == 1) || (fovColorMode == 1) ||
@@ -3952,10 +3952,10 @@ static inline uint64_t ESPPhaseNowUS(void) {
                 s_liveFovB = ESPPrefsFloat(@"FovColorB", fovB);
             }
 
-            float wantBoxR = 0.0f, wantBoxG = 1.0f, wantBoxB = 0.0f, wantBoxW = 1.0f;
+            float wantBoxR = 1.0f, wantBoxG = 1.0f, wantBoxB = 1.0f, wantBoxW = 1.0f;
             float wantBoneR = s_liveBoneR, wantBoneG = s_liveBoneG, wantBoneB = s_liveBoneB, wantBoneW = boneThick;
-            float wantLineR = 0.0f, wantLineG = 1.0f, wantLineB = 0.0f, wantLineW = 1.0f;
-            float wantFovR = 0.0f, wantFovG = 1.0f, wantFovB = 0.0f, wantFovW = 0.6f;
+            float wantLineR = 1.0f, wantLineG = 1.0f, wantLineB = 1.0f, wantLineW = 1.0f;
+            float wantFovR = 1.0f, wantFovG = 1.0f, wantFovB = 1.0f, wantFovW = 0.6f;
 
             if (!isESP2) {
                 wantBoxR = s_liveBoxR; wantBoxG = s_liveBoxG; wantBoxB = s_liveBoxB; wantBoxW = boxThick;

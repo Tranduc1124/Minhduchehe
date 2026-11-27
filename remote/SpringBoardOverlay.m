@@ -1559,6 +1559,8 @@ static BOOL sb_ios_render_frame(UIView *espView,
     //    compute their union bounding box in landscape coordinates.
     CGPathRef geomPaths[16];
     int geomCount = 0;
+    CGPathRef hpPaths[3];
+    int hpCount = 0;
     CGPathRef nameBgPath = NULL;
     CGPathRef nameTextPath = NULL;
     CGPathRef counterPath = sb_text_glyph_path_for_frame(espView);
@@ -1605,6 +1607,8 @@ static BOOL sb_ios_render_frame(UIView *espView,
                 nameBgPath = p;
             } else if (i == SB_NAME_TEXT_INDEX) {
                 nameTextPath = p;
+            } else if (i >= 9 && i <= 11 && hpCount < 3) {
+                hpPaths[hpCount++] = p;
             } else if (i < 16 && geomCount < 16) {
                 geomPaths[geomCount++] = p;
             }
@@ -1633,8 +1637,9 @@ static BOOL sb_ios_render_frame(UIView *espView,
         return NO;
     }
 
-    // 3. Render paths into the persistent CGBitmapContext matching 52f25c938 visuals:
-    //    - Geometry (boxes, snaplines, 0.75pt HP bars, FOV): stroked white at 0.75pt
+    // 3. Render paths into the persistent CGBitmapContext:
+    //    - Geometry (boxes, snaplines, FOV, line-to-target): stroked white at 0.75pt
+    //    - Health bars (hpFillGreen/Orange/RedLayer, indices 9..11): filled+stroked green (0.0, 1.0, 0.0, 1.0)
     //    - Name plate (alertNumBGLayer): filled dark grey (0.16, 0.16, 0.16, 0.82)
     //    - Name & distance glyphs (nameTextLayer): filled white (1.0, 1.0, 1.0, 1.0)
     //    - Enemy counter digits (statusLayer): filled red (1.0, 0.0, 0.0, 1.0)
@@ -1651,12 +1656,22 @@ static BOOL sb_ios_render_frame(UIView *espView,
         CGContextSetLineWidth(g_iosCtx, 0.75);
 
         if (geomCount > 0) {
-            CGContextSetRGBStrokeColor(g_iosCtx, 0.0, 1.0, 0.0, 1.0);
+            CGContextSetRGBStrokeColor(g_iosCtx, 1.0, 1.0, 1.0, 1.0);
             CGContextBeginPath(g_iosCtx);
             for (int k = 0; k < geomCount; k++) {
                 CGContextAddPath(g_iosCtx, geomPaths[k]);
             }
             CGContextStrokePath(g_iosCtx);
+        }
+
+        if (hpCount > 0) {
+            CGContextSetRGBStrokeColor(g_iosCtx, 0.0, 1.0, 0.0, 1.0);
+            CGContextSetRGBFillColor(g_iosCtx, 0.0, 1.0, 0.0, 1.0);
+            CGContextBeginPath(g_iosCtx);
+            for (int k = 0; k < hpCount; k++) {
+                CGContextAddPath(g_iosCtx, hpPaths[k]);
+            }
+            CGContextDrawPath(g_iosCtx, kCGPathFillStroke);
         }
 
         if (nameBgPath) {
@@ -1991,8 +2006,8 @@ int SBoardStartOverlay(void) {
 
     uint64_t clsCol = r_class("UIColor");
     uint64_t clear = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "clearColor", 0,0,0,0) : 0;
-    uint64_t greenColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "greenColor", 0,0,0,0) : 0;
-    uint64_t greenCGColor = r_is_objc_ptr(greenColor) ? r_msg2_main(greenColor, "CGColor", 0,0,0,0) : 0;
+    uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
+    uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
     // Built with four separate CGFloats, which is the call the diagnostic proved
     // carries its arguments: numberWithDouble: on the same path came back
@@ -2206,9 +2221,9 @@ int SBoardStartOverlay(void) {
     // log line that had already been wrong four times. The proof was made and
     // the diagnostic was never taken back down, so the overlay has been drawing
     // green ever since. The requested ESP is monochrome white.
-    if (r_is_objc_ptr(greenCGColor)) r_msg2_main(shape, "setStrokeColor:", greenCGColor, 0,0,0);
-    NSLog(@"[SB-COLOR] green=%d cg=%d", (int)r_is_objc_ptr(greenColor),
-          (int)r_is_objc_ptr(greenCGColor));
+    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
+    NSLog(@"[SB-COLOR] white=%d cg=%d", (int)r_is_objc_ptr(whiteColor),
+          (int)r_is_objc_ptr(whiteCGColor));
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     // 0.75, down from 1.5. At 1.5 the box reads as a thick slab on a phone
     // screen and the horizontal health bar 2.5pt tall disappears into its own
