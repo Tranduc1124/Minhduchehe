@@ -414,8 +414,9 @@ static void ESPRenderPawnCore(
     // them: the bar itself, and the name plate, which has to sit on exactly the
     // line the bar's top edge is on so the two do not overlap. A literal written
     // twice is a value that gets changed once.
-    const CGFloat barH   = 0.75f;      // bằng nét vẽ, hai cạnh dính khít
-    const CGFloat barGap = 3.0f;       // đáy thanh lên khỏi đỉnh box
+    const CGFloat barW   = fmaxf(2.0f, fminf(4.0f, boxWidth * 0.10f)); // bề dày thanh máu dọc bên trái (cộng nét 0.75pt ~ 2.75..4.75pt)
+    const CGFloat barGap = 2.5f;       // khoảng cách từ mép trái box sang mép phải thanh máu
+    const CGFloat plateGap = 2.0f;     // khoảng cách từ đỉnh box lên đáy card tên
 
     // Chiều dài thanh máu ở đầy máu, và chiều cao cố định của card tên.
     //
@@ -486,7 +487,7 @@ static void ESPRenderPawnCore(
         // top edge of the health bar), so the line touches the name instead of
         // stopping at the box and leaving the plate floating above it. With names
         // off there is no plate and the line goes to the box top, as before.
-        CGPoint lineEnd = CGPointMake(centerX, isName ? (y - barGap - barH) : y);
+        CGPoint lineEnd = CGPointMake(centerX, isName ? (y - plateGap) : y);
 
         if (isKnocked) { ESPAddFanRay(buffers->snaplineKnockedPath, lineStart, lineEnd, &buffers->snaplineKnockedFanStarted); buffers->snaplineKnockedDirty = true; }
         else if (isBot) { ESPAddFanRay(buffers->snaplineBotPath, lineStart, lineEnd, &buffers->snaplineBotFanStarted); buffers->snaplineBotDirty = true; }
@@ -567,7 +568,7 @@ static void ESPRenderPawnCore(
         // the part the bar already occupies, so leaving it clear is not a gap and
         // not an overlap. Both places read the same barGap and barH, so the
         // number cannot drift away from the bar.
-        const CGFloat plateBottom = y - barGap - barH;
+        const CGFloat plateBottom = y - plateGap;
 
         // Width is barFullLen -- the health bar's full length, not its health-
         // scaled fill and not boxWidth -- so the card sits exactly as wide as the
@@ -620,48 +621,16 @@ static void ESPRenderPawnCore(
     }
 
     // ---------------------------------------------------------
-    // THANH MÁU — ngang, trên đỉnh đầu, MỘT thanh mảnh.
-    //
-    // Một hình chữ nhật duy nhất, cao đúng bằng nét vẽ. Cần hiểu vì sao cao
-    // đúng bằng nét: SpringBoard chỉ có nét, không có tô, nên nét 0.75 tô đều
-    // lên cả bốn cạnh của hình chữ nhật. Một hình chữ nhật cao h chắn cạnh
-    // trên che từ -0.375 tới +0.375 và cạnh dưới che từ h-0.375 tới h+0.375,
-    // nên giữa lại hở h-1.5pt. h = 0.75 là giá trị duy nhất hai cạnh chồng
-    // khít và ra một dải đặc, dày 1.5pt. Mọi h lớn hơn đều ra khung rỗng, và
-    // đó là lỗi đo được bằng cách chụp màn hình chứ không phải cảm giác.
-    //
-    // Trước đây ở đây là ba hình chữ nhật 0.75 chồng nhau để dải đặc dày 3pt,
-    // vì lúc đó 1.5pt được cho là quá mảnh để đọc trên một box cao 60px. Người
-    // dùng nói nó to quá và chỉ muốn một thanh ngang. Ba rect đó còn tốn ba
-    // cạnh vẽ cho một dải, tức là nó đậm lên rồi lại nhòe ở giữa, đúng cái
-    // mà câu "to quá" là thanh quay lại đúng một thanh.
-    //
-    // Hình chữ nhật nên decoder ở SpringBoard nhận ra bốn góc và gom vào
-    // CGPathAddRects chung, tức vẫn đúng một lệnh cho toàn bộ thanh máu
-    // trên màn hình, không tăng theo số người.
-    //
-    // barGap là khoảng hở giữa đáy thanh và đỉnh box. Nó là 3 chứ không phải
-    // 1.5: ở 1.5 thì dải đặc dính sát mép trên của box và đọc ra như một
-    // đường viền dày thêm chứ không phải một thanh. Đây là khoảng cách trông
-    // đẹp nhất trong ba giá trị thử; không phải thanh to thêm, chỉ dời lên.
-    //
-    // barW là chiều dài theo lượng máu nên nó thay đổi mỗi khung, và nó là
-    // thứ duy nhất ở đây co lại được: nền xám của tên cố ý dùng barFullLen —
-    // chiều dài ĐẦY của thanh — chứ không dùng barW, để card không co theo
-    // lượng máu. Xem phần NAME PLATE.
+    // THANH MÁU — dọc bên trái khung địch, bản to rõ nét.
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barW = barFullLen * healthRatio;
-        const CGFloat barTop = y - barGap - barH;
-        // The full-length track is centred on the box, and the fill grows from
-        // its left edge. Anchoring the track at the box's left edge put its
-        // centre to the right of the box centre, which is what dragged the name
-        // plate off centre with it.
-        const CGFloat barLeft = centerX - barFullLen * 0.5f;
+        const CGFloat barFillH = boxHeight * healthRatio;
+        const CGFloat barLeft = x - barGap - barW;
+        const CGFloat barTop = y + (boxHeight - barFillH);
 
         CGPathAddRect(buffers->hpFillGreenPath, NULL,
-                      CGRectMake(barLeft, barTop, barW, barH));
+                      CGRectMake(barLeft, barTop, barW, barFillH));
         buffers->hpFillGreenDirty = true;
     }
 }

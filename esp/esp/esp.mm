@@ -6146,12 +6146,10 @@ static void EspEmitStatusLine(void) {
                         bool *hpDirtyFlag = &buffers->hpFillGreenDirty;
                         if (hpPerc <= 0.35f) { currentHpPath = buffers->hpFillRedPath; hpDirtyFlag = &buffers->hpFillRedDirty; }
                         else if (hpPerc <= 0.70f) { currentHpPath = buffers->hpFillOrangePath; hpDirtyFlag = &buffers->hpFillOrangeDirty; }
-                        float hpBarWidth = fmaxf(1.5f, boxWidth * 0.05f);
+                        float hpBarWidth = fmaxf(2.0f, fminf(4.0f, boxWidth * 0.10f));
                         float hpBarHeight = boxHeight * hpPerc;
-                        float hpBarX = boxX + boxWidth;
+                        float hpBarX = boxX - 2.5f - hpBarWidth;
                         float hpBarY = boxY + (boxHeight - hpBarHeight);
-                        CGPathAddRect(buffers->bgFillBlackPath, NULL, CGRectMake(hpBarX, boxY, hpBarWidth, boxHeight));
-                        buffers->bgFillBlackDirty = YES;
                         CGPathAddRect(currentHpPath, NULL, CGRectMake(hpBarX, hpBarY, hpBarWidth, hpBarHeight));
                         *hpDirtyFlag = YES;
                     }
