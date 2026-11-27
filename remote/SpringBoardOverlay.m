@@ -1514,22 +1514,56 @@ static BOOL sb_ensure_setcontents_invocation(void) {
     return YES;
 }
 
+static uint64_t g_iosLockAddr   = 0;
+static uint64_t g_iosUnlockAddr = 0;
+
+static inline void sb_ios_ensure_surface_fns(void) {
+    if (!g_iosLockAddr) {
+        g_iosLockAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "IOSurfaceLock"));
+    }
+    if (!g_iosUnlockAddr) {
+        g_iosUnlockAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock"));
+    }
+}
+
+static bool sb_ios_lock_surface(uint64_t surf) {
+    if (!r_is_objc_ptr(surf)) return false;
+    sb_ios_ensure_surface_fns();
+    if (g_iosLockAddr) {
+        do_remote_call_stable_addr(R_TIMEOUT, g_iosLockAddr, "IOSurfaceLock",
+                                   surf, 0, 0, 0, 0, 0, 0, 0);
+    } else {
+        dlsym_remote_void("IOSurfaceLock", surf, 0, 0, 0, 0, 0, 0, 0);
+    }
+    return remote_call_current_success();
+}
+
+static void sb_ios_unlock_surface(uint64_t surf) {
+    if (!r_is_objc_ptr(surf)) return;
+    sb_ios_ensure_surface_fns();
+    if (g_iosUnlockAddr) {
+        do_remote_call_stable_addr(R_TIMEOUT, g_iosUnlockAddr, "IOSurfaceUnlock",
+                                   surf, 0, 0, 0, 0, 0, 0, 0);
+    } else {
+        dlsym_remote_void("IOSurfaceUnlock", surf, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
 static void sb_invoke_ios_present_cached(int bufIdx) {
     if (bufIdx < 0 || bufIdx > 1) return;
     const uint64_t surf = g_iosSbSurf[bufIdx];
     if (!r_is_objc_ptr(surf) || !r_is_objc_ptr(g_sbShape)) return;
-    // Increment the back-buffer IOSurface kernel modification seed, then swap
-    // shape.contents directly from the front IOSurface to this back IOSurface in
-    // ONE atomic main-thread invocation (never setting contents = nil, so there
-    // is zero blank intermediate commit and zero flicker).
-    dlsym_remote_void("IOSurfaceLock", surf, 0, 0, 0,0,0,0,0);
-    dlsym_remote_void("IOSurfaceUnlock", surf, 0, 0, 0,0,0,0,0);
+    // Unlock after remote_write finishes so the kernel IOSurface seed bumps on
+    // a complete frame, then swap shape.contents synchronously on SB's main
+    // thread (waitUntilDone: YES) so the other buffer is never overwritten while
+    // still active on screen or stacked in RunLoop backlogs.
+    sb_ios_unlock_surface(surf);
     if (!sb_ensure_setcontents_invocation()) {
-        r_msg2_main_async(g_sbShape, "setContents:", surf, 0,0,0);
+        r_msg2_main(g_sbShape, "setContents:", surf, 0, 0, 0);
         return;
     }
     if (g_sbPerformMainSel && g_sbInvokeSel) {
-        r_msg(g_sbSetContentsInv[bufIdx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+        r_msg(g_sbSetContentsInv[bufIdx], g_sbPerformMainSel, g_sbInvokeSel, 0, 1, 0);
     }
 }
 
@@ -2927,13 +2961,18 @@ void SBRemotePushESPFrame(UIView *espView) {
                 if (!remote_call_has_local_state() || !remote_call_current_success()) return;
                 if (!g_iosReady || !g_iosSbBase[bufIdx] || !g_iosLocalBuf) return;
 
+                const bool lockOk = sb_ios_lock_surface(g_iosSbSurf[bufIdx]);
                 const size_t writeLen = dirtyMaxOff - dirtyMinOff;
                 const uint64_t tWrite0 = now_us();
-                const bool wOk = remote_write(g_iosSbBase[bufIdx] + dirtyMinOff,
+                const bool wOk = lockOk && remote_call_current_success() &&
+                                 remote_write(g_iosSbBase[bufIdx] + dirtyMinOff,
                                               (const uint8_t *)g_iosLocalBuf + dirtyMinOff,
                                               writeLen);
                 const uint64_t writeUS = now_us() - tWrite0;
                 if (!wOk || !remote_call_current_success()) {
+                    if (lockOk && remote_call_current_success()) {
+                        sb_ios_unlock_surface(g_iosSbSurf[bufIdx]);
+                    }
                     if (++g_sbConsecFail >= 3) {
                         NSLog(@"[PUSH-DEAD] IOSurface remote_write failed %d times — rebuilding",
                               g_sbConsecFail);

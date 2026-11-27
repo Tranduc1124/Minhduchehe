@@ -5858,14 +5858,7 @@ static void EspEmitStatusLine(void) {
     // truncates the name layers, so only snaplines are shed to keep the publish
     // bounded. Boxes and HP are batched rectangles and always go.
     g_espCrowdNoLines = veryCrowded;
-    // Re-sample matrix once more right before project when many targets — collect
-    // pass can take several ms and cam has already moved (stick-then-snap feel).
-    if (crowded) {
-        float matrixRefresh[16];
-        if (GetViewMatrixInto(camera, matrixRefresh)) {
-            memcpy(matrixData, matrixRefresh, sizeof(matrixData));
-        }
-    }
+    // Use the single Phase-2 matrix sampled at line 5828 across the entire draw pass.
 
     // Draw pass (Lite + Pro) with the fresh matrix.
     for (int si = 0; si < snapN; si++) {

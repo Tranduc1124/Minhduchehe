@@ -91,13 +91,15 @@ uint64_t CameraMain(uint64_t matchgame) {
     return ReadAddr<uint64_t>(CameraControllerManager + kMainCamera);
 }
 
-// Bulk-read 16 floats (64 bytes) so view/proj don't tear across 16 remote reads
-// under lag — torn matrices make ESP boxes "slide with strafe then snap back".
-static void TipaReadMatrix16(uint64_t addr, float *out) {
-    if (!_read((long)addr, out, 16 * (int)sizeof(float))) {
-        for (int i = 0; i < 16; i++)
-            out[i] = ReadAddr<float>(addr + (uint64_t)i * 4u);
+// Atomic bulk read for 16 floats (64 bytes); never tear across 16 scalar
+// reads during fast camera rotation.
+static bool TipaReadMatrix16(uint64_t addr, float *out) {
+    if (!addr || !out) return false;
+    if (!_read((long)addr, out, 16 * (int)sizeof(float))) return false;
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(out[i])) return false;
     }
+    return true;
 }
 
 static void TipaMultiply4x4(const float *P, const float *V, float *out) {
@@ -119,14 +121,28 @@ bool GetViewMatrixInto(uint64_t cameraMain, float *out16) {
         return false;
 
     float V[16], P[16];
-    TipaReadMatrix16(v1 + kViewMatrixOff, V);
-    TipaReadMatrix16(v1 + kProjMatrixOff, P);
+    // V and P are contiguous (0x80 and 0xC0) — read both in one contiguous
+    // snapshot whenever adjacent so V and P cannot skew mid-rotation.
+    if (kProjMatrixOff == kViewMatrixOff + (uint64_t)sizeof(float) * 16u) {
+        float vpRaw[32];
+        if (!_read((long)(v1 + kViewMatrixOff), vpRaw, (int)sizeof(vpRaw)))
+            return false;
+        for (int i = 0; i < 32; i++) {
+            if (!isfinite(vpRaw[i])) return false;
+        }
+        memcpy(V, vpRaw, sizeof(V));
+        memcpy(P, vpRaw + 16, sizeof(P));
+    } else {
+        if (!TipaReadMatrix16(v1 + kViewMatrixOff, V)) return false;
+        if (!TipaReadMatrix16(v1 + kProjMatrixOff, P)) return false;
+    }
     TipaMultiply4x4(P, V, out16);
-    // Reject NaN / zeroed matrix (common mid-teleport or bad ptr).
-    if (isnan(out16[0]) || isnan(out16[15]))
-        return false;
+    // Reject NaN / Inf / zeroed matrix.
     float sumAbs = 0.f;
-    for (int i = 0; i < 16; i++) sumAbs += fabsf(out16[i]);
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(out16[i])) return false;
+        sumAbs += fabsf(out16[i]);
+    }
     if (sumAbs < 1e-4f)
         return false;
     return true;

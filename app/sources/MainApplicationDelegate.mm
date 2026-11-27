@@ -9,6 +9,7 @@
 #import "ESPPrefs.h"
 #import "KeepAlive.h"
 #import "HUDHelper.h"
+#import "DirectOverlay.h"
 #import "SpringBoardOverlay.h"
 #import "MDLicenseGuard.h"
 #import "../KernelBoot.h"
@@ -197,8 +198,12 @@ static void MDResetAccentPrefs(void) {
     // (hacking usecount back) triggers sodealloc on the corrupted
     // socket → kernel panic → device respring. The leak IS the fix.
     //
-    // Hide SB overlay so a killed app does not leave a ghost DrawView.
-    SBoardStopOverlay();
+    // Stop ESP_View's render timer first, then run SBoardTeardownOverlayForExit()
+    // so SpringBoard's synthetic trojan thread executes pthread_exit and both
+    // Mach exception ports are disarmed BEFORE this process exits (preventing
+    // SpringBoard SIGBUS at FAKE_LR_TROJAN 0x401 when XNU closes our ports).
+    StopESPHost();
+    SBoardTeardownOverlayForExit();
 }
 
 @end
