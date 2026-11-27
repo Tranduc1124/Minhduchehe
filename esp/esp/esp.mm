@@ -999,19 +999,21 @@ static Vector3 g_silentLastLiveOrigin{0, 0, 0};
 static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
                                         const Vector3 &targetPos,
                                         const Vector3 &fromFallback) {
-    (void)fromFallback;
     if (!isVaildPtr(aimingInfo) || IsZeroVec(targetPos)) return false;
+    // Verify aimingInfo has a valid Il2CppClass* header (same memory page, 0 extra remaps)
+    // so we never write into a freed or uninitialized block during match teardown.
+    uint64_t klass = ReadAddr<uint64_t>(aimingInfo);
+    if (!isVaildPtr(klass)) return false;
+
     const SilentAimDirection::Point targetPt{targetPos.x, targetPos.y, targetPos.z};
     if (!SilentAimDirection::Finite(targetPt)) return false;
 
-    // MINDOKERNEL requirement: Only write when HandlerInfo + 0x4C (InfoOrigin) has already been
-    // populated by MDPBNKPCGNG with a valid world position. Never write when InfoOrigin is 0/invalid,
-    // which prevents corrupting uninitialized or tearing-down objects at match start/end.
     Vector3 startPos = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
-    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}) ||
-        !looksLikeWorldPos(startPos)) {
-        return false;
-    }
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
+        startPos = g_silentLastLiveOrigin;
+    if (IsZeroVec(startPos) || !SilentAimDirection::Finite({startPos.x, startPos.y, startPos.z}))
+        startPos = fromFallback;
+    if (IsZeroVec(startPos) || !looksLikeWorldPos(startPos)) return false;
 
     SilentAimDirection::Point originPt{startPos.x, startPos.y, startPos.z};
     SilentAimDirection::Point desired{};
@@ -1044,11 +1046,8 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (!isVaildPtr(localPawn) || IsZeroVec(targetPos)) return 0;
     int wrote = 0;
 
-    // MINDOKERNEL primary path ONLY: resolve active weapon (verified by Il2Cpp class name "Weapon")
-    // -> WeaponHandler (+0x80, MDPBNKPCGNG) -> HandlerInfo (+0x28, CGKJLKPMGDJ).
-    // CRITICAL (FF 1.134.1): Never write to stale 1.132.1 localPawn + 0xDC8 / 0xDD0 (kHitObjectInfo):
-    // in 1.134.1 those Player offsets hold unrelated C# sub-objects whose internal pointers at
-    // +0x28 / +0x40 were overwritten with floats, causing FreeFire to crash on match teardown!
+    // 1. MINDOKERNEL primary path: resolve active weapon -> WeaponHandler (+0x80, MDPBNKPCGNG)
+    //    -> HandlerInfo (+0x28, CGKJLKPMGDJ).
     uint64_t weapon = 0, handler = 0;
     uint64_t handlerInfo = SilentAimWeapon::ResolveHandlerInfo(
         localPawn,
@@ -1059,6 +1058,20 @@ static inline int SilentForcePrimary(uint64_t localPawn, const Vector3 &fromLoc,
     if (isVaildPtr(handlerInfo)) {
         if (SilentWriteAimingDir(handlerInfo, targetPos, fromLoc)) {
             g_lastAimingInfo = handlerInfo;
+            wrote++;
+        }
+    }
+
+    // 2. Also update Player's cached HitObjectInfo slots (0xE50 / 0xE58, CGKJLKPMGDJ) when present
+    //    and distinct from handlerInfo.
+    uint64_t offs[2];
+    int n = 0;
+    SilentFillPrimaryOnly(offs, &n);
+    for (int i = 0; i < n; i++) {
+        uint64_t aimingInfo = ReadAddr<uint64_t>(localPawn + offs[i]);
+        if (!isVaildPtr(aimingInfo) || aimingInfo == handlerInfo) continue;
+        if (SilentWriteAimingDir(aimingInfo, targetPos, fromLoc)) {
+            g_lastAimingInfo = aimingInfo;
             wrote++;
         }
     }
@@ -1090,11 +1103,11 @@ static void SilentAimThread(uint64_t localPlayer) {
             posMode = g_silentAimPosMode;
         }
 
-        if (hasTarget && isVaildPtr(lp)) {
+        if (hasTarget && isVaildPtr(lp) && s_lastLiveMatch != 0 && lp == s_locPawn) {
             if (!AimThroughAnyCoverNow() && isVaildPtr(enemy) && !AimTargetVisibleStrictForSilent(lp, enemy)) {
                 SilentAimClearTarget();
                 g_lastAimingInfo = 0;
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::this_thread::yield();
                 continue;
             }
             if (isVaildPtr(enemy)) {
@@ -1109,9 +1122,11 @@ static void SilentAimThread(uint64_t localPlayer) {
             Vector3 fromNow = AimCameraOrigin(lp, fromLoc);
             if (!looksLikeWorldPos(fromNow)) fromNow = fromLoc;
             if (!IsZeroVec(targetPos)) {
-                SilentForcePrimary(lp, fromNow, targetPos);
+                for (int i = 0; i < 12; i++) {
+                    if (!g_silentHasTarget || s_lastLiveMatch == 0 || lp != s_locPawn) break;
+                    SilentForcePrimary(lp, fromNow, targetPos);
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
             g_lastAimingInfo = 0;
             // No target: do not spin a full core. The old yield-only loop kept
@@ -1120,6 +1135,7 @@ static void SilentAimThread(uint64_t localPlayer) {
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
             continue;
         }
+        std::this_thread::yield();
     }
 }
 
@@ -7074,7 +7090,8 @@ static void EspEmitStatusLine(void) {
                 g_silentTargetPos = liveBone;
                 g_silentFromLoc = myLocation;
             }
-            const int bursts = silentFireWindow ? 4 : 1;
+            // Tăng 160 burst khi firing (trước 120) — viên trúng viên.
+            const int bursts = silentFireWindow ? 160 : 6;
             for (int burst = 0; burst < bursts; burst++) {
                 if ((burst & 3) == 0) {
                     Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, silentPosMode);
