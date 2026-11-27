@@ -4050,6 +4050,28 @@ static inline uint64_t ESPPhaseNowUS(void) {
             bool needAttach = (Moudule_Base == (uint64_t)-1 || Moudule_Base == 0 ||
                                !ds_attached() || ds_pid() != s_attachedPid);
             if (needAttach) {
+                if (s_attachedPid != -1) {
+                    // Game exited or restarted: stop background aim threads and drop
+                    // stale process pointers/caches immediately so we never write to
+                    // or draw leftover state from the old game PID.
+                    SilentAimStop();
+                    AimLockClear();
+                    gAimLockTarget = 0;
+                    gAimLockLostFrames = 0;
+                    s_lockHoldFrames = 0;
+                    s_lastAimPawn = 0;
+                    g_target_task = 0;
+                    g_rainbowInit = 0;
+                    g_rainbowPawn = 0;
+                    g_gvdPatched = false;
+                    g_aaLegitBoostActive = false;
+                    memset(g_playerCache, 0, sizeof(g_playerCache));
+                    {
+                        std::lock_guard<std::recursive_mutex> ptLk(g_posTrackMtx);
+                        for (int pi = 0; pi < kPawnSlotCount; pi++) g_posTrack[pi] = PosTrack{};
+                    }
+                    SBClearESPNameLayers();
+                }
                 if (s_reattachCooldown > 0) {
                     s_reattachCooldown--;
                 } else {
@@ -4749,80 +4771,62 @@ static void EspEmitStatusLine(void) {
     // Brutal ON: hold BrutalSpeed (default 0.16). Menu Speed only when Brutal OFF.
     // Jitter fix: do NOT thrash RunSpeed every frame / fight pattern with hard clamps.
     // Only re-write when value drifts; never clamp weapon while Brutal is on.
+    // CRITICAL (FF 1.134.1): Never write to PlayerAttributes (+0x2C0/+0x340/+0x26C/+0x130)
+    // when both Norecoil and isSpeed are OFF! Unconditional writes to stale 1.132.1
+    // PlayerAttributes offsets corrupt sub-object pointers and crash FreeFire on match entry.
     if (isVaildPtr(myPawnObject)) {
         static int s_speedTick = 0;
         static float s_lastRunWrite = -1.0f;
         static uint64_t s_lastAttrs = 0;
-        const uint64_t attrsOff = kPlayerAttributes ? kPlayerAttributes : 0x700;
-        const uint64_t runOff   = kRunSpeedUpScale ? kRunSpeedUpScale : 0x270;
-        const uint64_t fallOff  = 0x26C;
-        const uint64_t forceOff = 0x340;
-        const uint64_t weapOff  = 0x130;
-        uint64_t PlayerAttributes = ReadAddr<uint64_t>(myPawnObject + attrsOff);
-        if (isVaildPtr(PlayerAttributes) && PlayerAttributes != 0) {
-            ++s_speedTick;
-            if (PlayerAttributes != s_lastAttrs) {
-                s_lastAttrs = PlayerAttributes;
-                s_lastRunWrite = -1.0f; // new attrs object → re-seed
-            }
+        static bool s_speedEverWrote = false;
+        const bool wantSpeedWrite = (Norecoil || (isSpeed && moveSpeedScale > 1.0f));
+        if (wantSpeedWrite || s_speedEverWrote) {
+            const uint64_t attrsOff = kPlayerAttributes ? kPlayerAttributes : 0x700;
+            const uint64_t runOff   = kRunSpeedUpScale ? kRunSpeedUpScale : 0x270;
+            uint64_t PlayerAttributes = ReadAddr<uint64_t>(myPawnObject + attrsOff);
+            if (isVaildPtr(PlayerAttributes) && PlayerAttributes != 0) {
+                if (!wantSpeedWrite) {
+                    if (s_speedEverWrote && PlayerAttributes == s_lastAttrs) {
+                        WriteAddr<float>(PlayerAttributes + runOff, 1.0f);
+                    }
+                    s_speedEverWrote = false;
+                    s_lastRunWrite = -1.0f;
+                } else {
+                    ++s_speedTick;
+                    if (PlayerAttributes != s_lastAttrs) {
+                        s_lastAttrs = PlayerAttributes;
+                        s_lastRunWrite = -1.0f;
+                    }
+                    float writeVal = speedvalue;
+                    if (!Norecoil && isSpeed && moveSpeedScale > 1.0f) {
+                        writeVal = moveSpeedScale;
+                        if (writeVal > 1.28f) writeVal = 1.28f;
+                    }
+                    if (writeVal <= 0.0f) writeVal = 1.0f;
 
-            // Brutal: speedvalue from BrutalSpeed pref. Else menu Speed scale / 1.0.
-            float writeVal = speedvalue;
-            if (!Norecoil && isSpeed && moveSpeedScale > 1.0f) {
-                writeVal = moveSpeedScale;
-                if (writeVal > 1.28f) writeVal = 1.28f;
-            }
-            if (writeVal <= 0.0f) writeVal = 1.0f;
+                    float cur = ReadAddr<float>(PlayerAttributes + runOff);
+                    const bool curBad = isnan(cur) || cur < 0.01f || cur > 80.0f;
+                    const float drift = (!curBad && s_lastRunWrite > 0.0f) ? fabsf(cur - writeVal) : 999.0f;
+                    const float reassertEps = Norecoil ? 0.04f : 0.015f;
+                    const bool needWrite =
+                        curBad ||
+                        s_lastRunWrite < 0.0f ||
+                        fabsf(s_lastRunWrite - writeVal) > 0.001f ||
+                        drift > reassertEps ||
+                        (!curBad && cur > (Norecoil ? 12.0f : 3.0f));
 
-            // Hold run scale without per-frame spam (spam = giật khi chạy).
-            // Re-assert only when drifted or first write on this attrs.
-            float cur = ReadAddr<float>(PlayerAttributes + runOff);
-            const bool curBad = isnan(cur) || cur < 0.01f || cur > 80.0f;
-            const float drift = (!curBad && s_lastRunWrite > 0.0f) ? fabsf(cur - writeVal) : 999.0f;
-            // Brutal: looser hold — game/pattern micro-updates shouldn't thrash us.
-            // Menu speed: tighter so boost stays accurate.
-            const float reassertEps = Norecoil ? 0.04f : 0.015f;
-            const bool needWrite =
-                curBad ||
-                s_lastRunWrite < 0.0f ||
-                fabsf(s_lastRunWrite - writeVal) > 0.001f || // slider changed
-                drift > reassertEps ||
-                // Soft emergency: only insane turbo, not pattern micro bumps.
-                (!curBad && cur > (Norecoil ? 12.0f : 3.0f));
-
-            // Cadence: Brutal re-check every 3 frames max; Speed every frame if needed.
-            const int cadence = Norecoil ? 3 : 1;
-            if (needWrite && (Norecoil ? ((s_speedTick % cadence) == 0) : true)) {
-                WriteAddr<float>(PlayerAttributes + runOff, writeVal);
-                s_lastRunWrite = writeVal;
-            }
-
-            // Force absolute OFF occasionally — not every frame.
-            // IMPORTANT: while Brutal is ON, do NOT clamp weapon scale (0x130).
-            // Pattern scan is super-fast fire — resetting weap→1.0 killed it.
-            // Also: do NOT touch fall while Brutal ON (fall clamp caused run hitch).
-            if ((s_speedTick % 16) == 0) {
-                float force = ReadAddr<float>(PlayerAttributes + forceOff);
-                if (!isnan(force) && fabsf(force) > 0.001f)
-                    WriteAddr<float>(PlayerAttributes + forceOff, 0.0f);
-
-                if (!Norecoil && writeVal <= 1.001f) {
-                    // Normal / no-speed only: clean leftover turbo after Brutal OFF.
-                    float f = ReadAddr<float>(PlayerAttributes + fallOff);
-                    if (!isnan(f) && f > 1.05f && f < 50.0f)
-                        WriteAddr<float>(PlayerAttributes + fallOff, 1.0f);
-                    float w = ReadAddr<float>(PlayerAttributes + weapOff);
-                    if (!isnan(w) && w > 1.05f && w < 50.0f)
-                        WriteAddr<float>(PlayerAttributes + weapOff, 1.0f);
+                    const int cadence = Norecoil ? 3 : 1;
+                    if (needWrite && (Norecoil ? ((s_speedTick % cadence) == 0) : true)) {
+                        WriteAddr<float>(PlayerAttributes + runOff, writeVal);
+                        s_lastRunWrite = writeVal;
+                        s_speedEverWrote = true;
+                    }
                 }
             }
-            (void)fallOff;
-            (void)weapOff;
         }
     }
 
-
-    if (g_target_task == 0) {
+    if (s_setNameEnabledGlobal && g_target_task == 0) {
         pid_t pid = (pid_t)GameTargetProcessPid();
         if (pid > 0) task_for_pid(mach_task_self(), pid, &g_target_task);
     }
@@ -4835,8 +4839,6 @@ static void EspEmitStatusLine(void) {
             if (!g_rainbowInit || ![s_customNameGlobal isEqualToString:cachedCustomName]) {
                 uint64_t originalStrPtr = ReadAddr<uint64_t>(myPawnObject + kNickname);
                 if (isVaildPtr(originalStrPtr)) {
-                    // Recorded before the first substitution, so there is
-                    // something to put back. See RainbowNameDetach.
                     g_rainbowOrigNick = originalStrPtr;
                     g_rainbowOrigNickDisp = ReadAddr<uint64_t>(myPawnObject + kNicknameDisplay);
                     g_rainbowPawn = myPawnObject;
@@ -4862,13 +4864,8 @@ static void EspEmitStatusLine(void) {
 
         bool actualFastReload = isFastReload && (fastReloadSpeed > 1.0f);
         EnableFastReload(myPawnObject, actualFastReload, fastReloadSpeed);
-        // Kill vanilla AA (strength + AllOff). The switch is the whole decision now:
-        // ON kills it every frame, OFF leaves the game's magnet alone even while
-        // aimbot or assist is firing, which is what "off" has to mean or the switch
-        // reads as broken. Aimbot and aim assist are unaffected either way -- they
-        // write their own rotations, and this only decides whether the game is also
-        // stomping on them at the same moment.
-        DisableGameDefaultAimAssist(myPawnObject, isKillGameAA);
+        const bool anyCustomAimOn = (isAimbot || isAimAssist || isAimSilent || isAimLegit);
+        DisableGameDefaultAimAssist(myPawnObject, isKillGameAA && anyCustomAimOn);
 
         // DIAG (once per 5s): confirm the cheat apply-path is actually running.
         {
@@ -5334,11 +5331,19 @@ static void EspEmitStatusLine(void) {
 
         if (isEspCheckVisible && (cacheMiss || (g_cacheFrameCounter & 1) == 0)) {
             const uint32_t vflags = get_VisibleFlags(PawnObject);
-            c.isCamVis = (vflags & kISVisibleCamera) != 0;
-            c.isPvsVis = (vflags & kISVisibleDynamicPVS) != 0;
-            c.isFPP = (vflags & kISVisibleFPPMask) == kISVisibleFPPMask;
-            c.isTrueVis = c.isFPP;
-            c.visGoodFrames = c.isTrueVis ? 1 : 0;
+            if (vflags == 0) {
+                c.isCamVis = true;
+                c.isPvsVis = true;
+                c.isFPP = true;
+                c.isTrueVis = true;
+                c.visGoodFrames = 1;
+            } else {
+                c.isCamVis = (vflags & kISVisibleCamera) != 0;
+                c.isPvsVis = (vflags & kISVisibleDynamicPVS) != 0;
+                c.isFPP = (vflags & kISVisibleFPPMask) == kISVisibleFPPMask;
+                c.isTrueVis = c.isFPP;
+                c.visGoodFrames = c.isTrueVis ? 1 : 0;
+            }
         }
 
         bool isBot     = c.isBot;
@@ -5485,6 +5490,11 @@ static void EspEmitStatusLine(void) {
 
         // MINDOKERNEL parity: never invent CurHP=200 when CurHP<=0 (that revived
         // dead/pool dummy shells in playerDict and caused the +1 enemy count).
+        if (!hpReadOk) {
+            esp_count_drop(PawnObject);
+            rej.hpUnread++;
+            continue;
+        }
         if (CurHP <= 0) {
             markGhostDead(120);
             rej.dead++;
@@ -5552,53 +5562,16 @@ static void EspEmitStatusLine(void) {
         const bool bodyCollapsed = haveLiveBody && liveBodyLen < 0.35f;
         // CRITICAL: bodyCollapsed alone is NOT vehicle — dead shells often collapse.
         const bool treatAsVehicle = enemyMounted || haveMountPos;
-
-        // MINDOKERNEL AvatarVisibility check (UmaAvatarSimple +0x101 == 1):
-        // Filters out hidden pool dummies, despawned corpses, and spectator clones in playerDict.
-        {
-            const uint64_t avatarMgrOff = GameTargetIsMax() ? 0x778ULL : 0x770ULL;
-            const bool avatarVis = AvatarVisibility::IsVisible(
-                PawnObject,
-                [](uint64_t address, void *value, size_t size) {
-                    return _read((long)address, value, (int)size);
-                },
-                [](uint64_t address) { return isVaildPtr(address); },
-                avatarMgrOff);
-            if (!avatarVis && !isKnocked && !treatAsVehicle) {
-                esp_count_drop(PawnObject);
-                rej.noAnchor++;
-                continue;
-            }
-        }
+        (void)bodyCollapsed;
 
         // No live skeleton AND no mount → despawned ghost (dict still holds pointer).
         const bool anyLiveAnchor =
             looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip) ||
             looksLikeWorldPos(liveRoot) || haveMountPos;
         if (!anyLiveAnchor) {
-            // Now reached only when the pawn has neither a live anchor nor a recent
-            // remembered one, so this really is a despawned shell rather than a frame
-            // whose reads happened not to land.
             markGhostDead(60);
             rej.noAnchor++;
             continue;
-        }
-        // Standing ghost: collapsed body without vehicle → skip (was ESP/aim on empty).
-        // Be robust to isKnocked lag: only treat as ghost when we have clear evidence they
-        // should be standing tall (root-to-head height looks upright) and bones are collapsed.
-        if (!treatAsVehicle && bodyCollapsed) {
-            bool expectStanding = !isKnocked;
-            bool rootSaysUpright = false;
-            if (looksLikeWorldPos(liveRoot) && looksLikeWorldPos(liveHead)) {
-                float dy = liveHead.y - liveRoot.y;
-                if (dy >= 1.15f) rootSaysUpright = true;
-            }
-            if (expectStanding && (rootSaysUpright || !looksLikeWorldPos(liveRoot))) {
-                markGhostDead(45);
-                rej.collapsed++;
-                continue;
-            }
-            // If root indicates low profile (knocked/prone) or isKnocked true, allow collapsed.
         }
         // Bones both missing while not mounted → shell / spectator leftover.
         if (!treatAsVehicle && !looksLikeWorldPos(liveHead) && !looksLikeWorldPos(liveHip) &&

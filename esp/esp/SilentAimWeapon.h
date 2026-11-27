@@ -50,17 +50,17 @@ uint64_t ResolveHandlerInfo(uint64_t local, Reader read, TextCheck textEq, Valid
         !read(handler, hKlass) || !valid(hKlass)) {
         return 0;
     }
-    if (!SilentAimNative::Derives(hKlass, "MDPBNKPCGNG", read, textEq)) {
-        return 0;
-    }
+    // hWeapon == weapon already proves handler is this weapon's WeaponHandler.
+    // Do NOT require reading C-string class names ("MDPBNKPCGNG" / "CGKJLKPMGDJ")
+    // from read-only global-metadata.dat pages on every SilentAim tick: in external
+    // DSMemory mode, metadata string page remap misses fail ResolveHandlerInfo and
+    // trip DS_FAIL_DEGRADE_THRESHOLD (g_degraded).
+    (void)textEq;
     if (outHandler) *outHandler = handler;
 
     uint64_t info = 0, infoKlass = 0;
     if (!read(handler + HandlerInfo, info) || !valid(info) ||
         !read(info, infoKlass) || !valid(infoKlass)) {
-        return 0;
-    }
-    if (!textEq(infoKlass + 0x10, "CGKJLKPMGDJ")) {
         return 0;
     }
     return info;

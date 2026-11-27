@@ -14,6 +14,7 @@
 #import "ESPPrefs.h"
 #import "DirectOverlay.h"
 #import "SpringBoardOverlay.h"
+#import "../esp/DSMemory.h"
 #import "../esp/menu.h"
 
 extern "C" char **environ;
@@ -104,6 +105,7 @@ void StopESPSession(void)
     StopESPHost();
     SBoardStopOverlay();
     SetHUDEnabled(NO);
+    ds_detach();
     // The optimistic flag, cleared with the real session. Left set, it made the
     // next launch open on a Stop button for a session that had ended a
     // hundred launches earlier.

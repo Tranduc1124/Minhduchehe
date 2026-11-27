@@ -156,8 +156,9 @@ static void MDResetAccentPrefs(void) {
     // (hacking usecount back) triggers sodealloc on the corrupted
     // socket → kernel panic → device respring. The leak IS the fix.
     //
-    // Hide SB overlay so a killed app does not leave a ghost DrawView.
-    SBoardStopOverlay();
+    // Hide SB overlay and terminate synthetic call thread cleanly on app exit.
+    StopESPSession();
+    SBoardTeardownOverlayForExit();
 }
 
 @end

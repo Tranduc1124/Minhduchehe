@@ -54,9 +54,9 @@ static void boot_start_esp_host(void) {
 
 static void boot_start_sb_overlay(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s, 5s, 8s, 12s
+        static const int delays[] = {0, 2, 3, 4};
         for (int attempt = 0; attempt < 4; attempt++) {
-            sleep(delays[attempt]);
+            if (delays[attempt] > 0) sleep(delays[attempt]);
             int sbret = SBoardStartOverlay();
             if (sbret == 0) {
                 NSLog(@"[BOOT] SpringBoard overlay OK attempt %d", attempt + 1);
@@ -78,15 +78,6 @@ static void boot_start_sb_overlay(void) {
 
 static void kernelBootStartEx(BOOL kernelOnly) {
     if (g_booting) {
-        // The launch-time boot is already on the queue. Returning here used to
-        // drop the tap on the floor, and the caller had already recorded the
-        // session as running before it got here -- markSessionRunning:YES and
-        // SetHUDEnabled(YES) both run ahead of this call. So the Game tab went
-        // to "Active" with nothing drawing and nothing queued to draw it.
-        //
-        // Arm the request instead. Whoever owns the queue reads it at the
-        // kernel-only exit, and a plain boot needs no handling because it is
-        // already going to run stages 5 and 6.
         if (!kernelOnly) {
             g_startESPAfterBoot = YES;
             L(@"WAIT Boot already running — the overlay and ESP start when it finishes.");
@@ -96,11 +87,11 @@ static void kernelBootStartEx(BOOL kernelOnly) {
     if (g_ready) {
         L(@"OK Already booted — re-establishing SpringBoard overlay + ESP host.");
         [[KeepAlive shared] start];
-        // A kernel-only boot after the fact must not drag the overlay back up.
         if (kernelOnly) {
             L(@"OK Kernel already ready — nothing else to do.");
             return;
         }
+        ds_detach();
         boot_start_sb_overlay();
         boot_start_esp_host();
         return;
