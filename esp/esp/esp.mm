@@ -1021,7 +1021,13 @@ static inline bool SilentWriteAimingDir(uint64_t aimingInfo,
     g_silentLastLiveOrigin = startPos;
 
     Vector3 dir(desired.x, desired.y, desired.z);
-    WriteAddr<Vector3>(aimingInfo + kGmpHitPointOff, targetPos);
+    // CRITICAL (FF 1.134.1 crash log proof: FreeFireVN-2026-11-27-195108.ips & 195558.ips):
+    // NEVER write targetPos (12 bytes) to aimingInfo + 0x28 (kGmpHitPointOff)!
+    // Writing 12 bytes at +0x28..+0x33 writes targetPos.z (e.g. 0x43ced4be = 413.66f,
+    // 0xc378eb0f = -248.92f) into the lower 32 bits of the 64-bit managed pointer at
+    // CGKJLKPMGDJ + 0x30, causing Unity's AssetGarbageCollectorHelper thread to crash with
+    // SIGSEGV at 0x0000000043ced4be / 0x00000000c378eb0f during match-end GC!
+    // MINDOKERNEL ONLY writes InfoDirection (+0x40..+0x4B).
     WriteAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoDirection, dir);
 
     Vector3 start2 = ReadAddr<Vector3>(aimingInfo + SilentAimWeapon::InfoOrigin);
