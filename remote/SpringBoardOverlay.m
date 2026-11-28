@@ -98,17 +98,18 @@
 // CoreAnimation's render server re-composites the surface on every frame.
 // Falls back cleanly to the CGPath engine if IOSurface setup fails.
 #define SB_IOSURFACE_RENDER 1
+#define SB_IOS_BUFFERS      3
 
 static BOOL g_sbOverlayOn = NO;
 #if SB_IOSURFACE_RENDER
 static BOOL     g_iosReady             = NO;
-static uint64_t g_iosSbSurf[2]         = {0, 0}; // Double-buffered IOSurfaces in SB process
-static uint64_t g_iosSbBase[2]         = {0, 0}; // Base addresses of the two IOSurfaces in SB
-static int      g_iosBackIdx           = 0;      // Which buffer (0 or 1) is the next back buffer
+static uint64_t g_iosSbSurf[SB_IOS_BUFFERS]  = {0}; // Triple-buffered IOSurfaces in SB process
+static uint64_t g_iosSbBase[SB_IOS_BUFFERS]  = {0}; // Base addresses of the IOSurfaces in SB
+static int      g_iosBackIdx           = 0;      // Which buffer (0..SB_IOS_BUFFERS-1) is the next back buffer
 static size_t   g_iosBpr               = 0;      // bytes per row
 static int      g_iosW                 = 0;      // surface pixel width (portrait)
 static int      g_iosH                 = 0;      // surface pixel height (portrait)
-static double   g_iosScale             = 2.0;    // pixel scale factor (2.0x Retina -> ~323 pages/buffer, 646 total < 1024 shmem cache)
+static double   g_iosScale             = 2.0;    // pixel scale factor (1.5x -> ~192 pages/buffer, ~576 total < 1024 shmem cache)
 static CGFloat  g_iosLandW             = 0;      // landscape width in points (= portrait H)
 static CGFloat  g_iosLandH             = 0;      // landscape height in points (= portrait W)
 static void    *g_iosLocalBuf          = NULL;   // malloc'd local draw buffer (app process)
@@ -116,11 +117,11 @@ static size_t   g_iosLocalSize         = 0;
 static CGContextRef g_iosCtx           = NULL;   // persistent CGBitmapContext over g_iosLocalBuf
 static size_t   g_iosPrevLocalMinOff   = 0;      // dirty byte range in g_iosLocalBuf from prev frame
 static size_t   g_iosPrevLocalMaxOff   = 0;
-static size_t   g_iosPrevRemoteMinOff[2] = {0, 0}; // dirty byte range in each SB surface from its last write
-static size_t   g_iosPrevRemoteMaxOff[2] = {0, 0};
+static size_t   g_iosPrevRemoteMinOff[SB_IOS_BUFFERS] = {0}; // dirty byte range in each SB surface from its last write
+static size_t   g_iosPrevRemoteMaxOff[SB_IOS_BUFFERS] = {0};
 static int      g_iosWasEmpty          = 1;      // 1 when the currently displayed surface in SB is already empty
-static uint64_t g_sbSetContentsInv[2]    = {0, 0};
-static uint64_t g_sbSetContentsArgBuf[2] = {0, 0};
+static uint64_t g_sbSetContentsInv[SB_IOS_BUFFERS]    = {0};
+static uint64_t g_sbSetContentsArgBuf[SB_IOS_BUFFERS] = {0};
 #endif
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
@@ -1138,7 +1139,7 @@ static void sb_forget_local_paint_state(void) {
         g_sbNameArgBuf[i] = 0;
     }
 #if SB_IOSURFACE_RENDER
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < SB_IOS_BUFFERS; i++) {
         if (r_is_objc_ptr(g_sbSetContentsInv[i]) && canCallRemote) {
             r_msg2(g_sbSetContentsInv[i], "release", 0,0,0,0);
         }
@@ -1483,13 +1484,17 @@ static BOOL sb_invoke_name_cached(int slot, uint64_t target, uint64_t path) {
 
 #if SB_IOSURFACE_RENDER
 static BOOL sb_ensure_setcontents_invocation(void) {
-    if (r_is_objc_ptr(g_sbSetContentsInv[0]) && g_sbSetContentsArgBuf[0] &&
-        r_is_objc_ptr(g_sbSetContentsInv[1]) && g_sbSetContentsArgBuf[1]) {
-        return YES;
+    BOOL allReady = YES;
+    for (int i = 0; i < SB_IOS_BUFFERS; i++) {
+        if (!r_is_objc_ptr(g_sbSetContentsInv[i]) || !g_sbSetContentsArgBuf[i]) {
+            allReady = NO;
+            break;
+        }
     }
-    if (!r_is_objc_ptr(g_sbShape) ||
-        !r_is_objc_ptr(g_iosSbSurf[0]) || !r_is_objc_ptr(g_iosSbSurf[1])) {
-        return NO;
+    if (allReady) return YES;
+    if (!r_is_objc_ptr(g_sbShape)) return NO;
+    for (int i = 0; i < SB_IOS_BUFFERS; i++) {
+        if (!r_is_objc_ptr(g_iosSbSurf[i])) return NO;
     }
 
     uint64_t setContentsSel = r_sel("setContents:");
@@ -1502,7 +1507,7 @@ static BOOL sb_ensure_setcontents_invocation(void) {
     uint64_t NSInvocation = r_class("NSInvocation");
     if (!r_is_objc_ptr(NSInvocation)) return NO;
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < SB_IOS_BUFFERS; i++) {
         if (!r_is_objc_ptr(g_sbSetContentsInv[i]) || !g_sbSetContentsArgBuf[i]) {
             uint64_t sInv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
             if (!r_is_objc_ptr(sInv)) return NO;
@@ -1528,11 +1533,10 @@ static BOOL sb_ensure_setcontents_invocation(void) {
     if (!g_sbInvokeSel) {
         g_sbInvokeSel = r_sel("invoke");
     }
-    NSLog(@"[SB-IOS] DoubleBuffer Invocations ready inv0=0x%llx inv1=0x%llx surf0=0x%llx surf1=0x%llx",
+    NSLog(@"[SB-IOS] TripleBuffer Invocations ready inv0=0x%llx inv1=0x%llx inv2=0x%llx",
           (unsigned long long)g_sbSetContentsInv[0],
           (unsigned long long)g_sbSetContentsInv[1],
-          (unsigned long long)g_iosSbSurf[0],
-          (unsigned long long)g_iosSbSurf[1]);
+          (unsigned long long)g_sbSetContentsInv[2]);
     return YES;
 }
 
@@ -1568,7 +1572,7 @@ static void sb_ios_unlock_surface(uint64_t surf) {
     sb_ios_ensure_surface_fns();
     const uint64_t lockOpts = 2; // kIOSurfaceLockAvoidSync
     if (g_iosUnlockAddr) {
-        do_remote_call_stable_addr(R_TIMEOUT, g_iosUnlockAddr, "IOSurfaceUnlock",
+        do_remote_call_stable_addr(RC_TIMEOUT_NORET, g_iosUnlockAddr, "IOSurfaceUnlock",
                                    surf, lockOpts, 0, 0, 0, 0, 0, 0);
     } else {
         dlsym_remote_void("IOSurfaceUnlock", surf, lockOpts, 0, 0, 0, 0, 0, 0);
@@ -1576,20 +1580,20 @@ static void sb_ios_unlock_surface(uint64_t surf) {
 }
 
 static void sb_invoke_ios_present_cached(int bufIdx) {
-    if (bufIdx < 0 || bufIdx > 1) return;
+    if (bufIdx < 0 || bufIdx >= SB_IOS_BUFFERS) return;
     const uint64_t surf = g_iosSbSurf[bufIdx];
     if (!r_is_objc_ptr(surf) || !r_is_objc_ptr(g_sbShape)) return;
-    // Unlock after remote_write finishes so the kernel IOSurface seed bumps on
-    // a complete frame, then swap shape.contents synchronously on SB's main
-    // thread (waitUntilDone: YES) so the other buffer is never overwritten while
-    // still active on screen or stacked in RunLoop backlogs.
+    // Unlock with RC_TIMEOUT_NORET so Thread 10 runs unlock before dispatching setContents:
+    // without paying a second return exception wait. Triple buffering (SB_IOS_BUFFERS = 3)
+    // lets us present with waitUntilDone: NO (0) so SpringBoard's background main RunLoop
+    // never stalls the publisher at 15-40ms/frame while still leaving displayed/queued buffers untouched.
     sb_ios_unlock_surface(surf);
     if (!sb_ensure_setcontents_invocation()) {
-        r_msg2_main(g_sbShape, "setContents:", surf, 0, 0, 0);
+        r_msg2_main_async(g_sbShape, "setContents:", surf, 0, 0, 0);
         return;
     }
     if (g_sbPerformMainSel && g_sbInvokeSel) {
-        r_msg(g_sbSetContentsInv[bufIdx], g_sbPerformMainSel, g_sbInvokeSel, 0, 1, 0);
+        r_msg(g_sbSetContentsInv[bufIdx], g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
 }
 
@@ -1598,9 +1602,11 @@ static BOOL sb_ios_render_frame(UIView *espView,
                                 size_t *outMinOff,
                                 size_t *outMaxOff,
                                 uint32_t *outSubCount) {
-    if (!g_iosReady || !g_iosLocalBuf || !g_iosCtx ||
-        !g_iosSbBase[0] || !g_iosSbBase[1] || g_iosLocalSize == 0) {
+    if (!g_iosReady || !g_iosLocalBuf || !g_iosCtx || g_iosLocalSize == 0) {
         return NO;
+    }
+    for (int b = 0; b < SB_IOS_BUFFERS; b++) {
+        if (!g_iosSbBase[b]) return NO;
     }
 
     const CGRect vb = espView.bounds;
@@ -1778,8 +1784,8 @@ static BOOL sb_ios_render_frame(UIView *espView,
     g_iosPrevLocalMinOff = curMinOff;
     g_iosPrevLocalMaxOff = curMaxOff;
 
-    const int bufIdx = g_iosBackIdx & 1;
-    g_iosBackIdx = bufIdx ^ 1;
+    const int bufIdx = g_iosBackIdx % SB_IOS_BUFFERS;
+    g_iosBackIdx = (bufIdx + 1) % SB_IOS_BUFFERS;
     const size_t prevRemMin = g_iosPrevRemoteMinOff[bufIdx];
     const size_t prevRemMax = (g_iosPrevRemoteMaxOff[bufIdx] <= g_iosLocalSize)
                             ? g_iosPrevRemoteMaxOff[bufIdx] : g_iosLocalSize;
@@ -2545,11 +2551,11 @@ int SBoardStartOverlay(void) {
                 r_msg2_main(props, "setObject:forKey:", nBpe, kBpe, 0,0);
                 r_msg2_main(props, "setObject:forKey:", nFmt, kFmt, 0,0);
 
-                uint64_t sbSurf[2] = {0, 0};
-                uint64_t sbBase[2] = {0, 0};
+                uint64_t sbSurf[SB_IOS_BUFFERS] = {0};
+                uint64_t sbBase[SB_IOS_BUFFERS] = {0};
                 uint64_t sbBpr = 0;
                 int surfOk = 1;
-                for (int b = 0; b < 2; b++) {
+                for (int b = 0; b < SB_IOS_BUFFERS; b++) {
                     uint64_t surfAlloc = r_msg2_main(clsIOS, "alloc", 0,0,0,0);
                     sbSurf[b] = r_is_objc_ptr(surfAlloc)
                               ? r_msg2_main(surfAlloc, "initWithProperties:", props, 0,0,0)
@@ -2569,6 +2575,15 @@ int SBoardStartOverlay(void) {
                     dlsym_remote("IOSurfaceUnlock", sbSurf[b], 0, 0, 0,0,0,0,0);
                 }
 
+                if (!surfOk) {
+                    for (int b = 0; b < SB_IOS_BUFFERS; b++) {
+                        if (r_is_objc_ptr(sbSurf[b])) {
+                            r_msg2_main(sbSurf[b], "release", 0,0,0,0);
+                            sbSurf[b] = 0;
+                        }
+                    }
+                }
+
                 if (surfOk) {
                     size_t bufSize = (size_t)sbBpr * (size_t)iosH;
                     r_msg2_main(shape, "setContents:", sbSurf[0], 0,0,0);
@@ -2586,11 +2601,13 @@ int SBoardStartOverlay(void) {
                         CGColorSpaceRelease(cs);
                     }
                     if (g_iosLocalBuf && g_iosCtx) {
-                        g_iosSbSurf[0] = sbSurf[0];
-                        g_iosSbSurf[1] = sbSurf[1];
-                        g_iosSbBase[0] = sbBase[0];
-                        g_iosSbBase[1] = sbBase[1];
-                        g_iosBackIdx = 1; // surf[0] is on screen initially; next write goes to surf[1]
+                        for (int b = 0; b < SB_IOS_BUFFERS; b++) {
+                            g_iosSbSurf[b] = sbSurf[b];
+                            g_iosSbBase[b] = sbBase[b];
+                            g_iosPrevRemoteMinOff[b] = 0;
+                            g_iosPrevRemoteMaxOff[b] = 0;
+                        }
+                        g_iosBackIdx = 1; // surf[0] is on screen initially; next write goes to surf[1], then surf[2]
                         g_iosBpr = (size_t)sbBpr;
                         g_iosW = iosW;
                         g_iosH = iosH;
@@ -2599,20 +2616,22 @@ int SBoardStartOverlay(void) {
                         g_iosLocalSize = bufSize;
                         g_iosPrevLocalMinOff = 0;
                         g_iosPrevLocalMaxOff = 0;
-                        g_iosPrevRemoteMinOff[0] = g_iosPrevRemoteMinOff[1] = 0;
-                        g_iosPrevRemoteMaxOff[0] = g_iosPrevRemoteMaxOff[1] = 0;
                         g_iosWasEmpty = 1;
                         g_iosReady = YES;
                         (void)sb_ensure_setcontents_invocation();
-                        NSLog(@"[SB-IOS] READY double-buffer surf0=0x%llx/0x%llx surf1=0x%llx/0x%llx %dx%d bpr=%zu scale=%.2f pages=%zu",
+                        NSLog(@"[SB-IOS] READY triple-buffer surf0=0x%llx/0x%llx surf1=0x%llx/0x%llx surf2=0x%llx/0x%llx %dx%d bpr=%zu scale=%.2f pages=%zu",
                               (unsigned long long)sbSurf[0], (unsigned long long)sbBase[0],
                               (unsigned long long)sbSurf[1], (unsigned long long)sbBase[1],
+                              (unsigned long long)sbSurf[2], (unsigned long long)sbBase[2],
                               iosW, iosH, (size_t)sbBpr, g_iosScale, (bufSize + 16383) / 16384);
                     } else {
+                        for (int b = 0; b < SB_IOS_BUFFERS; b++) {
+                            if (r_is_objc_ptr(sbSurf[b])) r_msg2_main(sbSurf[b], "release", 0,0,0,0);
+                        }
                         NSLog(@"[SB-IOS] local CGBitmapContext alloc failed — falling back to CGPath");
                     }
                 } else {
-                    NSLog(@"[SB-IOS] double-buffer initWithProperties failed — falling back to CGPath");
+                    NSLog(@"[SB-IOS] triple-buffer initWithProperties failed — falling back to CGPath");
                 }
             }
         }
@@ -3039,7 +3058,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                     s_iosWinWrite = g_sbWinDecodeUS;
                     s_iosWinPres = g_sbWinPresentUS;
                     s_iosWinPub = g_sbWinPubUS;
-                    NSLog(@"[SB-PUSH] IOSURFACE-DB hz=%.1f bdropsHz=%.1f ups=%llu "
+                    NSLog(@"[SB-PUSH] IOSURFACE-TB hz=%.1f bdropsHz=%.1f ups=%llu "
                           @"render=%.2fms write=%.2fms present=%.2fms pubavg=%.2fms "
                           @"dirtyKB=%zu layers=%u buf=%d",
                           hz, bdropHz, (unsigned long long)updWin,
@@ -4214,14 +4233,14 @@ void SBClearESPNameLayers(void) {
     // Same nil hand-over as the publish's off edges, one crossing per layer.
     @try {
 #if SB_IOSURFACE_RENDER
-        if (g_iosReady && g_iosSbBase[0] && g_iosSbBase[1] && g_iosLocalBuf && g_iosLocalSize > 0) {
+        if (g_iosReady && g_iosSbBase[0] && g_iosSbBase[1] && g_iosSbBase[2] && g_iosLocalBuf && g_iosLocalSize > 0) {
             const size_t lMin = g_iosPrevLocalMinOff;
             const size_t lMax = (g_iosPrevLocalMaxOff <= g_iosLocalSize) ? g_iosPrevLocalMaxOff : g_iosLocalSize;
             if (lMax > lMin) {
                 memset((uint8_t *)g_iosLocalBuf + lMin, 0, lMax - lMin);
             }
-            const int bufIdx = g_iosBackIdx & 1;
-            g_iosBackIdx = bufIdx ^ 1;
+            const int bufIdx = g_iosBackIdx % SB_IOS_BUFFERS;
+            g_iosBackIdx = (bufIdx + 1) % SB_IOS_BUFFERS;
             const size_t rMin = g_iosPrevRemoteMinOff[bufIdx];
             const size_t rMax = (g_iosPrevRemoteMaxOff[bufIdx] <= g_iosLocalSize)
                               ? g_iosPrevRemoteMaxOff[bufIdx] : g_iosLocalSize;
@@ -4277,7 +4296,7 @@ void SBoardStopOverlay(void) {
 #if SB_IOSURFACE_RENDER
                 if (g_iosReady && g_iosLocalBuf && g_iosLocalSize > 0) {
                     memset(g_iosLocalBuf, 0, g_iosLocalSize);
-                    for (int b = 0; b < 2; b++) {
+                    for (int b = 0; b < SB_IOS_BUFFERS; b++) {
                         const size_t rMin = g_iosPrevRemoteMinOff[b];
                         const size_t rMax = (g_iosPrevRemoteMaxOff[b] <= g_iosLocalSize)
                                           ? g_iosPrevRemoteMaxOff[b] : g_iosLocalSize;
