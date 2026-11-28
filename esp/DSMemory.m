@@ -593,7 +593,7 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // finishes, which turns the interval between noticing a dead mapping from six seconds
 // into one cycle -- a couple of hundred milliseconds -- at a cost that is a few
 // hundred kernel reads per frame against the ~17,000 the render loop already makes.
-#define DS_VMO_SWEEP_PER_TICK 64
+#define DS_VMO_SWEEP_PER_TICK 32
 #define DS_VMO_SNAP_MAX       16384
 // Backoff before restarting after the map could not be read at all, so a torn or
 // absent map does not become a kread per frame.
@@ -666,36 +666,32 @@ static struct {
 //
 // -1 means empty. Every read and write of this array is under g_pageCacheLock,
 // same as g_pageCache itself.
-static int32_t     g_pageIndex[DS_PAGE_CACHE_SLOTS];
+// 2-way set-associative page -> slot accelerator so hash collisions between
+// active pages stay O(1) instead of falling back to a 2048-slot linear scan.
+static int32_t     g_pageIndex[DS_PAGE_CACHE_SLOTS][2];
 
 static inline int ds_page_index_hash(uint64_t pageVA) {
-    // The page offset must be shifted out before any bits are taken, and that is
-    // not a style choice. pageVA is masked to a PAGE_SIZE boundary, and PAGE_SIZE
-    // is 0x4000 (PAGE_SHIFT 14), so its low fourteen bits are always zero:
-    // `pageVA & 0xFF` returned 0 for every page that was ever probed. Every page
-    // wrote bucket 0 of g_pageIndex, every entry but the most recently indexed
-    // one missed the probe, and the miss fell straight to the 256-slot scan this
-    // probe exists to replace -- on every read, under g_pageCacheLock, which the
-    // render thread, SilentAimThread and AimLockThreadMain all contend for.
     return (int)((pageVA >> PAGE_SHIFT) & (uint64_t)(DS_PAGE_CACHE_SLOTS - 1));
 }
 
 static inline void ds_page_index_set(uint64_t pageVA, int slot) {
     if (slot < 0 || slot >= DS_PAGE_CACHE_SLOTS) return;
-    g_pageIndex[ds_page_index_hash(pageVA)] = (int32_t)slot;
+    const int h = ds_page_index_hash(pageVA);
+    if (g_pageIndex[h][0] == (int32_t)slot || g_pageIndex[h][1] == (int32_t)slot) return;
+    if (g_pageIndex[h][0] < 0) { g_pageIndex[h][0] = (int32_t)slot; return; }
+    if (g_pageIndex[h][1] < 0) { g_pageIndex[h][1] = (int32_t)slot; return; }
+    // Evict way 0 by shifting way 1 -> way 0 (keeps the most recently inserted pair).
+    g_pageIndex[h][0] = g_pageIndex[h][1];
+    g_pageIndex[h][1] = (int32_t)slot;
 }
 
-// Drop this slot's index entry if it still names it. The slot's pageVA is read
-// BEFORE the caller clears it, so a slot that is being evicted for a different
-// page drops the right entry. A collision victim leaves another page's index
-// entry pointing at the reused slot; that entry fails its pageVA check and falls
-// back to the scan, which is correct.
 static inline void ds_page_index_drop(int slot) {
     if (slot < 0 || slot >= DS_PAGE_CACHE_SLOTS) return;
     const uint64_t pva = g_pageCache[slot].pageVA;
     if (pva == 0) return;
     const int h = ds_page_index_hash(pva);
-    if (g_pageIndex[h] == (int32_t)slot) g_pageIndex[h] = -1;
+    if (g_pageIndex[h][0] == (int32_t)slot) g_pageIndex[h][0] = -1;
+    if (g_pageIndex[h][1] == (int32_t)slot) g_pageIndex[h][1] = -1;
 }
 
 // Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
@@ -755,7 +751,10 @@ static uint64_t g_dsLastSweepMs = 0;
 static void ds_page_cache_lock_init(void) {
     // Every entry starts empty, so a miss is one comparison instead of a scan
     // through slots nobody has ever populated.
-    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) g_pageIndex[i] = -1;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        g_pageIndex[i][0] = -1;
+        g_pageIndex[i][1] = -1;
+    }
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
@@ -1356,12 +1355,15 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     // wrongly: it only reports a hit when the slot it names really holds this
     // pageVA, so a stale or colliding entry costs one comparison and falls through.
     {
-        const int32_t cand = g_pageIndex[ds_page_index_hash(pageVA)];
-        if (cand >= 0 && cand < DS_PAGE_CACHE_SLOTS) {
-            const uint64_t aIndexed = ds_page_hit((int)cand, pageVA);
-            if (aIndexed) {
-                ds_unlock();
-                return aIndexed;
+        const int h = ds_page_index_hash(pageVA);
+        for (int way = 0; way < 2; way++) {
+            const int32_t cand = g_pageIndex[h][way];
+            if (cand >= 0 && cand < DS_PAGE_CACHE_SLOTS) {
+                const uint64_t aIndexed = ds_page_hit((int)cand, pageVA);
+                if (aIndexed) {
+                    ds_unlock();
+                    return aIndexed;
+                }
             }
         }
     }
@@ -1657,7 +1659,8 @@ void ds_detach(void) {
     ds_lock();
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         ds_release_page_slot_locked(i);
-        g_pageIndex[i] = -1;
+        g_pageIndex[i][0] = -1;
+        g_pageIndex[i][1] = -1;
     }
     g_pageCacheNext = 0;
     g_consecutiveMapFailures = 0;
@@ -1725,7 +1728,8 @@ void ds_flush_page_cache(void) {
     ds_lock();
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         ds_release_page_slot_locked(i);
-        g_pageIndex[i] = -1;
+        g_pageIndex[i][0] = -1;
+        g_pageIndex[i][1] = -1;
     }
     g_pageCacheNext = 0;
     g_pageUseCounter++;

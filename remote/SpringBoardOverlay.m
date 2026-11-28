@@ -1551,11 +1551,14 @@ static inline void sb_ios_ensure_surface_fns(void) {
 static bool sb_ios_lock_surface(uint64_t surf) {
     if (!r_is_objc_ptr(surf)) return false;
     sb_ios_ensure_surface_fns();
+    // kIOSurfaceLockAvoidSync (0x2) prevents blocking Thread 10 on WindowServer GPU fences
+    // while still taking the CPU lock and letting unlock bump the IOSurface seed.
+    const uint64_t lockOpts = 2; // kIOSurfaceLockAvoidSync
     if (g_iosLockAddr) {
         do_remote_call_stable_addr(R_TIMEOUT, g_iosLockAddr, "IOSurfaceLock",
-                                   surf, 0, 0, 0, 0, 0, 0, 0);
+                                   surf, lockOpts, 0, 0, 0, 0, 0, 0);
     } else {
-        dlsym_remote_void("IOSurfaceLock", surf, 0, 0, 0, 0, 0, 0, 0);
+        dlsym_remote_void("IOSurfaceLock", surf, lockOpts, 0, 0, 0, 0, 0, 0);
     }
     return remote_call_current_success();
 }
@@ -1563,11 +1566,12 @@ static bool sb_ios_lock_surface(uint64_t surf) {
 static void sb_ios_unlock_surface(uint64_t surf) {
     if (!r_is_objc_ptr(surf)) return;
     sb_ios_ensure_surface_fns();
+    const uint64_t lockOpts = 2; // kIOSurfaceLockAvoidSync
     if (g_iosUnlockAddr) {
         do_remote_call_stable_addr(R_TIMEOUT, g_iosUnlockAddr, "IOSurfaceUnlock",
-                                   surf, 0, 0, 0, 0, 0, 0, 0);
+                                   surf, lockOpts, 0, 0, 0, 0, 0, 0);
     } else {
-        dlsym_remote_void("IOSurfaceUnlock", surf, 0, 0, 0, 0, 0, 0, 0);
+        dlsym_remote_void("IOSurfaceUnlock", surf, lockOpts, 0, 0, 0, 0, 0, 0);
     }
 }
 

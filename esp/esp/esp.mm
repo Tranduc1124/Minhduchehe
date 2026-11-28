@@ -1149,7 +1149,7 @@ static void SilentAimThread(uint64_t localPlayer) {
             Vector3 fromNow = AimCameraOrigin(lp, fromLoc);
             if (!looksLikeWorldPos(fromNow)) fromNow = fromLoc;
             if (!IsZeroVec(targetPos)) {
-                for (int i = 0; i < 12; i++) {
+                for (int i = 0; i < 3; i++) {
                     if (!g_silentHasTarget || s_lastLiveMatch == 0 || lp != s_locPawn) break;
                     SilentForcePrimary(lp, fromNow, targetPos);
                 }
@@ -1162,7 +1162,9 @@ static void SilentAimThread(uint64_t localPlayer) {
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
             continue;
         }
-        std::this_thread::yield();
+        // Brief sleep (~1ms) avoids starving g_pageCacheLock / main-queue ESP reads
+        // and prevents thermal throttling while still refreshing ~1000Hz during combat.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
