@@ -676,6 +676,7 @@ bool set_exception_port_on_thread(mach_port_t exceptionPort, uint64_t currThread
                __FUNCTION__, __LINE__, createErr, pthread);
         return false;
     }
+    pthread_detach(pthread);
 
     mach_port_t machThread = pthread_mach_thread_np(pthread);
     if (!machThread) {
@@ -862,6 +863,7 @@ static bool tro_swap_thread_op(uint64_t targetThread,
     int createErr = pthread_create_suspended_np(&pthread, NULL, (void *(*)(void *))fn, NULL);
     if (createErr != 0 || !pthread)
         return false;
+    pthread_detach(pthread);
 
     mach_port_t machThread = pthread_mach_thread_np(pthread);
     if (!machThread) {
@@ -1474,6 +1476,18 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
     const uint64_t tW1Done = rc_now_us();
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
+    if (gIsPACSupported &&
+        (!exc.threadState.__pc || exc.threadState.__pc == (uint64_t)-1 ||
+         !exc.threadState.__lr || exc.threadState.__lr == (uint64_t)-1)) {
+        RC_DIAG("stable/%s remote_pac failed (pc=0x%llx lr=0x%llx) — poisoning crossing",
+                name ?: "(addr-call)",
+                (unsigned long long)exc.threadState.__pc,
+                (unsigned long long)exc.threadState.__lr);
+        g_RC_crossingPoisoned = true;
+        g_RC_wedgeKeepPorts = true;
+        g_RC_success = false;
+        return 0;
+    }
     const uint64_t tSignDone = rc_now_us();
     reply_with_state(&exc, &exc.threadState);
 
@@ -1677,6 +1691,7 @@ void abandon_remote_call_internal(void) {
     g_RC_vphoneBridge = false;
     g_RC_trojanMem = 0;
     g_RC_threadList = [NSMutableArray new];
+    pac_invalidate_thread_keys();
 }
 
 int destroy_remote_call(void) {
@@ -1755,6 +1770,11 @@ static bool rc_try_kill_parked_synthetic_thread(int waitTimeoutMS, int pollAttem
 
     exc.threadState.__x[0] = 0;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, exitAddr, FAKE_LR_TROJAN);
+    if (gIsPACSupported &&
+        (!exc.threadState.__pc || exc.threadState.__pc == (uint64_t)-1 ||
+         !exc.threadState.__lr || exc.threadState.__lr == (uint64_t)-1)) {
+        return false;
+    }
     reply_with_state(&exc, &exc.threadState);
 
     return !rc_synthetic_thread_still_in_target(g_RC_taskAddr, g_RC_callThreadAddr, pollAttempts);
@@ -1860,6 +1880,7 @@ int destroy_remote_call_internal(void) {
     g_RC_trojanMem = 0;
 
     g_RC_threadList = [NSMutableArray new];
+    pac_invalidate_thread_keys();
 
     return 0;
 }
@@ -2117,6 +2138,7 @@ static NSArray<NSNumber *> *collect_all_task_threads(uint64_t taskAddr) {
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
+    pac_invalidate_thread_keys();
     remote_call_note_init_failure(RemoteCallInitFailureNone, 0);
     g_RC_vphoneBridge = false;
     // crossingPoisoned clears here: a fresh trojan thread is a fresh subject, and

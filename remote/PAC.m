@@ -91,48 +91,133 @@ void pac_cleanup(mach_port_t pacThread, mach_port_t exceptionPort, void *stack)
         free(stack);
 }
 
+#define PAC_SIG_CACHE_CAP   128
+#define PAC_KEY_CACHE_CAP   8
+
+typedef struct {
+    bool valid;
+    uint64_t keyA;
+    uint64_t keyB;
+    uint64_t address;
+    uint64_t modifier;
+    uint64_t signedAddress;
+} PacSigCacheEntry;
+
+typedef struct {
+    bool valid;
+    uint64_t threadAddr;
+    uint64_t keyA;
+    uint64_t keyB;
+} PacKeyCacheEntry;
+
+static pthread_mutex_t g_pacCacheLock = PTHREAD_MUTEX_INITIALIZER;
+static PacSigCacheEntry g_pacSigCache[PAC_SIG_CACHE_CAP];
+static int g_pacSigCacheNext = 0;
+static PacKeyCacheEntry g_pacKeyCache[PAC_KEY_CACHE_CAP];
+static int g_pacKeyCacheNext = 0;
+
+void pac_invalidate_thread_keys(void)
+{
+    pthread_mutex_lock(&g_pacCacheLock);
+    memset(g_pacKeyCache, 0, sizeof(g_pacKeyCache));
+    g_pacKeyCacheNext = 0;
+    pthread_mutex_unlock(&g_pacCacheLock);
+}
+
+static bool pac_lookup_thread_keys(uint64_t remoteThreadAddr, uint64_t *outKeyA, uint64_t *outKeyB)
+{
+    if (!remoteThreadAddr || !outKeyA || !outKeyB) return false;
+    pthread_mutex_lock(&g_pacCacheLock);
+    for (int i = 0; i < PAC_KEY_CACHE_CAP; i++) {
+        if (g_pacKeyCache[i].valid && g_pacKeyCache[i].threadAddr == remoteThreadAddr) {
+            *outKeyA = g_pacKeyCache[i].keyA;
+            *outKeyB = g_pacKeyCache[i].keyB;
+            pthread_mutex_unlock(&g_pacCacheLock);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_pacCacheLock);
+
+    uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
+    uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
+
+    pthread_mutex_lock(&g_pacCacheLock);
+    g_pacKeyCache[g_pacKeyCacheNext].valid = true;
+    g_pacKeyCache[g_pacKeyCacheNext].threadAddr = remoteThreadAddr;
+    g_pacKeyCache[g_pacKeyCacheNext].keyA = keyA;
+    g_pacKeyCache[g_pacKeyCacheNext].keyB = keyB;
+    g_pacKeyCacheNext = (g_pacKeyCacheNext + 1) % PAC_KEY_CACHE_CAP;
+    pthread_mutex_unlock(&g_pacCacheLock);
+
+    *outKeyA = keyA;
+    *outKeyB = keyB;
+    return true;
+}
+
 uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifier) {
     if(!gIsPACSupported)
         return address;
-    
+    if (!remoteThreadAddr)
+        return 0;
+
     if(!g_RC_gadgetPacia) {
         uint64_t gadgetAddr = find_pacia_gadget();
         if(gadgetAddr == 0) {
             printf("[%s:%d] find_pacia_gadget failed\n", __FUNCTION__, __LINE__);
-            return -1;
+            return 0;
         }
         g_RC_gadgetPacia = gadgetAddr;
     }
-    
+
     address = native_strip(address);
-    
-    uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
-    uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
-    
+
+    uint64_t keyA = 0, keyB = 0;
+    if (!pac_lookup_thread_keys(remoteThreadAddr, &keyA, &keyB)) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_pacCacheLock);
+    for (int i = 0; i < PAC_SIG_CACHE_CAP; i++) {
+        if (g_pacSigCache[i].valid &&
+            g_pacSigCache[i].keyA == keyA &&
+            g_pacSigCache[i].keyB == keyB &&
+            g_pacSigCache[i].address == address &&
+            g_pacSigCache[i].modifier == modifier) {
+            uint64_t cached = g_pacSigCache[i].signedAddress;
+            pthread_mutex_unlock(&g_pacCacheLock);
+            return cached;
+        }
+    }
+    pthread_mutex_unlock(&g_pacCacheLock);
+
     mach_port_t pacThread = MACH_PORT_NULL;
     kern_return_t kr = thread_create(mach_task_self_, &pacThread);
     if(kr != KERN_SUCCESS) {
         printf("[%s:%d] thread_create failed, kr = %s (0x%x)\n", __FUNCTION__, __LINE__, mach_error_string(kr), kr);
-        return -1;
+        return 0;
     }
-    
+
     void* stack = malloc(0x4000);
+    if (!stack) {
+        pac_cleanup(pacThread, MACH_PORT_NULL, NULL);
+        return 0;
+    }
     memset(stack, 0, 0x4000);
     uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
-    
+
     arm_thread_state64_internal state;
     memset(&state, 0, sizeof(state));
     state.__sp = sp;
     state.__pc = pacia(g_RC_gadgetPacia, ptrauth_string_discriminator("pc"));
     state.__lr = pacia(0x401, ptrauth_string_discriminator("lr"));
-    
+
     state.__x[0]  = 0;
     state.__x[1]  = address;
     state.__x[2]  = modifier;
     state.__x[3]  = (uint64_t)pacThread;
     state.__x[16] = address;
     state.__x[17] = modifier;
-    
+
     mach_port_t exceptionPort = create_exception_port();
     if (!exceptionPort) {
         printf("[%s:%d] create_exception_port failed\n", __FUNCTION__, __LINE__);
@@ -150,29 +235,29 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
-    
+
     uint64_t pacThreadAddr = task_get_ipc_port_kobject(task_self(), pacThread);
     if (!pacThreadAddr) {
         printf("[%s:%d] task_get_ipc_port_kobject failed\n", __FUNCTION__, __LINE__);
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
-    
+
     if (!thread_set_state_wrapper(pacThread, pacThreadAddr, &state)) {
         printf("[%s:%d] thread_set_state_wrapper failed\n", __FUNCTION__, __LINE__);
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
-    
+
     thread_set_pac_keys(pacThreadAddr, keyA, keyB);
-    
+
     kr = thread_resume(pacThread);
     if (kr != KERN_SUCCESS) {
         printf("[%s:%d] thread_resume failed: 0x%x (%s)\n", __FUNCTION__, __LINE__, kr, mach_error_string(kr));
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
-    
+
     ExceptionMessage exc;
     memset(&exc, 0, sizeof(exc));
 
@@ -181,10 +266,22 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
         pac_cleanup(pacThread, exceptionPort, stack);
         return 0;
     }
-    
+
     uint64_t signedAddress = exc.threadState.__x[16];
 
     pac_cleanup(pacThread, exceptionPort, stack);
-    
+
+    if (signedAddress != 0 && signedAddress != (uint64_t)-1 && signedAddress != address) {
+        pthread_mutex_lock(&g_pacCacheLock);
+        g_pacSigCache[g_pacSigCacheNext].valid = true;
+        g_pacSigCache[g_pacSigCacheNext].keyA = keyA;
+        g_pacSigCache[g_pacSigCacheNext].keyB = keyB;
+        g_pacSigCache[g_pacSigCacheNext].address = address;
+        g_pacSigCache[g_pacSigCacheNext].modifier = modifier;
+        g_pacSigCache[g_pacSigCacheNext].signedAddress = signedAddress;
+        g_pacSigCacheNext = (g_pacSigCacheNext + 1) % PAC_SIG_CACHE_CAP;
+        pthread_mutex_unlock(&g_pacCacheLock);
+    }
+
     return signedAddress;
 }

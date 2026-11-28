@@ -1083,21 +1083,24 @@ static BOOL mergePaths(UIView *espView, CGPathRef textPath, NSMutableData *d) {
 }
 
 static void sb_forget_local_paint_state(void) {
+    // Only invoke remote release/free when the remote session is healthy; calling
+    // into a dead/poisoned session burns 10s timeouts per object.
+    const bool canCallRemote = remote_call_has_local_state() && remote_call_current_success();
     // Fl0rk: release_all_cached_main_invocations / forget_remote_state (local side)
-    if (r_is_objc_ptr(g_sbSetPathInv) && remote_call_has_local_state()) {
+    if (r_is_objc_ptr(g_sbSetPathInv) && canCallRemote) {
         r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
     }
-    if (g_sbSetPathArgBuf && remote_call_has_local_state()) {
+    if (g_sbSetPathArgBuf && canCallRemote) {
         dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
     }
     g_sbSetPathInv = 0;
     g_sbSetPathArgBuf = 0;
     g_sbPerformMainSel = 0;
     g_sbInvokeSel = 0;
-    if (r_is_objc_ptr(g_sbTextInv) && remote_call_has_local_state()) {
+    if (r_is_objc_ptr(g_sbTextInv) && canCallRemote) {
         r_msg2(g_sbTextInv, "release", 0,0,0,0);
     }
-    if (g_sbTextArgBuf && remote_call_has_local_state()) {
+    if (g_sbTextArgBuf && canCallRemote) {
         dlsym_remote("free", g_sbTextArgBuf, 0,0,0,0,0,0,0);
     }
     g_sbTextInv = 0;
@@ -1125,10 +1128,10 @@ static void sb_forget_local_paint_state(void) {
     s_sbNameBgLive = 0;
     s_sbNameTextLive = 0;
     for (int i = 0; i < 2; i++) {
-        if (r_is_objc_ptr(g_sbNameInv[i]) && remote_call_has_local_state()) {
+        if (r_is_objc_ptr(g_sbNameInv[i]) && canCallRemote) {
             r_msg2(g_sbNameInv[i], "release", 0,0,0,0);
         }
-        if (g_sbNameArgBuf[i] && remote_call_has_local_state()) {
+        if (g_sbNameArgBuf[i] && canCallRemote) {
             dlsym_remote("free", g_sbNameArgBuf[i], 0,0,0,0,0,0,0);
         }
         g_sbNameInv[i] = 0;
@@ -1136,11 +1139,14 @@ static void sb_forget_local_paint_state(void) {
     }
 #if SB_IOSURFACE_RENDER
     for (int i = 0; i < 2; i++) {
-        if (r_is_objc_ptr(g_sbSetContentsInv[i]) && remote_call_has_local_state()) {
+        if (r_is_objc_ptr(g_sbSetContentsInv[i]) && canCallRemote) {
             r_msg2(g_sbSetContentsInv[i], "release", 0,0,0,0);
         }
-        if (g_sbSetContentsArgBuf[i] && remote_call_has_local_state()) {
+        if (g_sbSetContentsArgBuf[i] && canCallRemote) {
             dlsym_remote("free", g_sbSetContentsArgBuf[i], 0,0,0,0,0,0,0);
+        }
+        if (r_is_objc_ptr(g_iosSbSurf[i]) && canCallRemote) {
+            r_msg2(g_iosSbSurf[i], "release", 0,0,0,0);
         }
         g_sbSetContentsInv[i] = 0;
         g_sbSetContentsArgBuf[i] = 0;
@@ -1165,6 +1171,22 @@ static void sb_forget_local_paint_state(void) {
     // than left for the next SBoardStartOverlay to overwrite.
     for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
     g_sbPathRingAt = 0;
+}
+
+/// Drops local overlay/IOSurface handles and tears down the broken RemoteCall session
+/// before rebuilding. Caller must hold g_sbIoLock and NOT hold g_sbLock.
+static void sb_reset_broken_session_locked(uint64_t rearmDelayUS) {
+    pthread_mutex_lock(&g_sbLock);
+    g_sbOverlayOn = NO;
+    g_sbWin = 0;
+    g_sbShape = 0;
+    g_sbCanvas = 0;
+    pthread_mutex_unlock(&g_sbLock);
+    sb_forget_local_paint_state();
+    destroy_remote_call();
+    if (rearmDelayUS > 0) {
+        g_sbRearmAfterUS = now_us() + rearmDelayUS;
+    }
 }
 
 static void sb_disable_layer_actions(uint64_t layer) {
@@ -1945,11 +1967,7 @@ static void sb_cost_probe(void) {
     // A probe that breaks the session must not take the overlay down with it.
     if (remote_call_has_local_state() && !remote_call_current_success()) {
         NSLog(@"[SB-PROBE] session unhealthy after probe — dropping it so the rearm path rebuilds clean");
-        abandon_remote_call();
-        pthread_mutex_lock(&g_sbLock);
-        g_sbOverlayOn = NO;
-        pthread_mutex_unlock(&g_sbLock);
-        g_sbRearmAfterUS = now_us() + 2000000ULL;
+        sb_reset_broken_session_locked(2000000ULL);
     }
 }
 
@@ -2000,11 +2018,7 @@ int SBoardStartOverlay(void) {
                   (unsigned long long)g_sbWin, (unsigned long long)g_sbShape);
             return 0;
         }
-        g_sbWin = 0;
-        g_sbShape = 0;
-        g_sbCanvas = 0;
-        sb_forget_local_paint_state();
-        abandon_remote_call();
+        sb_reset_broken_session_locked(0);
     }
     if (sb_open_session() != 0) {
         NSLog(@"[SBOverlay] session open failed");
@@ -2976,11 +2990,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                     if (++g_sbConsecFail >= 3) {
                         NSLog(@"[PUSH-DEAD] IOSurface remote_write failed %d times — rebuilding",
                               g_sbConsecFail);
-                        abandon_remote_call();
-                        pthread_mutex_lock(&g_sbLock);
-                        g_sbOverlayOn = NO;
-                        pthread_mutex_unlock(&g_sbLock);
-                        g_sbRearmAfterUS = now_us() + 2000000ULL;
+                        sb_reset_broken_session_locked(2000000ULL);
                     }
                     return;
                 }
@@ -3182,11 +3192,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                     }
                     NSLog(@"[PUSH-DEAD] RemoteCall failed %d times in a row — overlay down, will rebuild",
                           g_sbConsecFail);
-                    abandon_remote_call();
-                    pthread_mutex_lock(&g_sbLock);
-                    g_sbOverlayOn = NO;
-                    pthread_mutex_unlock(&g_sbLock);
-                    g_sbRearmAfterUS = now_us() + 2000000ULL;   // 2s
+                    sb_reset_broken_session_locked(2000000ULL);
                 }
                 return;
             }
@@ -4286,15 +4292,7 @@ void SBoardStopOverlay(void) {
 #endif
                 if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
             } else {
-                pthread_mutex_lock(&g_sbLock);
-                g_sbWin = 0;
-                g_sbShape = 0;
-                g_sbCanvas = 0;
-                pthread_mutex_unlock(&g_sbLock);
-                for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
-                g_sbPathRingAt = 0;
-                sb_forget_local_paint_state();
-                abandon_remote_call();
+                sb_reset_broken_session_locked(0);
             }
         }
     } @finally {
