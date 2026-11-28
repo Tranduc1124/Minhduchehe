@@ -99,11 +99,12 @@ BOOL IsESPSessionRunning(void)
 void StopESPSession(void)
 {
     // Three separate sessions have to be told, in this order: the local host
-    // first so nothing republishes a frame, then the SpringBoard view that
-    // was mirroring it, then the -hud process. Skipping the first two is what
-    // left the overlay on screen after the user pressed Stop.
+    // first so nothing republishes a frame, then full SpringBoard overlay
+    // teardown (pthread_exit on the synthetic trojan thread + port cleanup so
+    // background kill/swipe cannot escalate 0x401 into SpringBoard SIGBUS),
+    // then the -hud process.
     StopESPHost();
-    SBoardStopOverlay();
+    SBoardTeardownOverlayForExit();
     SetHUDEnabled(NO);
     ds_detach();
     // The optimistic flag, cleared with the real session. Left set, it made the

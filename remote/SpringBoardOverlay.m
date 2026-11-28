@@ -4303,9 +4303,17 @@ void SBoardStopOverlay(void) {
 }
 
 void SBoardTeardownOverlayForExit(void) {
-    SBoardStopOverlay();
     pthread_mutex_lock(&g_sbLock);
+    const BOOL wasOn = g_sbOverlayOn;
     uint64_t win = g_sbWin;
+    pthread_mutex_unlock(&g_sbLock);
+
+    if (wasOn) {
+        SBoardStopOverlay();
+    }
+
+    pthread_mutex_lock(&g_sbLock);
+    if (!win) win = g_sbWin;
     g_sbOverlayOn = NO;
     g_sbWin = 0;
     g_sbShape = 0;
@@ -4316,7 +4324,9 @@ void SBoardTeardownOverlayForExit(void) {
     @try {
         if (remote_call_has_local_state()) {
             if (remote_call_current_success()) {
-                if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
+                if (!wasOn && r_is_objc_ptr(win)) {
+                    r_msg2_main(win, "setHidden:", 1, 0,0,0);
+                }
                 if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
                 for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) {
                     if (g_sbPathRing[k] && g_sbPathRing[k] != g_sbPersistentPath) {
@@ -4326,13 +4336,15 @@ void SBoardTeardownOverlayForExit(void) {
                 }
                 g_sbPathRingAt = 0;
                 sb_forget_local_paint_state();
-                destroy_remote_call();
             } else {
                 for (int k = 0; k < SB_PATH_HOLD_FRAMES; k++) g_sbPathRing[k] = 0;
                 g_sbPathRingAt = 0;
                 sb_forget_local_paint_state();
-                abandon_remote_call();
             }
+            // Always try destroy_remote_call() rather than abandon_remote_call()
+            // on exit/stop so a still-parked synthetic thread executes pthread_exit
+            // before this process drops g_RC_secondExceptionPort.
+            destroy_remote_call();
         } else {
             sb_forget_local_paint_state();
         }
